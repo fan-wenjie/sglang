@@ -12,6 +12,26 @@
     "mem_fraction": 0.8,
     "coverage": "all"
   },
+  "arms": {
+    "stock": {
+      "positions": 24552,
+      "nats_per_token": 2.1634504782383495,
+      "ppl": 8.701108908092056,
+      "bpb": 0.7130095433839687
+    },
+    "shifted": {
+      "positions": 24552,
+      "nats_per_token": 2.22228323248575,
+      "ppl": 9.228377360699412,
+      "bpb": 0.7323990859983751
+    },
+    "shifted_split": {
+      "positions": 24552,
+      "nats_per_token": 2.22228323248575,
+      "ppl": 9.228377360699412,
+      "bpb": 0.7323990859983751
+    }
+  },
   "stock": {
     "positions": 24552,
     "nats_per_token": 2.1634504782383495,
@@ -42,6 +62,26 @@
       "shifted": 2.22228323248575,
       "absolute": 0.058832754247400754,
       "relative_pct": 2.7193945430776387
+    }
+  },
+  "split_delta": {
+    "bpb": {
+      "stock": 0.7323990859983751,
+      "shifted": 0.7323990859983751,
+      "absolute": 0.0,
+      "relative_pct": 0.0
+    },
+    "ppl": {
+      "stock": 9.228377360699412,
+      "shifted": 9.228377360699412,
+      "absolute": 0.0,
+      "relative_pct": 0.0
+    },
+    "nats_per_token": {
+      "stock": 2.22228323248575,
+      "shifted": 2.22228323248575,
+      "absolute": 0.0,
+      "relative_pct": 0.0
     }
   }
 }

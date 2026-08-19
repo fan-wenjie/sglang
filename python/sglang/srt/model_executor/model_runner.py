@@ -750,6 +750,7 @@ class ModelRunner:
         if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
         self.maybe_install_afd_early_q()
+        self.maybe_install_afd_roles()
 
     def maybe_install_afd_early_q(self):
         """Move each softmax layer's query read point, if --afd-q-shift-layers asks for it.
@@ -764,7 +765,34 @@ class ModelRunner:
             self.server_args.afd_q_shift_layers,
             coverage=self.server_args.afd_coverage,
             hf_config=self.model_config.hf_config,
+            split_attention=self.server_args.afd_split_attention,
+            verify_split=self.server_args.afd_verify_split,
         )
+
+    def maybe_install_afd_roles(self):
+        """Take the host or the pool side of the arrangement, if --afd-mode names one.
+
+        After the read point, because the host side hands its sweep schedule to the router: the
+        window has to open between the issue and the collect, and the router is what owns that
+        gap.
+        """
+        from sglang.srt.afd.roles import install_host_routing, serve_pool_in_background
+
+        mode = self.server_args.afd_mode
+        if mode == "pool":
+            self.afd_pool_thread = serve_pool_in_background(
+                self.model,
+                self.server_args.afd_bootstrap_port,
+                self.server_args.afd_min_batch,
+                self.server_args.afd_max_wait_ms,
+                self.device,
+            )
+        elif mode == "host":
+            self.afd_pool_client, self.afd_routing = install_host_routing(
+                self.model,
+                self.server_args.afd_pool_addr,
+                self.afd_early_q.hooks.sweep_ahead,
+            )
 
     def maybe_init_lora_manager(self):
         if get_lora().enable_lora:

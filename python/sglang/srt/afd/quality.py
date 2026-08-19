@@ -16,6 +16,28 @@ are not comparable and putting them side by side would fold quantisation into a 
 rewiring. Both arms here are the same FP8 weights; what is reported is the DELTA between them,
 which is what the rewiring is responsible for.
 
+## Three arms, because two would confound two changes
+
+Partitioning attention into a sweep and a join reassociates the additions inside one softmax, so
+the split arm is not bit-identical to the fused one even though it is the same mathematics. The
+split is on by default wherever the read point moved, so a two-arm run would report the read
+point's cost and the reassociation's together under the read point's name.
+
+    stock          shift 0, fused              the model as shipped
+    shifted        shift N, fused              what moving the read point costs
+    shifted_split  shift N, partitioned        what the schedule costs on top of that
+
+`shifted_split` minus `shifted` is NOT a measurement of what the partition costs, and reading it
+as one would be the mistake this paragraph exists to prevent. Scoring input logprobs is a prefill,
+and the partition is refused in prefill -- a chunk's join is a causal attention among its own
+tokens rather than one position per request. So the third arm runs the fused kernel at every layer
+and its delta is exactly zero by construction.
+
+What the arm is worth keeping for is the other direction: installing the schedule must not perturb
+the forward passes it does not split. A non-zero delta here means the wiring changed something on
+a path it was supposed to leave alone. The partition's own exactness is measured where it runs, by
+`--afd-verify-split` on decode traffic.
+
 ## Why both bpb and ppl
 
 Bits per byte is comparable across tokenisations and is what the study reports; perplexity is what
@@ -107,7 +129,7 @@ def compare(stock: dict, shifted: dict) -> dict:
 
 
 def run_arm(model_path: str, shift: int, prompts, mem_fraction: float,
-            coverage: str) -> tuple:
+            coverage: str, split: bool) -> tuple:
     import sglang as sgl
 
     engine = sgl.Engine(
@@ -119,6 +141,7 @@ def run_arm(model_path: str, shift: int, prompts, mem_fraction: float,
         log_level="warning",
         afd_q_shift_layers=shift,
         afd_coverage=coverage,
+        afd_split_attention=split,
     )
     try:
         return score(engine, prompts)
@@ -142,29 +165,48 @@ def main() -> int:
     print(f"  {len(tokens)} cached token(s); scoring {a.sequences} sequence(s) of {a.seq}",
           flush=True)
 
-    nats, positions = run_arm(a.model, 0, prompts, a.mem_fraction, a.coverage)
-    stock = as_metrics(nats, positions, a.bytes_per_token)
-    print(f"  stock     bpb {stock['bpb']:.4f}  ppl {stock['ppl']:.3f}  "
-          f"({stock['positions']} positions)", flush=True)
+    arms = {}
+    for name, shift, split in (
+        ("stock", 0, False),
+        ("shifted", a.shift, False),
+        ("shifted_split", a.shift, True),
+    ):
+        nats, positions = run_arm(a.model, shift, prompts, a.mem_fraction, a.coverage, split)
+        arms[name] = as_metrics(nats, positions, a.bytes_per_token)
+        print(f"  {name:14s} shift={shift} split={str(split):5s}  "
+              f"bpb {arms[name]['bpb']:.4f}  ppl {arms[name]['ppl']:.3f}  "
+              f"({arms[name]['positions']} positions)", flush=True)
 
-    nats, positions = run_arm(a.model, a.shift, prompts, a.mem_fraction, a.coverage)
-    shifted = as_metrics(nats, positions, a.bytes_per_token)
-    print(f"  shift={a.shift} ({a.coverage})  bpb {shifted['bpb']:.4f}  ppl {shifted['ppl']:.3f}  "
-          f"({shifted['positions']} positions)", flush=True)
-
-    if stock["positions"] != shifted["positions"]:
+    counted = {name: arm["positions"] for name, arm in arms.items()}
+    if len(set(counted.values())) != 1:
         raise SystemExit(
-            f"  the two arms scored different numbers of positions "
-            f"({stock['positions']} and {shifted['positions']}); they are not one measurement"
+            f"  the arms scored different numbers of positions ({counted}); they are not one "
+            f"measurement"
         )
 
+    stock, shifted = arms["stock"], arms["shifted"]
     delta = compare(stock, shifted)
+    split_delta = compare(shifted, arms["shifted_split"])
     for key in ("bpb", "ppl"):
         d = delta[key]
-        print(f"  {key}: {d['stock']:.4f} -> {d['shifted']:.4f}   "
+        print(f"  read point  {key}: {d['stock']:.4f} -> {d['shifted']:.4f}   "
               f"{d['absolute']:+.4f}  ({d['relative_pct']:+.2f}%)", flush=True)
+    for key in ("bpb", "ppl"):
+        d = split_delta[key]
+        print(f"  schedule    {key}: {d['stock']:.4f} -> {d['shifted']:.4f}   "
+              f"{d['absolute']:+.4f}  ({d['relative_pct']:+.2f}%)", flush=True)
+    print("  the schedule's delta is a prefill number and the partition is decode-only, so zero "
+          "here says the wiring left prefill alone -- not that the partition is free", flush=True)
 
-    out = {"model": a.model, "config": vars(a), "stock": stock, "shifted": shifted, "delta": delta}
+    out = {
+        "model": a.model,
+        "config": vars(a),
+        "arms": arms,
+        "stock": stock,
+        "shifted": shifted,
+        "delta": delta,
+        "schedule_delta_prefill_only": split_delta,
+    }
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     with open(a.out, "w") as f:
         json.dump(out, f, indent=2)

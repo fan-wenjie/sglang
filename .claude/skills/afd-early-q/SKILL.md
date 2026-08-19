@@ -161,6 +161,41 @@ a wait is a condition variable on that slot. Do not key by layer alone: two requ
 the same layer will overwrite each other, and the symptom is a model that produces fluent text with
 a slightly wrong distribution, which no assertion catches.
 
+### Step 2 is a partition of attention, not a different kernel
+
+`self.attn(q, k, v, forward_batch)` is one call: the sweep over the cache and the fold-in of this
+step's token happen inside one kernel, and there is nothing to put between the issue and the
+collect until that call is split. Softmax attention is a mergeable aggregate, so the split is
+exact:
+
+    sweep   the positions already in the cache. Needs q and the cache. Runs in the window
+    join    this step's token. Needs k and v, which need x_l, which comes back from the pool
+    merge   `merge_state(o_sweep, lse_sweep, o_join, lse_join)`
+
+Do both halves through the SAME `forward_decode`, with `kv_indptr`/`kv_indices` swapped for the
+partition's own, rather than writing a sweep kernel. That function is a hundred lines of branching
+-- kv scales, logit capping, sinks, sliding windows, MLA, the unified pool's loc translation -- and
+a reimplementation gets some subset right and drifts from the rest. The failure is not a crash; it
+is attention that is slightly wrong on the configurations the reimplementation forgot.
+
+### The order inside the window is the whole schedule
+
+    issue, sweep, collect     the window
+    sweep, issue, collect     nothing hidden: `issue` copies the hidden states to the host and so
+                              synchronises the stream, and the send waits for the sweep
+    issue, collect, sweep     nothing hidden: the synchronous port
+
+All three give the same tokens. Assert the order directly; a benchmark can only tell them apart by
+a smaller number, and a smaller number has many other explanations.
+
+### Which layers get a window
+
+A layer j opens one only when layer j+N sweeps a cache. On a hybrid stack that is the softmax
+layers alone -- 16 of 64 on Qwen3.8-27B -- because a linear-attention layer's query multiplies a
+recurrent state, and partitioning THAT is a separate piece of work. The other 48 feed-forwards are
+still issued and waited for. Report the window count beside any speedup, or the speedup is read
+against 64 layers of hiding that never existed.
+
 ## Testing, in the order the failures actually appear
 
 1. **The read point is the tensor you think it is.** Capture `h_l` on a converted layer and the
@@ -170,9 +205,16 @@ a slightly wrong distribution, which no assertion catches.
 2. **Coverage.** Assert the number of converted layers equals what the shift asks for, and that
    every clamped layer is in the record. On a hybrid stack, assert that the linear-attention layers
    were handled as the arm intends rather than skipped by accident.
-3. **The split is exact.** Sweep plus join against one fused attention call, on real weights, to
-   within the dtype's rounding. Do this before any performance claim; a protocol that is 1e-2
-   relative is not the same model.
+3. **The split is exact**, and the number that says so has a control. Sweep plus join against one
+   fused attention call, on real weights, to within the dtype's rounding -- before any performance
+   claim, because a protocol that is 1e-2 relative is not the same model. A small gap only means
+   something against what a WRONG partition would have given: measure the same comparison with the
+   boundary moved by one position in each direction. In float64 at this model's shapes the honest
+   partition sits at 6e-16 and either boundary error at 2e-1, so the two cannot be confused.
+   Check the partition in index space too -- complete and disjoint -- because the merge is exact
+   for any partition, including one that drops a position, and the output stays plausible.
+   Greedy-decode agreement is NOT this test: batch composition alone parts the same model's greedy
+   output on 3 of 4 prompts, so an arm that differs on 2 of 4 has said nothing yet.
 4. **Asynchrony actually happened.** Record the issue time and the wait time of each pool call. If
    `wait - issue` is the pool's service time for every call, nothing overlapped and the async path
    is a synchronous path with extra machinery.

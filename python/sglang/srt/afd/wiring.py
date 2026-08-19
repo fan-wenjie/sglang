@@ -39,6 +39,7 @@ from collections.abc import Callable
 
 import torch
 from sglang.srt.afd.checkpoint import resolve_coverage, resolve_shift
+from sglang.srt.afd.sweep_ahead import install_sweep_ahead, resolve_split
 from sglang.srt.afd.read_point import (
     ReadPlan,
     convertible_layers,
@@ -55,6 +56,18 @@ PREPARE_METHODS = (
     "forward_prepare_native",
     "forward_prepare_npu",
 )
+
+
+class PassHooks:
+    """What the per-pass wrappers call, filled in after they are installed.
+
+    The prepare_mlp wrapper is installed with the read point; the sweep-ahead schedule is
+    installed on top of it and needs to be called from inside it. A mutable holder is the join
+    between them, so neither has to be built twice.
+    """
+
+    def __init__(self) -> None:
+        self.sweep_ahead = None
 
 
 class LayerStash:
@@ -76,14 +89,18 @@ class LayerStash:
         return len(self._h)
 
 
-def _wrap_prepare_mlp(layer, layer_id: int, stash: LayerStash) -> Callable:
+def _wrap_prepare_mlp(layer, layer_id: int, stash: LayerStash, hooks: PassHooks) -> Callable:
     original = layer.layer_communicator.prepare_mlp
 
-    def wrapped(*args, **kwargs):
-        hidden_states, residual = original(*args, **kwargs)
+    def wrapped(hidden_states, residual, forward_batch, *args, **kwargs):
+        hidden_states, residual = original(
+            hidden_states, residual, forward_batch, *args, **kwargs
+        )
         # residual here is h_l. The layer's OUTPUT would be x_(l+1), which is the standard read
         # point with extra steps: a correct model, no overlap, and nothing to notice it by.
         stash.put(layer_id, residual)
+        if hooks.sweep_ahead is not None:
+            hooks.sweep_ahead.on_prepare_mlp(layer_id, forward_batch)
         return hidden_states, residual
 
     layer.layer_communicator.prepare_mlp = wrapped
@@ -100,6 +117,18 @@ def _wrap_prepare(layer, name: str) -> Callable:
 
     def wrapped(positions, hidden_states, **kwargs):
         q, k, v, gate = original(positions=positions, hidden_states=hidden_states, **kwargs)
+        early = layer._afd_q_precomputed
+        if early is not None:
+            if early[2] != name:
+                raise RuntimeError(
+                    f"the sweep window projected this layer's query with {early[2]} and the "
+                    f"layer called {name}. The two variants fuse the norm and the rotation "
+                    f"differently, so this is a query the model did not ask for -- and the only "
+                    f"symptom would be fluent output from an attention nobody wrote."
+                )
+            # the window already ran this projection on the early stream, inside the pool round
+            # trip. Running it again here would be the same arithmetic outside the window.
+            return early[0], k, v, early[1]
         source = layer._afd_q_hidden
         if source is None:
             return q, k, v, gate
@@ -169,15 +198,20 @@ def _wrap_layer_forward(layer, layer_id: int, source_of: dict[int, int],
 class InstalledWiring:
     """What was changed, so a run can record it and a test can put it back."""
 
-    def __init__(self, plan: ReadPlan, stash: LayerStash, undo: list[Callable]):
+    def __init__(self, plan: ReadPlan, stash: LayerStash, undo: list[Callable],
+                 hooks: PassHooks | None = None):
         self.plan = plan
         self.stash = stash
+        self.hooks = hooks if hooks is not None else PassHooks()
         self._undo = undo
 
     def record(self) -> dict:
         return self.plan.as_record()
 
     def remove(self) -> None:
+        if self.hooks.sweep_ahead is not None:
+            self.hooks.sweep_ahead.remove()
+            self.hooks.sweep_ahead = None
         for fn in self._undo:
             fn()
         self._undo.clear()
@@ -185,7 +219,8 @@ class InstalledWiring:
 
 
 def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
-                    coverage=None, hf_config=None) -> InstalledWiring:
+                    coverage=None, hf_config=None, split_attention=None,
+                    verify_split=None) -> InstalledWiring:
     """Move the query's read point, on every layer or on the softmax ones alone.
 
         coverage="all"     every layer that has a query, including linear attention. 63 of 64 on
@@ -230,18 +265,19 @@ def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
             f"tolerance rather than as a wiring that never installed."
         )
 
-    stash, undo = LayerStash(), []
+    stash, undo, hooks = LayerStash(), [], PassHooks()
     source_of = {p.layer: p.source for p in plan.points if not p.clamped}
     needed = sorted({s for s in source_of.values()})
 
     for layer_id in needed:
         layer = layers[layer_id]
-        original = _wrap_prepare_mlp(layer, layer_id, stash)
+        original = _wrap_prepare_mlp(layer, layer_id, stash, hooks)
         undo.append(lambda ly=layer, o=original: setattr(ly.layer_communicator, "prepare_mlp", o))
 
     for layer_id in sorted(source_of):
         layer = layers[layer_id]
         layer._afd_q_hidden = None
+        layer._afd_q_precomputed = None
         if hasattr(layer, "linear_attn"):
             # a linear-attention layer: one fused projection, splice the query slice
             original = _wrap_linear_input_proj(layer)
@@ -272,7 +308,21 @@ def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
     # converted fewer layers than asked would otherwise report a shallower shift's cost under a
     # deeper shift's name, with nothing in the log to notice it by.
     logger.info("afd early-q record: %s", plan.as_record())
-    return InstalledWiring(plan, stash, undo)
+    wiring = InstalledWiring(plan, stash, undo, hooks)
+
+    # The schedule goes on top of the read point, not beside it: it needs the plan to know which
+    # layer reads which, and the stash to find h_l when the window opens.
+    if resolve_split(split_attention):
+        hooks.sweep_ahead = install_sweep_ahead(model, wiring)
+        if hooks.sweep_ahead is not None and verify_split:
+            hooks.sweep_ahead.verify_path = verify_split
+            logger.warning(
+                "afd: --afd-verify-split recomputes every join the fused way and writes the "
+                "worst disagreement to %s. Attention runs twice; this is not a latency "
+                "configuration.",
+                verify_split,
+            )
+    return wiring
 
 
 # ---------------------------------------------------------------------------

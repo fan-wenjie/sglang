@@ -3132,6 +3132,16 @@ class ServerArgs:
         'Which layers the query shift reaches. "all" is every layer that has a query, including linear attention -- 63 of 64 on Qwen3.8-27B, and what a deployment converts. "softmax" is only the layers whose attention sweeps a cache, 16 of 64: an ablation, and a different number.',
         NS("afd"),
     ] = None
+    afd_split_attention: A[
+        Optional[bool],
+        "Partition each converted layer's attention into a sweep over the KV cache and a join with this step's token, so the sweep can run while the pool computes the feed-forward. Unset means on wherever the read point moved: the split changes the order of the additions inside softmax, so a quality number and a latency number measured on different settings would describe different models. Only decode is partitioned; prefill falls back and the fallback is counted.",
+        NS("afd"),
+    ] = None
+    afd_verify_split: A[
+        Optional[str],
+        "Path to write a comparison of the split attention against the fused call, recomputed on every join of real traffic. Doubles the attention work, so it is a diagnostic and not a deployment setting; the two differ only in the order of the additions inside one softmax, so a relative gap beyond bfloat16 rounding means a partition is covering the wrong positions.",
+        NS("afd"),
+    ] = None
     afd_min_batch: A[
         int,
         "How many callers the pool waits for before a departure. A departure carries every caller at the stop, not the first N.",

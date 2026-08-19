@@ -1,0 +1,27 @@
+{
+  "model": "/home/user/experiment/models/Qwen3.8-27B-FP8",
+  "requests": 4,
+  "max_new_tokens": 128,
+  "arms": [
+    {
+      "label": "colocated",
+      "tokens": 512,
+      "wall_s": 7.5680955201387405,
+      "tokens_per_second": 67.65242307494209
+    },
+    {
+      "label": "two-sided",
+      "tokens": 512,
+      "wall_s": 59.860977198928595,
+      "tokens_per_second": 8.553151384390763
+    },
+    {
+      "label": "q-first",
+      "tokens": 512,
+      "wall_s": 54.9035655669868,
+      "tokens_per_second": 9.325441703331972
+    }
+  ],
+  "qfirst_over_two_sided": 1.0902930726036972,
+  "two_sided_over_colocated": 0.12642786460014882
+}

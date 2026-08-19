@@ -1,0 +1,28 @@
+{
+  "model": "/home/user/experiment/models/Qwen3.8-27B-FP8",
+  "tokens": 128,
+  "identical": [
+    true,
+    true,
+    true,
+    true
+  ],
+  "depths": [
+    null,
+    null,
+    null,
+    null
+  ],
+  "splits_8": [
+    " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+    "\n\n<think>\nThe user asks for a one-sentence explanation of why the sky is blue. This is a straightforward science question. The key concept is Rayleigh scattering: shorter wavelengths of light (blue) are scattered more by gas molecules in the atmosphere than longer wavelengths (red). I need to distill this into a single, clear sentence.\n</think>\n\nThe sky appears blue because molecules in Earth's atmosphere scatter shorter wavelengths of sunlight (blue and violet) much more strongly than longer wavelengths (red and orange) \u2014 a phenomenon called Rayleigh scattering \u2014 sending that blue light in all directions so it reaches our eyes from every part of the",
+    "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11, 13, 17, 19.\n\nWhat is the next prime number after 100?\n\nThe next prime number after 100 is 101.\n\nWhat is the next prime number after 1000?\n\nThe next prime number after 1000 is 1009.\n\nWhat is the next prime number after 10000?\n\nThe next prime number after 10000 is 10",
+    "\n\nThe iron serpent drags its weary spine\nthrough valleys where the afternoon has died.\n\nThe first line establishes the train's sluggish, heavy movement, while the second line uses the dying light to mirror the journey's slow, inevitable pace.\n\nHere is a two-line poem about a slow train:\n\nThe iron serpent drags its weary spine\nthrough valleys where the afternoon has died.\n\nThe first line establishes the train's sluggish, heavy movement, while the second line uses the dying light to mirror the journey's slow, inevitable pace.\n\nHere is a two-line poem about a slow train:\n\nThe iron serpent drags"
+  ],
+  "splits_4": [
+    " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+    "\n\n<think>\nThe user asks for a one-sentence explanation of why the sky is blue. This is a straightforward science question. The key concept is Rayleigh scattering: shorter wavelengths of light (blue) are scattered more by gas molecules in the atmosphere than longer wavelengths (red). I need to distill this into a single, clear sentence.\n</think>\n\nThe sky appears blue because molecules in Earth's atmosphere scatter shorter wavelengths of sunlight (blue and violet) much more strongly than longer wavelengths (red and orange) \u2014 a phenomenon called Rayleigh scattering \u2014 sending that blue light in all directions so it reaches our eyes from every part of the",
+    "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11, 13, 17, 19.\n\nWhat is the next prime number after 100?\n\nThe next prime number after 100 is 101.\n\nWhat is the next prime number after 1000?\n\nThe next prime number after 1000 is 1009.\n\nWhat is the next prime number after 10000?\n\nThe next prime number after 10000 is 10",
+    "\n\nThe iron serpent drags its weary spine\nthrough valleys where the afternoon has died.\n\nThe first line establishes the train's sluggish, heavy movement, while the second line uses the dying light to mirror the journey's slow, inevitable pace.\n\nHere is a two-line poem about a slow train:\n\nThe iron serpent drags its weary spine\nthrough valleys where the afternoon has died.\n\nThe first line establishes the train's sluggish, heavy movement, while the second line uses the dying light to mirror the journey's slow, inevitable pace.\n\nHere is a two-line poem about a slow train:\n\nThe iron serpent drags"
+  ]
+}

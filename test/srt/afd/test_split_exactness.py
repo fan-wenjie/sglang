@@ -120,6 +120,61 @@ class TestSplitIsTheSameAttention(unittest.TestCase):
                             float((lse - whole[1]).abs().max()))
         self.assertLess(worst, 1e-12, f"a split cache disagreed with one sweep by {worst:.2e}")
 
+    def test_a_boundary_off_by_one_is_not_a_rounding(self):
+        """What the runtime verify number has to be read against.
+
+        `--afd-verify-split` reports how far the partitioned attention sits from the fused one on
+        real traffic, and a small number only means something if a WRONG partition would have
+        given a large one. The realistic mistake is at the boundary: the sweep is meant to cover
+        every cached position but this step's, and an off-by-one drops the position just before
+        it -- the one a decode attends to most.
+
+        Both are measured here in float64, where the honest split has nothing but summation order
+        between it and the fused answer, so the two failure modes cannot be confused with each
+        other or with the arithmetic.
+        """
+        torch.manual_seed(0)
+        cached = 32
+        q = torch.randn(N_Q_HEADS, HEAD_DIM, dtype=torch.float64)
+        k = torch.randn(N_Q_HEADS, cached + 1, HEAD_DIM, dtype=torch.float64)
+        v = torch.randn(N_Q_HEADS, cached + 1, HEAD_DIM, dtype=torch.float64)
+        reference = fused(q.unsqueeze(1), k, v).squeeze(1)
+        scale = HEAD_DIM**-0.5
+
+        def merged(prefix_end):
+            o_lt, lse_lt = sweep(q, k[:, :prefix_end], v[:, :prefix_end])
+            s_jj = (q * k[:, -1]).sum(-1) * scale
+            return join(o_lt, lse_lt, s_jj, v[:, -1])
+
+        honest = float((merged(cached) - reference).abs().max() / reference.abs().max())
+        short = float((merged(cached - 1) - reference).abs().max() / reference.abs().max())
+        print(f"    honest {honest:.2e}   one position short {short:.2e}")
+        self.assertLess(honest, 1e-12, "a partition of the cache reproduces the whole of it")
+        self.assertGreater(
+            short, 1e-2,
+            "a dropped position must be visible; if it is not, the runtime verify number is "
+            "measuring nothing and a wrong boundary would pass it",
+        )
+
+    def test_counting_a_position_twice_is_not_a_rounding(self):
+        """The other boundary error: the sweep keeps this step's slot, which the join adds again.
+
+        This one is worth its own case because it is what a partition built from the FULL sequence
+        length produces, and that length is the one every other part of the backend uses.
+        """
+        torch.manual_seed(1)
+        cached = 32
+        q = torch.randn(N_Q_HEADS, HEAD_DIM, dtype=torch.float64)
+        k = torch.randn(N_Q_HEADS, cached + 1, HEAD_DIM, dtype=torch.float64)
+        v = torch.randn(N_Q_HEADS, cached + 1, HEAD_DIM, dtype=torch.float64)
+        reference = fused(q.unsqueeze(1), k, v).squeeze(1)
+        o_lt, lse_lt = sweep(q, k, v)                       # the whole run, current token included
+        s_jj = (q * k[:, -1]).sum(-1) * HEAD_DIM**-0.5
+        double = join(o_lt, lse_lt, s_jj, v[:, -1])
+        gap = float((double - reference).abs().max() / reference.abs().max())
+        print(f"    one position counted twice {gap:.2e}")
+        self.assertGreater(gap, 1e-2)
+
     def test_a_frame_of_this_model_width_survives_the_wire(self):
         """The hidden width the pool actually carries, not a toy one."""
         import socket

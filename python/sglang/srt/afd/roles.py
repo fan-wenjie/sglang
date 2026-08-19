@@ -4,23 +4,23 @@
     host   loads the stack, installs the Early-Q read point, and sends every converted layer's
            feed-forward to the pool instead of running it locally
 
-## What this buys today, and what it does not
+## What this buys, and where
 
 The feed-forward genuinely leaves the host: the pool runs it, batches across callers, and the
 host's own MLP weights go unused on the converted layers. That is the arrangement's plumbing, and
 it is what a second machine needs.
 
-The OVERLAP is not here yet, and the reason is worth stating rather than discovering in a
-benchmark. In sglang's layer, `self.attn(q, k, v, forward_batch)` is one call: the sweep over the
-cache and the fold-in of the current position happen inside one kernel. The protocol's whole point
-is that the sweep needs only the query -- so the sweep can run while the pool works, and only the
-fold-in needs `x_{l+1}`. Until the backend returns `(o, lse)` for the cached positions separately,
-the host has nothing to do between issuing the call and needing its answer, and
-`overlap_report()["mean_hidden_s"]` will read near zero. It reads near zero honestly: that is the
-state of this port, not a property of the arrangement.
+The OVERLAP is `sweep_ahead`, passed in here as `between`. `self.attn(q, k, v, forward_batch)`
+used to be one call -- the sweep over the cache and the fold-in of this step's token inside one
+kernel -- so there was nothing the host could do between issuing a feed-forward and needing its
+answer. `split_attention` partitions that call, and the half that needs only the query is launched
+here, between the issue and the collect.
 
-The triton backend already carries an `attn_lse` in its metadata, so the split is reachable. It is
-the next step, not this one.
+The window exists at a layer j only when layer j+N sweeps a cache. On Qwen3.8-27B that is 16 of
+64 layers, because three of every four are linear attention, whose query multiplies a recurrent
+state this does not know how to partition. The other 48 feed-forwards are still issued and waited
+for. That is a property of the model's layer mix, and `SweepAhead.record()` reports the count so
+a speedup is read against the number of windows that actually existed.
 
 ## Why the pool loads the whole model
 
@@ -31,7 +31,9 @@ code, and a mapping bug there produces plausible tokens from the wrong weights.
 
 from __future__ import annotations
 
+import itertools
 import logging
+import os
 import threading
 from collections.abc import Callable
 
@@ -40,6 +42,10 @@ from sglang.srt.afd.pool_client import PoolClient
 from sglang.srt.afd.pool_server import serve
 
 logger = logging.getLogger(__name__)
+
+# how often the host says whether its windows are opening. Often enough to see a schedule that
+# stopped overlapping mid-run, rarely enough that the line is not the workload.
+REPORT_EVERY = 512
 
 
 def make_pool_forward(model) -> Callable[[torch.Tensor, int], torch.Tensor]:
@@ -68,6 +74,54 @@ def make_pool_forward(model) -> Callable[[torch.Tensor, int], torch.Tensor]:
     return forward
 
 
+def routable_layers(model) -> tuple[int, ...]:
+    """The layers whose feed-forward this router can speak for.
+
+    A sparse block takes a forward batch the wire does not carry, so it stays on the host. Chosen
+    here rather than refused at the first token, because a stack that turns out to be half
+    routable is a different arrangement from the one a benchmark was launched to measure.
+    """
+    from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+    return tuple(
+        i for i, layer in enumerate(model.model.layers)
+        if not isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+    )
+
+
+def serve_pool_in_background(model, port: int, min_batch: int, max_wait_ms: int, device):
+    """Answer feed-forward frames on a thread of an already-loaded server.
+
+    The pool role reuses the ordinary launch path: the model is loaded, the scheduler starts, and
+    nobody sends it a request. That is wasteful of a process and honest about what it is -- the
+    alternative is a second entrypoint whose weight loading, quantisation and device placement
+    would be a second implementation of the thing whose numbers must match the host's.
+    """
+    ready = threading.Event()
+    thread = threading.Thread(
+        target=run_pool,
+        kwargs=dict(model=model, host="0.0.0.0", port=port, min_batch=min_batch,
+                    max_wait_ms=max_wait_ms, device=device, ready=ready),
+        daemon=True,
+        name="afd-pool",
+    )
+    thread.start()
+    if not ready.wait(timeout=60):
+        raise RuntimeError(
+            f"the afd pool did not bind port {port} within 60s. A host pointed at it would fail "
+            f"at its first token instead, an hour into a benchmark."
+        )
+    return thread
+
+
+def install_host_routing(model, pool_addr: str, sweep_ahead, connect_timeout_s: float = 30.0):
+    """Point every routable layer's feed-forward at the pool, and open the sweep window."""
+    client = PoolClient(pool_addr, connect_timeout_s)
+    return client, install_pool_routing(
+        model, client, routable_layers(model), sweep_ahead=sweep_ahead
+    )
+
+
 def run_pool(model, host: str, port: int, min_batch: int, max_wait_ms: int,
              device: torch.device | str, ready: threading.Event | None = None):
     """Serve until killed. Blocks."""
@@ -87,12 +141,28 @@ def run_pool(model, host: str, port: int, min_batch: int, max_wait_ms: int,
 class PoolRouting:
     """Replaces the feed-forward of named layers with a call to the pool."""
 
-    def __init__(self, model, client: PoolClient, layers: tuple[int, ...], request_id: int):
+    def __init__(self, model, client: PoolClient, layers: tuple[int, ...], request_id: int,
+                 between: Callable[[int], None] | None = None):
         self.model = model
         self.client = client
         self.layers = layers
+        # Frames are keyed by (request_id, layer), so an id reused while a frame is outstanding
+        # crosses two answers. A fixed id is safe only while one caller talks to the pool; the
+        # counter makes every call of this host unique, and the random base keeps two hosts on
+        # one pool from starting at the same number.
         self.request_id = request_id
+        base = request_id if request_id else int.from_bytes(os.urandom(4), "big") << 24
+        self._ids = itertools.count(base + 1)
+        # what runs while the pool works. Called with the layer whose feed-forward is in flight,
+        # AFTER the issue: `issue` copies the hidden states to the host and so synchronises the
+        # stream, and work launched before it would be waited on by the send.
+        self.between = between
         self._undo: list[Callable] = []
+        # Skill check 4: whether anything overlapped. Reported from here because the host runs
+        # inside the scheduler process, where no caller can reach the client to ask -- and a
+        # schedule whose windows all closed looks exactly like one whose windows all opened,
+        # except in these two numbers.
+        self._calls = 0
         self._install()
 
     def _install(self) -> None:
@@ -114,10 +184,25 @@ class PoolRouting:
                     f"dense MLP. Route it locally or teach the wire its other arguments."
                 )
             device, dtype = hidden_states.device, hidden_states.dtype
-            handle = self.client.issue(self.request_id, layer_id, hidden_states)
-            # Nothing between issue and collect YET -- see this module's docstring. The two calls
-            # are kept apart so the day the sweep moves in between, only the middle changes.
+            handle = self.client.issue(next(self._ids), layer_id, hidden_states)
+            if self.between is not None:
+                # the window. The next converted layer's query was projected from THIS layer's
+                # h_l, so its cache sweep can be launched now and will run on the GPU while the
+                # host waits on the socket below.
+                self.between(layer_id)
             out = self.client.collect(handle, device)
+            self._calls += 1
+            if self._calls % REPORT_EVERY == 0:
+                report = self.client.overlap_report()
+                logger.info(
+                    "afd host: %s pool call(s); mean outstanding %.2f ms, mean blocked %.2f ms, "
+                    "hidden %.1f%%",
+                    self._calls,
+                    1e3 * report["mean_outstanding_s"],
+                    1e3 * report["mean_blocked_s"],
+                    100.0 * (1.0 - report["mean_blocked_s"] / report["mean_outstanding_s"])
+                    if report["mean_outstanding_s"] > 0 else 0.0,
+                )
             return out.to(dtype)
 
         return routed
@@ -129,11 +214,23 @@ class PoolRouting:
 
 
 def install_pool_routing(model, client: PoolClient, layers: tuple[int, ...],
-                         request_id: int = 0) -> PoolRouting:
+                         request_id: int = 0, sweep_ahead=None) -> PoolRouting:
     if not layers:
         raise ValueError(
             "no layer routed to the pool. A host that runs every feed-forward itself is the "
             "colocated arrangement with a socket open beside it."
         )
-    logger.info("afd host: routing %s layer(s) to the pool at %s", len(layers), client.address)
-    return PoolRouting(model, client, tuple(layers), request_id)
+    between = None
+    if sweep_ahead is not None:
+        # the schedule takes over the trigger for the layers it routes; without this handover the
+        # sweep would fire from the prepare_mlp wrapper, BEFORE the issue, and the send would wait
+        # on it -- a correct model with the window closed, and a benchmark that reads as "the
+        # overlap does not help".
+        sweep_ahead.routed_layers = set(layers)
+        between = sweep_ahead.sweep_after_issue
+    logger.info(
+        "afd host: routing %s layer(s) to the pool at %s, %s of them opening a sweep window",
+        len(layers), client.address,
+        len(set(layers) & set(sweep_ahead.sweep_at)) if sweep_ahead is not None else 0,
+    )
+    return PoolRouting(model, client, tuple(layers), request_id, between=between)
