@@ -18,6 +18,6 @@ export CU13=/home/user/.conda/envs/sglang/lib/python3.12/site-packages/nvidia/cu
 export CUDA_HOME="$CU13"
 export PATH="$CU13/bin:/home/user/.conda/envs/sglang/bin:$PATH"
 export LIBRARY_PATH="$SGLANG_SRC/.cuda-devlinks:$CU13/lib"
-export LD_LIBRARY_PATH="$CU13/lib:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$CU13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="$SGLANG_SRC/python"
 export AFD_MODEL=/home/user/experiment/models/Qwen3.8-27B-FP8

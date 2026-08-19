@@ -749,6 +749,21 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+        self.maybe_install_afd_early_q()
+
+    def maybe_install_afd_early_q(self):
+        """Move each softmax layer's query read point, if --afd-q-shift-layers asks for it.
+
+        Wired here because this is where a loaded model may be transformed, and because the model
+        lives in the scheduler process: a caller holding an Engine cannot reach it.
+        """
+        self.afd_early_q = None
+        if self.server_args.afd_q_shift_layers:
+            from sglang.srt.afd.wiring import install_early_q
+
+            self.afd_early_q = install_early_q(
+                self.model, self.server_args.afd_q_shift_layers
+            )
 
     def maybe_init_lora_manager(self):
         if get_lora().enable_lora:

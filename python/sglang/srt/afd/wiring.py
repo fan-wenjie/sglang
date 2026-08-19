@@ -38,7 +38,12 @@ import logging
 from collections.abc import Callable
 
 import torch
-from sglang.srt.afd.read_point import ReadPlan, full_attention_layers, plan_read_points
+from sglang.srt.afd.read_point import (
+    ReadPlan,
+    full_attention_layers,
+    layer_types_of,
+    plan_read_points,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,13 +147,18 @@ class InstalledWiring:
         self.stash.clear()
 
 
-def install_early_q(model, shift_layers: int, layer_types: list[str]) -> InstalledWiring:
+def install_early_q(model, shift_layers: int,
+                    layer_types: list[str] | None = None) -> InstalledWiring:
     """Move the query's read point on every full-attention layer the shift can reach.
 
     `layer_types` names which layers are softmax attention: a linear-attention layer has no cache
     to sweep, and converting one would be a different intervention than the one that was measured.
+    It is derived from the built stack when not given, so a caller in a frozen orchestrator can
+    ask for the wiring without computing its inputs.
     """
     layers = model.model.layers
+    if layer_types is None:
+        layer_types = layer_types_of(model)
     convertible = full_attention_layers(layer_types)
     plan = plan_read_points(shift_layers, len(layers), convertible=convertible)
     if shift_layers > 0 and not plan.moved:
@@ -179,12 +189,130 @@ def install_early_q(model, shift_layers: int, layer_types: list[str]) -> Install
         undo.append(lambda ly=layer, o=original: setattr(ly, "forward", o))
 
     logger.info(
-        "afd early-q installed: shift=%s (%s half-layers), %s layer(s) moved, %s clamped, "
-        "%s layer(s) stashed",
+        "afd early-q installed: shift=%s (%s half-layers, offset %.1f), %s layer(s) moved, "
+        "%s clamped, %s layer(s) stashed",
         plan.shift_layers,
         plan.half_layers,
+        plan.offset_layers,
         len(plan.moved),
         len(plan.clamped),
         len(needed),
     )
+    # the record goes in the log, not just into a return value a caller may drop: a run that
+    # converted fewer layers than asked would otherwise report a shallower shift's cost under a
+    # deeper shift's name, with nothing in the log to notice it by.
+    logger.info("afd early-q record: %s", plan.as_record())
     return InstalledWiring(plan, stash, undo)
+
+
+# ---------------------------------------------------------------------------
+# The same read plan, on a HuggingFace stack.
+#
+# sglang's layer fuses q, k and v into one projection, so moving the query
+# there costs a second projection. A HuggingFace Qwen3.5 layer keeps q_proj,
+# k_proj and v_proj apart, so the query's input can simply be substituted --
+# cheaper, and a cleaner statement of the intervention.
+#
+# This exists so the SAME plan drives both. A quality number measured on one
+# and a schedule measured on the other are then about one rewiring; two
+# installers driven by two notions of the read point would be two.
+# ---------------------------------------------------------------------------
+
+
+def _hf_layers(model):
+    """The decoder stack, wherever this family keeps it.
+
+    A vision-language wrapper keeps the text stack one level deeper. Hardcoding `model.model.layers`
+    finds nothing there and a conversion that hooks nothing costs nothing, which reads as tolerance.
+    """
+    for path in (
+        ("model", "layers"),
+        ("model", "language_model", "layers"),
+        ("model", "model", "layers"),
+        ("layers",),
+    ):
+        node = model
+        for name in path:
+            node = getattr(node, name, None)
+            if node is None:
+                break
+        if node is not None and len(node) > 0:
+            return node
+    raise RuntimeError(
+        f"no decoder stack found on a {type(model).__name__}; name the attribute rather than "
+        f"letting the search return an empty list"
+    )
+
+
+class HFEarlyQ:
+    """h_l captured at post_attention_layernorm's input; q_proj's input substituted."""
+
+    def __init__(self, model, plan: ReadPlan):
+        self.plan = plan
+        self.layers = _hf_layers(model)
+        self._h: dict[int, torch.Tensor] = {}
+        self._handles = []
+        self._source_of = {p.layer: p.source for p in plan.points if not p.clamped}
+        needed = {s for s in self._source_of.values()}
+
+        for layer_id in sorted(needed):
+            layer = self.layers[layer_id]
+            self._handles.append(
+                layer.post_attention_layernorm.register_forward_pre_hook(
+                    self._stash(layer_id)
+                )
+            )
+        for layer_id in sorted(self._source_of):
+            layer = self.layers[layer_id]
+            self._handles.append(
+                layer.self_attn.q_proj.register_forward_pre_hook(
+                    self._substitute(layer_id, layer.input_layernorm)
+                )
+            )
+
+    def _stash(self, layer_id: int):
+        def hook(_module, args):
+            # post_attention_layernorm's input IS h_l: the stream after this layer's attention
+            # and before its feed-forward.
+            self._h[layer_id] = args[0]
+
+        return hook
+
+    def _substitute(self, layer_id: int, norm):
+        source = self._source_of[layer_id]
+
+        def hook(_module, args):
+            h = self._h.get(source)
+            if h is None:
+                raise RuntimeError(
+                    f"layer {layer_id} wants h_{source} and it is not stashed; the layer that "
+                    f"produces it has not run, which is a plan error rather than a race"
+                )
+            return (norm(h),) + tuple(args[1:])
+
+        return hook
+
+    def record(self) -> dict:
+        return self.plan.as_record()
+
+    def remove(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        self._h.clear()
+
+
+def install_early_q_hf(model, shift_layers: int, layer_types: list[str]) -> HFEarlyQ:
+    """The same plan as `install_early_q`, on a HuggingFace stack."""
+    layers = _hf_layers(model)
+    convertible = full_attention_layers(layer_types)
+    plan = plan_read_points(shift_layers, len(layers), convertible=convertible)
+    if shift_layers > 0 and not plan.moved:
+        raise RuntimeError(
+            f"--afd-q-shift-layers={shift_layers} moves no layer of this {len(layers)}-layer stack"
+        )
+    logger.info(
+        "afd early-q (hf): shift=%s, %s moved, %s clamped",
+        plan.shift_layers, len(plan.moved), len(plan.clamped),
+    )
+    return HFEarlyQ(model, plan)

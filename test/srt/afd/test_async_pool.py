@@ -173,3 +173,62 @@ class TestDeparture(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPoolDoesNotCallItself(unittest.TestCase):
+    """A pool sharing a process with the host must not route work back to itself.
+
+    Guards a hang that actually happened: the single-machine test put both roles on one model, the
+    host replaced layer.mlp.forward with a router, and the pool -- which looked the method up per
+    call -- found the router, sent the work back out and waited for its own reply. Idle GPU, no
+    error, no timeout. On two machines the two models are separate and the bug cannot appear, so
+    it would have been found by a benchmark that hung rather than by a test.
+    """
+
+    def test_the_pool_binds_its_forward_before_the_router_replaces_it(self):
+        from sglang.srt.afd.roles import make_pool_forward
+
+        class FakeMLP:
+            def __init__(self, tag):
+                self.tag = tag
+
+            def forward(self, x):
+                return x + self.tag
+
+        class FakeLayer:
+            def __init__(self, tag):
+                self.mlp = FakeMLP(tag)
+
+        class FakeInner:
+            def __init__(self):
+                self.layers = [FakeLayer(1.0), FakeLayer(2.0)]
+
+        class FakeModel:
+            def __init__(self):
+                self.model = FakeInner()
+
+        model = FakeModel()
+        pool_forward = make_pool_forward(model)
+
+        # the host installs a router afterwards, as it does in the shared-process case
+        def router(_x):
+            raise AssertionError("the pool re-entered the host's router")
+
+        model.model.layers[0].mlp.forward = router
+
+        out = pool_forward(torch.zeros(2, 4), 0)
+        self.assertTrue(torch.allclose(out, torch.ones(2, 4)), "the pool ran the wrong layer")
+
+    def test_a_layer_outside_the_stack_is_refused(self):
+        from sglang.srt.afd.roles import make_pool_forward
+
+        class FakeInner:
+            def __init__(self):
+                self.layers = []
+
+        class FakeModel:
+            def __init__(self):
+                self.model = FakeInner()
+
+        with self.assertRaises(RuntimeError):
+            make_pool_forward(FakeModel())(torch.zeros(1, 4), 3)
