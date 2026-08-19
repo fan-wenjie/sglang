@@ -3105,6 +3105,40 @@ class ServerArgs:
     ] = True
 
     # -------------------------------------------------------------------------
+    # AFD: attention / feed-forward disaggregation
+    # -------------------------------------------------------------------------
+    afd_mode: A[
+        Literal["null", "host", "pool"],
+        'Attention/feed-forward disaggregation. "host" owns the KV cache and runs attention; "pool" owns the static weights and runs the feed-forward for whoever calls. If not specified, the two are colocated as usual.',
+        NS("afd"),
+    ] = "null"
+    afd_pool_addr: A[
+        Optional[str],
+        "HOST:PORT of the feed-forward pool an --afd-mode=host server calls. Required in host mode: a host that cannot reach its pool should fail at startup, not at the first token.",
+        NS("afd"),
+    ] = None
+    afd_bootstrap_port: A[
+        int,
+        "Port an --afd-mode=pool server listens on. Default is 8999.",
+        NS("afd"),
+    ] = 8999
+    afd_q_shift_layers: A[
+        int,
+        "Where each layer's query is read from, as a layer count N: the offset is N-0.5 layers, the source is h_(l-N), the span is N layers, and the study's unit is 2N-1 half-layers. 0 is the standard wiring; 1 reads h_(l-1), half a layer back. On a stack whose softmax layers end each group of N, N makes each of them read the previous softmax layer's residual.",
+        NS("afd"),
+    ] = 0
+    afd_min_batch: A[
+        int,
+        "How many callers the pool waits for before a departure. A departure carries every caller at the stop, not the first N.",
+        NS("afd"),
+    ] = 2
+    afd_max_wait_ms: A[
+        int,
+        "How long the pool waits for --afd-min-batch before departing anyway. Without it the last caller of a draining workload waits for a partner that never arrives.",
+        NS("afd"),
+    ] = 5
+
+    # -------------------------------------------------------------------------
     # PD disaggregation
     # -------------------------------------------------------------------------
     disaggregation_mode: A[
@@ -3651,6 +3685,7 @@ class ServerArgs:
 
         # Validate PD disaggregation flags before CUDA graph config.
         self._handle_pd_disaggregation()
+        self._handle_afd()
 
         # Normalize deprecated CP aliases before validations or model-specific
         # defaults inspect enable_prefill_cp/cp_strategy.
@@ -3988,6 +4023,11 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def _handle_afd(self):
+        from sglang.srt.arg_groups.afd_hook import handle_afd
+
+        handle_afd(self)
 
     def _handle_dcp_validation(self):
         if self.dcp_size < 1:
