@@ -3127,6 +3127,11 @@ class ServerArgs:
         "Where each layer's query is read from, as a layer count N: the offset is N-0.5 layers, the source is h_(l-N), the span is N layers, and the study's unit is 2N-1 half-layers. 0 is the standard wiring; 1 reads h_(l-1), half a layer back. On a stack whose softmax layers end each group of N, N makes each of them read the previous softmax layer's residual.",
         NS("afd"),
     ] = 0
+    afd_coverage: A[
+        Literal["all", "softmax"],
+        'Which layers the query shift reaches. "all" is every layer that has a query, including linear attention -- 63 of 64 on Qwen3.8-27B, and what a deployment converts. "softmax" is only the layers whose attention sweeps a cache, 16 of 64: an ablation, and a different number.',
+        NS("afd"),
+    ] = "all"
     afd_min_batch: A[
         int,
         "How many callers the pool waits for before a departure. A departure carries every caller at the stop, not the first N.",

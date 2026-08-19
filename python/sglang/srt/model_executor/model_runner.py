@@ -762,7 +762,9 @@ class ModelRunner:
             from sglang.srt.afd.wiring import install_early_q
 
             self.afd_early_q = install_early_q(
-                self.model, self.server_args.afd_q_shift_layers
+                self.model,
+                self.server_args.afd_q_shift_layers,
+                coverage=self.server_args.afd_coverage,
             )
 
     def maybe_init_lora_manager(self):

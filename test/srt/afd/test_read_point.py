@@ -141,3 +141,43 @@ def _t(value: float = 0.0):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCoverage(unittest.TestCase):
+    """Which layers move is not which layers sweep a cache, and conflating them caps coverage.
+
+    Guards a real capping: the installer used `full_attention_layers` for both questions, so a
+    run asking for the full shift silently converted 16 of 64 layers and reported the cost under
+    the fuller coverage's name. The study measured both -- +0.0181 bits per byte at 16/64 and
+    +0.0211 at 63/64 -- so the two are distinguishable and the mix-up is not cosmetic.
+    """
+
+    def test_the_three_questions_have_three_answers(self):
+        from sglang.srt.afd.read_point import (
+            convertible_layers,
+            full_attention_layers,
+            stateful_layers,
+        )
+
+        kinds = QWEN38_27B_LAYER_TYPES
+        sweeps = full_attention_layers(kinds)
+        moves = convertible_layers(kinds)
+        stateful = stateful_layers(kinds)
+        self.assertEqual(len(sweeps), 16, "only the softmax layers sweep a cache")
+        self.assertEqual(len(moves), 64, "every layer has a query to move")
+        self.assertEqual(len(stateful), 64, "a linear layer's recurrent state is state too")
+        self.assertNotEqual(len(sweeps), len(moves))
+
+    def test_full_coverage_is_63_of_64_at_one_layer_back(self):
+        from sglang.srt.afd.read_point import convertible_layers
+
+        plan = plan_read_points(1, 64, convertible=convertible_layers(QWEN38_27B_LAYER_TYPES))
+        # layer 0 is exempt, everything else moves
+        self.assertEqual(len(plan.moved), 63)
+        self.assertEqual(plan.clamped, ())
+
+    def test_softmax_only_coverage_is_16_of_64(self):
+        from sglang.srt.afd.read_point import full_attention_layers
+
+        plan = plan_read_points(1, 64, convertible=full_attention_layers(QWEN38_27B_LAYER_TYPES))
+        self.assertEqual(len(plan.moved), 16)

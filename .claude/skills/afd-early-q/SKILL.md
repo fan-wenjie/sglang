@@ -83,6 +83,47 @@ four times larger at `N = 4` than at `N = 1` on a dense stack. `N = 1` is the co
 and the one to deploy; the larger values exist because the question "how far back may it go" has to
 be answerable, not because a server should use them.
 
+## What may leave the host, and what may not
+
+The split is by STATE, not by cost. A pool is worth having because it is stateless: a caller that
+stalls blocks nobody, and the pool need not be reserved for a request between that request's own
+calls. Anything holding per-request state destroys that property the moment it moves.
+
+    host    every attention. A softmax layer holds a KV cache; a linear-attention layer holds a
+            recurrent state. Both belong to the request, and a pool holding either could no
+            longer be released and retaken between one request's calls.
+    pool    the feed-forward, and only it. It reads the same weights whatever the caller's
+            history, so a request sweeping a million positions and one sweeping a thousand cost
+            it exactly the same. That is why they can share it.
+
+A hybrid stack makes this concrete rather than abstract: Qwen3.8-27B is 48 linear-attention layers
+and 16 softmax ones, and all 64 keep their token mixer on the host. Only the 64 feed-forwards move.
+
+## Coverage is not the same question as overlap
+
+Three questions look alike and have different answers. Answering them with one function silently
+capped a run's coverage at a quarter of the stack:
+
+    which layers sweep a cache        the softmax ones. This is the DEPLOYMENT question: only a
+                                      sweep over cached keys can start before the feed-forward
+                                      preceding it, because only it needs no more than the query.
+    which layers' queries move        every layer that has a query, including linear attention.
+                                      This is the QUALITY question, and the rewiring is the same
+                                      rewiring on both kinds.
+    which layers hold state           all of them, for the reason above.
+
+On this model the two coverages are distinguishable and were measured: 16 of 64 layers costs
++0.0181 bits per byte, 63 of 64 costs +0.0211 -- four times the coverage for 1.17 times the cost.
+Reporting the cheaper coverage's number under the fuller coverage's name is a real error, not a
+rounding, and `--afd-coverage {all,softmax}` exists so the choice is written down in the run rather
+than implied by which function someone reached for.
+
+A linear-attention layer's query is the first slice of a fused `in_proj_qkvz` that splits
+`[key, key, value, value]`. Splicing at the projection's output is safe because the conv1d that
+follows is depthwise: each channel is filtered on its own, so replacing a contiguous channel range
+does not mix it with its neighbours. Check that before porting to a family whose convolution is
+not grouped.
+
 ## Argument naming
 
 Follow `disaggregation_*`. Concretely:

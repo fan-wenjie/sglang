@@ -106,7 +106,8 @@ def compare(stock: dict, shifted: dict) -> dict:
     return out
 
 
-def run_arm(model_path: str, shift: int, prompts, mem_fraction: float) -> tuple:
+def run_arm(model_path: str, shift: int, prompts, mem_fraction: float,
+            coverage: str) -> tuple:
     import sglang as sgl
 
     engine = sgl.Engine(
@@ -117,6 +118,7 @@ def run_arm(model_path: str, shift: int, prompts, mem_fraction: float) -> tuple:
         attention_backend="triton",
         log_level="warning",
         afd_q_shift_layers=shift,
+        afd_coverage=coverage,
     )
     try:
         return score(engine, prompts)
@@ -132,6 +134,7 @@ def main() -> int:
         ap.add_argument(f"--{name}", type=int, required=True)
     ap.add_argument("--bytes-per-token", type=float, required=True)
     ap.add_argument("--mem-fraction", type=float, required=True)
+    ap.add_argument("--coverage", required=True, choices=("all", "softmax"))
     a = ap.parse_args()
 
     tokens = load_tokens(a.tokens)
@@ -139,14 +142,14 @@ def main() -> int:
     print(f"  {len(tokens)} cached token(s); scoring {a.sequences} sequence(s) of {a.seq}",
           flush=True)
 
-    nats, positions = run_arm(a.model, 0, prompts, a.mem_fraction)
+    nats, positions = run_arm(a.model, 0, prompts, a.mem_fraction, a.coverage)
     stock = as_metrics(nats, positions, a.bytes_per_token)
     print(f"  stock     bpb {stock['bpb']:.4f}  ppl {stock['ppl']:.3f}  "
           f"({stock['positions']} positions)", flush=True)
 
-    nats, positions = run_arm(a.model, a.shift, prompts, a.mem_fraction)
+    nats, positions = run_arm(a.model, a.shift, prompts, a.mem_fraction, a.coverage)
     shifted = as_metrics(nats, positions, a.bytes_per_token)
-    print(f"  shift={a.shift}   bpb {shifted['bpb']:.4f}  ppl {shifted['ppl']:.3f}  "
+    print(f"  shift={a.shift} ({a.coverage})  bpb {shifted['bpb']:.4f}  ppl {shifted['ppl']:.3f}  "
           f"({shifted['positions']} positions)", flush=True)
 
     if stock["positions"] != shifted["positions"]:

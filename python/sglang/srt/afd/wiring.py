@@ -40,6 +40,7 @@ from collections.abc import Callable
 import torch
 from sglang.srt.afd.read_point import (
     ReadPlan,
+    convertible_layers,
     full_attention_layers,
     layer_types_of,
     plan_read_points,
@@ -110,6 +111,41 @@ def _wrap_prepare(layer, name: str) -> Callable:
     return original
 
 
+def _wrap_linear_input_proj(layer) -> Callable:
+    """A linear-attention layer's query slice, read from the earlier stream.
+
+    `in_proj_qkvz` is fused and splits `[key, key, value, value]`, so the query is the FIRST
+    slice. The projection is run twice when a source is set -- once on this layer's own normalised
+    input for the key, value and gate, once on the source's for the query -- and the two are
+    spliced at the projection's output. That splice is safe here because the conv1d that follows
+    is depthwise (`groups=conv_dim`): each channel is filtered independently, so replacing a
+    contiguous channel range does not mix it with the ones beside it.
+
+    The state stays here. A linear-attention layer holds a recurrent state that belongs to the
+    request, so it cannot move to a stateless pool -- only the feed-forward leaves.
+    """
+    original = layer.linear_attn._forward_input_proj
+    attn = layer.linear_attn
+
+    def wrapped(hidden_states, *args, **kwargs):
+        qkvz, ba = original(hidden_states, *args, **kwargs)
+        source = layer._afd_q_hidden
+        if source is None:
+            return qkvz, ba
+        early_qkvz, _ = original(source, *args, **kwargs)
+        k_tp = attn.key_dim // attn.attn_tp_size
+        if qkvz.shape[-1] < k_tp:
+            raise RuntimeError(
+                f"the fused projection is {qkvz.shape[-1]} wide and the query slice is {k_tp}; "
+                f"the split this splices at is not the split the model uses"
+            )
+        spliced = torch.cat([early_qkvz[..., :k_tp], qkvz[..., k_tp:]], dim=-1)
+        return spliced, ba
+
+    layer.linear_attn._forward_input_proj = wrapped
+    return original
+
+
 def _wrap_layer_forward(layer, layer_id: int, source_of: dict[int, int],
                         stash: LayerStash, norm) -> Callable:
     original = layer.forward
@@ -147,19 +183,28 @@ class InstalledWiring:
         self.stash.clear()
 
 
-def install_early_q(model, shift_layers: int,
-                    layer_types: list[str] | None = None) -> InstalledWiring:
-    """Move the query's read point on every full-attention layer the shift can reach.
+def install_early_q(model, shift_layers: int, layer_types: list[str] | None = None,
+                    coverage: str = "all") -> InstalledWiring:
+    """Move the query's read point, on every layer or on the softmax ones alone.
 
-    `layer_types` names which layers are softmax attention: a linear-attention layer has no cache
-    to sweep, and converting one would be a different intervention than the one that was measured.
-    It is derived from the built stack when not given, so a caller in a frozen orchestrator can
-    ask for the wiring without computing its inputs.
+        coverage="all"     every layer that has a query, including linear attention. 63 of 64 on
+                           this model, and the coverage a deployment converts.
+        coverage="softmax" only the layers whose attention is a sweep over a cache. 16 of 64.
+                           Useful as an ablation; NOT the same number, and the study measured the
+                           gap: +0.0181 bits per byte against +0.0211, a factor of 1.17.
+
+    `layer_types` is derived from the built stack when not given, so a caller in a frozen
+    orchestrator can ask for the wiring without computing its inputs.
     """
     layers = model.model.layers
     if layer_types is None:
         layer_types = layer_types_of(model)
-    convertible = full_attention_layers(layer_types)
+    if coverage == "all":
+        convertible = convertible_layers(layer_types)
+    elif coverage == "softmax":
+        convertible = full_attention_layers(layer_types)
+    else:
+        raise ValueError(f'coverage is "all" or "softmax", got {coverage!r}')
     plan = plan_read_points(shift_layers, len(layers), convertible=convertible)
     if shift_layers > 0 and not plan.moved:
         raise RuntimeError(
@@ -180,17 +225,25 @@ def install_early_q(model, shift_layers: int,
     for layer_id in sorted(source_of):
         layer = layers[layer_id]
         layer._afd_q_hidden = None
-        for name in PREPARE_METHODS:
-            # Accessed directly, not guarded: all four exist on this class, and a missing one
-            # means the model file changed under this patch, which should be loud.
-            original = _wrap_prepare(layer, name)
-            undo.append(lambda ly=layer, n=name, o=original: setattr(ly, n, o))
+        if hasattr(layer, "linear_attn"):
+            # a linear-attention layer: one fused projection, splice the query slice
+            original = _wrap_linear_input_proj(layer)
+            undo.append(
+                lambda ly=layer, o=original: setattr(ly.linear_attn, "_forward_input_proj", o)
+            )
+        else:
+            for name in PREPARE_METHODS:
+                # Accessed directly, not guarded: all four exist on this class, and a missing one
+                # means the model file changed under this patch, which should be loud.
+                original = _wrap_prepare(layer, name)
+                undo.append(lambda ly=layer, n=name, o=original: setattr(ly, n, o))
         original = _wrap_layer_forward(layer, layer_id, source_of, stash, layer.input_layernorm)
         undo.append(lambda ly=layer, o=original: setattr(ly, "forward", o))
 
     logger.info(
-        "afd early-q installed: shift=%s (%s half-layers, offset %.1f), %s layer(s) moved, "
-        "%s clamped, %s layer(s) stashed",
+        "afd early-q installed: coverage=%s, shift=%s (%s half-layers, offset %.1f), "
+        "%s layer(s) moved, %s clamped, %s layer(s) stashed",
+        coverage,
         plan.shift_layers,
         plan.half_layers,
         plan.offset_layers,

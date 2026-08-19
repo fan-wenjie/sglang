@@ -124,13 +124,43 @@ def plan_read_points(
 
 
 def full_attention_layers(layer_types: list[str]) -> tuple[int, ...]:
-    """The layers whose query this project moves: the softmax-attention ones.
+    """The layers whose attention is a sweep over a cache: the softmax ones.
 
-    A linear-attention layer has no cache to sweep and no query in the sense that matters here;
-    its state update is sequential. Converting one would be a different intervention than the one
-    that was measured, so the arm names them rather than letting a loop over all layers decide.
+    This answers the DEPLOYMENT question -- which layers can start their attention before the
+    feed-forward that precedes them, because a sweep over cached keys needs only the query. A
+    linear-attention layer has no cache to sweep; its state update is sequential.
+
+    It is NOT the answer to "which layers' queries move". Those are two questions and they were
+    one function here for a while, which silently capped coverage at the softmax layers.
     """
     return tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
+
+
+def convertible_layers(layer_types: list[str]) -> tuple[int, ...]:
+    """The layers whose query read point moves: every layer that has a query.
+
+    A linear-attention layer has one too. Its query is the first slice of a fused projection and
+    it meets a recurrent state rather than a cache, but the rewiring -- read the query from an
+    earlier point of the residual stream -- is the same rewiring, and the quality it costs is a
+    property of the whole stack rather than of the softmax layers alone.
+
+    The study measured both coverages on this model: 16 of 64 layers costs +0.0181 bits per byte
+    and 63 of 64 costs +0.0211, a factor of 1.17 for four times the coverage. Reporting the
+    cheaper coverage's cost under the fuller coverage's name is the error this function exists to
+    make impossible.
+    """
+    return tuple(range(len(layer_types)))
+
+
+def stateful_layers(layer_types: list[str]) -> tuple[int, ...]:
+    """The layers that hold per-request state and therefore cannot leave the host.
+
+    A softmax layer holds a KV cache; a linear-attention layer holds a recurrent state. Both are
+    the request's, and a pool that held either would stop being stateless -- it could no longer be
+    released between a request's own calls, which is the property the arrangement is built on.
+    Only the feed-forward, which reads the same weights whatever the caller's history, may leave.
+    """
+    return tuple(range(len(layer_types)))
 
 
 def layer_types_of(model) -> list[str]:
