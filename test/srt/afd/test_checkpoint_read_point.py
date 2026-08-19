@@ -61,13 +61,25 @@ class TestResolveShift(unittest.TestCase):
         with self.assertNoLogs(logger, level=logging.WARNING):
             self.assertEqual(resolve_shift(1, _config(shift=1)), 1)
 
-    def test_a_shift_on_an_unconverted_checkpoint_informs_but_does_not_warn(self):
-        """Forward-only measurement is legitimate and is how the study's numbers were taken."""
+    def test_a_shift_on_an_unconverted_checkpoint_warns(self):
+        """Legitimate -- it is how the study's forward-only numbers were taken -- and still a
+        warning, because the weights were never repaired for this read point. Only a specific
+        intent wants it, and a deployment that arrives here arrived by accident."""
+        from sglang.srt.afd.checkpoint import resolve_shift
+
+        with self.assertLogs("sglang.srt.afd.checkpoint", level=logging.WARNING) as caught:
+            self.assertEqual(resolve_shift(1, _config()), 1)
+        self.assertIn("nothing has repaired", "".join(caught.output))
+
+    def test_standard_wiring_on_an_unconverted_checkpoint_is_silent(self):
+        """The one arrangement nothing is wrong with, however it was spelled. Serving stock
+        weights at the stock read point must stay quiet whether the flag was omitted or written
+        out, or every ordinary launch carries an afd warning and the real ones stop being read."""
         from sglang.srt.afd.checkpoint import resolve_shift
 
         logger = logging.getLogger("sglang.srt.afd.checkpoint")
         with self.assertNoLogs(logger, level=logging.WARNING):
-            self.assertEqual(resolve_shift(1, _config()), 1)
+            self.assertEqual(resolve_shift(0, _config()), 0)
 
     def test_the_top_level_is_read_when_there_is_no_text_config(self):
         from sglang.srt.afd.checkpoint import resolve_shift

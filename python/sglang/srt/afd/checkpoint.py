@@ -16,18 +16,26 @@ a vision-language wrapper the text stack is what was converted.
 
 ## The resolution, and why the command line only warns
 
-    config says N, nothing on the command line     serve at N. The checkpoint knows.
-    nothing anywhere                               serve at 0. An unconverted checkpoint.
-    command line says M, config says the same      fine, said twice.
-    command line says M, config says N != M        WARN and use M. An override is legitimate --
-                                                   measuring what a shift costs on an unconverted
-                                                   checkpoint is exactly how the study's
-                                                   forward-only numbers were taken -- but it is
-                                                   also how someone serves a repaired checkpoint
-                                                   wrongly, and those two look identical from
-                                                   here. The warning names both readings.
-    command line says M, checkpoint is unconverted  info, not a warning. Nothing is being
-                                                   contradicted.
+    config says N, nothing on the command line     serve at N. The checkpoint knows. Info, since
+                                                   this is the one routine path and a routine
+                                                   path that warns teaches people to skip warnings.
+    nothing anywhere                               serve at 0, silently. An unconverted
+                                                   checkpoint served the way it was trained.
+    command line says M, config says the same      fine, said twice. Silent.
+    command line says M != 0, config says nothing  WARN. The weights were never repaired for this
+                                                   read point, so the model being served is one
+                                                   nobody trained -- correct as a measurement of
+                                                   what the rewiring costs before repair, which is
+                                                   how the study's forward-only numbers were
+                                                   taken, and wrong as a deployment.
+    command line says M, config says N != M        WARN. Either measuring an unrepaired shift or
+                                                   serving a repaired checkpoint at the wrong read
+                                                   point, and those two look identical from here.
+                                                   The warning names both readings.
+
+Every path that serves weights at a read point they were not repaired for warns; nothing else
+does. A warning here means the command line asked for something only a specific intent wants, and
+if that intent is a measurement campaign the line is the record of it.
 
 The command line cannot be silently right: `--afd-q-shift-layers` defaults to None, meaning "take
 the checkpoint's", and 0 is a real value meaning "serve the standard wiring even if the checkpoint
@@ -75,11 +83,14 @@ def resolve_shift(requested, hf_config) -> int:
         return stated
 
     if stated is None:
-        logger.info(
-            "afd: --afd-q-shift-layers=%s on a checkpoint that states no read point. Its weights "
-            "were not repaired for this wiring, so this measures what the rewiring costs before "
-            "any repair.",
-            requested,
+        if requested == 0:
+            return 0
+        logger.warning(
+            "afd: --afd-q-shift-layers=%s on a checkpoint that states no read point. Its query "
+            "projection was trained to read x_l and is being given h_(l-%s), so this serves a "
+            "model nothing has repaired -- valid as a measurement of what the rewiring costs "
+            "before repair, and wrong as a deployment. Serving at %s.",
+            requested, requested, requested,
         )
         return requested
 
