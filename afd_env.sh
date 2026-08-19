@@ -17,6 +17,9 @@ export SGLANG_SRC=/home/user/experiment/sglang
 export CU13=/home/user/.conda/envs/sglang/lib/python3.12/site-packages/nvidia/cu13
 export CUDA_HOME="$CU13"
 export PATH="$CU13/bin:/home/user/.conda/envs/sglang/bin:$PATH"
+# generated, not checked in -- and generated HERE rather than by hand, because a link that only
+# exists on the machine somebody made it on is a build step no check has ever read
+"$SGLANG_SRC/afd_devlinks.sh" "$CU13" > /dev/null
 export LIBRARY_PATH="$SGLANG_SRC/.cuda-devlinks:$CU13/lib"
 export LD_LIBRARY_PATH="$CU13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="$SGLANG_SRC/python"

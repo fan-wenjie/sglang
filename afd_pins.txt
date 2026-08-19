@@ -12,3 +12,8 @@ nvidia-cuda-nvrtc==13.3.*
 nvidia-cuda-cupti==13.3.*
 nvidia-cuda-nvcc==13.3.*
 nvidia-cuda-crt==13.3.*
+
+# `cuda-toolkit` is a meta-package that pins nvrtc to the 13.0 line, and the host env carries both
+# it and the 13.3 wheels because the pins were force-applied on top. pip cannot resolve that pair
+# from a freeze: reproducing this environment means dropping cuda-toolkit and installing the
+# individual nvidia-* wheels, which is what the host actually runs.
