@@ -12,7 +12,6 @@ import time
 import unittest
 
 import torch
-
 from sglang.srt.afd.pool_client import PoolClient
 from sglang.srt.afd.pool_server import serve
 from sglang.srt.afd.protocol import Frame, decode, encode

@@ -26,10 +26,9 @@ import logging
 import socket
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
 
 import torch
-
 from sglang.srt.afd.protocol import Frame, decode, encode
 
 logger = logging.getLogger(__name__)

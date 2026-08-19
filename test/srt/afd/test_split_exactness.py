@@ -23,7 +23,6 @@ import itertools
 import unittest
 
 import torch
-
 from sglang.srt.afd.protocol import Frame, decode, encode
 
 # Qwen3.8-27B text config: num_attention_heads 24, num_key_value_heads 4, head_dim 256.
@@ -114,7 +113,7 @@ class TestSplitIsTheSameAttention(unittest.TestCase):
         for cuts in ([0, 1, 399], [0, 200, 399], [0, 100, 250, 399], [0, 399]):
             edges = sorted(set(cuts))
             parts = [sweep(q[:, -1], k[:, a:b], v[:, a:b])
-                     for a, b in zip(edges, edges[1:]) if b > a]
+                     for a, b in itertools.pairwise(edges) if b > a]
             for order in itertools.permutations(range(len(parts))):
                 o, lse = merge([parts[i] for i in order])
                 worst = max(worst, float((o - whole[0]).abs().max()),

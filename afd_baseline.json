@@ -1,0 +1,8 @@
+{
+  "load_s": 20.02444076538086,
+  "gen_s": 108.37188339233398,
+  "outputs": [
+    " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is",
+    "\n\nA KV cache is a memory structure that stores the key and value vectors generated during the self-attention mechanism of a transformer model to avoid redundant computations in subsequent"
+  ]
+}

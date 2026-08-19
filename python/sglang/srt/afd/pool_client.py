@@ -26,7 +26,6 @@ import time
 from typing import NamedTuple
 
 import torch
-
 from sglang.srt.afd.protocol import CLOSE, Frame, decode, encode
 
 logger = logging.getLogger(__name__)
@@ -116,8 +115,18 @@ class PoolClient:
                     )
                 self._cond.wait(timeout=0.5)
             out = self._slots.pop(handle.key)
+            # both spans, because their DIFFERENCE is the evidence. issued->collected is how
+            # long the call was outstanding; blocked is how much of that the caller actually
+            # spent waiting. If they are equal, the caller did nothing in between and nothing
+            # overlapped.
+            now = time.perf_counter()
             self._waits.append(
-                (handle.request_id, handle.layer, handle.issued_at, time.perf_counter())
+                {
+                    "request_id": handle.request_id,
+                    "layer": handle.layer,
+                    "outstanding_s": now - handle.issued_at,
+                    "blocked_s": now - started,
+                }
             )
         return out.to(device, non_blocking=True)
 
@@ -125,11 +134,18 @@ class PoolClient:
         """Issue-to-collect intervals, so a test can assert the overlap rather than assume it."""
         with self._cond:
             waits = list(self._waits)
-        spans = [end - issued for _, _, issued, end in waits]
+        if not waits:
+            return {"calls": 0}
+        outstanding = [w["outstanding_s"] for w in waits]
+        blocked = [w["blocked_s"] for w in waits]
+        hidden = [o - b for o, b in zip(outstanding, blocked)]
         return {
-            "calls": len(spans),
-            "mean_issue_to_collect_s": sum(spans) / len(spans) if spans else None,
-            "max_issue_to_collect_s": max(spans) if spans else None,
+            "calls": len(waits),
+            "mean_outstanding_s": sum(outstanding) / len(outstanding),
+            "mean_blocked_s": sum(blocked) / len(blocked),
+            # what the caller got done while the pool worked. Zero means the call was issued and
+            # immediately waited on, which is the synchronous arrangement wearing this one's name.
+            "mean_hidden_s": sum(hidden) / len(hidden),
         }
 
     def close(self) -> None:

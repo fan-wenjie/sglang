@@ -131,3 +131,27 @@ def full_attention_layers(layer_types: list[str]) -> tuple[int, ...]:
     that was measured, so the arm names them rather than letting a loop over all layers decide.
     """
     return tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
+
+
+def layer_types_of(model) -> list[str]:
+    """Read the layer kinds off the LOADED stack, not off a config field.
+
+    The checkpoint's config.json carries `layer_types`, and sglang's own config class does not:
+    it derives the pattern from `full_attention_interval`. Asking the built model which class each
+    layer is answers the question both ways round and cannot disagree with what is actually there
+    -- a config field says what was requested, the module list says what was constructed.
+    """
+    kinds = []
+    for layer in model.model.layers:
+        name = type(layer).__name__
+        if "Linear" in name:
+            kinds.append("linear_attention")
+        elif "Attention" in name:
+            kinds.append("full_attention")
+        else:
+            raise RuntimeError(
+                f"layer {len(kinds)} is a {name}, which is neither of the two kinds this arm "
+                f"knows how to treat. Name it before converting it: a layer handled by accident "
+                f"is a different intervention than the one that was measured."
+            )
+    return kinds

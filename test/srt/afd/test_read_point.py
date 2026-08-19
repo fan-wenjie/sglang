@@ -57,7 +57,7 @@ class TestReadPoint(unittest.TestCase):
         self.assertEqual(sources[7], 3)
         self.assertEqual(sources[11], 7)
         self.assertEqual(sources[63], 59)
-        for layer, source in sources.items():
+        for source in sources.values():
             if source >= 0:
                 self.assertIn(source, full, "the source of a group shift is itself a softmax layer")
 

@@ -27,10 +27,8 @@ Two failures this file is built to make loud rather than quiet:
 from __future__ import annotations
 
 import logging
-from typing import Callable
 
 import torch
-
 from sglang.srt.afd.read_point import ReadPlan, plan_read_points
 
 logger = logging.getLogger(__name__)
