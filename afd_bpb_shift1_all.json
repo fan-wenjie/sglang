@@ -1,0 +1,47 @@
+{
+  "model": "/home/user/experiment/models/Qwen3.8-27B-FP8",
+  "config": {
+    "model": "/home/user/experiment/models/Qwen3.8-27B-FP8",
+    "tokens": "/home/user/experiment/v6/run/tokens/val_Qwen_Qwen3.8-27B.u32",
+    "out": "/home/user/experiment/sglang/afd_bpb_shift1_all.json",
+    "shift": 1,
+    "sequences": 24,
+    "seq": 1024,
+    "seed": 0,
+    "bytes_per_token": 4.3775,
+    "mem_fraction": 0.8,
+    "coverage": "all"
+  },
+  "stock": {
+    "positions": 24552,
+    "nats_per_token": 2.1634504782383495,
+    "ppl": 8.701108908092056,
+    "bpb": 0.7130095433839687
+  },
+  "shifted": {
+    "positions": 24552,
+    "nats_per_token": 2.22228323248575,
+    "ppl": 9.228377360699412,
+    "bpb": 0.7323990859983751
+  },
+  "delta": {
+    "bpb": {
+      "stock": 0.7130095433839687,
+      "shifted": 0.7323990859983751,
+      "absolute": 0.019389542614406396,
+      "relative_pct": 2.7193945430776334
+    },
+    "ppl": {
+      "stock": 8.701108908092056,
+      "shifted": 9.228377360699412,
+      "absolute": 0.5272684526073554,
+      "relative_pct": 6.059784542140305
+    },
+    "nats_per_token": {
+      "stock": 2.1634504782383495,
+      "shifted": 2.22228323248575,
+      "absolute": 0.058832754247400754,
+      "relative_pct": 2.7193945430776387
+    }
+  }
+}

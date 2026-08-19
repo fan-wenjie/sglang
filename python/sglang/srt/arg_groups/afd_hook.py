@@ -33,6 +33,9 @@ def handle_afd(server_args: ServerArgs) -> None:
         )
 
     shift = server_args.afd_q_shift_layers
+    if shift is None:
+        # unset: the checkpoint's own read point is resolved at load, where its config is in hand
+        return _check_pool_args(server_args)
     if not isinstance(shift, int) or isinstance(shift, bool):
         raise TypeError(
             f"--afd-q-shift-layers is a layer count, got {shift!r}. There is no fractional "
@@ -49,6 +52,25 @@ def handle_afd(server_args: ServerArgs) -> None:
             f"twice the depth it names."
         )
 
+    _check_pool_args(server_args)
+
+    if shift > 0 and server_args.afd_mode == "null":
+        logger.warning(
+            "--afd-q-shift-layers=%s with the two sides colocated: the query is read early and "
+            "there is no pool call for it to overlap. This measures what the rewiring costs, "
+            "which is a real question, but it is not what the arrangement buys.",
+            shift,
+        )
+    if shift == 0 and server_args.afd_mode != "null":
+        logger.info(
+            "afd %s with --afd-q-shift-layers=0: the standard read point, so the host waits for "
+            "each feed-forward before its next attention. This is the synchronous baseline.",
+            server_args.afd_mode,
+        )
+
+
+def _check_pool_args(server_args) -> None:
+    """The pool and departure settings, checked whether or not a shift was asked for."""
     if server_args.afd_mode == "host":
         if not server_args.afd_pool_addr:
             raise ValueError(
@@ -78,18 +100,4 @@ def handle_afd(server_args: ServerArgs) -> None:
             f"no timeout and a minimum batch above one hangs the last caller of a draining "
             f"workload, waiting for a partner that never arrives; it does not fail, which is "
             f"worse."
-        )
-
-    if shift > 0 and server_args.afd_mode == "null":
-        logger.warning(
-            "--afd-q-shift-layers=%s with the two sides colocated: the query is read early and "
-            "there is no pool call for it to overlap. This measures what the rewiring costs, "
-            "which is a real question, but it is not what the arrangement buys.",
-            shift,
-        )
-    if shift == 0 and server_args.afd_mode != "null":
-        logger.info(
-            "afd %s with --afd-q-shift-layers=0: the standard read point, so the host waits for "
-            "each feed-forward before its next attention. This is the synchronous baseline.",
-            server_args.afd_mode,
         )

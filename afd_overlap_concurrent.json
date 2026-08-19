@@ -1,0 +1,93 @@
+{
+  "model": "/home/user/experiment/models/Qwen3.8-27B-FP8",
+  "config": {
+    "model": "/home/user/experiment/models/Qwen3.8-27B-FP8",
+    "out": "/home/user/experiment/sglang/afd_overlap_concurrent.json",
+    "context": 8192,
+    "layers": 1,
+    "steps": 20,
+    "min_batch": 2,
+    "link_us": 0.0,
+    "max_wait_ms": 2.0,
+    "requests": 8
+  },
+  "shapes": {
+    "q_heads": 24,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "hidden": 5120,
+    "intermediate": 17408
+  },
+  "arms": {
+    "synchronous": {
+      "median_s": 0.0035617873072624207,
+      "mean_s": 0.0035852136090397833,
+      "min_s": 0.003398548811674118,
+      "steps": 20,
+      "output_checksum": 88.57064056396484
+    },
+    "q-first": {
+      "median_s": 0.0035538244992494583,
+      "mean_s": 0.0035726431757211684,
+      "min_s": 0.0034191086888313293,
+      "steps": 20,
+      "output_checksum": 88.57064056396484
+    }
+  },
+  "concurrent": {
+    "synchronous": {
+      "requests": 8,
+      "steps_each": 20,
+      "median_step_s": 0.012756675481796265,
+      "wall_s": 0.4763312004506588,
+      "steps_per_second": 335.90073429710964,
+      "checksums": {
+        "8": 89.97444152832031,
+        "4": 89.48326110839844,
+        "5": 88.80181884765625,
+        "6": 89.18073272705078,
+        "2": 88.50579833984375,
+        "3": 87.921142578125,
+        "7": 90.4152603149414,
+        "1": 89.17858123779297
+      }
+    },
+    "q-first": {
+      "requests": 8,
+      "steps_each": 20,
+      "median_step_s": 0.013118160888552666,
+      "wall_s": 0.3051418699324131,
+      "steps_per_second": 524.346265674517,
+      "checksums": {
+        "4": 89.48326110839844,
+        "6": 89.18073272705078,
+        "1": 89.17858123779297,
+        "7": 90.4152603149414,
+        "3": 87.921142578125,
+        "8": 89.97444152832031,
+        "5": 88.80181884765625,
+        "2": 88.50579833984375
+      }
+    }
+  },
+  "pool_calls": {
+    "calls": 414,
+    "mean_outstanding_s": 0.00900254250112651,
+    "mean_blocked_s": 0.0078496466782214,
+    "mean_hidden_s": 0.001152895822905112
+  },
+  "single_request": {
+    "hidden_s": 7.962808012962341e-06,
+    "hidden_pct": 0.2235621424313102,
+    "speedup": 1.0022406306261449
+  },
+  "concurrent_summary": {
+    "requests": 8,
+    "throughput_speedup": 1.561015538628517,
+    "median_step_ratio": 1.0283369603053898,
+    "steps_per_second": {
+      "synchronous": 335.90073429710964,
+      "q-first": 524.346265674517
+    }
+  }
+}

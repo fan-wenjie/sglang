@@ -38,6 +38,7 @@ import logging
 from collections.abc import Callable
 
 import torch
+from sglang.srt.afd.checkpoint import resolve_coverage, resolve_shift
 from sglang.srt.afd.read_point import (
     ReadPlan,
     convertible_layers,
@@ -183,8 +184,8 @@ class InstalledWiring:
         self.stash.clear()
 
 
-def install_early_q(model, shift_layers: int, layer_types: list[str] | None = None,
-                    coverage: str = "all") -> InstalledWiring:
+def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
+                    coverage=None, hf_config=None) -> InstalledWiring:
     """Move the query's read point, on every layer or on the softmax ones alone.
 
         coverage="all"     every layer that has a query, including linear attention. 63 of 64 on
@@ -196,6 +197,22 @@ def install_early_q(model, shift_layers: int, layer_types: list[str] | None = No
     `layer_types` is derived from the built stack when not given, so a caller in a frozen
     orchestrator can ask for the wiring without computing its inputs.
     """
+    # The checkpoint states its own read point when it has one, and a caller contradicting it is
+    # warned rather than silently obeyed: serving a repaired checkpoint at the wrong read point
+    # feeds its query projection an input it was never trained on.
+    if hf_config is not None:
+        shift_layers = resolve_shift(shift_layers, hf_config)
+        coverage = resolve_coverage(coverage, hf_config)
+    if shift_layers is None:
+        shift_layers = 0
+    if coverage is None:
+        coverage = "all"
+
+    if shift_layers == 0:
+        # nothing to install. Returning an empty wiring rather than None keeps the caller from
+        # having to branch, and its record still says what was resolved.
+        return InstalledWiring(plan_read_points(0, len(model.model.layers)), LayerStash(), [])
+
     layers = model.model.layers
     if layer_types is None:
         layer_types = layer_types_of(model)

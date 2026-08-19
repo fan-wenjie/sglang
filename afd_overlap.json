@@ -1,0 +1,45 @@
+{
+  "model": "/home/user/experiment/models/Qwen3.8-27B-FP8",
+  "config": {
+    "model": "/home/user/experiment/models/Qwen3.8-27B-FP8",
+    "out": "/home/user/experiment/sglang/afd_overlap.json",
+    "context": 8192,
+    "layers": 1,
+    "steps": 20,
+    "min_batch": 1,
+    "link_us": 0.0,
+    "max_wait_ms": 2.0
+  },
+  "shapes": {
+    "q_heads": 24,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "hidden": 5120,
+    "intermediate": 17408
+  },
+  "arms": {
+    "synchronous": {
+      "median_s": 0.0010511912405490875,
+      "mean_s": 0.0010632846504449844,
+      "min_s": 0.0010383091866970062,
+      "steps": 20,
+      "output_checksum": 88.57064056396484
+    },
+    "q-first": {
+      "median_s": 0.0009799599647521973,
+      "mean_s": 0.0009848695248365403,
+      "min_s": 0.0009197704493999481,
+      "steps": 20,
+      "output_checksum": 88.57064056396484
+    }
+  },
+  "pool_calls": {
+    "calls": 46,
+    "mean_outstanding_s": 0.004510154785669368,
+    "mean_blocked_s": 0.004363979253432025,
+    "mean_hidden_s": 0.00014617553223734316
+  },
+  "hidden_s": 7.123127579689026e-05,
+  "hidden_pct_of_synchronous": 6.776243279927138,
+  "speedup": 1.0726879447722157
+}

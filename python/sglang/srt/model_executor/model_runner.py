@@ -757,15 +757,14 @@ class ModelRunner:
         Wired here because this is where a loaded model may be transformed, and because the model
         lives in the scheduler process: a caller holding an Engine cannot reach it.
         """
-        self.afd_early_q = None
-        if self.server_args.afd_q_shift_layers:
-            from sglang.srt.afd.wiring import install_early_q
+        from sglang.srt.afd.wiring import install_early_q
 
-            self.afd_early_q = install_early_q(
-                self.model,
-                self.server_args.afd_q_shift_layers,
-                coverage=self.server_args.afd_coverage,
-            )
+        self.afd_early_q = install_early_q(
+            self.model,
+            self.server_args.afd_q_shift_layers,
+            coverage=self.server_args.afd_coverage,
+            hf_config=self.model_config.hf_config,
+        )
 
     def maybe_init_lora_manager(self):
         if get_lora().enable_lora:
