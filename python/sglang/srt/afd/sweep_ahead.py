@@ -46,6 +46,7 @@ from collections import Counter
 from collections.abc import Callable
 
 import torch
+from sglang.srt.afd.protocol import OP_APPEND, OP_SWEEP_Q
 from sglang.srt.afd.read_point import is_full_attention
 from sglang.srt.afd.split_attention import PerPassIndex, join, split_refusal, sweep
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -100,6 +101,11 @@ class SweepAhead:
             if is_full_attention(self.layers[target]):
                 self.softmax_targets.add(target)
         self.routed_layers: set[int] = set()
+        # a two-pool split attaches the CACHE pool here. The window then issues the sweep to it
+        # instead of running it locally, which is what makes the two pools concurrent: the
+        # feed-forward is already in flight to the weights pool when this goes out.
+        self.cache_client = None
+        self.cache_request_id = 1
 
         self.index = PerPassIndex()
         self.pending: dict[int, object] = {}
@@ -172,7 +178,10 @@ class SweepAhead:
             q, _, _, gate = getattr(layer, method)(
                 positions=forward_batch.positions, hidden_states=normed
             )
-            state = sweep(backend, layer.attn, forward_batch, q=q, index=self.index)
+            if self.cache_client is not None:
+                state = self._issue_remote_sweep(target, q)
+            else:
+                state = sweep(backend, layer.attn, forward_batch, q=q, index=self.index)
         if state is None:
             self._refuse("every request is one token long; there is no cache to sweep")
             return
@@ -182,6 +191,15 @@ class SweepAhead:
         # lives in the model file, and a mirror drifts silently -- this is what makes it loud.
         layer._afd_q_precomputed = (q, gate, method)
         self.n_sweeps += 1
+
+    def _issue_remote_sweep(self, target: int, q):
+        """Send the query to the cache pool and DO NOT wait. The handle is the state."""
+        from sglang.srt.afd.split_attention import SweepResult
+
+        handle = self.cache_client.issue_frame(self.cache_request_id, target, (q,), OP_SWEEP_Q)
+        state = SweepResult(target, q, None, None)
+        state.handle = handle
+        return state
 
     def _project_linear_ahead(self, layer, hidden) -> None:
         """A linear-attention layer's fused input projection, on the early stream, in the window.
@@ -197,6 +215,20 @@ class SweepAhead:
             early_qkvz, _ = layer.linear_attn._forward_input_proj(normed)
         layer._afd_qkvz_precomputed = early_qkvz
         self.n_projections += 1
+
+    def _join_remote(self, target: int, attn, state, k, v, device):
+        """Collect the sweep the window issued, fold this step's token in, and post the append.
+
+        The append goes out AFTER the answer is formed and is never waited on: this step's join
+        uses the host's own key and value, and the cache only has to hold them by the next step.
+        """
+        from sglang.srt.afd.remote_attention import join_scored
+
+        o_swept, lse = self.cache_client.collect_frame(state.handle, device)
+        out = join_scored(o_swept, lse, state.q, k, v, attn=attn)
+        self.cache_client.issue_frame(self.cache_request_id, target, (k, v), OP_APPEND)
+        self.n_joins += 1
+        return out
 
     def _refuse(self, reason: str) -> None:
         """Count it, and say it once. A refusal that only lands in a counter is a schedule that
@@ -237,6 +269,8 @@ class SweepAhead:
                     f"The two halves must share a query: attending the cache with q_a and this "
                     f"step's token with q_b is not attention with either."
                 )
+            if self.cache_client is not None:
+                return self._join_remote(target, attn, state, k, v, q.device)
             k = k.view(-1, attn.tp_k_head_num, attn.qk_head_dim)
             v = v.view(-1, attn.tp_v_head_num, attn.v_head_dim)
             out = join(get_attn_backend(), attn, forward_batch, k=k, v=v,

@@ -31,9 +31,11 @@ from collections.abc import Callable
 import torch
 from sglang.srt.afd.protocol import (
     OP_FFN,
+    OP_APPEND,
     OP_KVPROJ,
     OP_RELEASE,
     OP_SWEEP,
+    OP_SWEEP_Q,
     Frame,
     decode,
     encode,
@@ -57,6 +59,9 @@ class Departure(threading.Thread):
         self.forward = forward
         # set by serve() when the pool also holds the KV cache; None means feed-forward only
         self.attention = None
+        # set when this process is the CACHE pool of a two-pool split: it answers sweeps and
+        # appends and holds no weights at all
+        self.cache = None
         self.min_batch = min_batch
         self.max_wait_s = max_wait_s
         self.device = device
@@ -80,6 +85,8 @@ class Departure(threading.Thread):
         thread and never queued: queueing it would add the departure's latency to buy the batching
         it cannot use.
         """
+        if self.cache is not None and frame.op in (OP_SWEEP_Q, OP_APPEND, OP_RELEASE):
+            return self._answer_cache(frame, sock)
         if self.attention is None or frame.op not in (OP_SWEEP, OP_RELEASE, OP_KVPROJ):
             return False
         if frame.op == OP_KVPROJ:
@@ -100,6 +107,24 @@ class Departure(threading.Thread):
             frame.request_id, frame.layer, normed.to(device), positions.view(-1).to(device),
         )
         send_frame(sock, Frame(frame.request_id, frame.layer, (o, lse, score, v), OP_SWEEP))
+        return True
+
+    def _answer_cache(self, frame: Frame, sock: socket.socket) -> bool:
+        """The cache pool's three ops. None of them touches a weight or a hidden state."""
+        device = self.device
+        if frame.op == OP_SWEEP_Q:
+            o, lse = self.cache.sweep(frame.request_id, frame.layer, frame.tensor.to(device))
+            send_frame(sock, Frame(frame.request_id, frame.layer, (o, lse), OP_SWEEP_Q))
+            return True
+        if frame.op == OP_APPEND:
+            k, v = frame.tensors
+            held = self.cache.append(frame.request_id, frame.layer, k.to(device), v.to(device))
+            send_frame(sock, Frame(frame.request_id, frame.layer,
+                                   (torch.tensor([[float(held)]]),), OP_APPEND))
+            return True
+        dropped = self.cache.holder.release(frame.request_id)
+        send_frame(sock, Frame(frame.request_id, frame.layer,
+                               (torch.tensor([[float(dropped)]]),), OP_RELEASE))
         return True
 
     def offer(self, frame: Frame, sock: socket.socket) -> None:
@@ -213,6 +238,7 @@ def serve(
     device: torch.device | str,
     ready: threading.Event | None = None,
     attention=None,
+    cache=None,
 ) -> Departure:
     """Run a pool until the process is killed. Returns the departure thread for inspection.
 
@@ -221,6 +247,7 @@ def serve(
     """
     departure = Departure(forward, min_batch, max_wait_s, device)
     departure.attention = attention
+    departure.cache = cache
     departure.start()
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

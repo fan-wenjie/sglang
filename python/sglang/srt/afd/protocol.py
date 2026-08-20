@@ -57,8 +57,14 @@ OP_SWEEP = 1      # q, h_(l-1) -> o, lse, x_l
 OP_HEAD = 2       # hidden -> logits
 OP_RELEASE = 3    # drop one request's cache; sglang reuses slots and the next one is not this one
 OP_KVPROJ = 4     # normalised x_l -> k, v, gate. The cache stays on the host; only the weights move
+OP_SWEEP_Q = 5    # q -> o, lse. Sweeps the cache and appends nothing: the two-pool split, where
+                  # this frame goes to the CACHE pool at the same moment the feed-forward goes
+                  # to the WEIGHTS pool, because the query is ready a layer early and the
+                  # feed-forward's answer is not needed to sweep positions that predate it
+OP_APPEND = 6     # k, v -> ack. Off the critical path: this step's join uses the host's own
+                  # k and v, and the cache only has to hold them by the NEXT step
 OP_NAMES = {OP_FFN: "ffn", OP_SWEEP: "sweep", OP_HEAD: "head", OP_RELEASE: "release",
-            OP_KVPROJ: "kvproj"}
+            OP_KVPROJ: "kvproj", OP_SWEEP_Q: "sweep_q", OP_APPEND: "append"}
 
 
 class Frame(NamedTuple):

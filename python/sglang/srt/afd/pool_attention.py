@@ -105,6 +105,14 @@ class KVHolder:
                 self._v.pop(key, None)
         return len(keys)
 
+    def peek_k(self, request_id: int, layer: int):
+        with self._lock:
+            return self._k.get((request_id, layer))
+
+    def peek_v(self, request_id: int, layer: int):
+        with self._lock:
+            return self._v.get((request_id, layer))
+
     def positions(self, request_id: int, layer: int) -> int:
         with self._lock:
             held = self._k.get((request_id, layer))
@@ -296,3 +304,67 @@ def layer_feed_forward(layer, hidden: torch.Tensor) -> torch.Tensor:
     """One layer's feed-forward, unwrapping the tuple some blocks return."""
     out = layer.mlp(hidden)
     return out[0] if isinstance(out, tuple) else out
+
+
+class CachePool:
+    """The cache half alone: hold a history, sweep it with a query, append to it.
+
+    The other half of the two-pool split. This side is STATEFUL and shares nothing between
+    callers -- each request sweeps its own history -- so it scales with memory and request count,
+    and it is deliberately not the side that also holds the weights. Measured on this model, the
+    feed-forward amortises 60x from one caller to sixty-four and the sweep amortises 1.00x at long
+    context; putting them in one service makes the second 88% of what that service costs per token
+    at 16k and drags the first's economics down with it.
+
+    Two calls, and the split between them is the point:
+
+        sweep(q)      needs the query and the history. Not this step's key or value, because those
+                      belong to a position the sweep does not cover. Issued the moment the query
+                      exists, which under Early-Q is a layer before x_l does
+        append(k, v)  needed by the NEXT step, not this one, so it is off the critical path
+
+    It never sees a hidden state, a weight, or a feed-forward.
+    """
+
+    def __init__(self, holder: KVHolder, layers, scalings: dict):
+        self.holder = holder
+        self.layers = layers
+        self.scalings = scalings
+
+    def sweep(self, request_id: int, layer_id: int, q: torch.Tensor):
+        attn = self.layers[layer_id].attn
+        heads, kv_heads = attn.tp_q_head_num, attn.tp_k_head_num
+        head_dim, v_head_dim = attn.qk_head_dim, attn.v_head_dim
+        k_all = self.holder.peek_k(request_id, layer_id)
+        v_all = self.holder.peek_v(request_id, layer_id)
+        tokens = q.shape[0]
+        if k_all is None:
+            # nothing cached: the log partition of an empty sum is -inf, and the join then takes
+            # this step's own value whole, which is what attention over one position is
+            o = torch.zeros(tokens, heads * v_head_dim, device=q.device, dtype=q.dtype)
+            lse = torch.full((tokens, heads), float("-inf"), device=q.device,
+                             dtype=torch.float32)
+            return o, lse
+        q3 = q.view(tokens, heads, head_dim)
+        outs, lses = [], []
+        for t in range(tokens):
+            seen = k_all.shape[POSITION_AXIS] - (tokens - 1 - t)
+            if seen <= 0:
+                outs.append(torch.zeros(heads, v_head_dim, device=q.device, dtype=torch.float32))
+                lses.append(torch.full((heads,), float("-inf"), device=q.device,
+                                       dtype=torch.float32))
+                continue
+            o, lse = sweep_cache(q3[t], k_all[:, :seen], v_all[:, :seen],
+                                 scaling=attn.scaling, kv_group=heads // kv_heads)
+            outs.append(o)
+            lses.append(lse)
+        return (torch.stack(outs).reshape(tokens, heads * v_head_dim).to(q.dtype),
+                torch.stack(lses).to(torch.float32))
+
+    def append(self, request_id: int, layer_id: int, k: torch.Tensor, v: torch.Tensor):
+        attn = self.layers[layer_id].attn
+        kv_heads, head_dim, v_head_dim = attn.tp_k_head_num, attn.qk_head_dim, attn.v_head_dim
+        k3 = k.view(-1, kv_heads, head_dim).transpose(0, 1).contiguous()
+        v3 = v.view(-1, kv_heads, v_head_dim).transpose(0, 1).contiguous()
+        self.holder.append(request_id, layer_id, k3, v3)
+        return self.holder.positions(request_id, layer_id)

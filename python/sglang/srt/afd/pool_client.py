@@ -105,6 +105,32 @@ class PoolClient:
             send_frame(self._sock, frame)
         return Handle(request_id, layer, time.perf_counter())
 
+    def issue_frame(self, request_id: int, layer: int, tensors, op: int) -> Handle:
+        """Send a multi-tensor frame and do NOT wait. The two-pool split needs this: the sweep
+        goes to the cache pool while the feed-forward is already in flight to the weights pool,
+        and a synchronous call here would put them back in series."""
+        with self._send_lock:
+            send_frame(self._sock, Frame(request_id, layer, tuple(tensors), op))
+        return Handle(request_id, layer, time.perf_counter(), ((request_id, 0),))
+
+    def collect_frame(self, handle: Handle, device):
+        """Block for the reply to a frame `issue_frame` sent."""
+        key = (handle.request_id, handle.layer)
+        started = time.perf_counter()
+        with self._cond:
+            while key not in self._replies:
+                if self._failure is not None:
+                    raise PoolClosed(f"pool at {self.address} failed") from self._failure
+                if self._closed:
+                    raise PoolClosed(f"pool at {self.address} closed mid-call")
+                self._cond.wait(timeout=0.5)
+            reply = self._replies.pop(key)
+            now = time.perf_counter()
+            self._waits.append({"request_id": handle.request_id, "layer": handle.layer,
+                                "outstanding_s": now - handle.issued_at,
+                                "blocked_s": now - started})
+        return tuple(t.to(device, non_blocking=True) for t in reply)
+
     def call(self, request_id: int, layer: int, tensors, op: int, device):
         """Send a multi-tensor frame and block for its multi-tensor reply.
 

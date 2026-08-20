@@ -244,3 +244,24 @@ def install_kv_projection(model, client, layer_types: list[str]) -> RemoteKVProj
     if not layers:
         raise RuntimeError("no softmax layer to move a projection off")
     return RemoteKVProjection(model, client, layers)
+
+
+def join_scored(o_swept, lse_swept, q, k_now, v_now, *, attn):
+    """Fold this step's token in, using the host's own query, key and value.
+
+    In the two-pool split the host sends its query to the cache pool, so the sweep and the score
+    are taken with THE SAME query -- the one this side projected. That is why the score is
+    computed here rather than returned: there is only one query in the system, and it is here.
+    """
+    heads, kv_heads = attn.tp_q_head_num, attn.tp_k_head_num
+    head_dim, v_head_dim = attn.qk_head_dim, attn.v_head_dim
+    tokens = q.shape[0]
+    group = heads // kv_heads
+    q3 = q.view(tokens, heads, head_dim).float()
+    k3 = k_now.view(tokens, kv_heads, head_dim).float().repeat_interleave(group, dim=1)
+    v3 = v_now.view(tokens, kv_heads, v_head_dim).float().repeat_interleave(group, dim=1)
+    o3 = o_swept.view(tokens, heads, v_head_dim).float()
+    score = (q3 * k3).sum(-1) * attn.scaling
+    weight = torch.sigmoid(lse_swept.float() - score).unsqueeze(-1)
+    weight = torch.where(torch.isnan(weight), torch.zeros_like(weight), weight)
+    return torch.lerp(v3, o3, weight).reshape(tokens, heads * v_head_dim).to(q.dtype)

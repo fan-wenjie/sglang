@@ -89,6 +89,36 @@ def routable_layers(model) -> tuple[int, ...]:
     )
 
 
+def make_cache_pool(model, *, enabled, max_context: int, device):
+    """The cache half of a two-pool split: a history, a sweep, an append. No weights."""
+    if not enabled:
+        return None
+    from sglang.srt.afd.pool_attention import CachePool, KVHolder
+
+    logger.info(
+        "afd cache pool: histories only, up to %s positions a request. It holds no weight and "
+        "answers no feed-forward: the sweep shares nothing between callers, so it is kept off "
+        "the service whose whole economy is one weight read serving many.",
+        max_context,
+    )
+    return CachePool(KVHolder(device, max_context), model.model.layers, {})
+
+
+def attach_cache_pool(sweep_ahead, *, addr, connect_timeout_s: float = 30.0):
+    """Point the Early-Q window at a cache pool, so its sweep goes out over the wire.
+
+    This is what makes the two pools concurrent. The window already opens between the issue and
+    the collect of the feed-forward -- that is the whole point of the moved read point -- so a
+    sweep issued there is in flight to one machine while the feed-forward is in flight to another.
+    """
+    if sweep_ahead is None or not addr:
+        return None
+    client = PoolClient(addr, connect_timeout_s)
+    sweep_ahead.cache_client = client
+    logger.info("afd host: sweeps go to the cache pool at %s, issued inside the window", addr)
+    return client
+
+
 def make_sweep_service(model, *, enabled, max_context: int, device):
     """The pool's cache and sweep, if --afd-kv-on-pool asked for them. None otherwise."""
     if not enabled:
