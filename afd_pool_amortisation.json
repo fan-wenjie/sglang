@@ -1,0 +1,56 @@
+{
+  "hidden": 5120,
+  "rows": [
+    {
+      "tokens": 1,
+      "round_trip_ms": 1.1965390294790268,
+      "us_per_token": 1196.5390294790268
+    },
+    {
+      "tokens": 2,
+      "round_trip_ms": 1.2669377028942108,
+      "us_per_token": 633.4688514471054
+    },
+    {
+      "tokens": 4,
+      "round_trip_ms": 1.1180490255355835,
+      "us_per_token": 279.5122563838959
+    },
+    {
+      "tokens": 8,
+      "round_trip_ms": 1.301674172282219,
+      "us_per_token": 162.70927153527737
+    },
+    {
+      "tokens": 16,
+      "round_trip_ms": 1.7935391515493393,
+      "us_per_token": 112.0961969718337
+    },
+    {
+      "tokens": 32,
+      "round_trip_ms": 2.510199323296547,
+      "us_per_token": 78.44372885301709
+    },
+    {
+      "tokens": 64,
+      "round_trip_ms": 4.214605316519737,
+      "us_per_token": 65.8532080706209
+    },
+    {
+      "tokens": 128,
+      "round_trip_ms": 7.090410217642784,
+      "us_per_token": 55.39382982533425
+    },
+    {
+      "tokens": 256,
+      "round_trip_ms": 10.574379935860634,
+      "us_per_token": 41.3061716244556
+    },
+    {
+      "tokens": 512,
+      "round_trip_ms": 21.809058263897896,
+      "us_per_token": 42.59581692167558
+    }
+  ],
+  "amortisation": 6.766840048144494
+}
