@@ -39,6 +39,7 @@ from collections.abc import Callable
 
 import torch
 from sglang.srt.afd.checkpoint import resolve_coverage, resolve_shift
+from sglang.srt.afd.supported import check_supported
 from sglang.srt.afd.sweep_ahead import install_sweep_ahead, resolve_split
 from sglang.srt.afd.read_point import (
     ReadPlan,
@@ -328,6 +329,11 @@ def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
         # having to branch, and its record still says what was resolved.
         return InstalledWiring(plan_read_points(0, len(model.model.layers)), LayerStash(), [])
 
+    # Checked before anything is wrapped, and reported whole. Wrapping first and discovering the
+    # gaps one AttributeError at a time -- from inside a wrapper, during a forward -- is how a
+    # family that spells these differently would learn the contract, and it would learn it in
+    # production.
+    check_supported(model, coverage=coverage)
     plan = _plan_for(model, shift_layers=shift_layers, coverage=coverage, layer_types=layer_types)
     stash, hooks = LayerStash(), PassHooks()
     undo, stashed = _install_hooks(model.model.layers, plan, stash, hooks)
