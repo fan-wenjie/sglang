@@ -215,6 +215,16 @@ against 64 layers of hiding that never existed.
    for any partition, including one that drops a position, and the output stays plausible.
    Greedy-decode agreement is NOT this test: batch composition alone parts the same model's greedy
    output on 3 of 4 prompts, so an arm that differs on 2 of 4 has said nothing yet.
+4. **The model that decodes is the model that was scored.** bits-per-byte comes from scoring input
+   logprobs, which is a prefill, colocated, with attention fused -- so it never touches the
+   partition, the schedule, or the pool. A fault in any of the three leaves the reported
+   perplexity untouched and the served text wrong. Take both numbers again through the whole
+   arrangement and decode the same prompts on both sides.
+5. **Likelihood is not generation quality**, and if a serving audience is the reader, say which one
+   is being reported. A model can lose bits-per-byte and generate indistinguishably, or hold it and
+   degenerate. MAUVE answers the second question -- but only with a NULL: score the same model
+   against a second sample of itself, because that is what the metric reads at this sample size
+   when nothing differs, and a gap smaller than it is not a finding.
 4. **Asynchrony actually happened.** Record the issue time and the wait time of each pool call. If
    `wait - issue` is the pool's service time for every call, nothing overlapped and the async path
    is a synchronous path with extra machinery.

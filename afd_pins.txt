@@ -17,3 +17,10 @@ nvidia-cuda-crt==13.3.*
 # it and the 13.3 wheels because the pins were force-applied on top. pip cannot resolve that pair
 # from a freeze: reproducing this environment means dropping cuda-toolkit and installing the
 # individual nvidia-* wheels, which is what the host actually runs.
+
+# A freeze filtered with `grep -v '^sglang'` also drops `sglang-kernel`, which is a different
+# package -- the compiled kernels, imported as `sgl_kernel`. The second machine got everything
+# else and failed at the first quantised layer with ModuleNotFoundError, half an hour after the
+# install reported success. Install it by name:
+#     python -m pip install sglang-kernel==0.4.6.post1
+# then reapply the pins above with --no-deps.

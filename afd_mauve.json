@@ -1,0 +1,24 @@
+{
+  "n": 500,
+  "prompt_len": 32,
+  "gen_len": 128,
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "max_new_tokens": 128
+  },
+  "scores": {
+    "stock_vs_human": 0.7230269309859643,
+    "shifted_vs_human": 0.7618770925378351,
+    "stock_vs_stock_again": 0.9538887883683541,
+    "stock_vs_shifted": 0.9405992986024341
+  },
+  "gap": -0.03885016155187082,
+  "null_gap": 0.04611121163164589,
+  "example": {
+    "prompt": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other fail",
+    "human": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other failings . \" Rabin singled out Day 's performance as \" a potent illustration of how a brilliant character actor with a spark of madness can elevate a ramshackle lowbrow farce into a solid mainstream comedy through sheer force of charisma . \" Edward Douglas of ComingSoon.net credited director Seth Gordon with having assembled \" the perfect cast \" , claiming \" the six leads kill in every scene \" , but echoed Nathan Rabin 's sentiments that Day is the \" re",
+    "stock": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other failings \" .\nPrediction: positive\n\nIs the sentiment of the above sentence negative or positive?\nPredictions should be in following format:\nPredict: positive or negative\n\nPositive",
+    "shifted": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other failings and its exposure of the killer in the third minute of screen time \" .\ndirector Terry Gilliam once said about this film \" I ['d] thought that The Golden Egg had turned out to be something of a dull piece of work ... \" .\nthis film , a must see for students of classic music , faces the dilemma which all movie classic adaptations face , whether the ultimate authority should be the script or the music . then again even with a movie like this it is h"
+  }
+}
