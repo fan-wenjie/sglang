@@ -237,3 +237,37 @@ class DepartureQueue:
                 "departed_on_time": self.departed_on_time,
                 "waiting": sum(len(q) for q in self._waiting.values()),
             }
+
+
+class AppendLedger:
+    """How many positions this host has posted to the database, per (request, layer).
+
+    Sent with each query so the database can refuse a sweep that would run ahead of an append. The
+    host is the only writer of its own history, so its count is authoritative; the database's is
+    the one that can lag.
+
+    Kept here rather than derived from the step number because a request does not advance one
+    layer per step in a dataflow schedule -- layers progress independently, and a count per layer
+    is the only thing that stays true when they do.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._posted: dict[tuple[int, int], int] = {}
+
+    def posted(self, request_id: int, layer: int) -> int:
+        with self._lock:
+            return self._posted.get((request_id, layer), 0)
+
+    def record(self, request_id: int, layer: int, positions: int) -> int:
+        with self._lock:
+            key = (request_id, layer)
+            self._posted[key] = self._posted.get(key, 0) + positions
+            return self._posted[key]
+
+    def drop(self, request_id: int) -> int:
+        with self._lock:
+            keys = [k for k in self._posted if k[0] == request_id]
+            for k in keys:
+                self._posted.pop(k, None)
+        return len(keys)

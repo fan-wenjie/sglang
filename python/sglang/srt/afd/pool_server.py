@@ -113,7 +113,10 @@ class Departure(threading.Thread):
         """The cache pool's three ops. None of them touches a weight or a hidden state."""
         device = self.device
         if frame.op == OP_SWEEP_Q:
-            o, lse = self.cache.sweep(frame.request_id, frame.layer, frame.tensor.to(device))
+            # a second tensor, when present, is the caller's own count of what it has appended
+            expect = int(frame.tensors[1][0, 0]) if len(frame.tensors) > 1 else None
+            o, lse = self.cache.sweep(frame.request_id, frame.layer, frame.tensor.to(device),
+                                      expect=expect)
             send_frame(sock, Frame(frame.request_id, frame.layer, (o, lse), OP_SWEEP_Q))
             return True
         if frame.op == OP_APPEND:

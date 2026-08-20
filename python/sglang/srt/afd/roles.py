@@ -113,8 +113,11 @@ def attach_cache_pool(sweep_ahead, *, addr, connect_timeout_s: float = 30.0):
     """
     if sweep_ahead is None or not addr:
         return None
+    from sglang.srt.afd.rendezvous import AppendLedger
+
     client = PoolClient(addr, connect_timeout_s)
     sweep_ahead.cache_client = client
+    sweep_ahead.ledger = AppendLedger()
     logger.info("afd host: sweeps go to the cache pool at %s, issued inside the window", addr)
     return client
 

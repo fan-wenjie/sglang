@@ -106,6 +106,9 @@ class SweepAhead:
         # feed-forward is already in flight to the weights pool when this goes out.
         self.cache_client = None
         self.cache_request_id = 1
+        # what this host has posted to the database, per (request, layer). Sent with every query
+        # so the database can refuse a sweep that has overtaken its own append.
+        self.ledger = None
 
         self.index = PerPassIndex()
         self.pending: dict[int, object] = {}
@@ -196,7 +199,11 @@ class SweepAhead:
         """Send the query to the cache pool and DO NOT wait. The handle is the state."""
         from sglang.srt.afd.split_attention import SweepResult
 
-        handle = self.cache_client.issue_frame(self.cache_request_id, target, (q,), OP_SWEEP_Q)
+        tensors = (q,)
+        if self.ledger is not None:
+            posted = self.ledger.posted(self.cache_request_id, target)
+            tensors = (q, torch.tensor([[float(posted)]], dtype=torch.float32))
+        handle = self.cache_client.issue_frame(self.cache_request_id, target, tensors, OP_SWEEP_Q)
         state = SweepResult(target, q, None, None)
         state.handle = handle
         return state
@@ -227,6 +234,11 @@ class SweepAhead:
         o_swept, lse = self.cache_client.collect_frame(state.handle, device)
         out = join_scored(o_swept, lse, state.q, k, v, attn=attn)
         self.cache_client.issue_frame(self.cache_request_id, target, (k, v), OP_APPEND)
+        if self.ledger is not None:
+            # recorded HERE, not when the append is acknowledged: the next query must expect this
+            # position, and waiting for the ack would put the ledger a step behind the history it
+            # is meant to describe
+            self.ledger.record(self.cache_request_id, target, k.shape[0])
         self.n_joins += 1
         return out
 

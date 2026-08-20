@@ -331,7 +331,32 @@ class CachePool:
         self.layers = layers
         self.scalings = scalings
 
-    def sweep(self, request_id: int, layer_id: int, q: torch.Tensor):
+    def sweep(self, request_id: int, layer_id: int, q: torch.Tensor, expect: int | None = None):
+        """Sweep this request's history at this layer.
+
+        `expect` is how many positions the CALLER believes it has appended here, and checking it
+        turns this arrangement's one silent race into a loud failure.
+
+        The race: a stage ends by computing k_t and v_t and posting them here, and the append is
+        deliberately not waited on -- this step's join uses the host's own copy, and the cache only
+        has to hold them by the NEXT step. So step n's append and step n+1's query are both in
+        flight, and if the query overtakes, the sweep covers a history with a hole in it. Nothing
+        raises. The model attends to a past that is missing one position and its output stays
+        fluent.
+
+        Ordering is real today: both frames travel one connection and this pool answers a
+        connection's frames in the order they arrive, so TCP supplies it. That is a property of
+        the current transport, not of the design -- sharding the client across links, which the
+        measurements recommend, would break it. So the count is checked rather than trusted.
+        """
+        held = self.holder.positions(request_id, layer_id)
+        if expect is not None and held != expect:
+            raise RuntimeError(
+                f"request {request_id} layer {layer_id}: the caller expects {expect} cached "
+                f"position(s) and this pool holds {held}. An append for an earlier step has not "
+                f"landed, so this sweep would cover a history with a hole in it -- which reads as "
+                f"a fluent model that has forgotten one token."
+            )
         attn = self.layers[layer_id].attn
         heads, kv_heads = attn.tp_q_head_num, attn.tp_k_head_num
         head_dim, v_head_dim = attn.qk_head_dim, attn.v_head_dim
