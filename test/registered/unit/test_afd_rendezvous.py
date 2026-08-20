@@ -12,7 +12,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.afd.rendezvous import Rendezvous
+from sglang.srt.afd.rendezvous import DepartureQueue, Rendezvous
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -133,6 +133,102 @@ class TestWhoWasLate(CustomTestCase):
         r.put_local((2, 0), "k", "v")
         self.assertEqual(r.drop(1), 3)
         self.assertEqual(r.outstanding(), 1)
+
+
+class TestTheSecondLayerBatches(CustomTestCase):
+    """Completed pairs group by layer before the weight-shared work runs on them."""
+
+    def test_a_full_load_departs_at_once(self):
+        q = DepartureQueue(min_batch=3, max_interval_s=1.0)
+        self.assertIsNone(q.offer(5, "a"))
+        self.assertIsNone(q.offer(5, "b"))
+        self.assertEqual(q.offer(5, "c"), ["a", "b", "c"])
+        self.assertEqual(q.waiting(), 0)
+
+    def test_two_layers_do_not_ride_together(self):
+        """They share no weight, so riding together buys them nothing and costs the smaller one
+        the larger one's wait."""
+        q = DepartureQueue(min_batch=2, max_interval_s=1.0)
+        self.assertIsNone(q.offer(5, "a"))
+        self.assertIsNone(q.offer(6, "b"))
+        self.assertEqual(q.waiting(), 2)
+        self.assertEqual(q.offer(5, "c"), ["a", "c"])
+
+    def test_a_short_load_departs_when_the_interval_runs_out(self):
+        """The last requests of a draining workload never reach min_batch. Without this they wait
+        for a partner that is not coming, and the symptom is a hang rather than a failure."""
+        clock = Clock()
+        q = DepartureQueue(min_batch=8, max_interval_s=0.5, now=clock)
+        q.offer(3, "lonely")
+        self.assertEqual(q.due(), [])
+        clock.t = 0.6
+        self.assertEqual(q.due(), [(3, ["lonely"])])
+        self.assertEqual(q.waiting(), 0)
+
+    def test_the_interval_runs_from_the_last_departure_not_from_arrival(self):
+        """The rule as specified, and the two differ. Timed from arrival, a slow trickle departs
+        every item alone the moment its own wait expires -- which is the unbatched arrangement
+        wearing this one's name. Timed from the last departure, a trickle still collects whatever
+        accumulated during the interval."""
+        clock = Clock()
+        q = DepartureQueue(min_batch=8, max_interval_s=1.0, now=clock)
+        clock.t = 0.9
+        q.offer(3, "early")
+        clock.t = 1.05                      # 1.05 since the last departure, 0.15 since arrival
+        due = q.due()
+        self.assertEqual(due, [(3, ["early"])],
+                         "an item that arrived recently still rides if the INTERVAL expired")
+
+        clock.t = 1.10
+        q.offer(3, "next")
+        clock.t = 1.9                       # 0.85 since the departure above
+        self.assertEqual(q.due(), [], "and no second departure inside the same interval")
+
+    def test_an_empty_queue_does_not_depart(self):
+        clock = Clock()
+        q = DepartureQueue(min_batch=2, max_interval_s=0.1, now=clock)
+        clock.t = 5.0
+        self.assertEqual(q.due(), [])
+        self.assertEqual(q.report()["departures"], 0)
+
+    def test_a_queue_with_no_timeout_is_refused(self):
+        with self.assertRaises(ValueError):
+            DepartureQueue(min_batch=4, max_interval_s=0)
+
+    def test_the_report_separates_full_loads_from_timed_out_ones(self):
+        """The diagnosis: departures that were full mean the batching is working, departures that
+        timed out mean the queue is starved and min_batch is aspirational."""
+        clock = Clock()
+        q = DepartureQueue(min_batch=2, max_interval_s=1.0, now=clock)
+        q.offer(1, "a")
+        q.offer(1, "b")                     # full
+        clock.t = 2.0
+        q.offer(1, "c")
+        q.due()                             # timed out
+        report = q.report()
+        self.assertEqual(report["departed_full"], 1)
+        self.assertEqual(report["departed_on_time"], 1)
+        self.assertEqual(report["riders"], 3)
+        self.assertAlmostEqual(report["mean_riders"], 1.5)
+
+
+class TestTheTwoLayersTogether(CustomTestCase):
+    def test_a_half_reaches_the_first_layer_and_not_the_second(self):
+        r, q = Rendezvous(), DepartureQueue(min_batch=1, max_interval_s=1.0)
+        slot = r.put_local((1, 7), "k", "v")
+        self.assertIsNone(slot)
+        self.assertEqual(r.outstanding(), 1)
+        self.assertEqual(q.waiting(), 0)
+
+    def test_a_completed_pair_moves_from_the_first_layer_to_the_second(self):
+        r = Rendezvous()
+        q = DepartureQueue(min_batch=2, max_interval_s=1.0)
+        r.put_local((1, 7), "k", "v")
+        slot = r.put_remote((1, 7), "o", "lse")
+        self.assertIsNotNone(slot)
+        self.assertEqual(r.outstanding(), 0)
+        self.assertIsNone(q.offer(slot.key[1], slot))
+        self.assertEqual(q.waiting(), 1, "whole, and now waiting for company rather than a half")
 
 
 if __name__ == "__main__":

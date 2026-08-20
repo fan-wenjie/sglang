@@ -142,3 +142,98 @@ class Rendezvous:
                 "reissued": self._reissued,
                 "dropped_stale_replies": self._dropped_stale_replies,
             }
+
+
+class DepartureQueue:
+    """The second layer: completed pairs, grouped by layer, waiting to ride together.
+
+    The first layer pairs the two halves of one (request, layer) and is about CORRECTNESS -- a
+    slot leaves it when it is whole. This one is about EFFICIENCY: everything the next stage does
+    with a completed pair is weight-shared -- W_o, the MLP, the query and key/value projections --
+    so one read of those weights should serve as many pairs as are ready. Measured on this model,
+    that work is flat from batch 1 to batch 24 (409 us against 422), which is 24x per token for
+    free, and it is the aggregation the whole arrangement would otherwise give up.
+
+    Grouped BY LAYER, because two pairs at different layers share no weight and riding together
+    would buy them nothing.
+
+    ## The timeout runs from the last departure, not from arrival
+
+    A queue that waits for a full load stalls the last few requests of a draining workload
+    forever -- the same failure the pool's own departure has, and the reason it carries
+    --afd-max-wait-ms. The rule here is the one asked for: at most one departure per interval, and
+    at least one per interval if anything is waiting. Timing from arrival instead would let a slow
+    trickle depart every item on its own the moment each landed, which is the un-batched
+    arrangement wearing this one's name.
+    """
+
+    def __init__(self, min_batch: int, max_interval_s: float, now=time.perf_counter):
+        if min_batch < 1:
+            raise ValueError(f"a departure carries at least one, got {min_batch}")
+        if max_interval_s <= 0:
+            raise ValueError(
+                f"max_interval_s must be positive, got {max_interval_s}. A queue with no timeout "
+                f"and a minimum above one strands the last requests of a draining workload; it "
+                f"does not fail, which is worse."
+            )
+        self.min_batch = min_batch
+        self.max_interval_s = max_interval_s
+        self._now = now
+        self._lock = threading.Lock()
+        self._waiting: dict[int, list] = {}
+        self._last_departure = now()
+        self.departures = 0
+        self.departed_full = 0
+        self.departed_on_time = 0
+        self.riders = 0
+
+    def offer(self, layer: int, item) -> list | None:
+        """Add a completed pair. Returns a full load to run now, or None to keep waiting."""
+        with self._lock:
+            queue = self._waiting.setdefault(layer, [])
+            queue.append(item)
+            if len(queue) < self.min_batch:
+                return None
+            self.departed_full += 1
+            return self._depart(layer)
+
+    def due(self) -> list[tuple[int, list]]:
+        """Everything waiting, if the interval since the last departure has run out.
+
+        Returns (layer, riders) pairs and empties the queues. Called from a timer; a caller that
+        never calls it turns min_batch into a requirement rather than a target.
+        """
+        with self._lock:
+            if self._now() - self._last_departure < self.max_interval_s:
+                return []
+            if not any(self._waiting.values()):
+                return []
+            out = []
+            for layer in list(self._waiting):
+                if self._waiting[layer]:
+                    self.departed_on_time += 1
+                    out.append((layer, self._depart(layer)))
+            return out
+
+    def _depart(self, layer: int) -> list:
+        """Caller holds the lock."""
+        riders = self._waiting.pop(layer, [])
+        self._last_departure = self._now()
+        self.departures += 1
+        self.riders += len(riders)
+        return riders
+
+    def waiting(self) -> int:
+        with self._lock:
+            return sum(len(q) for q in self._waiting.values())
+
+    def report(self) -> dict:
+        with self._lock:
+            return {
+                "departures": self.departures,
+                "riders": self.riders,
+                "mean_riders": (self.riders / self.departures) if self.departures else 0.0,
+                "departed_full": self.departed_full,
+                "departed_on_time": self.departed_on_time,
+                "waiting": sum(len(q) for q in self._waiting.values()),
+            }
