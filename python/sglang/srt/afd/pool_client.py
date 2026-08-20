@@ -94,7 +94,7 @@ class PoolClient:
 
     def issue(self, request_id: int, layer: int, hidden: torch.Tensor) -> Handle:
         """Send one layer's work. Returns immediately; the reply lands in a slot."""
-        frame = Frame(request_id, layer, hidden)
+        frame = Frame.one(request_id, layer, hidden)
         with self._send_lock:
             send_frame(self._sock, frame)
         return Handle(request_id, layer, time.perf_counter())

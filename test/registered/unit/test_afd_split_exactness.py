@@ -187,7 +187,7 @@ class TestSplitIsTheSameAttention(CustomTestCase):
 
         a, b = socket.socketpair()
         hidden = torch.randn(7, 5120).to(torch.bfloat16)      # Qwen3.8-27B hidden_size
-        a.sendall(encode(Frame(42, 7, hidden)))
+        a.sendall(encode(Frame.one(42, 7, hidden)))
         got = decode(b)
         self.assertTrue(torch.equal(got.tensor, hidden))
         self.assertEqual(got.key, (42, 7))

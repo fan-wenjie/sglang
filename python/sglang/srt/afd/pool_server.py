@@ -144,7 +144,7 @@ class Departure(threading.Thread):
             piece = out[offset : offset + n]
             offset += n
             try:
-                send_frame(sock, Frame(frame.request_id, layer, piece))
+                send_frame(sock, Frame.one(frame.request_id, layer, piece))
             except OSError:
                 logger.warning(
                     "caller for request %s layer %s went away before its reply",
