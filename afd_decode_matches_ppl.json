@@ -1,0 +1,35 @@
+{
+  "colocated": {
+    "positions": 24552,
+    "nats_per_token": 2.22228323248575,
+    "ppl": 9.228377360699412,
+    "bpb": 0.7323990859983751,
+    "decode_s": 4.521858312189579
+  },
+  "two_sided": {
+    "positions": 24552,
+    "nats_per_token": 2.2217312859345983,
+    "ppl": 9.223285195073348,
+    "bpb": 0.7322171806752038,
+    "decode_s": 8.774161171168089
+  },
+  "recorded_bpb": 0.73239909,
+  "identical": [
+    true,
+    true,
+    true,
+    true
+  ],
+  "text_colocated": [
+    " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+    "\n\n<think>\nThe user asks for a one-sentence explanation of why the sky is blue. This is a straightforward science question. The key concept is Rayleigh scattering: shorter wavelengths of light (blue) are scattered more by gas molecules in the atmosphere than longer wavelengths (red). I need to distill this into a",
+    "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11, 13, 17, 19.\n\nWhat is the next prime number after 100?\n\nThe next prime number after 100 is 101",
+    "\n\nThe iron serpent drags its weary spine\nthrough valleys where the afternoon has died.\n\n**Note:** While the prompt requested a \"two-line poem,\" the lines above are written in **iambic pentameter** (10 syllables per line) to create a rhythmic, slow-moving feel that"
+  ],
+  "text_two_sided": [
+    " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+    "\n\n<think>\nThe user asks for a one-sentence explanation of why the sky is blue. This is a straightforward science question. The key concept is Rayleigh scattering: shorter wavelengths of light (blue) are scattered more by gas molecules in the atmosphere than longer wavelengths (red). I need to distill this into a",
+    "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11, 13, 17, 19.\n\nWhat is the next prime number after 100?\n\nThe next prime number after 100 is 101",
+    "\n\nThe iron serpent drags its weary spine\nthrough valleys where the afternoon has died.\n\n**Note:** While the prompt requested a \"two-line poem,\" the lines above are written in **iambic pentameter** (10 syllables per line) to create a rhythmic, slow-moving feel that"
+  ]
+}
