@@ -27,7 +27,7 @@ import time
 from typing import NamedTuple
 
 import torch
-from sglang.srt.afd.protocol import CLOSE, OP_FFN, Frame, decode, send_frame
+from sglang.srt.afd.protocol import CLOSE, OP_FFN, OP_HELLO, Frame, decode, send_frame
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,7 @@ class PoolClient:
         # multi-tensor replies live apart from the one-tensor feed-forward slots, so a reply of
         # the wrong shape cannot be handed to a caller expecting the other
         self._replies: dict[tuple[int, int], tuple] = {}
+        self._hello: float | None = None
         self._failure: BaseException | None = None
         # bounded: an hour of decode is millions of entries, and overlap_report used to slice a
         # list that only ever grew. The report is windowed anyway.
@@ -156,7 +157,10 @@ class PoolClient:
                 if frame is None:
                     break
                 with self._cond:
-                    if len(frame.tensors) == 1 and frame.op == OP_FFN:
+                    if frame.op == OP_HELLO:
+                        self._hello = float(frame.tensor[0, 0])
+                        self._replies[(frame.request_id, frame.layer, frame.op)] = frame.tensors
+                    elif len(frame.tensors) == 1 and frame.op == OP_FFN:
                         self._slots[frame.key] = frame.tensor
                     else:
                         # keyed by op as well: one (request, layer) has more than one answer in
@@ -178,6 +182,35 @@ class PoolClient:
         with self._send_lock:
             send_frame(self._sock, frame)
         return Handle(request_id, layer, time.perf_counter())
+
+    NEEDS_FEED_FORWARD = 1
+    NEEDS_CACHE = 2
+    NEEDS_KV_PROJECTION = 4
+    _NEED_NAMES = {1: "a feed-forward", 2: "a cache to sweep and append",
+                   4: "the key and value projections"}
+
+    def require(self, needs: int, timeout_s: float = 15.0) -> int:
+        """Ask the pool what it does, and refuse now if it is not what this host needs.
+
+        Called once at startup. The alternative is what this cost twice: a host configured for a
+        cache pool reaches one that only runs feed-forwards, sends it a frame it cannot parse, and
+        reports "closed mid-call" -- a message about a socket that names neither side's
+        configuration.
+        """
+        self.collect_frame(
+            self.issue_frame(0, 0, (torch.zeros(1, 1),), OP_HELLO), "cpu"
+        )
+        served = int(self._hello or 0)
+        missing = [name for bit, name in self._NEED_NAMES.items()
+                   if needs & bit and not served & bit]
+        if missing:
+            raise PoolClosed(
+                f"the pool at {self.address} does not serve {', and '.join(missing)}. This host "
+                f"was configured to ask it for that, so the two were started with different "
+                f"roles -- most likely the pool is running without the flag that gives it a "
+                f"cache. Failing here rather than at the first token."
+            )
+        return served
 
     def issue_frame(self, request_id: int, layer: int, tensors, op: int) -> Handle:
         """Send a multi-tensor frame and do NOT wait. The two-pool split needs this: the sweep

@@ -24,7 +24,13 @@ arithmetic inverts and this is the first thing to reconsider.
 from __future__ import annotations
 
 import torch
-from sglang.srt.afd.protocol import OP_KVPROJ, OP_RELEASE, OP_SWEEP, Frame
+from sglang.srt.afd.protocol import (
+    OP_KVPROJ,
+    OP_RELEASE,
+    OP_SWEEP,
+    Frame,
+    pack_positions,
+)
 from sglang.srt.afd.sweep_ahead import row_request_ids
 
 # the layer field is unused by a release; naming it keeps the frame readable
@@ -131,17 +137,31 @@ class RemoteAttention:
             if kwargs or normed is None or not (mode.is_decode() or mode.is_extend()):
                 self.refusals += 1
                 return original(q, k, v, forward_batch, save_kv_cache=save_kv_cache, **kwargs)
-            positions = forward_batch.positions.reshape(-1)
-            request_id = int(forward_batch.req_pool_indices[0]) + 1
-            if int(positions[0]) == 0 and layer_id == self.layers[0]:
-                # a token at position 0 means this slot is starting a new sequence. sglang reuses
-                # slots, so without dropping what was there the sweep would read another
-                # request's history -- which is what "Paris, Paris, Paris" was.
-                self.client.call(request_id, RELEASE_LAYER, (positions.reshape(-1, 1),),
-                                 OP_RELEASE, "cpu")
+
+            ids = row_request_ids(forward_batch)
+            if ids.shape[0] != normed.shape[0]:
+                self.refusals += 1
+                return original(q, k, v, forward_batch, save_kv_cache=save_kv_cache, **kwargs)
+
+            raw = forward_batch.positions
+            # mrope carries one row per rotation axis, so the TOKEN index is the last dimension.
+            # Reading positions[0] off a flattened view is what sent three axes' worth of
+            # positions for one batch of hidden states.
+            per_token = raw.reshape(-1) if raw.dim() == 1 else raw[0].reshape(-1)
+
+            if layer_id == self.layers[0]:
+                # a row at position 0 means that slot is starting a new sequence. sglang reuses
+                # slots, so without dropping what was there the sweep would read the previous
+                # occupant's history -- which is what "Paris, Paris, Paris" was.
+                starting = sorted({int(r) for r, p in zip(ids.tolist(), per_token.tolist())
+                                   if p == 0})
+                for request_id in starting:
+                    self.client.call(request_id + 1, RELEASE_LAYER, (torch.zeros(1, 1),),
+                                     OP_RELEASE, "cpu")
+
             o_swept, lse, score, v_now = self.client.call(
-                request_id, layer_id,
-                (normed, positions.reshape(-1, 1).to(torch.int64)),
+                0, layer_id,
+                (normed, pack_positions(raw), (ids + 1).reshape(-1, 1).to(torch.int64)),
                 OP_SWEEP, q.device,
             )
             self.calls += 1
@@ -214,7 +234,7 @@ class RemoteKVProjection:
                 return q, k, v, gate
             k_pool, v_pool, gate_pool = self.client.call(
                 0, layer_id,
-                (hidden_states, positions.reshape(-1, 1).to(torch.int64)),
+                (hidden_states, pack_positions(positions)),
                 OP_KVPROJ, q.device,
             )
             self.calls += 1

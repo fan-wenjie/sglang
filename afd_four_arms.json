@@ -1,0 +1,42 @@
+{
+  "stock": {
+    "wall_s": 5.290995206683874,
+    "identical": 3,
+    "of": 3,
+    "text": [
+      " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is",
+      "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11, 13, 17,",
+      "\n\n<think>\nThe user wants a one-sentence explanation of why the sky is blue. This is a straightforward science question about Rayleigh scattering. I need to"
+    ]
+  },
+  "A": {
+    "wall_s": 16.83632992580533,
+    "identical": 3,
+    "of": 3,
+    "text": [
+      " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is",
+      "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11, 13, 17,",
+      "\n\n<think>\nThe user wants a one-sentence explanation of why the sky is blue. This is a straightforward science question about Rayleigh scattering. I need to"
+    ]
+  },
+  "B": {
+    "wall_s": 27.68681737780571,
+    "identical": 2,
+    "of": 3,
+    "text": [
+      " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is",
+      "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11, 13, 17,",
+      "\n\n<think>\nThe user asks for a one-sentence explanation of why the sky is blue. This is a straightforward science question. The answer is Rayleigh scattering"
+    ]
+  },
+  "C": {
+    "wall_s": 24.98600308969617,
+    "identical": 1,
+    "of": 3,
+    "text": [
+      " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is",
+      "\n\nThe first eight prime numbers are:\n\n2, 3, 5, 7, 11, 13, 17,",
+      "\n\n<think>\nThe user asks for a one-sentence explanation of why the sky is blue. The key physics is Rayleigh scattering: shorter wavelengths (blue/v"
+    ]
+  }
+}

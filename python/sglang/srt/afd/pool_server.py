@@ -36,7 +36,9 @@ from sglang.srt.afd.protocol import (
     OP_NAMES,
     OP_RELEASE,
     OP_SWEEP,
+    OP_HELLO,
     OP_SWEEP_Q,
+    unpack_positions,
     Frame,
     decode,
     encode,
@@ -77,23 +79,58 @@ class Departure(threading.Thread):
         self._stop = False
         self.departures: list[dict] = []
 
+    def capabilities(self) -> int:
+        """What this pool serves, as a bitmask on the wire.
+
+        1  feed-forward
+        2  a cache: sweeps and appends
+        4  the key/value projection with the cache
+
+        Sent in reply to a HELLO so a host learns at STARTUP that it has reached a pool which does
+        not do what it was configured to ask for. Without it the mismatch surfaces as the first
+        frame the far end cannot parse, the connection thread dies, and the host reports "closed
+        mid-call" -- which describes the socket and not the configuration that broke it.
+        """
+        bits = 1
+        if self.cache is not None:
+            bits |= 2
+        if self.attention is not None:
+            bits |= 2 | 4
+        return bits
+
     def answer_directly(self, frame: Frame, sock: socket.socket) -> bool:
-        """Ops that are per-request and gain nothing from riding with others.
+        """Ops answered on the connection thread rather than queued for a departure.
 
         A departure exists to make one weight read serve many callers. A sweep reads the CALLER'S
         OWN cache -- there is no shared read to amortise, and measured at 16k context it is 88% of
-        what the pool costs per token even at 64 requests. So it is answered on the connection
-        thread and never queued: queueing it would add the departure's latency to buy the batching
-        it cannot use.
+        what the pool costs per token even at 64 requests -- so queueing it would add the
+        departure's latency to buy batching it cannot use.
+
+        Every layout is CHECKED rather than unpacked. A tuple unpack going wrong here raises
+        inside a socket thread, the connection dies, and the caller reports "closed mid-call" --
+        a message about a socket that names neither the frame nor the configuration behind it.
+        That cost two debugging rounds in this tree before the checks went in.
+
+            HELLO     anything                     ->  what this pool serves
+            KVPROJ    normalised x_l, positions    ->  k, v, gate
+            SWEEP     normalised x_l, positions, row ids -> o, lse, score, v
+            RELEASE   anything                     ->  layers dropped
         """
+        if frame.op == OP_HELLO:
+            send_frame(sock, Frame(frame.request_id, 0,
+                                   (torch.tensor([[float(self.capabilities())]]),), OP_HELLO))
+            return True
         if self.cache is not None and frame.op in (OP_SWEEP_Q, OP_APPEND, OP_RELEASE):
             return self._answer_cache(frame, sock)
         if self.attention is None or frame.op not in (OP_SWEEP, OP_RELEASE, OP_KVPROJ):
             return False
+
+        device = self.device
         if frame.op == OP_KVPROJ:
-            normed, positions = frame.tensors
+            self._expect_tensors(frame, (2,), "KVPROJ: normalised x_l, positions")
+            normed, positions = frame.tensors[0], unpack_positions(frame.tensors[1])
             k, v, gate = self.attention.project_kv(
-                frame.layer, normed.to(self.device), positions.view(-1).to(self.device)
+                frame.layer, normed.to(device), positions.to(device)
             )
             send_frame(sock, Frame(frame.request_id, frame.layer, (k, v, gate), OP_KVPROJ))
             return True
@@ -102,10 +139,12 @@ class Departure(threading.Thread):
             send_frame(sock, Frame(frame.request_id, frame.layer,
                                    (torch.tensor([[float(dropped)]]),), OP_RELEASE))
             return True
-        normed, positions = frame.tensors
-        device = self.device
+
+        self._expect_tensors(frame, (2, 3), "SWEEP: normalised x_l, positions [, row ids]")
+        normed, positions = frame.tensors[0], unpack_positions(frame.tensors[1])
+        ids = frame.tensors[2].view(-1) if len(frame.tensors) > 2 else frame.request_id
         o, lse, score, v = self.attention.serve_attention(
-            frame.request_id, frame.layer, normed.to(device), positions.view(-1).to(device),
+            ids, frame.layer, normed.to(device), positions.to(device),
         )
         send_frame(sock, Frame(frame.request_id, frame.layer, (o, lse, score, v), OP_SWEEP))
         return True

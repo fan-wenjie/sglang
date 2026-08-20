@@ -257,7 +257,11 @@ class SweepService:
                 f"model without the output gate needs its own reply shape rather than a "
                 f"placeholder the host would silently multiply by."
             )
-        return k, v, gate
+        # the gate is (tokens, heads, dim) and the wire carries two dimensions, so it goes flat
+        # and the host restores it from the shape its own projection produced. Sending a rank-3
+        # tensor instead is refused by the encoder, which is the right place to refuse it and the
+        # wrong place to discover it.
+        return k, v, gate.reshape(gate.shape[0], -1)
 
     def _sweep_with(self, request_id, layer_id: int, q: torch.Tensor,
                     k_now: torch.Tensor, v_now: torch.Tensor):

@@ -61,10 +61,15 @@ OP_SWEEP_Q = 5    # q -> o, lse. Sweeps the cache and appends nothing: the two-p
                   # this frame goes to the CACHE pool at the same moment the feed-forward goes
                   # to the WEIGHTS pool, because the query is ready a layer early and the
                   # feed-forward's answer is not needed to sweep positions that predate it
+OP_HELLO = 7      # what each side does, exchanged before the first token. A host that needs a
+                  # cache pool and reaches a weights pool otherwise finds out from a frame the
+                  # far end cannot parse, which arrives as "closed mid-call" -- a message about
+                  # the socket that says nothing about the configuration that caused it
 OP_APPEND = 6     # k, v -> ack. Off the critical path: this step's join uses the host's own
                   # k and v, and the cache only has to hold them by the NEXT step
 OP_NAMES = {OP_FFN: "ffn", OP_SWEEP: "sweep", OP_HEAD: "head", OP_RELEASE: "release",
-            OP_KVPROJ: "kvproj", OP_SWEEP_Q: "sweep_q", OP_APPEND: "append"}
+            OP_KVPROJ: "kvproj", OP_SWEEP_Q: "sweep_q", OP_APPEND: "append",
+            OP_HELLO: "hello"}
 
 
 class Frame(NamedTuple):
@@ -199,3 +204,33 @@ def decode(sock) -> Frame | None:
         tensors.append(flat.view(DTYPES[code]).view(rows, cols))
         offset += length
     return Frame(request_id, layer, tuple(tensors), op)
+
+
+def pack_positions(positions: torch.Tensor) -> torch.Tensor:
+    """Put a positions tensor on the wire without losing its shape.
+
+    A rotation's positions are one row per token for a text stack and SEVERAL for a multimodal
+    one -- mrope carries a temporal, a height and a width row, so the tensor is (3, tokens). The
+    wire takes two dimensions, which fits both, and the rule is that the ROW COUNT is the meaning:
+
+        (tokens,)      -> (1, tokens)      one row, flattened again on arrival
+        (3, tokens)    -> (3, tokens)      kept, because each row is a different axis
+
+    Flattening the second into (3 * tokens, 1) is what the first version did. It produced a frame
+    whose positions were three times as long as its hidden states, and the far end learned about
+    it from a broadcast failure inside apply_rotary_emb -- which names neither the frame nor the
+    axis it lost.
+    """
+    if positions.dim() == 1:
+        return positions.reshape(1, -1).to(torch.int64)
+    if positions.dim() == 2:
+        return positions.to(torch.int64)
+    raise ValueError(
+        f"positions have {positions.dim()} dimension(s); the wire carries one row per rotation "
+        f"axis and this is neither a plain sequence nor a multi-axis one"
+    )
+
+
+def unpack_positions(packed: torch.Tensor) -> torch.Tensor:
+    """The inverse. One row means a plain sequence; more means the axes are the rows."""
+    return packed.reshape(-1) if packed.shape[0] == 1 else packed

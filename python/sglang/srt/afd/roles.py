@@ -116,6 +116,7 @@ def attach_cache_pool(sweep_ahead, *, addr, connect_timeout_s: float = 30.0):
     from sglang.srt.afd.rendezvous import AppendLedger
 
     client = PoolClient(addr, connect_timeout_s)
+    client.require(PoolClient.NEEDS_CACHE)
     sweep_ahead.cache_client = client
     sweep_ahead.ledger = AppendLedger()
     logger.info("afd host: sweeps go to the cache pool at %s, issued inside the window", addr)
@@ -153,10 +154,14 @@ def install_kv_on_pool(model, *, client, mode):
         install_remote_attention,
     )
 
+    from sglang.srt.afd.pool_client import PoolClient
+
     types = layer_types_of(model)
     if mode == "cache":
+        client.require(PoolClient.NEEDS_CACHE | PoolClient.NEEDS_KV_PROJECTION)
         return install_remote_attention(model, client, types)
     if mode == "projection":
+        client.require(PoolClient.NEEDS_KV_PROJECTION)
         return install_kv_projection(model, client, types)
     raise ValueError(f'--afd-pool-attention is "cache" or "projection", got {mode!r}')
 
@@ -190,6 +195,7 @@ def serve_pool_in_background(model, port: int, min_batch: int, max_wait_ms: int,
 def install_host_routing(model, pool_addr: str, sweep_ahead, connect_timeout_s: float = 30.0):
     """Point every routable layer's feed-forward at the pool, and open the sweep window."""
     client = PoolClient(pool_addr, connect_timeout_s)
+    client.require(PoolClient.NEEDS_FEED_FORWARD)
     return client, install_pool_routing(
         model, client, routable_layers(model), sweep_ahead=sweep_ahead
     )
