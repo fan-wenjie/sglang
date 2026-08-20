@@ -143,3 +143,84 @@ def sweep_cache(q: torch.Tensor, k_cached: torch.Tensor, v_cached: torch.Tensor,
     lse = torch.logsumexp(scores, dim=-1)
     out = torch.einsum("hj,hjd->hd", torch.softmax(scores, dim=-1), v)
     return out, lse
+
+
+class SweepService:
+    """The pool's answer to one SWEEP frame: this layer's cache swept, and the last one's
+    feed-forward, in a single round trip.
+
+    The two jobs ride together because the Early-Q read point makes them simultaneous. A frame for
+    the boundary between layer l-1 and layer l carries
+
+        h_(l-1)   the residual after layer l-1's attention, which layer l-1's feed-forward takes
+        q_l       layer l's query, which the host projected from that same h_(l-1)
+        positions for the rotation
+
+    and neither depends on the other. The sweep reads the CACHE, which is already here and has
+    nothing to do with this step, so it can start the moment the frame lands; the feed-forward runs
+    for x_l, which is what the key and value are then projected from. One round trip per layer
+    rather than two, and it is the moved read point that allows it -- at the standard read point
+    q_l is a function of x_l and the two jobs are strictly ordered.
+
+    The key and value go back with the answer because the JOIN stays on the host. It could run
+    here -- k_t and v_t are right there -- but then the pool's work would depend on this step's
+    token and could no longer be issued early, which is the whole property being bought.
+    """
+
+    def __init__(self, model, holder: KVHolder, layer_types: list[str]):
+        self.layers = model.model.layers
+        self.holder = holder
+        self.layer_types = layer_types
+
+    def _prepare_kv(self, layer, positions: torch.Tensor, x: torch.Tensor):
+        """This layer's key and value, through the model's own projection.
+
+        Calls the layer's `forward_prepare_native` and discards its query. That computes a query
+        nobody wants, and it is still the right call: the alternative is reimplementing the fused
+        projection's slicing, the qk-norm and the rotation, and a reimplementation is correct on
+        the configurations it was written against and wrong on the others without failing.
+        """
+        with torch.no_grad():
+            normed = layer.input_layernorm(x)
+            _, k, v, _ = layer.forward_prepare_native(positions=positions, hidden_states=normed)
+        return k, v
+
+    def serve(self, request_id: int, layer_id: int, q: torch.Tensor, hidden: torch.Tensor,
+              positions: torch.Tensor):
+        """One frame in, the tensors of one reply out."""
+        layer = self.layers[layer_id]
+        attn = layer.attn
+        heads, head_dim = attn.tp_q_head_num, attn.qk_head_dim
+        kv_heads = attn.tp_k_head_num
+
+        # the previous layer's feed-forward, and the residual it completes
+        with torch.no_grad():
+            ffn_out = layer_feed_forward(self.layers[layer_id - 1], hidden)
+            x = hidden + ffn_out
+            k_now, v_now = self._prepare_kv(layer, positions, x)
+
+        k_cache = k_now.view(-1, kv_heads, head_dim).transpose(0, 1).contiguous()
+        v_cache = v_now.view(-1, kv_heads, attn.v_head_dim).transpose(0, 1).contiguous()
+        k_all, v_all = self.holder.append(request_id, layer_id, k_cache, v_cache)
+
+        tokens = q.shape[0]
+        q3 = q.view(tokens, heads, head_dim)
+        outs, lses = [], []
+        for t in range(tokens):
+            # the cache this token may see ends where its own position begins
+            seen = k_all.shape[POSITION_AXIS] - (tokens - 1 - t) - 1
+            o, lse = sweep_cache(
+                q3[t], k_all[:, :seen], v_all[:, :seen],
+                scaling=attn.scaling, kv_group=heads // kv_heads,
+            )
+            outs.append(o)
+            lses.append(lse)
+        o_swept = torch.stack(outs).reshape(tokens, heads * attn.v_head_dim).to(q.dtype)
+        lse_swept = torch.stack(lses).to(torch.float32)
+        return o_swept, lse_swept, k_now, v_now, x
+
+
+def layer_feed_forward(layer, hidden: torch.Tensor) -> torch.Tensor:
+    """One layer's feed-forward, unwrapping the tuple some blocks return."""
+    out = layer.mlp(hidden)
+    return out[0] if isinstance(out, tuple) else out

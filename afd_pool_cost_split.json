@@ -1,0 +1,98 @@
+[
+  {
+    "context": 512,
+    "requests": 1,
+    "ffn_us": 354.3423970540365,
+    "sweep_us": 40.673598647117615,
+    "ffn_per_token_us": 354.3423970540365,
+    "sweep_per_token_us": 40.673598647117615
+  },
+  {
+    "context": 512,
+    "requests": 4,
+    "ffn_us": 364.27628199259436,
+    "sweep_us": 36.555200815200806,
+    "ffn_per_token_us": 91.06907049814859,
+    "sweep_per_token_us": 9.138800203800201
+  },
+  {
+    "context": 512,
+    "requests": 16,
+    "ffn_us": 368.2719866434733,
+    "sweep_us": 36.70719861984253,
+    "ffn_per_token_us": 23.016999165217083,
+    "sweep_per_token_us": 2.294199913740158
+  },
+  {
+    "context": 512,
+    "requests": 64,
+    "ffn_us": 381.45281473795575,
+    "sweep_us": 88.30080032348633,
+    "ffn_per_token_us": 5.960200230280559,
+    "sweep_per_token_us": 1.3797000050544739
+  },
+  {
+    "context": 4096,
+    "requests": 1,
+    "ffn_us": 359.5402717590332,
+    "sweep_us": 42.532798647880554,
+    "ffn_per_token_us": 359.5402717590332,
+    "sweep_per_token_us": 42.532798647880554
+  },
+  {
+    "context": 4096,
+    "requests": 4,
+    "ffn_us": 363.91681035359704,
+    "sweep_us": 42.41600036621094,
+    "ffn_per_token_us": 90.97920258839926,
+    "sweep_per_token_us": 10.604000091552734
+  },
+  {
+    "context": 4096,
+    "requests": 16,
+    "ffn_us": 368.014939626058,
+    "sweep_us": 198.67520332336426,
+    "ffn_per_token_us": 23.000933726628624,
+    "sweep_per_token_us": 12.417200207710266
+  },
+  {
+    "context": 4096,
+    "requests": 64,
+    "ffn_us": 380.1696141560872,
+    "sweep_us": 701.0640144348145,
+    "ffn_per_token_us": 5.940150221188863,
+    "sweep_per_token_us": 10.954125225543976
+  },
+  {
+    "context": 16384,
+    "requests": 1,
+    "ffn_us": 359.06238555908203,
+    "sweep_us": 145.68639993667603,
+    "ffn_per_token_us": 359.06238555908203,
+    "sweep_per_token_us": 145.68639993667603
+  },
+  {
+    "context": 16384,
+    "requests": 4,
+    "ffn_us": 364.10134633382165,
+    "sweep_us": 276.67999267578125,
+    "ffn_per_token_us": 91.02533658345541,
+    "sweep_per_token_us": 69.16999816894531
+  },
+  {
+    "context": 16384,
+    "requests": 16,
+    "ffn_us": 369.69919204711914,
+    "sweep_us": 762.7855777740479,
+    "ffn_per_token_us": 23.106199502944946,
+    "sweep_per_token_us": 47.67409861087799
+  },
+  {
+    "context": 16384,
+    "requests": 64,
+    "ffn_us": 380.66345850626624,
+    "sweep_us": 2713.572883605957,
+    "ffn_per_token_us": 5.94786653916041,
+    "sweep_per_token_us": 42.39957630634308
+  }
+]

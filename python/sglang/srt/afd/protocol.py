@@ -45,7 +45,9 @@ HEADER = struct.Struct("!QIIII")
 PART = struct.Struct("!IIII")
 CLOSE = HEADER.pack(0, 0, 0, 0, 0)
 
-DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+# int64 is on the list because RoPE travels with the frame: the pool projects the key, so it
+# needs the positions, and sending them as floats would round past 2^24.
+DTYPES = (torch.bfloat16, torch.float16, torch.float32, torch.int64)
 DTYPE_CODE = {d: i for i, d in enumerate(DTYPES)}
 
 # What the pool is being asked for. The opcode travels because the reply's SHAPE depends on it and
