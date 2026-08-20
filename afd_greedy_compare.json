@@ -1,0 +1,31 @@
+{
+  "n": 500,
+  "gen_len": 128,
+  "greedy": true,
+  "null_agreement": {
+    "exact": 110,
+    "exact_pct": 22.0,
+    "median_shared_tokens": 25.0,
+    "mean_shared_tokens": 47.282
+  },
+  "effect_agreement": {
+    "exact": 10,
+    "exact_pct": 2.0,
+    "median_shared_tokens": 3.0,
+    "mean_shared_tokens": 7.8
+  },
+  "mauve": {
+    "stock_vs_human": 0.2685414456047722,
+    "shifted_vs_human": 0.19287922991025072,
+    "stock_vs_stock_reordered": 0.9844431809046738,
+    "stock_vs_shifted": 0.9468531450029933
+  },
+  "gap": 0.0756622156945215,
+  "null_gap": 0.015556819095326246,
+  "example": {
+    "prompt": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other fail",
+    "human": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other failings . \" Rabin singled out Day 's performance as \" a potent illustration of how a brilliant character actor with a spark of madness can elevate a ramshackle lowbrow farce into a solid mainstream comedy through sheer force of charisma . \" Edward Douglas of ComingSoon.net credited director Seth Gordon with having assembled \" the perfect cast \" , claiming \" the six leads kill in every scene \" , but echoed Nathan Rabin 's sentiments that Day is the \" re",
+    "stock": "ings \" .\nThe film is a \" fun , light , and breezy \" comedy , \" a film that is a lot of fun \" .\n\" The film is a fun , light , and breezy comedy , a film that is a lot of fun \" .\n\" The film is a fun , light , and breezy comedy , a film that is a lot of fun \" .\n\" The film is a fun , light , and breezy comedy , a film that is a lot of fun \" .\n\" The film is a fun , light , and breezy comedy , a film that is a lot of fun",
+    "shifted": "ings \" .\nThe film is a \" bit of a mess \" , but \" the acting is so good that it makes the film work \" .\nThe film is \" a bit of a mess \" , but \" the acting is so good that it makes the film work \" .\nThe film is \" a bit of a mess \" , but \" the acting is so good that it makes the film work \" .\nThe film is \" a bit of a mess \" , but \" the acting is so good that it makes the film work \" .\nThe film is \" a bit of a mess \" , but \" the acting is"
+  }
+}
