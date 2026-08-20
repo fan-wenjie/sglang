@@ -167,7 +167,8 @@ class DepartureQueue:
     arrangement wearing this one's name.
     """
 
-    def __init__(self, min_batch: int, max_interval_s: float, now=time.perf_counter):
+    def __init__(self, min_batch: int, max_interval_s: float, now=time.perf_counter,
+                 pad_to: int = 0):
         if min_batch < 1:
             raise ValueError(f"a departure carries at least one, got {min_batch}")
         if max_interval_s <= 0:
@@ -176,8 +177,21 @@ class DepartureQueue:
                 f"and a minimum above one strands the last requests of a draining workload; it "
                 f"does not fail, which is worse."
             )
+        if pad_to and pad_to < min_batch:
+            raise ValueError(
+                f"pad_to={pad_to} is below min_batch={min_batch}; a load that departs full would "
+                f"then be padded DOWN, which is a truncation wearing padding's name"
+            )
         self.min_batch = min_batch
         self.max_interval_s = max_interval_s
+        # Pad the weight-shared work up to a fixed width. Nearly free at decode, because the
+        # feed-forward reads 535 MB of weights whatever the batch: measured 399 us at batch 1 and
+        # 432 at batch 64, so a load of three padded to sixty-four costs about what three would.
+        #
+        # Only the weight-shared work. The sweep runs at the REAL count: a padded rider has no
+        # history to sweep, and the sweep's cost is proportional to the batch once it is
+        # bandwidth-bound, so padding it is spent on nothing.
+        self.pad_to = pad_to
         self._now = now
         self._lock = threading.Lock()
         self._waiting: dict[int, list] = {}
@@ -186,6 +200,7 @@ class DepartureQueue:
         self.departed_full = 0
         self.departed_on_time = 0
         self.riders = 0
+        self.padding = 0
 
     def offer(self, layer: int, item) -> list | None:
         """Add a completed pair. Returns a full load to run now, or None to keep waiting."""
@@ -221,7 +236,19 @@ class DepartureQueue:
         self._last_departure = self._now()
         self.departures += 1
         self.riders += len(riders)
+        if self.pad_to:
+            self.padding += max(0, self.pad_to - len(riders))
         return riders
+
+    def width_for(self, riders: list) -> int:
+        """How wide to run the weight-shared work for this load.
+
+        The sweep is not run at this width. Nothing here enforces that -- it cannot, since it
+        never sees the sweep -- so the caller has to keep the two apart, and `report()` shows the
+        padding it is paying for so a load that is mostly padding is visible rather than assumed
+        away.
+        """
+        return max(len(riders), self.pad_to) if self.pad_to else len(riders)
 
     def waiting(self) -> int:
         with self._lock:
@@ -236,6 +263,9 @@ class DepartureQueue:
                 "departed_full": self.departed_full,
                 "departed_on_time": self.departed_on_time,
                 "waiting": sum(len(q) for q in self._waiting.values()),
+                "padding": self.padding,
+                "padding_pct": (100.0 * self.padding / (self.riders + self.padding))
+                if (self.riders + self.padding) else 0.0,
             }
 
 
