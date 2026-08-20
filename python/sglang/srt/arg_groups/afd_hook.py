@@ -71,6 +71,20 @@ def handle_afd(server_args: ServerArgs) -> None:
 
 def _check_pool_args(server_args) -> None:
     """The pool and departure settings, checked whether or not a shift was asked for."""
+    if server_args.afd_mode == "pool" and not server_args.sleep_on_idle:
+        # A pool serves feed-forward frames on a thread and never receives a generate request, so
+        # its own scheduler loop has nothing to do and spins -- and it spins holding the GIL that
+        # the departure thread needs. Measured on this arrangement: a 40 KB round trip took
+        # 7.08 ms against a spinning scheduler and 1.18 ms against a sleeping one, and end-to-end
+        # decode went from 6.4 to 21.4 tokens per second. It is set here rather than left to the
+        # operator because nothing about the symptom points at it: the network looks slow.
+        logger.info(
+            "afd pool: enabling --sleep-on-idle. The pool's own scheduler has no work and its "
+            "idle loop competes for the GIL with the thread answering feed-forward frames; "
+            "leaving it spinning cost 6x on the round trip here."
+        )
+        server_args.sleep_on_idle = True
+
     if server_args.afd_mode == "host":
         if not server_args.afd_pool_addr:
             raise ValueError(

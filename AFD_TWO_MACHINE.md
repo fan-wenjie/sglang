@@ -23,11 +23,34 @@ would have its own weight-mapping bugs, which produce plausible tokens from the 
 Link, measured rather than assumed:
 
     TCP round trip          0.3 ms      (connect+reply on the internal address, median 0.58 ms)
-    bulk bandwidth          4.4 Gbit/s  (3.2 GB streamed)
-    per-layer pool call     6.5 ms      steady state, decode, batch of 4
+    bulk bandwidth          4.4 Gbit/s  (3.2 GB streamed, on a 10 GbE link)
+    RDMA                    none        no infiniband devices, no /dev/infiniband, no libibverbs
+    per-layer pool call     1.2 ms      steady state, decode, batch of 4, 40 KB each way
 
-The gap between 0.3 ms and 6.5 ms is the point: the network is not what a pool call costs. It is
-the device-to-host copy, the host-to-device copy on the other side, and Python on both.
+## The 6 ms that was not the network
+
+That pool call was 7.1 ms until `--sleep-on-idle` was set on the pool. A pool serves feed-forward
+frames on a thread and never receives a generate request, so its own scheduler loop has nothing to
+do and spins -- holding the GIL that the departure thread needs. Nothing about the symptom points
+at it; the network looks slow. `afd/wire_breakdown.py` is what found it, by measuring the same
+protocol against a pool whose forward is the identity:
+
+    round trip, real pool, scheduler spinning     7.08 ms
+    round trip, real pool, --sleep-on-idle        1.18 ms
+    round trip, identity pool, no scheduler       0.80 ms
+    d2h of the frame                              0.011 ms
+    h2d of the frame                              0.014 ms
+
+End to end, at 4 concurrent requests:
+
+                              spinning      sleeping
+    two-sided, fused           6.4 tok/s    21.4 tok/s
+    two-sided, q-first         6.5 tok/s    25.5 tok/s
+    q-first over fused          1.020x        1.190x
+    hidden per pool call          ~10%      19.6-21.6%
+    two-sided over colocated     0.094x        0.308x
+
+The pool now sets `--sleep-on-idle` itself, with an info line saying why.
 
 ## Setup
 
