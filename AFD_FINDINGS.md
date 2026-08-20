@@ -186,12 +186,62 @@ query for layer l+1 goes out before layer l+1's key and value exist, so the swep
 include this step's own token. The version this replaces arranges that in arithmetic, in the one
 line of that file nothing else guards.
 
+## 9. The ranking flips with context length, and my previous one was wrong
+
+One decode layer has four pieces and only their ratio moves. The feed-forward, the query/output
+projections and the key/value projection are flat -- they read weights, whatever the history is.
+The sweep is linear in the context and unbounded. An arrangement is a choice of which pieces go
+to another machine; its per-layer wall clock is the MAX of the two sides, not the sum, provided
+the round trip is covered -- and how much work STAYS decides how deep a pipeline has to be to
+cover it.
+
+Batch 4, bfloat16, sweep charged to the 16 softmax layers rather than all 64:
+
+| context | | colocated | A ffn remote | B ffn+cache | two pools | E sweep remote |
+|---|---|---|---|---|---|---|
+| **1024** | per layer | 429 us | **365 (1.17x)** | 375 (1.14x) | **365 (1.17x)** | 418 (1.02x) |
+| short | depth needed | -- | 15.7 | 18.7 | 18.7 | **2.4** |
+| **131072** | per layer | 952 us | 588 (1.62x) | 899 (1.06x) | **535 (1.78x)** | **535 (1.78x)** |
+| half full | depth needed | -- | **1.7** | 19.0 | 19.0 | **2.4** |
+| **262144** | per layer | 1482 us | 1118 (1.33x) | 1429 (1.04x) | **1065 (1.39x)** | **1065 (1.39x)** |
+| full window | depth needed | -- | **0.9** | 19.1 | 19.1 | **2.4** |
+
+    the host's KV cache at batch 4:  0.3 GB at 1k,  34.4 GB at 128k,  68.7 GB at 256k
+
+Three readings:
+
+**At short context nothing is worth disaggregating.** The best arrangement is 1.17x and needs
+fifteen items in flight to reach it. The sweep is 41 us -- there is nothing to offload -- so
+moving the feed-forward only trades compute for wire.
+
+**At half and full window E is best on both axes at once**: the top speedup AND a depth of 2.4,
+which a dataflow queue supplies from three items in flight. Two pools tie on speedup and need
+nineteen. A degrades as the context grows -- the sweep stays on the host and grows with it, so at
+the full window the host does 1118 us against the remote's 364 -- while its depth requirement
+improves for the same reason.
+
+**At long context the memory argument outweighs the speed one.** 68.7 GB of cache at batch 4 is
+more than most cards have; an arrangement that moves it is not competing on 1.39x.
+
+### The correction
+
+My previous ranking charged the sweep to every layer. It runs on 16 of 64 -- three of every four
+layers here are linear attention, whose state this does not sweep.
+
+    what I said (sweep on 64/64)     colocated 730us   A 1.97x   E 1.73x
+    what it is  (sweep on 16/64)     colocated 499us   A 1.34x   E 1.18x
+
+A's advantage was a quarter of the sweep's cost being attributed to it four times over. The
+measured table above supersedes it. This is the fourth arithmetic in this tree that was checked
+only after it had already been used to recommend something.
+
 ## Not measured
 
 - The two-pool arrangement end to end. The mechanism and its ordering test exist; two processes
   and two addresses do not yet.
 - Arrangement C, which does not run.
 - The 500-prompt agreement statistic on any of the pool paths. Two prompts is not evidence.
+- Any of this at batch sizes other than 4 at long context, where the cache alone is 68.7 GB.
 - Whether any of this pays. Every arrangement here is slower than colocated, because every
   converted layer makes a synchronous round trip the colocated model does not make, and the
   overlap so far recovers a fraction of it. Whether disaggregation pays is a ratio between an
