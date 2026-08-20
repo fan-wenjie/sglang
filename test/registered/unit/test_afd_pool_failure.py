@@ -1,0 +1,154 @@
+"""What happens to a host when its pool goes away.
+
+Without reconnection a pool restart is fatal to the host: every call after it raises, the
+scheduler dies, and a server that was serving hundreds of requests stops because one of its two
+processes was replaced. That is not a serving system.
+
+The contract this pins is deliberately asymmetric:
+
+    in-flight work FAILS, loudly. Its answers went with the old process, and a client that resent
+    those frames would be guessing at whether the pool had already applied them -- which for a
+    pool that holds histories means a key appended twice, a past with one token in it twice, and
+    fluent output from it.
+
+    future work RECOVERS. The next call opens a new connection.
+"""
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+import socket
+import threading
+import unittest
+
+import torch
+from sglang.srt.afd.pool_client import PoolClient, PoolClosed
+from sglang.srt.afd.protocol import OP_FFN, Frame, decode, send_frame
+from sglang.test.test_utils import CustomTestCase
+
+
+class Echo:
+    """A pool that returns what it is given, and can be told to die."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        self.served = 0
+        self._stop = threading.Event()
+        self._conns = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self._conns.append(conn)
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            while True:
+                frame = decode(conn)
+                if frame is None:
+                    return
+                self.served += 1
+                send_frame(conn, Frame.one(frame.request_id, frame.layer, frame.tensor, OP_FFN))
+        except OSError:
+            return
+
+    def drop_connections(self):
+        for conn in self._conns:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        self._conns.clear()
+
+    def close(self):
+        self._stop.set()
+        self.drop_connections()
+        self.sock.close()
+
+
+class TestAPoolRestartIsSurvivable(CustomTestCase):
+    def setUp(self):
+        self.pool = Echo()
+
+    def tearDown(self):
+        self.pool.close()
+
+    def test_a_call_works_before_and_after_a_reconnect(self):
+        client = PoolClient(f"127.0.0.1:{self.pool.port}", 5.0)
+        try:
+            hidden = torch.ones(2, 8)
+            first = client.collect(client.issue(1, 0, hidden), "cpu")
+            self.assertTrue(torch.equal(first, hidden))
+
+            self.pool.drop_connections()
+            self.assertTrue(client.reconnect(), "a live pool must be reconnectable")
+
+            again = client.collect(client.issue(2, 0, hidden), "cpu")
+            self.assertTrue(torch.equal(again, hidden), "the next call recovers")
+            self.assertEqual(client.reconnects, 1)
+        finally:
+            client.close()
+
+    def test_reconnecting_fails_the_calls_that_were_outstanding(self):
+        """They are not retried. Resending a frame the pool may already have applied is how an
+        append lands twice, and a history with one token in it twice reads as fluent."""
+        client = PoolClient(f"127.0.0.1:{self.pool.port}", 5.0)
+        try:
+            with client._cond:
+                client._slots[(9, 1)] = torch.ones(1, 1)
+                client._replies[(9, 2, 5)] = (torch.ones(1, 1),)
+            client.reconnect()
+            with client._cond:
+                self.assertEqual(len(client._slots), 0)
+                self.assertEqual(len(client._replies), 0)
+        finally:
+            client.close()
+
+    def test_reconnection_can_be_switched_off(self):
+        """A deployment that would rather fail than serve through a flapping pool says so, and
+        gets the old behaviour without a surprise."""
+        client = PoolClient(f"127.0.0.1:{self.pool.port}", 5.0, reconnect=False)
+        try:
+            self.assertFalse(client.reconnect())
+            self.assertEqual(client.reconnects, 0)
+        finally:
+            client.close()
+
+    def test_it_gives_up_after_a_bounded_number_of_attempts(self):
+        """A pool that flaps forever must not turn the host into a reconnection loop that never
+        serves a token."""
+        client = PoolClient(f"127.0.0.1:{self.pool.port}", 5.0, max_reconnects=2)
+        try:
+            self.assertTrue(client.reconnect())
+            self.assertTrue(client.reconnect())
+            self.assertFalse(client.reconnect(), "the third is refused")
+        finally:
+            client.close()
+
+    def test_a_dead_pool_reports_failure_rather_than_hanging(self):
+        """The call that was in flight when the pool went away raises; it does not wait forever
+        for an answer that is not coming."""
+        client = PoolClient(f"127.0.0.1:{self.pool.port}", 5.0, reconnect=False)
+        try:
+            handle = client.issue(1, 0, torch.ones(2, 8))
+            client.collect(handle, "cpu")
+            self.pool.close()
+            with self.assertRaises((PoolClosed, OSError)):
+                for i in range(50):
+                    client.collect(client.issue(i + 2, 0, torch.ones(2, 8)), "cpu")
+        finally:
+            client.close()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

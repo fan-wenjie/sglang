@@ -65,16 +65,32 @@ class PoolClosed(RuntimeError):
 
 
 class PoolClient:
-    """One connection to one pool, shared by every request on this host."""
+    """One connection to one pool, shared by every request on this host.
 
-    def __init__(self, address: str, connect_timeout_s: float):
+    ## A pool that dies must not take the host with it
+
+    Without reconnection a pool restart is fatal: every call after it raises, the scheduler dies,
+    and a server that was serving hundreds of requests stops because one of its two processes was
+    replaced. With it, the calls that were in flight still fail -- their answers are gone and
+    inventing one would be worse -- and the next call reconnects.
+
+    That distinction is the contract: **in-flight work fails loudly, future work recovers.** A
+    client that retried the in-flight frames would be guessing at whether the pool had already
+    applied them, which for a stateful pool means a key appended twice.
+    """
+
+    def __init__(self, address: str, connect_timeout_s: float, reconnect: bool = True,
+                 max_reconnects: int = 8):
         host, _, port = address.rpartition(":")
         if not host or not port.isdigit():
             raise ValueError(f"--afd-pool-addr wants HOST:PORT, got {address!r}")
         self.address = address
-        self._sock = socket.create_connection((host, int(port)), timeout=connect_timeout_s)
-        self._sock.settimeout(None)
-        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._host, self._port = host, int(port)
+        self._connect_timeout_s = connect_timeout_s
+        self._reconnect = reconnect
+        self._max_reconnects = max_reconnects
+        self.reconnects = 0
+        self._sock = self._open()
         self._send_lock = threading.Lock()
         self._cond = threading.Condition()
         self._slots: dict[tuple[int, int], torch.Tensor] = {}
@@ -88,6 +104,50 @@ class PoolClient:
         self._closed = False
         self._receiver = threading.Thread(target=self._receive, name="afd-pool-recv", daemon=True)
         self._receiver.start()
+
+    def _open(self):
+        sock = socket.create_connection((self._host, self._port),
+                                        timeout=self._connect_timeout_s)
+        sock.settimeout(None)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return sock
+
+    def reconnect(self) -> bool:
+        """Replace a dead connection. Returns False when reconnection is off or exhausted.
+
+        Every call that was outstanding is failed first. Their answers went with the old process,
+        and a client that retried them would be guessing at whether the pool had already applied
+        them -- which for a pool holding histories means a key appended twice, a past with one
+        token in it twice, and fluent output from it.
+        """
+        if not self._reconnect or self.reconnects >= self._max_reconnects:
+            return False
+        with self._cond:
+            outstanding = len(self._slots) + len(self._replies)
+            self._slots.clear()
+            self._replies.clear()
+        try:
+            sock = self._open()
+        except OSError as e:
+            logger.warning("afd: could not reconnect to the pool at %s: %s", self.address, e)
+            return False
+        with self._cond:
+            old, self._sock = self._sock, sock
+            self._failure, self._closed = None, False
+            self.reconnects += 1
+        try:
+            old.close()
+        except OSError:
+            pass
+        logger.warning(
+            "afd: reconnected to the pool at %s (attempt %s). %s call(s) that were outstanding "
+            "were failed rather than retried: their answers went with the old process, and "
+            "resending them would risk applying an append twice.",
+            self.address, self.reconnects, outstanding,
+        )
+        self._receiver = threading.Thread(target=self._receive, name="afd-pool-recv", daemon=True)
+        self._receiver.start()
+        return True
 
     def _receive(self) -> None:
         try:

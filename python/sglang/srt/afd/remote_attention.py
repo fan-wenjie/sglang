@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import torch
 from sglang.srt.afd.protocol import OP_KVPROJ, OP_RELEASE, OP_SWEEP, Frame
+from sglang.srt.afd.sweep_ahead import row_request_ids
 
 # the layer field is unused by a release; naming it keeps the frame readable
 RELEASE_LAYER = 0
@@ -85,11 +86,11 @@ class RemoteAttention:
     new sequence, which is the moment to drop what was there. sglang reuses slots, so without that
     the cache would be a different request's.
 
-    ## One request at a time, for now
+    ## Rows carry their own request id
 
-    A decode forward carries one token from each of N requests and this wrapper sends them as one
-    frame, so N > 1 would append every request's key to one request's history. It refuses instead.
-    Lifting it means a frame per request, or a request id per row.
+    A decode forward carries one token from each of N requests and each has its own history, so
+    the frame names a request PER ROW rather than once. Reading it off the batch size instead was
+    what made every pool path a batch-of-one path.
     """
 
     def __init__(self, model, client, layers: tuple[int, ...]):
@@ -130,12 +131,6 @@ class RemoteAttention:
             if kwargs or normed is None or not (mode.is_decode() or mode.is_extend()):
                 self.refusals += 1
                 return original(q, k, v, forward_batch, save_kv_cache=save_kv_cache, **kwargs)
-            if forward_batch.batch_size != 1:
-                raise RuntimeError(
-                    f"the pool keys its cache by request and this frame carries "
-                    f"{forward_batch.batch_size} requests' tokens; sending them as one would "
-                    f"append every request's key to one request's history"
-                )
             positions = forward_batch.positions.reshape(-1)
             request_id = int(forward_batch.req_pool_indices[0]) + 1
             if int(positions[0]) == 0 and layer_id == self.layers[0]:

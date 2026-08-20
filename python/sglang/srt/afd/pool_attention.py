@@ -195,7 +195,7 @@ class SweepService:
             _, k, v, _ = layer.forward_prepare_native(positions=positions, hidden_states=normed)
         return k, v
 
-    def serve_attention(self, request_id: int, layer_id: int, normed: torch.Tensor,
+    def serve_attention(self, request_id, layer_id: int, normed: torch.Tensor,
                         positions: torch.Tensor):
         """Everything the host's join needs, from the host's normalised input alone.
 
@@ -259,9 +259,28 @@ class SweepService:
             )
         return k, v, gate
 
-    def _sweep_with(self, request_id: int, layer_id: int, q: torch.Tensor,
+    def _sweep_with(self, request_id, layer_id: int, q: torch.Tensor,
                     k_now: torch.Tensor, v_now: torch.Tensor):
-        """Append this step's key and value, then sweep everything before each token's own slot."""
+        """Append this step's key and value, then sweep everything before each token's own slot.
+
+        `request_id` may be one id or one per row. Rows of a request are contiguous, so the work
+        is done a run at a time and the pieces concatenated in row order.
+        """
+        if not isinstance(request_id, int):
+            ids = [int(r) for r in request_id]
+            outs, lses, start = [], [], 0
+            while start < len(ids):
+                end = start + 1
+                while end < len(ids) and ids[end] == ids[start]:
+                    end += 1
+                o, lse = self._sweep_with(ids[start], layer_id, q[start:end],
+                                          k_now[start:end], v_now[start:end])
+                outs.append(o)
+                lses.append(lse)
+                start = end
+            return (torch.cat(outs, dim=0) if len(outs) > 1 else outs[0],
+                    torch.cat(lses, dim=0) if len(lses) > 1 else lses[0])
+
         attn = self.layers[layer_id].attn
         heads, kv_heads = attn.tp_q_head_num, attn.tp_k_head_num
         head_dim, v_head_dim = attn.qk_head_dim, attn.v_head_dim
@@ -385,6 +404,58 @@ class CachePool:
                 f"layer this pool was not told the shape of"
             )
         return found
+
+    def sweep_rows(self, request_ids, layer_id: int, q: torch.Tensor, expect=None):
+        """Sweep a batch whose rows belong to different requests.
+
+        A decode forward carries one token from each of N requests, and each has its OWN history:
+        row i must be swept against request_ids[i]'s cache and no other. The single-request form
+        below is this with every row the same, and it was all this could do until now -- which
+        made every pool path a batch-of-one path, and a server that only works at batch one is not
+        a server.
+
+        Rows of one request stay contiguous and in order, because that is how a chunk arrives and
+        the sweep's causal boundary is positional within it.
+        """
+        ids = [int(r) for r in request_ids]
+        if len(ids) != q.shape[0]:
+            raise RuntimeError(
+                f"{len(ids)} request id(s) for {q.shape[0]} row(s); every row has to say whose "
+                f"history it belongs to, and a mismatch here sweeps one request's token against "
+                f"another's past"
+            )
+        wanted = None if expect is None else [int(e) for e in expect]
+        outs, lses = [], []
+        start = 0
+        while start < len(ids):
+            end = start + 1
+            while end < len(ids) and ids[end] == ids[start]:
+                end += 1
+            o, lse = self.sweep(ids[start], layer_id, q[start:end],
+                                expect=None if wanted is None else wanted[start])
+            outs.append(o)
+            lses.append(lse)
+            start = end
+        return (torch.cat(outs, dim=0) if len(outs) > 1 else outs[0],
+                torch.cat(lses, dim=0) if len(lses) > 1 else lses[0])
+
+    def append_rows(self, request_ids, layer_id: int, k: torch.Tensor, v: torch.Tensor):
+        """Append a batch whose rows belong to different requests."""
+        ids = [int(r) for r in request_ids]
+        if len(ids) != k.shape[0]:
+            raise RuntimeError(
+                f"{len(ids)} request id(s) for {k.shape[0]} row(s); a mismatch here files one "
+                f"request's key under another's history"
+            )
+        held = {}
+        start = 0
+        while start < len(ids):
+            end = start + 1
+            while end < len(ids) and ids[end] == ids[start]:
+                end += 1
+            held[ids[start]] = self.append(ids[start], layer_id, k[start:end], v[start:end])
+            start = end
+        return held
 
     def sweep(self, request_id: int, layer_id: int, q: torch.Tensor, expect: int | None = None):
         """Sweep this request's history at this layer.

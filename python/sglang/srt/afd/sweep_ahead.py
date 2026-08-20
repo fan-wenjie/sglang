@@ -57,6 +57,34 @@ logger = logging.getLogger(__name__)
 _IS_CUDA, _IS_HIP, _IS_NPU, _IS_XPU, _IS_CPU = is_cuda(), is_hip(), is_npu(), is_xpu(), is_cpu()
 
 
+def row_request_ids(forward_batch) -> torch.Tensor:
+    """Whose history each ROW of this forward belongs to.
+
+    Decode carries one token per request, so the rows are the requests. Extend carries a whole
+    chunk per request, so each request's id repeats for as many tokens as it brought. Both are the
+    same question -- the cache is keyed by request and the frame is keyed by row -- and answering
+    it from the batch size alone is right until two requests are in one forward, which is every
+    forward a server actually runs.
+    """
+    pool_indices = forward_batch.req_pool_indices.view(-1)
+    lens = forward_batch.extend_seq_lens
+    if lens is None:
+        return pool_indices
+    return torch.repeat_interleave(pool_indices, lens.to(pool_indices.device))
+
+
+def _runs(ids: list) -> list:
+    """Contiguous runs of one id, as (id, length). Rows of one request arrive together."""
+    out, start = [], 0
+    while start < len(ids):
+        end = start + 1
+        while end < len(ids) and ids[end] == ids[start]:
+            end += 1
+        out.append((int(ids[start]), end - start))
+        start = end
+    return out
+
+
 def _prepare_method_name(layer) -> str:
     """Which forward_prepare_* variant this layer's `self_attention` will call.
 
@@ -199,13 +227,21 @@ class SweepAhead:
         """Send the query to the cache pool and DO NOT wait. The handle is the state."""
         from sglang.srt.afd.split_attention import SweepResult
 
-        tensors = (q,)
+        ids = row_request_ids(self._forward_batch)
+        if ids.shape[0] != q.shape[0]:
+            raise RuntimeError(
+                f"layer {target}: {ids.shape[0]} row id(s) for {q.shape[0]} quer(ies). Every row "
+                f"has to say whose history it belongs to, and a mismatch sweeps one request's "
+                f"token against another's past -- which is fluent and wrong."
+            )
+        tensors = [q, ids.view(-1, 1)]
         if self.ledger is not None:
-            posted = self.ledger.posted(self.cache_request_id, target)
-            tensors = (q, torch.tensor([[float(posted)]], dtype=torch.float32))
-        handle = self.cache_client.issue_frame(self.cache_request_id, target, tensors, OP_SWEEP_Q)
+            posted = [self.ledger.posted(int(r), target) for r in ids]
+            tensors.append(torch.tensor(posted, dtype=torch.float32).view(-1, 1))
+        handle = self.cache_client.issue_frame(0, target, tuple(tensors), OP_SWEEP_Q)
         state = SweepResult(target, q, None, None)
         state.handle = handle
+        state.row_ids = ids
         return state
 
     def _project_linear_ahead(self, layer, hidden) -> None:
@@ -239,9 +275,13 @@ class SweepAhead:
         """
         if self.cache_client is None or k is None or v is None:
             return
-        self.cache_client.issue_frame(self.cache_request_id, target, (k, v), OP_APPEND)
+        ids = row_request_ids(self._forward_batch)
+        if ids.shape[0] != k.shape[0]:
+            return
+        self.cache_client.issue_frame(0, target, (k, v, ids.view(-1, 1)), OP_APPEND)
         if self.ledger is not None:
-            self.ledger.record(self.cache_request_id, target, k.shape[0])
+            for r, n in _runs(ids.tolist()):
+                self.ledger.record(r, target, n)
 
     def _join_remote(self, target: int, attn, state, k, v, device):
         """Collect the sweep the window issued, fold this step's token in, and post the append.

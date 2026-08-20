@@ -38,7 +38,7 @@ import threading
 from collections.abc import Callable
 
 import torch
-from sglang.srt.afd.pool_client import PoolClient
+from sglang.srt.afd.pool_client import PoolClient, PoolClosed
 from sglang.srt.afd.pool_server import serve
 
 logger = logging.getLogger(__name__)
@@ -258,7 +258,15 @@ class PoolRouting:
                     f"dense MLP. Route it locally or teach the wire its other arguments."
                 )
             device, dtype = hidden_states.device, hidden_states.dtype
-            handle = self.client.issue(next(self._ids), layer_id, hidden_states)
+            try:
+                handle = self.client.issue(next(self._ids), layer_id, hidden_states)
+            except (OSError, PoolClosed):
+                # the pool went away between calls. Reconnect and let THIS request fail: its
+                # answer is gone, and the alternative -- running the feed-forward locally instead
+                # -- would serve a token from weights the arrangement says are elsewhere, which is
+                # correct output arrived at by abandoning the arrangement without saying so.
+                self.client.reconnect()
+                raise
             if self.between is not None:
                 # the window. The next converted layer's query was projected from THIS layer's
                 # h_l, so its cache sweep can be launched now and will run on the GPU while the
