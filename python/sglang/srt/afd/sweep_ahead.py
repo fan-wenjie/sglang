@@ -133,7 +133,8 @@ class SweepAhead:
         # instead of running it locally, which is what makes the two pools concurrent: the
         # feed-forward is already in flight to the weights pool when this goes out.
         self.cache_client = None
-        self.cache_request_id = 1
+        # no constant request id: rows carry their own, and one here would be a second
+        # answer to the question of whose history a row belongs to
         # what this host has posted to the database, per (request, layer). Sent with every query
         # so the database can refuse a sweep that has overtaken its own append.
         self.ledger = None
@@ -293,12 +294,15 @@ class SweepAhead:
 
         o_swept, lse = self.cache_client.collect_frame(state.handle, device)
         out = join_scored(o_swept, lse, state.q, k, v, attn=attn)
-        self.cache_client.issue_frame(self.cache_request_id, target, (k, v), OP_APPEND)
+        # keyed per row, like the sweep that preceded it: the batch carries one token from each of
+        # several requests and each belongs to its own history
+        self.cache_client.issue_frame(0, target, (k, v, state.row_ids.view(-1, 1)), OP_APPEND)
         if self.ledger is not None:
-            # recorded HERE, not when the append is acknowledged: the next query must expect this
-            # position, and waiting for the ack would put the ledger a step behind the history it
+            # recorded HERE, not when the append is acknowledged: the next query must expect these
+            # positions, and waiting for the ack would put the ledger a step behind the history it
             # is meant to describe
-            self.ledger.record(self.cache_request_id, target, k.shape[0])
+            for request_id, count in _runs(state.row_ids.tolist()):
+                self.ledger.record(request_id, target, count)
         self.n_joins += 1
         return out
 

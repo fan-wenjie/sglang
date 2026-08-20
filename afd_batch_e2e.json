@@ -1,0 +1,38 @@
+{
+  "prompts": [
+    "The capital of France is",
+    "List the first eight prime numbers, separated by commas:",
+    "Explain in one sentence why the sky is blue:",
+    "Write a two-line poem about a slow train:",
+    "Name three programming languages that compile to machine code:",
+    "What is the derivative of x squared with respect to x?"
+  ],
+  "one_pool": [
+    " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+    "\n\nThe first eight prime numbers are:\n\n2, 3, 5, 7, 11,",
+    "\n\n<think>\nThe user asks for a one-sentence explanation of why the sky is blue. This is a straightforward science",
+    "\n\nThe iron serpent drags its silver spine\nthrough valleys where the afternoon has died.\n\nThe first line establishes the",
+    "\n\n1. **C** \u2013 A C compiler translates source code directly into native machine instructions for the target processor.\n",
+    "\n\nThe derivative of x squared with respect to x is 2x. This is because the power rule of differentiation states"
+  ],
+  "two_pools": [
+    " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+    "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11,",
+    "\n\n<think>\nThe user asks for a one-sentence explanation of why the sky is blue. This is a straightforward science",
+    "\n\nThe iron serpent drags its weary spine\nthrough valleys where the afternoon has died.\n\nHere is a two-line",
+    "\n\n1. C\n2. C++\n3. Rust\n\nName three programming languages that compile to bytecode:\n\n",
+    "\n\nThe derivative of x squared with respect to x is 2x. This is because the power rule of differentiation states"
+  ],
+  "identical": [
+    true,
+    false,
+    true,
+    false,
+    false,
+    true
+  ],
+  "wall": {
+    "one": 4.506499532610178,
+    "two": 8.218131262809038
+  }
+}

@@ -33,6 +33,7 @@ from sglang.srt.afd.protocol import (
     OP_FFN,
     OP_APPEND,
     OP_KVPROJ,
+    OP_NAMES,
     OP_RELEASE,
     OP_SWEEP,
     OP_SWEEP_Q,
@@ -110,25 +111,48 @@ class Departure(threading.Thread):
         return True
 
     def _answer_cache(self, frame: Frame, sock: socket.socket) -> bool:
-        """The cache pool's three ops. None of them touches a weight or a hidden state."""
+        """The cache pool's three ops. None of them touches a weight or a hidden state.
+
+        Frame layouts, checked rather than unpacked. A tuple unpack that goes wrong raises "too
+        many values to unpack" from inside a socket thread, which reaches the caller as a broken
+        pipe with no explanation -- the wrong end of the connection learning the wrong thing. A
+        protocol mismatch should name itself.
+
+            SWEEP_Q   q, row request ids [, expected history lengths]  ->  o, lse
+            APPEND    k, v, row request ids                            ->  positions held
+            RELEASE   anything                                         ->  layers dropped
+        """
         device = self.device
         if frame.op == OP_SWEEP_Q:
-            # a second tensor, when present, is the caller's own count of what it has appended
-            expect = int(frame.tensors[1][0, 0]) if len(frame.tensors) > 1 else None
-            o, lse = self.cache.sweep(frame.request_id, frame.layer, frame.tensor.to(device),
-                                      expect=expect)
+            self._expect_tensors(frame, (2, 3), "SWEEP_Q: q, row ids [, expected lengths]")
+            q, ids = frame.tensors[0], frame.tensors[1].view(-1)
+            expect = frame.tensors[2].view(-1) if len(frame.tensors) > 2 else None
+            o, lse = self.cache.sweep_rows(ids, frame.layer, q.to(device), expect=expect)
             send_frame(sock, Frame(frame.request_id, frame.layer, (o, lse), OP_SWEEP_Q))
             return True
         if frame.op == OP_APPEND:
-            k, v = frame.tensors
-            held = self.cache.append(frame.request_id, frame.layer, k.to(device), v.to(device))
+            self._expect_tensors(frame, (3,), "APPEND: k, v, row ids")
+            k, v, ids = frame.tensors[0], frame.tensors[1], frame.tensors[2].view(-1)
+            held = self.cache.append_rows(ids, frame.layer, k.to(device), v.to(device))
+            most = max(held.values()) if held else 0
             send_frame(sock, Frame(frame.request_id, frame.layer,
-                                   (torch.tensor([[float(held)]]),), OP_APPEND))
+                                   (torch.tensor([[float(most)]]),), OP_APPEND))
             return True
         dropped = self.cache.holder.release(frame.request_id)
         send_frame(sock, Frame(frame.request_id, frame.layer,
                                (torch.tensor([[float(dropped)]]),), OP_RELEASE))
         return True
+
+    @staticmethod
+    def _expect_tensors(frame: Frame, allowed: tuple, layout: str) -> None:
+        if len(frame.tensors) not in allowed:
+            raise ConnectionError(
+                f"{OP_NAMES.get(frame.op, frame.op)} frame for request {frame.request_id} layer "
+                f"{frame.layer} carries {len(frame.tensors)} tensor(s); this pool speaks "
+                f"{sorted(allowed)}. Layout is {layout}. The two sides are running different "
+                f"versions of the protocol, and unpacking anyway would answer with something "
+                f"nobody asked for."
+            )
 
     def offer(self, frame: Frame, sock: socket.socket) -> None:
         """Queue a frame, and depart it here if that completes a batch.
