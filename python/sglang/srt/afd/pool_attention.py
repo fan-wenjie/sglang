@@ -49,6 +49,8 @@ import threading
 
 import torch
 
+from typing import NamedTuple
+
 logger = logging.getLogger(__name__)
 
 
@@ -306,6 +308,35 @@ def layer_feed_forward(layer, hidden: torch.Tensor) -> torch.Tensor:
     return out[0] if isinstance(out, tuple) else out
 
 
+class LayerGeometry(NamedTuple):
+    """What a sweep needs to know about a layer. Numbers, not modules.
+
+    The cache pool holds no weights -- that is its defining property, and the thing that lets it
+    be a different machine, a cheaper one, or several. Taking a loaded model to read `layer.attn`
+    off would have made it need one, which is how a service acquires a dependency nobody meant to
+    give it.
+    """
+
+    q_heads: int
+    kv_heads: int
+    head_dim: int
+    v_head_dim: int
+    scaling: float
+
+    @classmethod
+    def of(cls, layer) -> "LayerGeometry":
+        attn = layer.attn
+        return cls(attn.tp_q_head_num, attn.tp_k_head_num, attn.qk_head_dim,
+                   attn.v_head_dim, attn.scaling)
+
+    @classmethod
+    def from_config(cls, config) -> "LayerGeometry":
+        """From a HuggingFace text config, so a pool can be started without loading anything."""
+        head_dim = config.head_dim
+        return cls(config.num_attention_heads, config.num_key_value_heads, head_dim, head_dim,
+                   head_dim**-0.5)
+
+
 class CachePool:
     """The cache half alone: hold a history, sweep it with a query, append to it.
 
@@ -326,10 +357,34 @@ class CachePool:
     It never sees a hidden state, a weight, or a feed-forward.
     """
 
-    def __init__(self, holder: KVHolder, layers, scalings: dict):
+    def __init__(self, holder: KVHolder, geometry):
+        """`geometry` is one LayerGeometry, or a list of them, or a loaded stack to read them off.
+
+        A single geometry covers a stack whose softmax layers are alike, which is every model this
+        serves; the list exists for one that is not, and passing a model is a convenience for a
+        caller that already has one -- not a requirement, which is the point.
+        """
         self.holder = holder
-        self.layers = layers
-        self.scalings = scalings
+        if isinstance(geometry, LayerGeometry):
+            self.geometry, self._per_layer = geometry, None
+        elif hasattr(geometry, "__len__") and len(geometry) and isinstance(
+                geometry[0], LayerGeometry):
+            self.geometry, self._per_layer = None, list(geometry)
+        else:
+            self.geometry, self._per_layer = None, [
+                LayerGeometry.of(ly) if hasattr(ly, "attn") else None for ly in geometry
+            ]
+
+    def _geometry(self, layer_id: int) -> LayerGeometry:
+        if self.geometry is not None:
+            return self.geometry
+        found = self._per_layer[layer_id]
+        if found is None:
+            raise RuntimeError(
+                f"layer {layer_id} has no attention geometry here; a sweep was asked for on a "
+                f"layer this pool was not told the shape of"
+            )
+        return found
 
     def sweep(self, request_id: int, layer_id: int, q: torch.Tensor, expect: int | None = None):
         """Sweep this request's history at this layer.
@@ -357,9 +412,9 @@ class CachePool:
                 f"landed, so this sweep would cover a history with a hole in it -- which reads as "
                 f"a fluent model that has forgotten one token."
             )
-        attn = self.layers[layer_id].attn
-        heads, kv_heads = attn.tp_q_head_num, attn.tp_k_head_num
-        head_dim, v_head_dim = attn.qk_head_dim, attn.v_head_dim
+        g = self._geometry(layer_id)
+        heads, kv_heads = g.q_heads, g.kv_heads
+        head_dim, v_head_dim = g.head_dim, g.v_head_dim
         k_all = self.holder.peek_k(request_id, layer_id)
         v_all = self.holder.peek_v(request_id, layer_id)
         tokens = q.shape[0]
@@ -380,15 +435,15 @@ class CachePool:
                                        dtype=torch.float32))
                 continue
             o, lse = sweep_cache(q3[t], k_all[:, :seen], v_all[:, :seen],
-                                 scaling=attn.scaling, kv_group=heads // kv_heads)
+                                 scaling=g.scaling, kv_group=heads // kv_heads)
             outs.append(o)
             lses.append(lse)
         return (torch.stack(outs).reshape(tokens, heads * v_head_dim).to(q.dtype),
                 torch.stack(lses).to(torch.float32))
 
     def append(self, request_id: int, layer_id: int, k: torch.Tensor, v: torch.Tensor):
-        attn = self.layers[layer_id].attn
-        kv_heads, head_dim, v_head_dim = attn.tp_k_head_num, attn.qk_head_dim, attn.v_head_dim
+        g = self._geometry(layer_id)
+        kv_heads, head_dim, v_head_dim = g.kv_heads, g.head_dim, g.v_head_dim
         k3 = k.view(-1, kv_heads, head_dim).transpose(0, 1).contiguous()
         v3 = v.view(-1, kv_heads, v_head_dim).transpose(0, 1).contiguous()
         self.holder.append(request_id, layer_id, k3, v3)

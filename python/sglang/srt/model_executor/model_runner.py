@@ -777,6 +777,7 @@ class ModelRunner:
         gap.
         """
         from sglang.srt.afd.roles import (
+            attach_cache_pool,
             install_host_routing,
             install_kv_on_pool,
             make_sweep_service,
@@ -803,6 +804,10 @@ class ModelRunner:
                 model=self.model,
                 pool_addr=self.server_args.afd_pool_addr,
                 sweep_ahead=self.afd_early_q.hooks.sweep_ahead,
+            )
+            self.afd_cache_client = attach_cache_pool(
+                self.afd_early_q.hooks.sweep_ahead,
+                addr=self.server_args.afd_cache_addr,
             )
             self.afd_remote_attention = install_kv_on_pool(
                 model=self.model,

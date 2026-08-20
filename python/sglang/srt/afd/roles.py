@@ -101,7 +101,7 @@ def make_cache_pool(model, *, enabled, max_context: int, device):
         "the service whose whole economy is one weight read serving many.",
         max_context,
     )
-    return CachePool(KVHolder(device, max_context), model.model.layers, {})
+    return CachePool(KVHolder(device, max_context), model.model.layers)
 
 
 def attach_cache_pool(sweep_ahead, *, addr, connect_timeout_s: float = 30.0):

@@ -1,0 +1,25 @@
+{
+  "stock": {
+    "wall": 2.6816552616655827,
+    "text": [
+      " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is",
+      "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11,"
+    ]
+  },
+  "one_pool": {
+    "wall": 6.868788905441761,
+    "text": [
+      " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+      "\n\nThe first eight prime numbers are:\n\n2, 3, 5, 7, 11,"
+    ]
+  },
+  "two_pools": {
+    "wall": 7.431878935545683,
+    "text": [
+      " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+      "\n\nThe first eight prime numbers are:\n\n2, 3, 5, 7, 11,"
+    ],
+    "identical": 0
+  },
+  "two_vs_one_identical": 2
+}

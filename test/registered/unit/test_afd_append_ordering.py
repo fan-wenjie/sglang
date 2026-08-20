@@ -31,7 +31,7 @@ def _pool(max_context=32):
     attn = types.SimpleNamespace(tp_q_head_num=HEADS, tp_k_head_num=KV_HEADS,
                                  qk_head_dim=HEAD_DIM, v_head_dim=HEAD_DIM,
                                  scaling=HEAD_DIM**-0.5)
-    return CachePool(KVHolder("cpu", max_context), [types.SimpleNamespace(attn=attn)], {})
+    return CachePool(KVHolder("cpu", max_context), [types.SimpleNamespace(attn=attn)])
 
 
 def _kv(n=1):

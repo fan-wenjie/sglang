@@ -37,15 +37,27 @@ WAIT_HISTORY = 8192
 
 
 class Handle(NamedTuple):
-    """What `issue` returns. `issued_at` is kept so a run can prove the overlap happened."""
+    """What `issue` returns. `issued_at` is kept so a run can prove the overlap happened.
+
+    `op` is part of the identity, not decoration. A cache pool answers a sweep and acknowledges an
+    append for the SAME (request, layer), and a slot table keyed by those two alone hands one
+    caller the other's answer -- an append's one-tensor acknowledgement arriving where a sweep's
+    (output, log partition) was expected. That is what "not enough values to unpack" looked like
+    the first time this ran with both in flight.
+    """
 
     request_id: int
     layer: int
     issued_at: float
+    op: int = 0
 
     @property
     def key(self) -> tuple[int, int]:
         return (self.request_id, self.layer)
+
+    @property
+    def reply_key(self) -> tuple[int, int, int]:
+        return (self.request_id, self.layer, self.op)
 
 
 class PoolClosed(RuntimeError):
@@ -87,7 +99,9 @@ class PoolClient:
                     if len(frame.tensors) == 1 and frame.op == OP_FFN:
                         self._slots[frame.key] = frame.tensor
                     else:
-                        self._replies[frame.key] = frame.tensors
+                        # keyed by op as well: one (request, layer) has more than one answer in
+                        # flight, and they are not interchangeable
+                        self._replies[(frame.request_id, frame.layer, frame.op)] = frame.tensors
                     self._cond.notify_all()
         except BaseException as e:  # noqa: BLE001 -- it is re-raised in every waiting caller
             with self._cond:
@@ -111,11 +125,11 @@ class PoolClient:
         and a synchronous call here would put them back in series."""
         with self._send_lock:
             send_frame(self._sock, Frame(request_id, layer, tuple(tensors), op))
-        return Handle(request_id, layer, time.perf_counter(), ((request_id, 0),))
+        return Handle(request_id, layer, time.perf_counter(), op)
 
     def collect_frame(self, handle: Handle, device):
         """Block for the reply to a frame `issue_frame` sent."""
-        key = (handle.request_id, handle.layer)
+        key = handle.reply_key
         started = time.perf_counter()
         with self._cond:
             while key not in self._replies:
@@ -141,7 +155,7 @@ class PoolClient:
         """
         with self._send_lock:
             send_frame(self._sock, Frame(request_id, layer, tuple(tensors), op))
-        key = (request_id, layer)
+        key = (request_id, layer, op)
         with self._cond:
             while key not in self._replies:
                 if self._failure is not None:

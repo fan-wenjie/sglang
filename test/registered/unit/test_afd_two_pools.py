@@ -113,6 +113,20 @@ class TestTwoPoolsAreConcurrent(CustomTestCase):
         this step's key into the history the same step is sweeping, counting it twice."""
         self.assertNotEqual(OP_SWEEP_Q, OP_APPEND)
 
+    def test_a_sweep_and_an_append_do_not_share_a_reply_slot(self):
+        """Both are outstanding on the same (request, layer) at once -- the append for step n and
+        the sweep for step n+1 -- and their replies have different shapes. Keyed by those two
+        alone, the append's one-tensor acknowledgement lands where the sweep's (output, log
+        partition) was expected, which is what "not enough values to unpack" was the first time
+        this ran with both in flight."""
+        from sglang.srt.afd.pool_client import Handle
+
+        sweep = Handle(7, 3, 0.0, OP_SWEEP_Q)
+        append = Handle(7, 3, 0.0, OP_APPEND)
+        self.assertEqual(sweep.key, append.key, "same request and layer, as they must be")
+        self.assertNotEqual(sweep.reply_key, append.reply_key,
+                            "and different slots, which is what keeps them apart")
+
 
 class TestTheCachePoolHoldsNoWeights(CustomTestCase):
     def test_an_empty_history_sweeps_to_the_identity_of_the_merge(self):
@@ -125,10 +139,49 @@ class TestTheCachePoolHoldsNoWeights(CustomTestCase):
                                      qk_head_dim=HEAD_DIM, v_head_dim=HEAD_DIM,
                                      scaling=HEAD_DIM**-0.5)
         layers = [types.SimpleNamespace(attn=attn)]
-        pool = CachePool(KVHolder("cpu", 16), layers, {})
+        pool = CachePool(KVHolder("cpu", 16), layers)
         o, lse = pool.sweep(1, 0, torch.randn(1, HEADS * HEAD_DIM))
         self.assertTrue(torch.isinf(lse).all() and (lse < 0).all())
         self.assertTrue((o == 0).all())
+
+
+class TestTheCachePoolHoldsNoModel(CustomTestCase):
+    """Its defining property, and the one that lets it be a different machine.
+
+    If it needed a loaded stack to read layer.attn off, it would need the weights, the loader, the
+    quantisation and a GPU big enough -- a dependency nobody meant to give a service whose whole
+    job is to remember things.
+    """
+
+    def test_it_can_be_built_from_a_config_alone(self):
+        import types as _types
+
+        from sglang.srt.afd.pool_attention import CachePool, KVHolder, LayerGeometry
+
+        config = _types.SimpleNamespace(num_attention_heads=HEADS, num_key_value_heads=KV_HEADS,
+                                        head_dim=HEAD_DIM)
+        geometry = LayerGeometry.from_config(config)
+        pool = CachePool(KVHolder("cpu", 16), geometry)
+        k = torch.randn(1, KV_HEADS * HEAD_DIM)
+        pool.append(1, 0, k, k)
+        o, lse = pool.sweep(1, 0, torch.randn(1, HEADS * HEAD_DIM))
+        self.assertEqual(tuple(o.shape), (1, HEADS * HEAD_DIM))
+        self.assertEqual(tuple(lse.shape), (1, HEADS))
+
+    def test_the_geometry_from_a_config_matches_the_one_from_a_layer(self):
+        """Two ways to reach the same five numbers; if they ever disagree the pool sweeps one
+        model's cache with another model's head count."""
+        import types as _types
+
+        from sglang.srt.afd.pool_attention import LayerGeometry
+
+        config = _types.SimpleNamespace(num_attention_heads=HEADS, num_key_value_heads=KV_HEADS,
+                                        head_dim=HEAD_DIM)
+        attn = _types.SimpleNamespace(tp_q_head_num=HEADS, tp_k_head_num=KV_HEADS,
+                                      qk_head_dim=HEAD_DIM, v_head_dim=HEAD_DIM,
+                                      scaling=HEAD_DIM**-0.5)
+        self.assertEqual(LayerGeometry.from_config(config),
+                         LayerGeometry.of(_types.SimpleNamespace(attn=attn)))
 
 
 if __name__ == "__main__":

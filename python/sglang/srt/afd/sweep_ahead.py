@@ -223,6 +223,26 @@ class SweepAhead:
         layer._afd_qkvz_precomputed = early_qkvz
         self.n_projections += 1
 
+    def _mirror_to_cache(self, target: int, k, v) -> None:
+        """Post a fallback layer's key and value to the cache pool anyway.
+
+        Prefill runs locally -- a chunk's join is a causal attention among its own tokens, which
+        the window's rank-1 join does not speak for -- so its keys and values are written to the
+        HOST's cache and nothing else would ever see them. The cache pool would then begin a
+        request's history empty and decode would sweep a past that starts after the prompt. It ran
+        that way once and answered a question about prime numbers with "Paris, Paris, Paris".
+
+        Mirroring rather than moving: the local cache stays authoritative for the layers and modes
+        that use it, and the pool gets what it needs to serve the ones that do not. That costs the
+        host its cache memory, which this arrangement was never trying to save -- it is about the
+        two pools being concurrent.
+        """
+        if self.cache_client is None or k is None or v is None:
+            return
+        self.cache_client.issue_frame(self.cache_request_id, target, (k, v), OP_APPEND)
+        if self.ledger is not None:
+            self.ledger.record(self.cache_request_id, target, k.shape[0])
+
     def _join_remote(self, target: int, attn, state, k, v, device):
         """Collect the sweep the window issued, fold this step's token in, and post the append.
 
@@ -274,7 +294,9 @@ class SweepAhead:
                 # write). The fused path is correct; it is only counted, so a run that fell back
                 # every step cannot report the split path's name.
                 self.n_fallbacks += 1
-                return original(q, k, v, forward_batch, save_kv_cache=save_kv_cache, **kwargs)
+                out = original(q, k, v, forward_batch, save_kv_cache=save_kv_cache, **kwargs)
+                self._mirror_to_cache(target, k, v)
+                return out
             if q is not state.q:
                 raise RuntimeError(
                     f"layer {target} swept the cache with one query and is joining with another. "
