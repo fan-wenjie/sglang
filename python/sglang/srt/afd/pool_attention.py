@@ -185,22 +185,69 @@ class SweepService:
             _, k, v, _ = layer.forward_prepare_native(positions=positions, hidden_states=normed)
         return k, v
 
-    def serve_attention(self, request_id: int, layer_id: int, q: torch.Tensor,
-                        normed: torch.Tensor, positions: torch.Tensor):
-        """The attention half alone, from an input the host has already normalised.
+    def serve_attention(self, request_id: int, layer_id: int, normed: torch.Tensor,
+                        positions: torch.Tensor):
+        """Everything the host's join needs, from the host's normalised input alone.
 
-        `serve` below also runs the previous layer's feed-forward, which is the arrangement this
-        is heading for -- one round trip a layer instead of two. This one exists first because it
-        drops into the existing wiring without moving the feed-forward's frame, and a data path
-        that is proved before it is merged is a data path whose failures have one cause.
+        The query does not cross the wire. It is a function of the same normalised input the key
+        and value are projected from, and that input has to be sent anyway, so projecting it here
+        costs one amortised GEMM and saves 12 KB a layer a token -- 22 us of wire against about
+        0.35 us of arithmetic at 64 requests.
+
+        More than bytes: the host's join needs the query ONLY to form the scalar q.k_t per head.
+        Computing that scalar here means every term of the merge
+
+            lerp(v_t, o_swept, sigmoid(lse_swept - score))
+
+        comes from ONE query -- this one. Send the query instead and the host merges an lse taken
+        with the pool's query against a score taken with its own, and the two differ, because the
+        same fp8 matmul picks different kernels on different cards. That gap was measured at 2.5e-4
+        on this pair, small and entirely avoidable.
+
+        `forward_prepare_native` produces the query, key and value in one call, which is also the
+        model's own qk-norm and rotation rather than a second implementation of them.
         """
         layer = self.layers[layer_id]
         attn = layer.attn
+        heads, kv_heads = attn.tp_q_head_num, attn.tp_k_head_num
+        head_dim = attn.qk_head_dim
         with torch.no_grad():
-            _, k_now, v_now, _ = layer.forward_prepare_native(
+            q, k_now, v_now, _ = layer.forward_prepare_native(
                 positions=positions, hidden_states=normed
             )
-        return self._sweep_with(request_id, layer_id, q, k_now, v_now) + (k_now, v_now)
+        o_swept, lse = self._sweep_with(request_id, layer_id, q, k_now, v_now)
+
+        tokens = q.shape[0]
+        group = heads // kv_heads
+        q3 = q.view(tokens, heads, head_dim).float()
+        k3 = k_now.view(tokens, kv_heads, head_dim).float().repeat_interleave(group, dim=1)
+        score = (q3 * k3).sum(-1) * attn.scaling
+        return o_swept, lse, score.to(torch.float32), v_now
+
+    def project_kv(self, layer_id: int, normed: torch.Tensor, positions: torch.Tensor):
+        """The key, value and gate alone -- no cache, no sweep, no state.
+
+        This is the other place the line can be drawn. The pool holds W_k, W_v and the gate's
+        share of the fused projection; the HOST keeps the cache and does the whole attention. The
+        pool never sees a query and never holds a byte of anyone's history, so it stays what it
+        was: shareable, freely batched, restartable.
+
+        What it costs is the wire. The key, value and gate go back every layer every token where
+        the cache-holding arrangement sends only a swept output, and what it buys is the weights
+        of those projections off the host.
+        """
+        layer = self.layers[layer_id]
+        with torch.no_grad():
+            _, k, v, gate = layer.forward_prepare_native(
+                positions=positions, hidden_states=normed
+            )
+        if gate is None:
+            raise RuntimeError(
+                f"layer {layer_id} projects no gate, and this frame's shape assumes one. A "
+                f"model without the output gate needs its own reply shape rather than a "
+                f"placeholder the host would silently multiply by."
+            )
+        return k, v, gate
 
     def _sweep_with(self, request_id: int, layer_id: int, q: torch.Tensor,
                     k_now: torch.Tensor, v_now: torch.Tensor):

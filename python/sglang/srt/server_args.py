@@ -3142,9 +3142,9 @@ class ServerArgs:
         "Path to write a comparison of the split attention against the fused call, recomputed on every join of real traffic. Doubles the attention work, so it is a diagnostic and not a deployment setting; the two differ only in the order of the additions inside one softmax, so a relative gap beyond bfloat16 rounding means a partition is covering the wrong positions.",
         NS("afd"),
     ] = None
-    afd_kv_on_pool: A[
-        Optional[bool],
-        "Move the KV cache and the key/value projections to the pool. The host then projects the query, sends it with its normalised input, and folds this step's token into what comes back; it never forms a key or a value and never holds a cache. Frees the host the whole cache -- 4.29 GB a request at 128k context -- and moves the pool's dominant cost from the feed-forward, which one weight read shares across every caller, to the sweep, which shares nothing: measured at 16k context the sweep is 88 percent of the pool's per-token cost even at 64 requests.",
+    afd_pool_attention: A[
+        Optional[Literal["cache", "projection"]],
+        'Which line to draw through attention when a pool is attached. "cache" gives the pool the KV cache and the key/value projections: the host sends its normalised input, gets back the swept output and the scalar it needs to fold in this step token, and never forms a key or holds a cache -- it frees the host 4.29 GB a request at 128k context, and it moves the pool dominant cost onto work that shares nothing between callers (measured: at 16k the sweep is 88 percent of the pool per-token cost even at 64 requests). "projection" gives the pool only W_k and W_v: the host keeps the cache and the whole attention, so the pool stays stateless and the query-first overlap window stays open, at the cost of returning the key, value and gate every layer. Unset leaves attention entirely on the host.',
         NS("afd"),
     ] = None
     afd_min_batch: A[

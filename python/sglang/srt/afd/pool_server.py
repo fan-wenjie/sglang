@@ -31,6 +31,7 @@ from collections.abc import Callable
 import torch
 from sglang.srt.afd.protocol import (
     OP_FFN,
+    OP_KVPROJ,
     OP_RELEASE,
     OP_SWEEP,
     Frame,
@@ -79,20 +80,26 @@ class Departure(threading.Thread):
         thread and never queued: queueing it would add the departure's latency to buy the batching
         it cannot use.
         """
-        if self.attention is None or frame.op not in (OP_SWEEP, OP_RELEASE):
+        if self.attention is None or frame.op not in (OP_SWEEP, OP_RELEASE, OP_KVPROJ):
             return False
+        if frame.op == OP_KVPROJ:
+            normed, positions = frame.tensors
+            k, v, gate = self.attention.project_kv(
+                frame.layer, normed.to(self.device), positions.view(-1).to(self.device)
+            )
+            send_frame(sock, Frame(frame.request_id, frame.layer, (k, v, gate), OP_KVPROJ))
+            return True
         if frame.op == OP_RELEASE:
             dropped = self.attention.holder.release(frame.request_id)
             send_frame(sock, Frame(frame.request_id, frame.layer,
                                    (torch.tensor([[float(dropped)]]),), OP_RELEASE))
             return True
-        q, normed, positions = frame.tensors
+        normed, positions = frame.tensors
         device = self.device
-        o, lse, k, v = self.attention.serve_attention(
-            frame.request_id, frame.layer, q.to(device), normed.to(device),
-            positions.view(-1).to(device),
+        o, lse, score, v = self.attention.serve_attention(
+            frame.request_id, frame.layer, normed.to(device), positions.view(-1).to(device),
         )
-        send_frame(sock, Frame(frame.request_id, frame.layer, (o, lse, k, v), OP_SWEEP))
+        send_frame(sock, Frame(frame.request_id, frame.layer, (o, lse, score, v), OP_SWEEP))
         return True
 
     def offer(self, frame: Frame, sock: socket.socket) -> None:

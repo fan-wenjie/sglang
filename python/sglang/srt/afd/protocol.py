@@ -56,7 +56,9 @@ OP_FFN = 0        # h_(l-1) -> x_l
 OP_SWEEP = 1      # q, h_(l-1) -> o, lse, x_l
 OP_HEAD = 2       # hidden -> logits
 OP_RELEASE = 3    # drop one request's cache; sglang reuses slots and the next one is not this one
-OP_NAMES = {OP_FFN: "ffn", OP_SWEEP: "sweep", OP_HEAD: "head", OP_RELEASE: "release"}
+OP_KVPROJ = 4     # normalised x_l -> k, v, gate. The cache stays on the host; only the weights move
+OP_NAMES = {OP_FFN: "ffn", OP_SWEEP: "sweep", OP_HEAD: "head", OP_RELEASE: "release",
+            OP_KVPROJ: "kvproj"}
 
 
 class Frame(NamedTuple):

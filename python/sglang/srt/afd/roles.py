@@ -106,14 +106,26 @@ def make_sweep_service(model, *, enabled, max_context: int, device):
     return SweepService(model, KVHolder(device, max_context), layer_types_of(model))
 
 
-def install_kv_on_pool(model, *, client, enabled):
-    """Send every softmax layer's attention to the pool that holds its cache."""
-    if not enabled:
+def install_kv_on_pool(model, *, client, mode):
+    """Which of the two lines to draw through attention, or neither.
+
+        "cache"       the pool holds the cache and sweeps it; the host joins this step's token
+        "projection"  the pool holds W_k and W_v; the host keeps the cache and the whole attention
+    """
+    if not mode:
         return None
     from sglang.srt.afd.read_point import layer_types_of
-    from sglang.srt.afd.remote_attention import install_remote_attention
+    from sglang.srt.afd.remote_attention import (
+        install_kv_projection,
+        install_remote_attention,
+    )
 
-    return install_remote_attention(model, client, layer_types_of(model))
+    types = layer_types_of(model)
+    if mode == "cache":
+        return install_remote_attention(model, client, types)
+    if mode == "projection":
+        return install_kv_projection(model, client, types)
+    raise ValueError(f'--afd-pool-attention is "cache" or "projection", got {mode!r}')
 
 
 def serve_pool_in_background(model, port: int, min_batch: int, max_wait_ms: int, device,

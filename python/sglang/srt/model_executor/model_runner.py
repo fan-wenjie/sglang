@@ -786,7 +786,7 @@ class ModelRunner:
         if self.server_args.afd_mode == "pool":
             self.afd_sweep_service = make_sweep_service(
                 model=self.model,
-                enabled=self.server_args.afd_kv_on_pool,
+                enabled=bool(self.server_args.afd_pool_attention),
                 max_context=self.model_config.context_len,
                 device=self.device,
             )
@@ -807,7 +807,7 @@ class ModelRunner:
             self.afd_remote_attention = install_kv_on_pool(
                 model=self.model,
                 client=self.afd_pool_client,
-                enabled=self.server_args.afd_kv_on_pool,
+                mode=self.server_args.afd_pool_attention,
             )
 
     def maybe_init_lora_manager(self):

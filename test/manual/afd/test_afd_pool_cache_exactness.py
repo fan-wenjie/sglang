@@ -73,9 +73,13 @@ class TestPoolCacheOnRealWeights(unittest.TestCase):
             q = torch.randn(1, heads * head_dim, device="cuda", dtype=torch.bfloat16) * 0.05
             positions = torch.tensor([step], device="cuda")
 
-            o_swept, lse, k_now, v_now, _ = service.serve(1, layer_id, q, hidden, positions)
-            got = join(o_swept, lse, q, k_now, v_now, heads=heads, kv_heads=kv_heads,
-                       head_dim=head_dim, v_head_dim=v_head_dim, scaling=attn.scaling)
+            normed = model.model.layers[layer_id].input_layernorm(hidden)
+            o_swept, lse, score, v_now = service.serve_attention(1, layer_id, normed, positions)
+            got = join(o_swept, lse, score, v_now, heads=heads, kv_heads=kv_heads,
+                       v_head_dim=v_head_dim, dtype=torch.bfloat16)
+            with torch.no_grad():
+                q, k_now, _, _ = model.model.layers[layer_id].forward_prepare_native(
+                    positions=positions, hidden_states=normed)
 
             history_k.append(k_now.view(kv_heads, 1, head_dim).double())
             history_v.append(v_now.view(kv_heads, 1, v_head_dim).double())
@@ -141,14 +145,14 @@ class TestPoolCacheOnRealWeights(unittest.TestCase):
         torch.manual_seed(3)
         hidden = torch.randn(1, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.05
         service = SweepService(model, KVHolder("cuda", 8), types)
-        _, _, k_at_0, _, _ = service.serve(1, layer_id, torch.zeros(
-            1, attn.tp_q_head_num * attn.qk_head_dim, device="cuda", dtype=torch.bfloat16),
-            hidden, torch.tensor([0], device="cuda"))
+        normed = model.model.layers[layer_id].input_layernorm(hidden)
+        _, _, score_at_0, _ = service.serve_attention(
+            1, layer_id, normed, torch.tensor([0], device="cuda"))
         service_b = SweepService(model, KVHolder("cuda", 8), types)
-        _, _, k_at_37, _, _ = service_b.serve(2, layer_id, torch.zeros(
-            1, attn.tp_q_head_num * attn.qk_head_dim, device="cuda", dtype=torch.bfloat16),
-            hidden, torch.tensor([37], device="cuda"))
-        gap = float((k_at_0.double() - k_at_37.double()).abs().max() / k_at_0.double().abs().max())
+        _, _, score_at_37, _ = service_b.serve_attention(
+            2, layer_id, normed, torch.tensor([37], device="cuda"))
+        gap = float((score_at_0.double() - score_at_37.double()).abs().max()
+                    / score_at_0.double().abs().max())
         print(f"    same hidden, positions 0 vs 37: {gap:.2e}")
         self.assertGreater(gap, 1e-2, "the rotation is not being applied at the position given")
 
