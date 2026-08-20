@@ -19,6 +19,7 @@ and the result is a model that still reads fluently from a subtly wrong distribu
 
 from __future__ import annotations
 
+import collections
 import logging
 import socket
 import threading
@@ -26,9 +27,13 @@ import time
 from typing import NamedTuple
 
 import torch
-from sglang.srt.afd.protocol import CLOSE, Frame, decode, encode
+from sglang.srt.afd.protocol import CLOSE, Frame, decode, send_frame
 
 logger = logging.getLogger(__name__)
+
+# how many call records to keep. Enough for several report windows, bounded so a long run does
+# not accumulate one dict per pool call forever.
+WAIT_HISTORY = 8192
 
 
 class Handle(NamedTuple):
@@ -62,7 +67,9 @@ class PoolClient:
         self._cond = threading.Condition()
         self._slots: dict[tuple[int, int], torch.Tensor] = {}
         self._failure: BaseException | None = None
-        self._waits: list[tuple[int, int, float, float]] = []
+        # bounded: an hour of decode is millions of entries, and overlap_report used to slice a
+        # list that only ever grew. The report is windowed anyway.
+        self._waits: collections.deque = collections.deque(maxlen=WAIT_HISTORY)
         self._closed = False
         self._receiver = threading.Thread(target=self._receive, name="afd-pool-recv", daemon=True)
         self._receiver.start()
@@ -88,9 +95,8 @@ class PoolClient:
     def issue(self, request_id: int, layer: int, hidden: torch.Tensor) -> Handle:
         """Send one layer's work. Returns immediately; the reply lands in a slot."""
         frame = Frame(request_id, layer, hidden)
-        payload = encode(frame)
         with self._send_lock:
-            self._sock.sendall(payload)
+            send_frame(self._sock, frame)
         return Handle(request_id, layer, time.perf_counter())
 
     def collect(self, handle: Handle, device: torch.device | str) -> torch.Tensor:
@@ -130,16 +136,18 @@ class PoolClient:
             )
         return out.to(device, non_blocking=True)
 
-    def overlap_report(self, since: int = 0) -> dict:
+    def overlap_report(self, last: int = 0) -> dict:
         """Issue-to-collect intervals, so a test can assert the overlap rather than assume it.
 
-        `since` drops the first N calls. A cumulative mean is the wrong statistic for this: the
+        `last` keeps only the most recent N calls. A cumulative mean is the wrong statistic: the
         pool JIT-compiles its kernels on the first frames it sees, and a warm-up call two orders
         of magnitude slower than steady state still moves the mean thousands of calls later. The
         two-machine run's first 512 calls averaged 188 ms against a steady 6.7 ms.
         """
         with self._cond:
-            waits = list(self._waits)[since:]
+            waits = list(self._waits)
+        if last:
+            waits = waits[-last:]
         if not waits:
             return {"calls": 0}
         outstanding = [w["outstanding_s"] for w in waits]

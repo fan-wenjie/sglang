@@ -29,7 +29,7 @@ import time
 from collections.abc import Callable
 
 import torch
-from sglang.srt.afd.protocol import Frame, decode, encode
+from sglang.srt.afd.protocol import Frame, decode, encode, send_frame
 
 logger = logging.getLogger(__name__)
 
@@ -53,33 +53,55 @@ class Departure(threading.Thread):
         # per layer, because a dense stack's layer weights differ: a departure is same-layer or it
         # is not a departure. Callers at different layers wait in different queues.
         self._waiting: dict[int, list[tuple[Frame, socket.socket]]] = {}
+        # when a layer's queue first became non-empty. Held here rather than in run()'s frame
+        # because `offer` can now take the departure itself, and a timer that still believed the
+        # popped queue was waiting would depart the NEXT caller instantly.
+        self._first_seen: dict[int, float] = {}
         self._stop = False
         self.departures: list[dict] = []
 
     def offer(self, frame: Frame, sock: socket.socket) -> None:
+        """Queue a frame, and depart it here if that completes a batch.
+
+        The connection thread used to hand every frame to the departure thread and go back to the
+        socket, which costs a condition-variable wake and a scheduler round trip per call -- on a
+        single-caller pool, where the batch is complete the moment it arrives, that handoff buys
+        nothing. When the queue is already full the offering thread takes the departure itself.
+        The queue is popped under the lock, so exactly one thread ever carries a given set of
+        riders, and the timer thread still owns the partial-batch case.
+        """
+        riding = None
         with self._cond:
-            self._waiting.setdefault(frame.layer, []).append((frame, sock))
-            self._cond.notify()
+            queue = self._waiting.setdefault(frame.layer, [])
+            queue.append((frame, sock))
+            if len(queue) >= self.min_batch:
+                riding = self._waiting.pop(frame.layer)
+                self._first_seen.pop(frame.layer, None)
+            else:
+                self._first_seen.setdefault(frame.layer, time.perf_counter())
+                self._cond.notify()
+        if riding is not None:
+            self._depart(frame.layer, riding)
 
     def stop(self) -> None:
         with self._cond:
             self._stop = True
             self._cond.notify_all()
 
-    def _ready_layer(self, now: float, first_seen: dict[int, float]) -> int | None:
+    def _ready_layer(self, now: float) -> int | None:
         for layer, queue in self._waiting.items():
             if not queue:
                 continue
             if len(queue) >= self.min_batch:
                 return layer
-            if now - first_seen.get(layer, now) >= self.max_wait_s:
+            if now - self._first_seen.get(layer, now) >= self.max_wait_s:
                 # the timeout the strict rule needs. Without it the last caller of a draining
                 # workload waits for a partner that never comes.
                 return layer
         return None
 
     def run(self) -> None:
-        first_seen: dict[int, float] = {}
+        """The timeout half. The full-batch half is taken by whichever thread offered the frame."""
         while True:
             with self._cond:
                 while True:
@@ -87,16 +109,16 @@ class Departure(threading.Thread):
                         return
                     now = time.perf_counter()
                     for layer, queue in self._waiting.items():
-                        if queue and layer not in first_seen:
-                            first_seen[layer] = now
+                        if queue and layer not in self._first_seen:
+                            self._first_seen[layer] = now
                         if not queue:
-                            first_seen.pop(layer, None)
-                    layer = self._ready_layer(now, first_seen)
+                            self._first_seen.pop(layer, None)
+                    layer = self._ready_layer(now)
                     if layer is not None:
                         break
                     self._cond.wait(timeout=self.max_wait_s / 4 or 0.01)
                 riding = self._waiting.pop(layer)
-                first_seen.pop(layer, None)
+                self._first_seen.pop(layer, None)
             self._depart(layer, riding)
 
     def _depart(self, layer: int, riding: list[tuple[Frame, socket.socket]]) -> None:
@@ -105,7 +127,12 @@ class Departure(threading.Thread):
         if len(widths) != 1:
             raise RuntimeError(f"layer {layer} departure mixes hidden widths {widths}")
         counts = [f.tensor.shape[0] for f, _ in riding]
-        batch = torch.cat([f.tensor for f, _ in riding], dim=0).to(self.device)
+        # one rider is the common case on a single-caller pool, and torch.cat on a one-element
+        # list still copies the whole frame
+        joined = riding[0][0].tensor if len(riding) == 1 else torch.cat(
+            [f.tensor for f, _ in riding], dim=0
+        )
+        batch = joined.to(self.device)
         out = self.forward(batch, layer)
         if out.shape != batch.shape:
             raise RuntimeError(
@@ -117,7 +144,7 @@ class Departure(threading.Thread):
             piece = out[offset : offset + n]
             offset += n
             try:
-                sock.sendall(encode(Frame(frame.request_id, layer, piece)))
+                send_frame(sock, Frame(frame.request_id, layer, piece))
             except OSError:
                 logger.warning(
                     "caller for request %s layer %s went away before its reply",

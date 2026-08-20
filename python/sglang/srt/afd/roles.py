@@ -196,7 +196,7 @@ class PoolRouting:
                 # only the calls since the last line: a cumulative mean carries the pool's JIT
                 # warm-up forever, and a schedule that stopped overlapping halfway through would
                 # be averaged back into looking fine
-                report = self.client.overlap_report(since=self._calls - REPORT_EVERY)
+                report = self.client.overlap_report(last=REPORT_EVERY)
                 logger.info(
                     "afd host: %s pool call(s); last %s: mean outstanding %.2f ms, mean blocked "
                     "%.2f ms, hidden %.1f%%",

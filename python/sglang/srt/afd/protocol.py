@@ -58,16 +58,55 @@ def encode(frame: Frame) -> bytes:
     return head + payload
 
 
-def _recv_exactly(sock, n: int) -> bytes | None:
-    """Read n bytes or report the peer went away. A short read is not an error to paper over."""
-    parts, got = [], 0
+def send_frame(sock, frame: Frame) -> None:
+    """Put one frame on the wire without concatenating the header onto the payload.
+
+    `encode` builds `head + payload`, which copies the whole tensor a second time to prepend
+    twelve bytes. At 40 KB a call and sixty-four calls a token that is real. `sendmsg` takes the
+    two buffers as they are.
+    """
+    head, payload = encode_parts(frame)
+    view = memoryview(payload)
+    sent = sock.sendmsg([head, view])
+    total = len(head) + len(view)
+    while sent < total:
+        # a partial write lands somewhere in one of the two buffers; resume from wherever it was
+        if sent < len(head):
+            sent += sock.sendmsg([memoryview(head)[sent:], view])
+        else:
+            sent += sock.send(view[sent - len(head):])
+
+
+def encode_parts(frame: Frame) -> tuple[bytes, memoryview]:
+    """The header and the tensor's own bytes, without a copy to join them."""
+    t = frame.tensor
+    if t.dtype not in DTYPE_CODE:
+        raise ValueError(f"{t.dtype} is not on the wire's dtype list {DTYPES}")
+    if t.dim() != 2:
+        raise ValueError(f"a frame carries (tokens, width); got {tuple(t.shape)}")
+    host = t.detach().to("cpu").contiguous()
+    payload = memoryview(host.view(torch.uint8).numpy()).cast("B")
+    head = HEADER.pack(
+        frame.request_id, frame.layer, t.shape[0], t.shape[1], DTYPE_CODE[t.dtype], len(payload)
+    )
+    return head, payload
+
+
+def _recv_exactly(sock, n: int) -> bytearray | None:
+    """Read n bytes or report the peer went away. A short read is not an error to paper over.
+
+    Reads straight into one buffer. The chunk-list-and-join version copied the payload a second
+    time, and `torch.frombuffer` then needed a writable buffer, which copied it a third.
+    """
+    buf = bytearray(n)
+    view = memoryview(buf)
+    got = 0
     while got < n:
-        chunk = sock.recv(n - got)
-        if not chunk:
+        read = sock.recv_into(view[got:], n - got)
+        if not read:
             return None
-        parts.append(chunk)
-        got += len(chunk)
-    return b"".join(parts)
+        got += read
+    return buf
 
 
 def decode(sock) -> Frame | None:
@@ -85,5 +124,5 @@ def decode(sock) -> Frame | None:
             f"connection closed inside it; a truncated frame is not a short frame"
         )
     dtype = DTYPES[dtype_code]
-    flat = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+    flat = torch.frombuffer(payload, dtype=torch.uint8)
     return Frame(request_id, layer, flat.view(dtype).view(tokens, width))
