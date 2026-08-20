@@ -1,0 +1,54 @@
+{
+  "waves": [
+    {
+      "wall_s": 11.642781265079975,
+      "tokens": 256,
+      "tokens_per_second": 21.98787335873234,
+      "wave": 0
+    },
+    {
+      "wall_s": 11.97796818614006,
+      "tokens": 256,
+      "tokens_per_second": 21.372573045921307,
+      "wave": 1
+    },
+    {
+      "wall_s": 12.125545963644981,
+      "tokens": 256,
+      "tokens_per_second": 21.112451411882283,
+      "wave": 2
+    },
+    {
+      "wall_s": 10.820278607308865,
+      "tokens": 256,
+      "tokens_per_second": 23.659279884630468,
+      "wave": 3
+    },
+    {
+      "wall_s": 3.4487268663942814,
+      "tokens": 256,
+      "tokens_per_second": 74.23029132708719,
+      "wave": 4
+    },
+    {
+      "wall_s": 3.460843812674284,
+      "tokens": 256,
+      "tokens_per_second": 73.97039966452058,
+      "wave": 5
+    },
+    {
+      "wall_s": 3.453198939561844,
+      "tokens": 256,
+      "tokens_per_second": 74.13415921889583,
+      "wave": 6
+    },
+    {
+      "wall_s": 3.4505409486591816,
+      "tokens": 256,
+      "tokens_per_second": 74.19126560415897,
+      "wave": 7
+    }
+  ],
+  "failures": [],
+  "drift": 3.420754100150035
+}

@@ -1,0 +1,78 @@
+{
+  "waves": [
+    {
+      "wall_s": 11.359727703034878,
+      "tokens": 256,
+      "tokens_per_second": 22.535751445134267,
+      "wave": 0
+    },
+    {
+      "wall_s": 11.736847996711731,
+      "tokens": 256,
+      "tokens_per_second": 21.81164824420684,
+      "wave": 1
+    },
+    {
+      "wall_s": 11.685165572911501,
+      "tokens": 256,
+      "tokens_per_second": 21.90811917919743,
+      "wave": 2
+    },
+    {
+      "wall_s": 11.51853408664465,
+      "tokens": 256,
+      "tokens_per_second": 22.225050347059643,
+      "wave": 3
+    },
+    {
+      "wall_s": 11.71456889435649,
+      "tokens": 256,
+      "tokens_per_second": 21.853130261014417,
+      "wave": 4
+    },
+    {
+      "wall_s": 11.716386124491692,
+      "tokens": 256,
+      "tokens_per_second": 21.849740805730438,
+      "wave": 5
+    },
+    {
+      "wall_s": 11.97109391540289,
+      "tokens": 256,
+      "tokens_per_second": 21.384846013998068,
+      "wave": 6
+    },
+    {
+      "wall_s": 11.802234172821045,
+      "tokens": 256,
+      "tokens_per_second": 21.690808388595908,
+      "wave": 7
+    },
+    {
+      "wall_s": 11.854319471865892,
+      "tokens": 256,
+      "tokens_per_second": 21.5955036986788,
+      "wave": 8
+    },
+    {
+      "wall_s": 11.39493802189827,
+      "tokens": 256,
+      "tokens_per_second": 22.466116051533668,
+      "wave": 9
+    },
+    {
+      "wall_s": 11.689591530710459,
+      "tokens": 256,
+      "tokens_per_second": 21.899824243425986,
+      "wave": 10
+    },
+    {
+      "wall_s": 11.61756957322359,
+      "tokens": 256,
+      "tokens_per_second": 22.03559000757215,
+      "wave": 11
+    }
+  ],
+  "failures": [],
+  "drift": 0.9945351254103106
+}

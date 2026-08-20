@@ -46,7 +46,10 @@ from collections import Counter
 from collections.abc import Callable
 
 import torch
-from sglang.srt.afd.protocol import OP_APPEND, OP_SWEEP_Q
+from sglang.srt.afd.protocol import OP_APPEND, OP_RELEASE, OP_SWEEP_Q
+
+# a release names no layer; the field is there and naming it keeps the frame readable
+RELEASE_LAYER = 0
 from sglang.srt.afd.read_point import is_full_attention
 from sglang.srt.afd.split_attention import PerPassIndex, join, split_refusal, sweep
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -145,6 +148,7 @@ class SweepAhead:
         self._forward_batch = None
 
         self.n_sweeps = 0
+        self.releases = 0
         self.n_projections = 0
         self.n_joins = 0
         self.n_fallbacks = 0
@@ -193,6 +197,7 @@ class SweepAhead:
         # leave no query behind for the layer to find
         layer._afd_q_precomputed = None
         layer._afd_qkvz_precomputed = None
+        self._release_restarted_slots(target)
 
         if target not in self.softmax_targets:
             self._project_linear_ahead(layer, hidden)
@@ -244,6 +249,32 @@ class SweepAhead:
         state.handle = handle
         state.row_ids = ids
         return state
+
+    def _release_restarted_slots(self, target: int) -> None:
+        """Drop the cache pool's history for any slot that is starting a new sequence.
+
+        The signal is a row at position 0. sglang reuses request slots, so without this the next
+        occupant sweeps the previous one's past -- and separately, nothing would ever free a
+        finished request's history and the pool would grow until it refused.
+
+        Done once per pass, at the first converted layer, because every layer of a restarting
+        request restarts together and the release drops all of them.
+        """
+        if self.cache_client is None or self._forward_batch is None:
+            return
+        if target != min(self.sweep_at.values()):
+            return
+        positions = self._forward_batch.positions.reshape(-1)
+        ids = row_request_ids(self._forward_batch)
+        if ids.shape[0] != positions.shape[0]:
+            return
+        starting = {int(r) for r, p in zip(ids.tolist(), positions.tolist()) if p == 0}
+        for request_id in sorted(starting):
+            self.cache_client.issue_frame(request_id, RELEASE_LAYER,
+                                          (torch.zeros(1, 1),), OP_RELEASE)
+            if self.ledger is not None:
+                self.ledger.drop(request_id)
+            self.releases += 1
 
     def _project_linear_ahead(self, layer, hidden) -> None:
         """A linear-attention layer's fused input projection, on the early stream, in the window.
@@ -409,6 +440,7 @@ class SweepAhead:
             "projections": self.n_projections,
             "window_layers": {str(s): t for s, t in sorted(self.sweep_at.items())},
             "sweeps": self.n_sweeps,
+            "releases": self.releases,
             "joins": self.n_joins,
             "fallbacks": self.n_fallbacks,
             "refusals": dict(self.refusals),

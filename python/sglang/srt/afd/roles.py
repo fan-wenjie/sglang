@@ -237,6 +237,7 @@ class PoolRouting:
         # schedule whose windows all closed looks exactly like one whose windows all opened,
         # except in these two numbers.
         self._calls = 0
+        self._local_fallbacks = 0
         self._install()
 
     def _install(self) -> None:
@@ -260,19 +261,21 @@ class PoolRouting:
             device, dtype = hidden_states.device, hidden_states.dtype
             try:
                 handle = self.client.issue(next(self._ids), layer_id, hidden_states)
-            except (OSError, PoolClosed):
-                # the pool went away between calls. Reconnect and let THIS request fail: its
-                # answer is gone, and the alternative -- running the feed-forward locally instead
-                # -- would serve a token from weights the arrangement says are elsewhere, which is
-                # correct output arrived at by abandoning the arrangement without saying so.
-                self.client.reconnect()
-                raise
+            except (OSError, PoolClosed) as e:
+                return self._without_the_pool(layer_id, original, hidden_states, e)
             if self.between is not None:
                 # the window. The next converted layer's query was projected from THIS layer's
                 # h_l, so its cache sweep can be launched now and will run on the GPU while the
                 # host waits on the socket below.
                 self.between(layer_id)
-            out = self.client.collect(handle, device)
+            try:
+                out = self.client.collect(handle, device)
+            except (OSError, PoolClosed) as e:
+                # THIS is where a pool dying lands, and where the first version did not look. A
+                # call is outstanding when the process goes away, so the failure arrives at the
+                # collect, not the issue -- and an exception inside a forward pass kills sglang's
+                # scheduler, so a pool restart took the whole server with it.
+                return self._without_the_pool(layer_id, original, hidden_states, e)
             self._calls += 1
             if self._calls % REPORT_EVERY == 0:
                 # only the calls since the last line: a cumulative mean carries the pool's JIT
@@ -292,6 +295,31 @@ class PoolRouting:
             return out.to(dtype)
 
         return routed
+
+    def _without_the_pool(self, layer_id: int, original, hidden_states, error):
+        """Serve this layer locally because the pool is gone, and say so.
+
+        The alternative is what the first version did: re-raise, and let an exception inside a
+        forward pass kill the scheduler. A pool restart then stops a server that was carrying
+        hundreds of requests, which is a worse outcome than serving them from weights that were
+        supposed to be elsewhere.
+
+        So the host computes it, and the degradation is COUNTED and logged rather than silent. The
+        host has these weights -- it loads the whole stack -- so the answer is right; what is lost
+        is the arrangement, and a run that fell back for half its layers must not be able to
+        report the arrangement's throughput under the arrangement's name.
+        """
+        self._local_fallbacks += 1
+        if self._local_fallbacks == 1 or self._local_fallbacks % 512 == 0:
+            logger.warning(
+                "afd host: the pool at %s is unreachable (%s). Running layer %s locally; %s "
+                "layer(s) so far have been served without it. The answers are right and the "
+                "arrangement is not in effect -- any timing taken from here is a colocated timing.",
+                self.client.address, type(error).__name__, layer_id, self._local_fallbacks,
+            )
+        self.client.reconnect()
+        out = original(hidden_states)
+        return out[0] if isinstance(out, tuple) else out
 
     def remove(self) -> None:
         for fn in self._undo:

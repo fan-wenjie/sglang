@@ -150,5 +150,59 @@ class TestAPoolRestartIsSurvivable(CustomTestCase):
             client.close()
 
 
+class TestTheRouterRecoversAndNotJustTheClient(CustomTestCase):
+    """The gap the first version of this file left, and a stress test found.
+
+    Those cases asserted that `reconnect()` works. Nothing asserted that anything CALLS it at the
+    moment a pool dies -- and the router only guarded its `issue`, while a dying pool fails at the
+    `collect`, because that is where a call is outstanding when the process goes away. An
+    exception there kills sglang's scheduler, so a pool restart stopped a server that was carrying
+    hundreds of requests. The suite was green throughout.
+    """
+
+    def _model(self):
+        import types
+
+        mlp = types.SimpleNamespace()
+        mlp.forward = lambda x: x * 3
+        layer = types.SimpleNamespace(mlp=mlp)
+        return types.SimpleNamespace(model=types.SimpleNamespace(layers=[layer]))
+
+    def test_a_pool_that_dies_at_the_collect_does_not_raise(self):
+        from sglang.srt.afd.roles import install_pool_routing
+
+        pool = Echo()
+        try:
+            client = PoolClient(f"127.0.0.1:{pool.port}", 5.0)
+            model = self._model()
+            routing = install_pool_routing(model, client, (0,))
+            hidden = torch.ones(2, 8)
+            self.assertTrue(torch.equal(model.model.layers[0].mlp.forward(hidden), hidden))
+
+            pool.close()
+            out = model.model.layers[0].mlp.forward(hidden)
+            self.assertTrue(torch.equal(out, hidden * 3),
+                            "served locally, from the weights this host also has")
+            self.assertGreaterEqual(routing._local_fallbacks, 1)
+            client.close()
+        finally:
+            pool.close()
+
+    def test_the_degradation_is_counted(self):
+        """A run that fell back for half its layers must not be able to report the arrangement's
+        throughput under the arrangement's name."""
+        from sglang.srt.afd.roles import install_pool_routing
+
+        pool = Echo()
+        client = PoolClient(f"127.0.0.1:{pool.port}", 5.0, reconnect=False)
+        model = self._model()
+        routing = install_pool_routing(model, client, (0,))
+        pool.close()
+        for _ in range(3):
+            model.model.layers[0].mlp.forward(torch.ones(1, 4))
+        self.assertEqual(routing._local_fallbacks, 3)
+        client.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
