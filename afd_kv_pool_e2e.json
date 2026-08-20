@@ -1,0 +1,14 @@
+{
+  "stock": [
+    " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is",
+    "\n\nThe first eight prime numbers are: 2, 3, 5, 7, 11,"
+  ],
+  "remote": [
+    " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is",
+    "\n\nThe first eight prime numbers are:\n\n2, 3, 5, 7, 11,"
+  ],
+  "identical": [
+    true,
+    false
+  ]
+}

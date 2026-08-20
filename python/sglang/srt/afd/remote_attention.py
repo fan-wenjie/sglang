@@ -24,7 +24,10 @@ arithmetic inverts and this is the first thing to reconsider.
 from __future__ import annotations
 
 import torch
-from sglang.srt.afd.protocol import OP_SWEEP, Frame
+from sglang.srt.afd.protocol import OP_RELEASE, OP_SWEEP, Frame
+
+# the layer field is unused by a release; naming it keeps the frame readable
+RELEASE_LAYER = 0
 
 
 def sweep_frame(request_id: int, layer: int, *, q: torch.Tensor, hidden: torch.Tensor,
@@ -55,3 +58,121 @@ def join(o_swept: torch.Tensor, lse_swept: torch.Tensor, q: torch.Tensor, k_now:
     weight = torch.where(torch.isnan(weight), torch.zeros_like(weight), weight)
     merged = torch.lerp(v3, o3, weight)
     return merged.reshape(tokens, heads * v_head_dim).to(q.dtype)
+
+
+class RemoteAttention:
+    """Route a converted layer's attention to the pool that holds its cache.
+
+    Installed on `layer.attn.forward`, so the host still projects the query and still applies the
+    output projection; what leaves is the key and value projection, the cache, and the sweep.
+
+    The host's normalised x_l is captured on the way past `forward_prepare_*` rather than
+    recomputed, because the pool applies W_k and W_v to it directly. Re-normalising on the far end
+    would be a second implementation of the same norm, and the two agreeing is not something
+    anything downstream checks.
+
+    ## Prefill goes over the wire too, and has to
+
+    The first version routed only decode and let prefill fall back to the local path. That writes
+    the prompt's keys into the HOST's cache, which nothing then reads: the pool starts its history
+    empty and the model answers from nothing. It ran, and it produced "Paris, Paris, Paris" for a
+    prompt about prime numbers -- visibly wrong rather than subtly, which is the only good thing
+    about it. The sweep already handles a chunk correctly, each token seeing everything before its
+    own position including the earlier tokens of the same chunk, so extend goes over the wire.
+
+    ## The request id is the slot, and position zero frees it
+
+    The first version used a constant, so a second request attended the first one's history. The
+    id is the request's own pool slot; when a token arrives at position 0 that slot is starting a
+    new sequence, which is the moment to drop what was there. sglang reuses slots, so without that
+    the cache would be a different request's.
+
+    ## One request at a time, for now
+
+    A decode forward carries one token from each of N requests and this wrapper sends them as one
+    frame, so N > 1 would append every request's key to one request's history. It refuses instead.
+    Lifting it means a frame per request, or a request id per row.
+    """
+
+    def __init__(self, model, client, layers: tuple[int, ...]):
+        self.model = model
+        self.client = client
+        self.layers = layers
+        self.calls = 0
+        self.refusals = 0
+        self._undo = []
+        self._install()
+
+    def _install(self) -> None:
+        for layer_id in self.layers:
+            layer = self.model.model.layers[layer_id]
+            layer._afd_normed_input = None
+            for name in ("forward_prepare_cuda_fused", "forward_prepare_fused_gate",
+                         "forward_prepare_native", "forward_prepare_npu"):
+                original = getattr(layer, name)
+                setattr(layer, name, self._capture(layer, original))
+                self._undo.append(lambda ly=layer, n=name, o=original: setattr(ly, n, o))
+            original_attn = layer.attn.forward
+            layer.attn.forward = self._remote(layer, layer_id, layer.attn, original_attn)
+            self._undo.append(
+                lambda ly=layer, o=original_attn: setattr(ly.attn, "forward", o)
+            )
+
+    def _capture(self, layer, original):
+        def wrapped(positions, hidden_states, **kwargs):
+            layer._afd_normed_input = hidden_states
+            return original(positions=positions, hidden_states=hidden_states, **kwargs)
+
+        return wrapped
+
+    def _remote(self, layer, layer_id: int, attn, original):
+        def forward(q, k, v, forward_batch, save_kv_cache: bool = True, **kwargs):
+            normed = layer._afd_normed_input
+            mode = forward_batch.forward_mode
+            if kwargs or normed is None or not (mode.is_decode() or mode.is_extend()):
+                self.refusals += 1
+                return original(q, k, v, forward_batch, save_kv_cache=save_kv_cache, **kwargs)
+            if forward_batch.batch_size != 1:
+                raise RuntimeError(
+                    f"the pool keys its cache by request and this frame carries "
+                    f"{forward_batch.batch_size} requests' tokens; sending them as one would "
+                    f"append every request's key to one request's history"
+                )
+            positions = forward_batch.positions.view(-1)
+            request_id = int(forward_batch.req_pool_indices[0]) + 1
+            if int(positions[0]) == 0 and layer_id == self.layers[0]:
+                # a token at position 0 means this slot is starting a new sequence. sglang reuses
+                # slots, so without dropping what was there the sweep would read another
+                # request's history -- which is what "Paris, Paris, Paris" was.
+                self.client.call(request_id, RELEASE_LAYER, (positions.view(-1, 1),),
+                                 OP_RELEASE, "cpu")
+            o_swept, lse, k_now, v_now = self.client.call(
+                request_id, layer_id,
+                (q, normed, positions.view(-1, 1).to(torch.int64)),
+                OP_SWEEP, q.device,
+            )
+            self.calls += 1
+            return join(o_swept, lse, q, k_now, v_now,
+                        heads=attn.tp_q_head_num, kv_heads=attn.tp_k_head_num,
+                        head_dim=attn.qk_head_dim, v_head_dim=attn.v_head_dim,
+                        scaling=attn.scaling)
+
+        return forward
+
+    def record(self) -> dict:
+        return {"layers": list(self.layers), "calls": self.calls, "refusals": self.refusals}
+
+    def remove(self) -> None:
+        for fn in self._undo:
+            fn()
+        self._undo.clear()
+
+
+def install_remote_attention(model, client, layer_types: list[str]) -> RemoteAttention:
+    """Send every softmax layer's attention to the pool that holds its cache."""
+    from sglang.srt.afd.read_point import full_attention_layers
+
+    layers = tuple(full_attention_layers(layer_types))
+    if not layers:
+        raise RuntimeError("no layer sweeps a cache; there is nothing to move to the pool")
+    return RemoteAttention(model, client, layers)

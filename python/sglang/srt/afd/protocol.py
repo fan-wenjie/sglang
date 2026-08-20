@@ -55,7 +55,8 @@ DTYPE_CODE = {d: i for i, d in enumerate(DTYPES)}
 OP_FFN = 0        # h_(l-1) -> x_l
 OP_SWEEP = 1      # q, h_(l-1) -> o, lse, x_l
 OP_HEAD = 2       # hidden -> logits
-OP_NAMES = {OP_FFN: "ffn", OP_SWEEP: "sweep", OP_HEAD: "head"}
+OP_RELEASE = 3    # drop one request's cache; sglang reuses slots and the next one is not this one
+OP_NAMES = {OP_FFN: "ffn", OP_SWEEP: "sweep", OP_HEAD: "head", OP_RELEASE: "release"}
 
 
 class Frame(NamedTuple):

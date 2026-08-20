@@ -185,6 +185,48 @@ class SweepService:
             _, k, v, _ = layer.forward_prepare_native(positions=positions, hidden_states=normed)
         return k, v
 
+    def serve_attention(self, request_id: int, layer_id: int, q: torch.Tensor,
+                        normed: torch.Tensor, positions: torch.Tensor):
+        """The attention half alone, from an input the host has already normalised.
+
+        `serve` below also runs the previous layer's feed-forward, which is the arrangement this
+        is heading for -- one round trip a layer instead of two. This one exists first because it
+        drops into the existing wiring without moving the feed-forward's frame, and a data path
+        that is proved before it is merged is a data path whose failures have one cause.
+        """
+        layer = self.layers[layer_id]
+        attn = layer.attn
+        with torch.no_grad():
+            _, k_now, v_now, _ = layer.forward_prepare_native(
+                positions=positions, hidden_states=normed
+            )
+        return self._sweep_with(request_id, layer_id, q, k_now, v_now) + (k_now, v_now)
+
+    def _sweep_with(self, request_id: int, layer_id: int, q: torch.Tensor,
+                    k_now: torch.Tensor, v_now: torch.Tensor):
+        """Append this step's key and value, then sweep everything before each token's own slot."""
+        attn = self.layers[layer_id].attn
+        heads, kv_heads = attn.tp_q_head_num, attn.tp_k_head_num
+        head_dim, v_head_dim = attn.qk_head_dim, attn.v_head_dim
+
+        k_cache = k_now.view(-1, kv_heads, head_dim).transpose(0, 1).contiguous()
+        v_cache = v_now.view(-1, kv_heads, v_head_dim).transpose(0, 1).contiguous()
+        k_all, v_all = self.holder.append(request_id, layer_id, k_cache, v_cache)
+
+        tokens = q.shape[0]
+        q3 = q.view(tokens, heads, head_dim)
+        outs, lses = [], []
+        for t in range(tokens):
+            # everything strictly before this token's own position, which for a chunk includes the
+            # earlier tokens of the same chunk -- they are already in the cache
+            seen = k_all.shape[POSITION_AXIS] - (tokens - 1 - t) - 1
+            o, lse = sweep_cache(q3[t], k_all[:, :seen], v_all[:, :seen],
+                                 scaling=attn.scaling, kv_group=heads // kv_heads)
+            outs.append(o)
+            lses.append(lse)
+        return (torch.stack(outs).reshape(tokens, heads * v_head_dim).to(q.dtype),
+                torch.stack(lses).to(torch.float32))
+
     def serve(self, request_id: int, layer_id: int, q: torch.Tensor, hidden: torch.Tensor,
               positions: torch.Tensor):
         """One frame in, the tensors of one reply out."""
@@ -199,24 +241,7 @@ class SweepService:
             x = hidden + ffn_out
             k_now, v_now = self._prepare_kv(layer, positions, x)
 
-        k_cache = k_now.view(-1, kv_heads, head_dim).transpose(0, 1).contiguous()
-        v_cache = v_now.view(-1, kv_heads, attn.v_head_dim).transpose(0, 1).contiguous()
-        k_all, v_all = self.holder.append(request_id, layer_id, k_cache, v_cache)
-
-        tokens = q.shape[0]
-        q3 = q.view(tokens, heads, head_dim)
-        outs, lses = [], []
-        for t in range(tokens):
-            # the cache this token may see ends where its own position begins
-            seen = k_all.shape[POSITION_AXIS] - (tokens - 1 - t) - 1
-            o, lse = sweep_cache(
-                q3[t], k_all[:, :seen], v_all[:, :seen],
-                scaling=attn.scaling, kv_group=heads // kv_heads,
-            )
-            outs.append(o)
-            lses.append(lse)
-        o_swept = torch.stack(outs).reshape(tokens, heads * attn.v_head_dim).to(q.dtype)
-        lse_swept = torch.stack(lses).to(torch.float32)
+        o_swept, lse_swept = self._sweep_with(request_id, layer_id, q, k_now, v_now)
         return o_swept, lse_swept, k_now, v_now, x
 
 

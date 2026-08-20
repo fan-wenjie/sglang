@@ -27,7 +27,7 @@ import time
 from typing import NamedTuple
 
 import torch
-from sglang.srt.afd.protocol import CLOSE, Frame, decode, send_frame
+from sglang.srt.afd.protocol import CLOSE, OP_FFN, Frame, decode, send_frame
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,9 @@ class PoolClient:
         self._send_lock = threading.Lock()
         self._cond = threading.Condition()
         self._slots: dict[tuple[int, int], torch.Tensor] = {}
+        # multi-tensor replies live apart from the one-tensor feed-forward slots, so a reply of
+        # the wrong shape cannot be handed to a caller expecting the other
+        self._replies: dict[tuple[int, int], tuple] = {}
         self._failure: BaseException | None = None
         # bounded: an hour of decode is millions of entries, and overlap_report used to slice a
         # list that only ever grew. The report is windowed anyway.
@@ -81,7 +84,10 @@ class PoolClient:
                 if frame is None:
                     break
                 with self._cond:
-                    self._slots[frame.key] = frame.tensor
+                    if len(frame.tensors) == 1 and frame.op == OP_FFN:
+                        self._slots[frame.key] = frame.tensor
+                    else:
+                        self._replies[frame.key] = frame.tensors
                     self._cond.notify_all()
         except BaseException as e:  # noqa: BLE001 -- it is re-raised in every waiting caller
             with self._cond:
@@ -98,6 +104,27 @@ class PoolClient:
         with self._send_lock:
             send_frame(self._sock, frame)
         return Handle(request_id, layer, time.perf_counter())
+
+    def call(self, request_id: int, layer: int, tensors, op: int, device):
+        """Send a multi-tensor frame and block for its multi-tensor reply.
+
+        Synchronous on purpose. The asynchronous issue/collect pair exists so a sweep can run
+        while the pool works; when the SWEEP itself is what the pool is doing, there is nothing
+        left on this side to overlap it with, and pretending otherwise would add a slot table to
+        buy nothing.
+        """
+        with self._send_lock:
+            send_frame(self._sock, Frame(request_id, layer, tuple(tensors), op))
+        key = (request_id, layer)
+        with self._cond:
+            while key not in self._replies:
+                if self._failure is not None:
+                    raise PoolClosed(f"pool at {self.address} failed") from self._failure
+                if self._closed:
+                    raise PoolClosed(f"pool at {self.address} closed mid-call")
+                self._cond.wait(timeout=0.5)
+            reply = self._replies.pop(key)
+        return tuple(t.to(device, non_blocking=True) for t in reply)
 
     def collect(self, handle: Handle, device: torch.device | str) -> torch.Tensor:
         """Block until this handle's reply is in, and record how long the block actually was.

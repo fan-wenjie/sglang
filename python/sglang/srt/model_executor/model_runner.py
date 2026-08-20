@@ -776,21 +776,38 @@ class ModelRunner:
         window has to open between the issue and the collect, and the router is what owns that
         gap.
         """
-        from sglang.srt.afd.roles import install_host_routing, serve_pool_in_background
+        from sglang.srt.afd.roles import (
+            install_host_routing,
+            install_kv_on_pool,
+            make_sweep_service,
+            serve_pool_in_background,
+        )
 
         if self.server_args.afd_mode == "pool":
+            self.afd_sweep_service = make_sweep_service(
+                model=self.model,
+                enabled=self.server_args.afd_kv_on_pool,
+                max_context=self.model_config.context_len,
+                device=self.device,
+            )
             self.afd_pool_thread = serve_pool_in_background(
                 model=self.model,
                 port=self.server_args.afd_bootstrap_port,
                 min_batch=self.server_args.afd_min_batch,
                 max_wait_ms=self.server_args.afd_max_wait_ms,
                 device=self.device,
+                attention=self.afd_sweep_service,
             )
         elif self.server_args.afd_mode == "host":
             self.afd_pool_client, self.afd_routing = install_host_routing(
                 model=self.model,
                 pool_addr=self.server_args.afd_pool_addr,
                 sweep_ahead=self.afd_early_q.hooks.sweep_ahead,
+            )
+            self.afd_remote_attention = install_kv_on_pool(
+                model=self.model,
+                client=self.afd_pool_client,
+                enabled=self.server_args.afd_kv_on_pool,
             )
 
     def maybe_init_lora_manager(self):

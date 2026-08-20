@@ -89,7 +89,35 @@ def routable_layers(model) -> tuple[int, ...]:
     )
 
 
-def serve_pool_in_background(model, port: int, min_batch: int, max_wait_ms: int, device):
+def make_sweep_service(model, *, enabled, max_context: int, device):
+    """The pool's cache and sweep, if --afd-kv-on-pool asked for them. None otherwise."""
+    if not enabled:
+        return None
+    from sglang.srt.afd.pool_attention import KVHolder, SweepService
+    from sglang.srt.afd.read_point import layer_types_of
+
+    logger.info(
+        "afd pool: holding the KV cache and the key/value projections, up to %s positions a "
+        "request. The sweep is answered on the connection thread rather than queued for a "
+        "departure: it reads the caller's own cache, so there is no shared weight read for a "
+        "departure to amortise.",
+        max_context,
+    )
+    return SweepService(model, KVHolder(device, max_context), layer_types_of(model))
+
+
+def install_kv_on_pool(model, *, client, enabled):
+    """Send every softmax layer's attention to the pool that holds its cache."""
+    if not enabled:
+        return None
+    from sglang.srt.afd.read_point import layer_types_of
+    from sglang.srt.afd.remote_attention import install_remote_attention
+
+    return install_remote_attention(model, client, layer_types_of(model))
+
+
+def serve_pool_in_background(model, port: int, min_batch: int, max_wait_ms: int, device,
+                             attention=None):
     """Answer feed-forward frames on a thread of an already-loaded server.
 
     The pool role reuses the ordinary launch path: the model is loaded, the scheduler starts, and
@@ -101,7 +129,7 @@ def serve_pool_in_background(model, port: int, min_batch: int, max_wait_ms: int,
     thread = threading.Thread(
         target=run_pool,
         kwargs=dict(model=model, host="0.0.0.0", port=port, min_batch=min_batch,
-                    max_wait_ms=max_wait_ms, device=device, ready=ready),
+                    max_wait_ms=max_wait_ms, device=device, ready=ready, attention=attention),
         daemon=True,
         name="afd-pool",
     )
@@ -123,7 +151,7 @@ def install_host_routing(model, pool_addr: str, sweep_ahead, connect_timeout_s: 
 
 
 def run_pool(model, host: str, port: int, min_batch: int, max_wait_ms: int,
-             device: torch.device | str, ready: threading.Event | None = None):
+             device: torch.device | str, ready: threading.Event | None = None, attention=None):
     """Serve until killed. Blocks."""
     logger.info("afd pool: %s layers, min_batch=%s, max_wait=%sms",
                 len(model.model.layers), min_batch, max_wait_ms)
@@ -135,6 +163,7 @@ def run_pool(model, host: str, port: int, min_batch: int, max_wait_ms: int,
         max_wait_s=max_wait_ms / 1000.0,
         device=device,
         ready=ready,
+        attention=attention,
     )
 
 

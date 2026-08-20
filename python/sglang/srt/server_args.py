@@ -3142,6 +3142,11 @@ class ServerArgs:
         "Path to write a comparison of the split attention against the fused call, recomputed on every join of real traffic. Doubles the attention work, so it is a diagnostic and not a deployment setting; the two differ only in the order of the additions inside one softmax, so a relative gap beyond bfloat16 rounding means a partition is covering the wrong positions.",
         NS("afd"),
     ] = None
+    afd_kv_on_pool: A[
+        Optional[bool],
+        "Move the KV cache and the key/value projections to the pool. The host then projects the query, sends it with its normalised input, and folds this step's token into what comes back; it never forms a key or a value and never holds a cache. Frees the host the whole cache -- 4.29 GB a request at 128k context -- and moves the pool's dominant cost from the feed-forward, which one weight read shares across every caller, to the sweep, which shares nothing: measured at 16k context the sweep is 88 percent of the pool's per-token cost even at 64 requests.",
+        NS("afd"),
+    ] = None
     afd_min_batch: A[
         int,
         "How many callers the pool waits for before a departure. A departure carries every caller at the stop, not the first N.",

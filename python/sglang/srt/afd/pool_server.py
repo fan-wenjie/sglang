@@ -29,7 +29,15 @@ import time
 from collections.abc import Callable
 
 import torch
-from sglang.srt.afd.protocol import Frame, decode, encode, send_frame
+from sglang.srt.afd.protocol import (
+    OP_FFN,
+    OP_RELEASE,
+    OP_SWEEP,
+    Frame,
+    decode,
+    encode,
+    send_frame,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +54,8 @@ class Departure(threading.Thread):
     ):
         super().__init__(name="afd-pool-departure", daemon=True)
         self.forward = forward
+        # set by serve() when the pool also holds the KV cache; None means feed-forward only
+        self.attention = None
         self.min_batch = min_batch
         self.max_wait_s = max_wait_s
         self.device = device
@@ -59,6 +69,31 @@ class Departure(threading.Thread):
         self._first_seen: dict[int, float] = {}
         self._stop = False
         self.departures: list[dict] = []
+
+    def answer_directly(self, frame: Frame, sock: socket.socket) -> bool:
+        """Ops that are per-request and gain nothing from riding with others.
+
+        A departure exists to make one weight read serve many callers. A sweep reads the CALLER'S
+        OWN cache -- there is no shared read to amortise, and measured at 16k context it is 88% of
+        what the pool costs per token even at 64 requests. So it is answered on the connection
+        thread and never queued: queueing it would add the departure's latency to buy the batching
+        it cannot use.
+        """
+        if self.attention is None or frame.op not in (OP_SWEEP, OP_RELEASE):
+            return False
+        if frame.op == OP_RELEASE:
+            dropped = self.attention.holder.release(frame.request_id)
+            send_frame(sock, Frame(frame.request_id, frame.layer,
+                                   (torch.tensor([[float(dropped)]]),), OP_RELEASE))
+            return True
+        q, normed, positions = frame.tensors
+        device = self.device
+        o, lse, k, v = self.attention.serve_attention(
+            frame.request_id, frame.layer, q.to(device), normed.to(device),
+            positions.view(-1).to(device),
+        )
+        send_frame(sock, Frame(frame.request_id, frame.layer, (o, lse, k, v), OP_SWEEP))
+        return True
 
     def offer(self, frame: Frame, sock: socket.socket) -> None:
         """Queue a frame, and depart it here if that completes a batch.
@@ -170,9 +205,15 @@ def serve(
     max_wait_s: float,
     device: torch.device | str,
     ready: threading.Event | None = None,
+    attention=None,
 ) -> Departure:
-    """Run a pool until the process is killed. Returns the departure thread for inspection."""
+    """Run a pool until the process is killed. Returns the departure thread for inspection.
+
+    `attention` is a SweepService when the pool also holds the KV cache. Without it the pool
+    answers feed-forward frames only, which is what it did before the cache moved.
+    """
     departure = Departure(forward, min_batch, max_wait_s, device)
+    departure.attention = attention
     departure.start()
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -191,6 +232,8 @@ def serve(
                 frame = decode(sock)
                 if frame is None:
                     return
+                if departure.answer_directly(frame, sock):
+                    continue
                 departure.offer(frame, sock)
         finally:
             sock.close()
