@@ -1,0 +1,14 @@
+{
+  "fused": [
+    " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+    "\n\nThe first eight prime numbers are:\n\n2, 3, 5, 7, 11, 13, 17, 19\n\nThese are the smallest numbers greater than 1 that have no divisors other than 1 and themselves."
+  ],
+  "windowed": [
+    " Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is Paris.\nThe capital of France is",
+    "\n\nThe first eight prime numbers are:\n\n2, 3, 5, 7, 11, 13, 17, 19\n\nThese are the smallest numbers greater than 1 that have no divisors other than 1 and themselves."
+  ],
+  "identical": [
+    true,
+    true
+  ]
+}

@@ -79,13 +79,25 @@ class SweepAhead:
         # the same stash the read point already fills; a second copy of h_l would be a second
         # answer to "what did layer j produce", and only one of them would be wrong
         self.stash = stash
-        # only a layer that sweeps a KV cache has a half to run early. A linear-attention layer's
-        # query multiplies a recurrent state that this module does not know how to partition, so
-        # its read point is moved (that is the quality question) and its schedule is not.
+        # Every converted layer has SOMETHING that reads only h_(l-N): its query projection,
+        # which a converted layer runs on a different input from its key and value and therefore
+        # runs twice. That projection goes in the window on all of them.
+        #
+        # Only a softmax layer also has a cache to sweep. A linear-attention layer's query
+        # multiplies a recurrent state, and the state is read by the update as well, so
+        # partitioning that recurrence would read the biggest tensor in the layer twice to hide
+        # one of the two reads. Measured on this model at batch 4: the state is 12.6 MB, q^T S
+        # takes 21 us and the update re-reads it for another 21 us, against a 6500 us pool round
+        # trip. There is nothing there. The projection is 47 layers x its own cost and is free,
+        # because it is already being run.
         self.sweep_at: dict[int, int] = {}
+        self.softmax_targets: set[int] = set()
         for target, source in sorted(source_of.items()):
-            if source >= 0 and hasattr(self.layers[target], "attn"):
-                self.sweep_at[source] = target
+            if source < 0:
+                continue
+            self.sweep_at[source] = target
+            if hasattr(self.layers[target], "attn"):
+                self.softmax_targets.add(target)
         self.routed_layers: set[int] = set()
 
         self.index = PerPassIndex()
@@ -94,6 +106,7 @@ class SweepAhead:
         self._forward_batch = None
 
         self.n_sweeps = 0
+        self.n_projections = 0
         self.n_joins = 0
         self.n_fallbacks = 0
         self.refusals: Counter = Counter()
@@ -119,6 +132,7 @@ class SweepAhead:
             # which would simply use it -- last pass's query over this pass's cache.
             for target in self.sweep_at.values():
                 self.layers[target]._afd_q_precomputed = None
+                self.layers[target]._afd_qkvz_precomputed = None
         self._forward_batch = forward_batch
         if layer_id in self.sweep_at and layer_id not in self.routed_layers:
             self.sweep_after_issue(layer_id)
@@ -139,6 +153,12 @@ class SweepAhead:
         # cleared before the refusals below, not after them: a pass that refuses to sweep must
         # leave no query behind for the layer to find
         layer._afd_q_precomputed = None
+        layer._afd_qkvz_precomputed = None
+
+        if target not in self.softmax_targets:
+            self._project_linear_ahead(layer, hidden)
+            return
+
         backend = get_attn_backend()
         reason = split_refusal(backend, layer.attn, forward_batch)
         if reason is not None:
@@ -162,6 +182,21 @@ class SweepAhead:
         layer._afd_q_precomputed = (q, gate, method)
         self.n_sweeps += 1
 
+    def _project_linear_ahead(self, layer, hidden) -> None:
+        """A linear-attention layer's fused input projection, on the early stream, in the window.
+
+        This is the whole of what such a layer can do before x_l exists. The conv1d that follows
+        mixes over time using a state this must not disturb, and the gates, the key and the value
+        all come from x_l. So the projection runs here and the layer splices its query slice out
+        of the result instead of projecting a second time -- the same arithmetic the read point
+        already costs, moved inside the pool round trip.
+        """
+        with torch.no_grad():
+            normed = layer.input_layernorm(hidden)
+            early_qkvz, _ = layer.linear_attn._forward_input_proj(normed)
+        layer._afd_qkvz_precomputed = early_qkvz
+        self.n_projections += 1
+
     def _refuse(self, reason: str) -> None:
         """Count it, and say it once. A refusal that only lands in a counter is a schedule that
         quietly ran synchronously under the overlapped arm's name."""
@@ -175,6 +210,9 @@ class SweepAhead:
         for target in sorted(self.sweep_at.values()):
             layer = self.layers[target]
             layer._afd_q_precomputed = None
+            layer._afd_qkvz_precomputed = None
+            if target not in self.softmax_targets:
+                continue
             original = layer.attn.forward
             layer.attn.forward = self._joined(target, layer.attn, original)
             self._undo.append(
@@ -252,6 +290,9 @@ class SweepAhead:
     def record(self) -> dict:
         return {
             "windows": len(self.sweep_at),
+            "sweep_windows": len(self.softmax_targets),
+            "projection_windows": len(self.sweep_at) - len(self.softmax_targets),
+            "projections": self.n_projections,
             "window_layers": {str(s): t for s, t in sorted(self.sweep_at.items())},
             "sweeps": self.n_sweeps,
             "joins": self.n_joins,
@@ -302,8 +343,9 @@ def install_sweep_ahead(model, wiring) -> SweepAhead | None:
         )
         return None
     logger.info(
-        "afd sweep-ahead: %s window(s); layer j's feed-forward overlaps layer j+N's cache sweep "
-        "at j in %s",
-        len(ahead.sweep_at), sorted(ahead.sweep_at),
+        "afd sweep-ahead: %s window(s) -- %s carrying a cache sweep, %s carrying a query "
+        "projection alone (linear attention, whose state the update reads again)",
+        len(ahead.sweep_at), len(ahead.softmax_targets),
+        len(ahead.sweep_at) - len(ahead.softmax_targets),
     )
     return ahead

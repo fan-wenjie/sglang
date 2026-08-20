@@ -156,6 +156,17 @@ class TestNoQuerySurvivesItsPass(unittest.TestCase):
         self.assertIsNone(model.model.layers[1]._afd_q_precomputed)
         self.assertIsNone(model.model.layers[3]._afd_q_precomputed)
 
+    def test_a_linear_layers_projection_is_cleared_the_same_way(self):
+        """The window's product for a linear-attention layer is a whole fused projection, not a
+        query. Same hazard, same clear: spliced into a later pass it would put another batch's
+        query into this batch's conv state, and the conv is depthwise so nothing would object."""
+        model = _model(4)
+        ahead = self._schedule(model)
+        ahead.on_prepare_mlp(0, object())
+        model.model.layers[1]._afd_qkvz_precomputed = "stale projection"
+        ahead.on_prepare_mlp(0, object())
+        self.assertIsNone(model.model.layers[1]._afd_qkvz_precomputed)
+
     def test_the_same_batch_keeps_them(self):
         """The clear is a pass boundary, not a per-layer reset: layer j+N's query is stashed at
         layer j and read several layers later, with other sources' prepare_mlp in between."""

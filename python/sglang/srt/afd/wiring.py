@@ -159,10 +159,15 @@ def _wrap_linear_input_proj(layer) -> Callable:
 
     def wrapped(hidden_states, *args, **kwargs):
         qkvz, ba = original(hidden_states, *args, **kwargs)
+        early_qkvz = layer._afd_qkvz_precomputed
+        # consumed, so a later pass that opens no window cannot splice this one's query in --
+        # the pass boundary clears it too, and this is the tighter of the two
+        layer._afd_qkvz_precomputed = None
         source = layer._afd_q_hidden
-        if source is None:
-            return qkvz, ba
-        early_qkvz, _ = original(source, *args, **kwargs)
+        if early_qkvz is None:
+            if source is None:
+                return qkvz, ba
+            early_qkvz, _ = original(source, *args, **kwargs)
         k_tp = attn.key_dim // attn.attn_tp_size
         if qkvz.shape[-1] < k_tp:
             raise RuntimeError(
@@ -278,6 +283,9 @@ def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
         layer = layers[layer_id]
         layer._afd_q_hidden = None
         layer._afd_q_precomputed = None
+        # the window's product for a linear-attention layer: its fused input projection, already
+        # run on the early stream, so this layer splices instead of projecting a second time
+        layer._afd_qkvz_precomputed = None
         if hasattr(layer, "linear_attn"):
             # a linear-attention layer: one fused projection, splice the query slice
             original = _wrap_linear_input_proj(layer)
