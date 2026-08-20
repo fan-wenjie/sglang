@@ -14,6 +14,12 @@ Run on the CPU with a stubbed backend, because the question is index arithmetic 
 only make it slower to find out.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+from sglang.test.test_utils import CustomTestCase
+
 import unittest
 
 import torch
@@ -55,7 +61,7 @@ def _make(seq_lens, seq_lens_sum, first_slot=100):
     return backend, Batch(lens, seq_lens_sum), indptr, indices
 
 
-class TestPartitionIndices(unittest.TestCase):
+class TestPartitionIndices(CustomTestCase):
     def test_the_sweep_covers_every_cached_position_but_this_steps(self):
         seq_lens = [5, 1, 9]
         backend, batch, indptr, indices = _make(seq_lens, sum(seq_lens))

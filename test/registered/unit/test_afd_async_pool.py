@@ -7,6 +7,12 @@ So the asynchrony is asserted here against a pool whose service time is known, r
 from the fact that the calls are on separate lines.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+from sglang.test.test_utils import CustomTestCase
+
 import threading
 import time
 import unittest
@@ -49,7 +55,7 @@ def _hidden(tokens=2, value=0.0):
     return torch.full((tokens, WIDTH), value, dtype=torch.bfloat16)
 
 
-class TestProtocol(unittest.TestCase):
+class TestProtocol(CustomTestCase):
     def test_a_frame_survives_the_round_trip_bit_for_bit(self):
         import socket
 
@@ -72,7 +78,7 @@ class TestProtocol(unittest.TestCase):
             decode(b)
 
 
-class TestAsynchrony(unittest.TestCase):
+class TestAsynchrony(CustomTestCase):
     def test_issue_returns_before_the_pool_has_answered(self):
         """The whole arrangement. If issue() blocked, the sweep could not run underneath it."""
         port = _start_pool(min_batch=1)
@@ -126,7 +132,7 @@ class TestAsynchrony(unittest.TestCase):
             client.close()
 
 
-class TestDeparture(unittest.TestCase):
+class TestDeparture(CustomTestCase):
     def test_a_departure_carries_everyone_at_the_stop(self):
         """Two waiting and a third arriving in the same instant is one departure of three."""
         record = []
@@ -175,7 +181,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestPoolDoesNotCallItself(unittest.TestCase):
+class TestPoolDoesNotCallItself(CustomTestCase):
     """A pool sharing a process with the host must not route work back to itself.
 
     Guards a hang that actually happened: the single-machine test put both roles on one model, the

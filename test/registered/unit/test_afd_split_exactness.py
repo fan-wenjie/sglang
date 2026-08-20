@@ -19,6 +19,12 @@ because a protocol verified at a shape the model does not have is verified again
 are written out here rather than read from the checkpoint so the test runs without one.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+from sglang.test.test_utils import CustomTestCase
+
 import itertools
 import unittest
 
@@ -72,7 +78,7 @@ def _qkv(positions, dtype=torch.float64, seed=0):
     return q, k.repeat_interleave(rep, 0), v.repeat_interleave(rep, 0)
 
 
-class TestSplitIsTheSameAttention(unittest.TestCase):
+class TestSplitIsTheSameAttention(CustomTestCase):
     def test_exact_in_float64_at_this_model_shapes(self):
         worst = 0.0
         for positions in (16, 129, 1024):

@@ -54,7 +54,13 @@ COVERAGE_KEY = "afd_coverage"
 
 
 def _from_config(hf_config, key: str):
-    """The value a checkpoint states about itself, text config first."""
+    """The value a checkpoint states about itself, text config first.
+
+    getattr with a default is defensive access when the field is always there. Here its absence IS
+    the answer -- an unconverted checkpoint says nothing about a read point, and that is the case
+    this function exists to report. The alternative the rule prefers, always setting the field,
+    would mean writing into a HuggingFace config class this code does not own.
+    """
     text = getattr(hf_config, "text_config", None)
     if text is not None and hasattr(text, key):
         return getattr(text, key)

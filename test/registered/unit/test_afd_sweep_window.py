@@ -14,6 +14,12 @@ So the order is asserted directly. A benchmark cannot tell these apart from a wr
 from a smaller number, and a smaller number has many other explanations.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+from sglang.test.test_utils import CustomTestCase
+
 import types
 import unittest
 
@@ -58,7 +64,7 @@ def _model(n_layers):
     return types.SimpleNamespace(model=types.SimpleNamespace(layers=layers))
 
 
-class TestTheWindowOpensBetweenIssueAndCollect(unittest.TestCase):
+class TestTheWindowOpensBetweenIssueAndCollect(CustomTestCase):
     def test_the_sweep_runs_after_the_send_and_before_the_wait(self):
         from sglang.srt.afd.roles import install_pool_routing
 
@@ -122,7 +128,7 @@ class TestTheWindowOpensBetweenIssueAndCollect(unittest.TestCase):
         self.assertEqual(fired, [2], "layer 0 is routed, so the router triggers it")
 
 
-class TestNoQuerySurvivesItsPass(unittest.TestCase):
+class TestNoQuerySurvivesItsPass(CustomTestCase):
     """A stashed query outliving its pass is the silent failure this schedule can produce.
 
     `pending` is consumed by the join, which raises if the partner is missing. The precomputed

@@ -6,22 +6,22 @@
     {
       "label": "colocated",
       "tokens": 512,
-      "wall_s": 7.4778374917805195,
-      "tokens_per_second": 68.46899261488092
+      "wall_s": 7.3092214204370975,
+      "tokens_per_second": 70.04850045565892
     },
     {
       "label": "two-sided",
       "tokens": 512,
-      "wall_s": 75.1027908809483,
-      "tokens_per_second": 6.817323217876336
+      "wall_s": 26.004067663103342,
+      "tokens_per_second": 19.689227340631277
     },
     {
       "label": "q-first",
       "tokens": 512,
-      "wall_s": 77.10549570992589,
-      "tokens_per_second": 6.640253010319335
+      "wall_s": 17.794138487428427,
+      "tokens_per_second": 28.77352001962491
     }
   ],
-  "qfirst_over_two_sided": 0.9740264320910166,
-  "two_sided_over_colocated": 0.09956803740668256
+  "qfirst_over_two_sided": 1.4613839091718452,
+  "two_sided_over_colocated": 0.2810799262304646
 }

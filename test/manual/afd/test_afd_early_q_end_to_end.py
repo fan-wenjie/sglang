@@ -22,6 +22,7 @@ import os
 import unittest
 
 import torch
+from sglang.test.test_utils import CustomTestCase
 
 MODEL = os.environ.get("AFD_MODEL", "/home/user/experiment/models/Qwen3.8-27B-FP8")
 RECORD = "/home/user/experiment/sglang/afd_e2e.json"
@@ -54,7 +55,7 @@ def _build_runner(shift: int):
     return runner, model_config
 
 
-class TestEarlyQOnTheRealStack(unittest.TestCase):
+class TestEarlyQOnTheRealStack(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():

@@ -1,0 +1,22 @@
+[
+  {
+    "streams": 1,
+    "median_ms": 1.4518201351165771,
+    "aggregate_fps": 686.5316839368841
+  },
+  {
+    "streams": 2,
+    "median_ms": 1.128222793340683,
+    "aggregate_fps": 1656.9843342761733
+  },
+  {
+    "streams": 4,
+    "median_ms": 4.591063596308231,
+    "aggregate_fps": 885.5081038875265
+  },
+  {
+    "streams": 8,
+    "median_ms": 15.481720678508282,
+    "aggregate_fps": 525.292778879115
+  }
+]

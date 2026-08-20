@@ -46,6 +46,7 @@ from collections import Counter
 from collections.abc import Callable
 
 import torch
+from sglang.srt.afd.read_point import is_full_attention
 from sglang.srt.afd.split_attention import PerPassIndex, join, split_refusal, sweep
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
@@ -96,7 +97,7 @@ class SweepAhead:
             if source < 0:
                 continue
             self.sweep_at[source] = target
-            if hasattr(self.layers[target], "attn"):
+            if is_full_attention(self.layers[target]):
                 self.softmax_targets.add(target)
         self.routed_layers: set[int] = set()
 
@@ -171,7 +172,7 @@ class SweepAhead:
             q, _, _, gate = getattr(layer, method)(
                 positions=forward_batch.positions, hidden_states=normed
             )
-            state = sweep(backend, layer.attn, q, forward_batch, self.index)
+            state = sweep(backend, layer.attn, forward_batch, q=q, index=self.index)
         if state is None:
             self._refuse("every request is one token long; there is no cache to sweep")
             return
@@ -238,7 +239,8 @@ class SweepAhead:
                 )
             k = k.view(-1, attn.tp_k_head_num, attn.qk_head_dim)
             v = v.view(-1, attn.tp_v_head_num, attn.v_head_dim)
-            out = join(get_attn_backend(), attn, k, v, forward_batch, state, self.index)
+            out = join(get_attn_backend(), attn, forward_batch, k=k, v=v,
+                       state=state, index=self.index)
             self.n_joins += 1
             if self.verify_path is not None:
                 self._verify(target, out, original, q, k, v, forward_batch)

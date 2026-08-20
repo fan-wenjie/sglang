@@ -163,6 +163,29 @@ def stateful_layers(layer_types: list[str]) -> tuple[int, ...]:
     return tuple(range(len(layer_types)))
 
 
+def is_full_attention(layer) -> bool:
+    """Whether this layer sweeps a KV cache, decided in the one place that decides it.
+
+    Asking `hasattr(layer, "attn")` at each call site is the same question answered separately in
+    each module, and the day a layer grows an `attn` attribute for another reason they answer it
+    differently. This routes through the same class-name rule `layer_types_of` uses, so a stack
+    whose layers are neither kind is refused once rather than silently sorted twice.
+    """
+    return _kind_of(layer) == "full_attention"
+
+
+def _kind_of(layer) -> str:
+    name = type(layer).__name__
+    if "Linear" in name:
+        return "linear_attention"
+    if "Attention" in name:
+        return "full_attention"
+    raise RuntimeError(
+        f"a {name} is neither of the two kinds this arm knows how to treat. Name it before "
+        f"converting it: a layer handled by accident is a layer nothing has checked."
+    )
+
+
 def layer_types_of(model) -> list[str]:
     """Read the layer kinds off the LOADED stack, not off a config field.
 
@@ -172,16 +195,11 @@ def layer_types_of(model) -> list[str]:
     -- a config field says what was requested, the module list says what was constructed.
     """
     kinds = []
-    for layer in model.model.layers:
-        name = type(layer).__name__
-        if "Linear" in name:
-            kinds.append("linear_attention")
-        elif "Attention" in name:
-            kinds.append("full_attention")
-        else:
-            raise RuntimeError(
-                f"layer {len(kinds)} is a {name}, which is neither of the two kinds this arm "
-                f"knows how to treat. Name it before converting it: a layer handled by accident "
-                f"is a different intervention than the one that was measured."
-            )
+    for index, layer in enumerate(model.model.layers):
+        try:
+            kinds.append(_kind_of(layer))
+        except RuntimeError as e:
+            raise RuntimeError(f"layer {index}: {e}") from e
     return kinds
+
+

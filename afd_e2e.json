@@ -1,0 +1,7 @@
+{
+  "model": "/home/user/experiment/models/Qwen3.8-27B-FP8",
+  "layer": 19,
+  "d_query": 10.8125,
+  "d_key": 0.0,
+  "d_value": 0.0
+}

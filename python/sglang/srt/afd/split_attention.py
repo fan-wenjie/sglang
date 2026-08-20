@@ -106,8 +106,13 @@ def full_attn_backend(backend):
     A hybrid stack wraps two: the softmax layers' backend and the linear-attention one. The wrapper
     dispatches per layer, and every layer this module touches is on the full-attention side.
     """
-    inner = getattr(backend, "full_attn_backend", None)
-    return backend if inner is None else inner
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    if isinstance(backend, HybridLinearAttnBackend):
+        return backend.full_attn_backend
+    return backend
 
 
 def split_refusal(backend, layer, forward_batch) -> str | None:
@@ -187,7 +192,7 @@ def _build_prefix(backend, forward_batch):
     )
 
 
-def _run_partition(backend, q, k, v, layer, forward_batch, indptr, indices, splits,
+def _run_partition(backend, layer, forward_batch, *, q, k, v, indptr, indices, splits,
                    save_kv_cache: bool):
     """One partition, through forward_decode itself, with the partition's indices swapped in."""
     metadata = backend.forward_metadata
@@ -205,7 +210,7 @@ def _run_partition(backend, q, k, v, layer, forward_batch, indptr, indices, spli
     return o.view(tokens, heads, layer.v_head_dim), lse
 
 
-def sweep(backend, layer, q, forward_batch, index: PerPassIndex) -> SweepResult | None:
+def sweep(backend, layer, forward_batch, *, q, index: PerPassIndex) -> SweepResult | None:
     """Attend the cache with the query alone. Returns None when the partition does not exist."""
     backend = full_attn_backend(backend)
     parts = index.get(forward_batch, lambda: _build_prefix(backend, forward_batch))
@@ -213,8 +218,8 @@ def sweep(backend, layer, q, forward_batch, index: PerPassIndex) -> SweepResult 
         return None
     prefix_indptr, prefix_indices, prefix_splits = parts[0], parts[1], parts[2]
     o, lse = _run_partition(
-        backend, q, None, None, layer, forward_batch,
-        prefix_indptr, prefix_indices, prefix_splits, save_kv_cache=False,
+        backend, layer, forward_batch, q=q, k=None, v=None, indptr=prefix_indptr,
+        indices=prefix_indices, splits=prefix_splits, save_kv_cache=False,
     )
     # An empty prefix leaves NaN beside an -inf log-partition; zero it before it meets a
     # weight. Applied unconditionally: asking `.any()` first would read a device tensor on the
@@ -225,14 +230,15 @@ def sweep(backend, layer, q, forward_batch, index: PerPassIndex) -> SweepResult 
     return SweepResult(layer.layer_id, q, o, lse)
 
 
-def join(backend, layer, k, v, forward_batch, state: SweepResult, index: PerPassIndex):
+def join(backend, layer, forward_batch, *, k, v, state: SweepResult,
+         index: PerPassIndex):
     """Fold this step's token into the swept cache. Writes the KV cache, as the fused call does."""
     backend = full_attn_backend(backend)
     parts = index.get(forward_batch, lambda: _build_prefix(backend, forward_batch))
     current_indptr, current_indices, current_splits = parts[3], parts[4], parts[5]
     o_cur, lse_cur = _run_partition(
-        backend, state.q, k, v, layer, forward_batch,
-        current_indptr, current_indices, current_splits, save_kv_cache=True,
+        backend, layer, forward_batch, q=state.q, k=k, v=v, indptr=current_indptr,
+        indices=current_indices, splits=current_splits, save_kv_cache=True,
     )
     merged, _ = merge_state(state.o, state.lse, o_cur, lse_cur)
     return merged.view(-1, layer.tp_q_head_num * layer.v_head_dim)

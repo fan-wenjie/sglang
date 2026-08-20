@@ -5,6 +5,12 @@ they catch are the silent ones: a shift that converts nothing costs nothing, and
 reads as tolerance rather than as a hook that never installed.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+from sglang.test.test_utils import CustomTestCase
+
 import unittest
 
 from sglang.srt.afd.early_q import EarlyQStash, EarlyQWiring, install
@@ -16,7 +22,7 @@ QWEN38_27B_LAYER_TYPES = ["linear_attention"] * 3 + ["full_attention"]
 QWEN38_27B_LAYER_TYPES = QWEN38_27B_LAYER_TYPES * 16
 
 
-class TestReadPoint(unittest.TestCase):
+class TestReadPoint(CustomTestCase):
     def test_the_model_is_the_shape_the_arm_assumes(self):
         self.assertEqual(len(QWEN38_27B_LAYER_TYPES), 64)
         full = full_attention_layers(QWEN38_27B_LAYER_TYPES)
@@ -94,7 +100,7 @@ class TestReadPoint(unittest.TestCase):
         self.assertNotIn("3", record["sources"], "a clamped layer has no source to record")
 
 
-class TestStash(unittest.TestCase):
+class TestStash(CustomTestCase):
     def test_the_stash_refuses_a_tensor_from_the_wrong_stage(self):
         """Reading the layer OUTPUT gives x_(l+1), which is the standard wiring with extra steps."""
         stash = EarlyQStash()
@@ -143,7 +149,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestCoverage(unittest.TestCase):
+class TestCoverage(CustomTestCase):
     """Which layers move is not which layers sweep a cache, and conflating them caps coverage.
 
     Guards a real capping: the installer used `full_attention_layers` for both questions, so a

@@ -44,6 +44,7 @@ from sglang.srt.afd.read_point import (
     ReadPlan,
     convertible_layers,
     full_attention_layers,
+    is_full_attention,
     layer_types_of,
     plan_read_points,
 )
@@ -223,37 +224,22 @@ class InstalledWiring:
         self.stash.clear()
 
 
-def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
-                    coverage=None, hf_config=None, split_attention=None,
-                    verify_split=None) -> InstalledWiring:
-    """Move the query's read point, on every layer or on the softmax ones alone.
+def _resolve_settings(shift_layers, coverage, hf_config):
+    """What to serve at, from the flag and the checkpoint.
 
-        coverage="all"     every layer that has a query, including linear attention. 63 of 64 on
-                           this model, and the coverage a deployment converts.
-        coverage="softmax" only the layers whose attention is a sweep over a cache. 16 of 64.
-                           Useful as an ablation; NOT the same number, and the study measured the
-                           gap: +0.0181 bits per byte against +0.0211, a factor of 1.17.
-
-    `layer_types` is derived from the built stack when not given, so a caller in a frozen
-    orchestrator can ask for the wiring without computing its inputs.
+    A caller contradicting the checkpoint is warned rather than silently obeyed: serving a
+    repaired checkpoint at the wrong read point feeds its query projection an input it was never
+    trained on.
     """
-    # The checkpoint states its own read point when it has one, and a caller contradicting it is
-    # warned rather than silently obeyed: serving a repaired checkpoint at the wrong read point
-    # feeds its query projection an input it was never trained on.
     if hf_config is not None:
         shift_layers = resolve_shift(shift_layers, hf_config)
         coverage = resolve_coverage(coverage, hf_config)
-    if shift_layers is None:
-        shift_layers = 0
-    if coverage is None:
-        coverage = "all"
+    return (0 if shift_layers is None else shift_layers,
+            "all" if coverage is None else coverage)
 
-    if shift_layers == 0:
-        # nothing to install. Returning an empty wiring rather than None keeps the caller from
-        # having to branch, and its record still says what was resolved.
-        return InstalledWiring(plan_read_points(0, len(model.model.layers)), LayerStash(), [])
 
-    layers = model.model.layers
+def _plan_for(model, *, shift_layers: int, coverage: str, layer_types) -> ReadPlan:
+    """Which layer reads which, refusing a conversion that would hook nothing."""
     if layer_types is None:
         layer_types = layer_types_of(model)
     if coverage == "all":
@@ -262,16 +248,20 @@ def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
         convertible = full_attention_layers(layer_types)
     else:
         raise ValueError(f'coverage is "all" or "softmax", got {coverage!r}')
-    plan = plan_read_points(shift_layers, len(layers), convertible=convertible)
-    if shift_layers > 0 and not plan.moved:
+    n_layers = len(model.model.layers)
+    plan = plan_read_points(shift_layers, n_layers, convertible=convertible)
+    if not plan.moved:
         raise RuntimeError(
-            f"--afd-q-shift-layers={shift_layers} moves no layer of this {len(layers)}-layer "
+            f"--afd-q-shift-layers={shift_layers} moves no layer of this {n_layers}-layer "
             f"stack. A conversion that hooks nothing costs nothing, and a cost of zero reads as "
             f"tolerance rather than as a wiring that never installed."
         )
+    return plan
 
-    stash, undo, hooks = LayerStash(), [], PassHooks()
-    source_of = {p.layer: p.source for p in plan.points if not p.clamped}
+
+def _install_hooks(layers, plan: ReadPlan, stash: LayerStash, hooks: PassHooks):
+    """Wrap the layers the plan names. Returns the undo list and the layers that were stashed."""
+    undo, source_of = [], {p.layer: p.source for p in plan.points if not p.clamped}
     needed = sorted({s for s in source_of.values()})
 
     for layer_id in needed:
@@ -286,7 +276,7 @@ def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
         # the window's product for a linear-attention layer: its fused input projection, already
         # run on the early stream, so this layer splices instead of projecting a second time
         layer._afd_qkvz_precomputed = None
-        if hasattr(layer, "linear_attn"):
+        if not is_full_attention(layer):
             # a linear-attention layer: one fused projection, splice the query slice
             original = _wrap_linear_input_proj(layer)
             undo.append(
@@ -300,24 +290,50 @@ def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
                 undo.append(lambda ly=layer, n=name, o=original: setattr(ly, n, o))
         original = _wrap_layer_forward(layer, layer_id, source_of, stash, layer.input_layernorm)
         undo.append(lambda ly=layer, o=original: setattr(ly, "forward", o))
+    return undo, needed
 
+
+def _report(plan: ReadPlan, coverage: str, n_stashed: int) -> None:
+    """The record goes in the log, not only into a return value a caller may drop.
+
+    A run that converted fewer layers than asked would otherwise report a shallower shift's cost
+    under a deeper shift's name, with nothing in the log to notice it by.
+    """
     logger.info(
         "afd early-q installed: coverage=%s, shift=%s (%s half-layers, offset %.1f), "
         "%s layer(s) moved, %s clamped, %s layer(s) stashed",
-        coverage,
-        plan.shift_layers,
-        plan.half_layers,
-        plan.offset_layers,
-        len(plan.moved),
-        len(plan.clamped),
-        len(needed),
+        coverage, plan.shift_layers, plan.half_layers, plan.offset_layers,
+        len(plan.moved), len(plan.clamped), n_stashed,
     )
-    # the record goes in the log, not just into a return value a caller may drop: a run that
-    # converted fewer layers than asked would otherwise report a shallower shift's cost under a
-    # deeper shift's name, with nothing in the log to notice it by.
     logger.info("afd early-q record: %s", plan.as_record())
-    wiring = InstalledWiring(plan, stash, undo, hooks)
 
+
+def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
+                    coverage=None, hf_config=None, split_attention=None,
+                    verify_split=None) -> InstalledWiring:
+    """Move the query's read point, on every layer or on the softmax ones alone.
+
+        coverage="all"     every layer that has a query, including linear attention. 63 of 64 on
+                           this model, and the coverage a deployment converts.
+        coverage="softmax" only the layers whose attention is a sweep over a cache. 16 of 64.
+                           Useful as an ablation; NOT the same number, and the study measured the
+                           gap: +0.0181 bits per byte against +0.0211, a factor of 1.17.
+
+    `layer_types` is derived from the built stack when not given, so a caller in a frozen
+    orchestrator can ask for the wiring without computing its inputs.
+    """
+    shift_layers, coverage = _resolve_settings(shift_layers, coverage, hf_config)
+    if shift_layers == 0:
+        # nothing to install. Returning an empty wiring rather than None keeps the caller from
+        # having to branch, and its record still says what was resolved.
+        return InstalledWiring(plan_read_points(0, len(model.model.layers)), LayerStash(), [])
+
+    plan = _plan_for(model, shift_layers=shift_layers, coverage=coverage, layer_types=layer_types)
+    stash, hooks = LayerStash(), PassHooks()
+    undo, stashed = _install_hooks(model.model.layers, plan, stash, hooks)
+    _report(plan, coverage, len(stashed))
+
+    wiring = InstalledWiring(plan, stash, undo, hooks)
     # The schedule goes on top of the read point, not beside it: it needs the plan to know which
     # layer reads which, and the stash to find h_l when the window opens.
     if resolve_split(split_attention):
@@ -361,6 +377,8 @@ def _hf_layers(model):
     ):
         node = model
         for name in path:
+                # a SEARCH over candidate paths, not defensive access: absence is the
+            # answer this loop is looking for
             node = getattr(node, name, None)
             if node is None:
                 break

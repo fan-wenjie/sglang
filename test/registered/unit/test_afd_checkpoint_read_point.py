@@ -10,6 +10,12 @@ With a default of 0 they would be the same value, and the override warning could
 repaired checkpoint served at the standard wiring -- which is the failure it exists for.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+from sglang.test.test_utils import CustomTestCase
+
 import logging
 import unittest
 
@@ -34,7 +40,7 @@ def _config(shift=None, coverage=None, nested=True):
     return cfg
 
 
-class TestResolveShift(unittest.TestCase):
+class TestResolveShift(CustomTestCase):
     def test_unset_takes_the_checkpoints_own(self):
         from sglang.srt.afd.checkpoint import resolve_shift
 
@@ -93,7 +99,7 @@ class TestResolveShift(unittest.TestCase):
             resolve_shift(None, _config(shift="half"))
 
 
-class TestResolveCoverage(unittest.TestCase):
+class TestResolveCoverage(CustomTestCase):
     def test_unset_takes_the_checkpoints_own(self):
         from sglang.srt.afd.checkpoint import resolve_coverage
 
@@ -118,7 +124,7 @@ class TestResolveCoverage(unittest.TestCase):
             resolve_coverage(None, _config(coverage="every-other"))
 
 
-class TestStamp(unittest.TestCase):
+class TestStamp(CustomTestCase):
     def test_a_conversion_can_write_the_read_point_into_the_config(self):
         """So the shift travels with the weights and nobody has to remember it."""
         from sglang.srt.afd.checkpoint import stamp
