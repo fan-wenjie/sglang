@@ -130,10 +130,16 @@ class PoolClient:
             )
         return out.to(device, non_blocking=True)
 
-    def overlap_report(self) -> dict:
-        """Issue-to-collect intervals, so a test can assert the overlap rather than assume it."""
+    def overlap_report(self, since: int = 0) -> dict:
+        """Issue-to-collect intervals, so a test can assert the overlap rather than assume it.
+
+        `since` drops the first N calls. A cumulative mean is the wrong statistic for this: the
+        pool JIT-compiles its kernels on the first frames it sees, and a warm-up call two orders
+        of magnitude slower than steady state still moves the mean thousands of calls later. The
+        two-machine run's first 512 calls averaged 188 ms against a steady 6.7 ms.
+        """
         with self._cond:
-            waits = list(self._waits)
+            waits = list(self._waits)[since:]
         if not waits:
             return {"calls": 0}
         outstanding = [w["outstanding_s"] for w in waits]

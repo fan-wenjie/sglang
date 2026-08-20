@@ -193,11 +193,15 @@ class PoolRouting:
             out = self.client.collect(handle, device)
             self._calls += 1
             if self._calls % REPORT_EVERY == 0:
-                report = self.client.overlap_report()
+                # only the calls since the last line: a cumulative mean carries the pool's JIT
+                # warm-up forever, and a schedule that stopped overlapping halfway through would
+                # be averaged back into looking fine
+                report = self.client.overlap_report(since=self._calls - REPORT_EVERY)
                 logger.info(
-                    "afd host: %s pool call(s); mean outstanding %.2f ms, mean blocked %.2f ms, "
-                    "hidden %.1f%%",
+                    "afd host: %s pool call(s); last %s: mean outstanding %.2f ms, mean blocked "
+                    "%.2f ms, hidden %.1f%%",
                     self._calls,
+                    REPORT_EVERY,
                     1e3 * report["mean_outstanding_s"],
                     1e3 * report["mean_blocked_s"],
                     100.0 * (1.0 - report["mean_blocked_s"] / report["mean_outstanding_s"])
