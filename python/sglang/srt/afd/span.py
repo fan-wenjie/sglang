@@ -228,6 +228,48 @@ def _add_and_norm(norm, hidden: torch.Tensor, residual: torch.Tensor | None):
     return out
 
 
+_HEAD_SEEN = {}
+
+
+def _trace_head(group, residual, *, attn_output, gated, projected) -> None:
+    """The three things only a MIDDLE span does, against the stream they join.
+
+    The residual leaving the first middle span is 34.7 where the model's own is 112.0 -- it fell by
+    two thirds across a group, and adding vectors cannot halve a norm unless what is added points
+    against what it is added to. So the number that matters is not any tensor's magnitude, it is
+    the COSINE between what this span adds and the residual it adds to. A contribution roughly
+    orthogonal to the stream is ordinary; one that is negative is the answer.
+
+    Three candidates, and this separates them: the output gate applied here to an attention output
+    computed on the host, `W_o` on that gated output, and the residual taken from this side's own
+    table rather than carried in the call. Printed in that order so the first line where the sign
+    turns names the stage.
+    """
+    import os
+
+    if not os.environ.get("SGLANG_AFD_SELFCHECK"):
+        return
+    seen = _HEAD_SEEN.get(group, 0)
+    if seen >= 2:
+        return
+    _HEAD_SEEN[group] = seen + 1
+
+    stream = residual[0].float()
+
+    def against(t):
+        row = t[0].float()
+        if row.numel() != stream.numel():
+            return f"|{float(row.norm()):.5g}| (width {row.numel()}, not the stream's)"
+        cos = torch.nn.functional.cosine_similarity(row, stream, dim=0)
+        return f"|{float(row.norm()):.5g}| cos {float(cos):+.4f}"
+
+    logger.info(
+        "afd head: group %s call %s -- residual |%.5g| | attn %s | gated %s | projected %s",
+        group, seen, float(stream.norm()),
+        against(attn_output), against(gated), against(projected),
+    )
+
+
 _RESIDUAL_SEEN = {}
 
 
@@ -419,7 +461,9 @@ class SpanRunner:
         # attention itself ran on the host, which is the whole point of the cut -- and the gate
         # was computed here on the previous call, so what comes back over the wire is the bare
         # attention output and the nonlinearity is applied on this side
-        attn_out, _ = layers[head].o_proj(self._gated(request_ids, attn_output))
+        gated = self._gated(request_ids, attn_output)
+        attn_out, _ = layers[head].o_proj(gated)
+        _trace_head(group, residual, attn_output=attn_output, gated=gated, projected=attn_out)
         hidden, residual = _add_and_norm(
             layers[head].post_attention_layernorm, attn_out, residual)
         hidden = layers[head].mlp(hidden)
