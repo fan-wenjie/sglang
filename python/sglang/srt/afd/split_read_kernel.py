@@ -91,6 +91,42 @@ if HAVE_TRITON:
         tl.store(tile, alpha * S + u[:, None] * k[None, :])
 
 
+def read_one(state: torch.Tensor, slots: torch.Tensor, q_tilde: torch.Tensor) -> torch.Tensor:
+    """One contraction of the state, and NOTHING written. The critical path's whole job.
+
+    The query coefficient folds the key's correction into the query, so the reading the weight
+    side needs is a single `S q~` -- one pass over the state and no write at all, against the
+    two passes a read-and-update costs. That halving is the point of splitting the state read
+    from the state update: the update is deferred, so only this is on the critical path.
+
+    The decay is NOT applied. It is a per-head scalar the weight side holds, and a value that
+    crossed the wire to be multiplied there and back is a value that should not have gone.
+    """
+    held = state.index_select(0, slots.long())
+    if held.shape[:2] != q_tilde.shape[:2]:
+        raise ValueError(
+            f"state {tuple(held.shape)} against a coefficient of {tuple(q_tilde.shape)}: a "
+            f"broadcast here would read one head's history for another and stay fluent."
+        )
+    return torch.einsum("bhvk,bhk->bhv", held, q_tilde)
+
+
+def update_only(state: torch.Tensor, slots: torch.Tensor, *, k: torch.Tensor, v: torch.Tensor,
+                alpha: torch.Tensor, beta: torch.Tensor) -> None:
+    """Advance the state in place, off the critical path. Reads its own `h_k`.
+
+    Deferred on purpose: the state only has to be right by the NEXT step, which is the argument
+    OP_APPEND already makes for a KV cache. The caller is not waiting, so this may run whenever
+    the reader thread reaches it.
+    """
+    from sglang.srt.afd.linear_history import read, update
+
+    index = slots.long()
+    held = state.index_select(0, index)
+    _, h_k = read(held, k, k)
+    state.index_copy_(0, index, update(held, h_k, v=v, k=k, alpha=alpha, beta=beta))
+
+
 def read_two_and_update(state: torch.Tensor, slots: torch.Tensor, *, q: torch.Tensor,
                         k: torch.Tensor, v: torch.Tensor, alpha: torch.Tensor,
                         beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -43,6 +43,8 @@ from sglang.srt.afd.protocol import (
     OP_SPAN_ENTER,
     OP_SPAN_EXIT,
     OP_SPAN_Q,
+    OP_STATE_READ,
+    OP_STATE_UPDATE,
     unpack_positions,
     Frame,
     decode,
@@ -434,6 +436,7 @@ class Departure(threading.Thread):
             # wait costs nothing: it is spent inside the last feed-forward either way.
             sent = threading.Event()
             handover = self._handover(riding, counts, group, sent)
+            self._install_history_calls(riding, counts)
             if op == OP_SPAN_ENTER:
                 _, k, v = self.span.run_prologue(
                     ids, joined, positions, on_query=handover)
@@ -458,6 +461,51 @@ class Departure(threading.Thread):
         )
         if self.riders_path and len(self.departures) % 200 == 0:
             self._write_riders()
+
+    def _install_history_calls(self, riding, counts) -> None:
+        """Give this span the two calls it makes back to whoever is holding the history.
+
+        A span's riders can come from SEVERAL sockets -- that is the point of a departure -- so a
+        state read is not one message but one per rider, each carrying that rider's own rows. They
+        are sent together and collected together, so the wait is one round trip rather than one
+        per rider.
+
+        Set per THREAD on the runner. Several groups can be departing at once and an instance
+        attribute would hand one span's sockets to another's rows.
+        """
+        def ask_host(layer_id, request_ids, q_tilde):
+            pending = []
+            offset = 0
+            for (frame, sock), n in zip(riding, counts):
+                piece = q_tilde[offset : offset + n].reshape(n, -1)
+                offset += n
+                send_frame(sock, Frame(frame.request_id, layer_id, (piece,), OP_STATE_READ))
+                pending.append((sock, frame, n))
+            out = []
+            for sock, frame, n in pending:
+                reply = decode(sock)
+                if reply is None or reply.op != OP_STATE_READ:
+                    raise RuntimeError(
+                        f"layer {layer_id}: expected a state reading back and got "
+                        f"{OP_NAMES.get(getattr(reply, 'op', None), reply)}. The far end is not "
+                        f"holding the history this span asked it for."
+                    )
+                out.append(reply.tensor.to(self.device))
+            joined = torch.cat(out, dim=0) if len(out) > 1 else out[0]
+            return joined.reshape(q_tilde.shape[0], q_tilde.shape[1], -1).float()
+
+        def defer_update(layer_id, request_ids, k, v, alpha, beta):
+            offset = 0
+            for (frame, sock), n in zip(riding, counts):
+                sl = slice(offset, offset + n)
+                offset += n
+                send_frame(sock, Frame(
+                    frame.request_id, layer_id,
+                    (k[sl].reshape(n, -1), v[sl].reshape(n, -1),
+                     alpha[sl], beta[sl]), OP_STATE_UPDATE))
+
+        self.span._local.ask_host = ask_host
+        self.span._local.defer_update = defer_update
 
     def _handover(self, riding, counts, group: int, sent: threading.Event):
         """Send the shifted read point without waiting for the feed-forward behind it.
