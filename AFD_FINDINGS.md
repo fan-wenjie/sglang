@@ -35,6 +35,17 @@ own input token at -0.206. A state that never advances cannot produce that -- th
 advance yet. So the scan was a real bug and a different one, and the fault is in the per-token
 forward of the span itself.
 
+A third real fault was found and fixed after this and is also NOT the cause. The pool's
+`run_epilogue` applied `model.norm`, and sglang's own forward applies it again after the layer
+loop because the closing head hands back `residual=None`. The final RMSNorm ran twice, which for a
+learned weight is that weight squared elementwise -- and this checkpoint's runs from -0.285 to
+1.711, so squaring flips the sign of the negative channels. Fixed in d686d39e, verified red on the
+bug and green on the fix, deployed: the output is unchanged, still `is is is`.
+
+Three faults now, each real, each verified, none of them it. What they have in common is how they
+were found -- a stack trace, a shape, a reading of the model's own forward -- and what none of
+them had was a check that could have failed before deployment.
+
 Alternatives killed, each by measurement rather than by argument:
 
     the checkpoint          both ends: config md5 0ecc077f, identical shard manifest
@@ -46,6 +57,16 @@ Alternatives killed, each by measurement rather than by argument:
     the pool's weights      the pool serves " Paris." colocated from the same process
     the host colocated      cannot be run as a control: the host card is 31.36 GiB and the model
                             needs ~50, which is the premise of the arrangement and not a defect
+    the pool's whole chain  cleared IN PROCESS. `benchmark/afd/span_moves_its_input.py` runs
+                            prologue, middle span and epilogue over a tiny stack of the model's
+                            own decoder classes: ||x-e||/||e|| goes 0.514, 1.094, 1.048 and cos
+                            0.887, 0.687, 0.681. Every stage carries a contribution
+    the host's tensors      all present and correctly shaped, under SGLANG_AFD_TRACE on the live
+                            arrangement: q (122, 6144) = 24 heads x 256, k and v (122, 1024) =
+                            4 x 256, attention output (122, 6144), norms growing 309 -> 4837 down
+                            the stack. Nothing is empty and nothing is the wrong width
+    the attention split     not implicated at PREFILL, where the host runs the fused path and
+                            counts it (`self.fused += 1`). The fault is present at prefill
 
 Copying the input means the final hidden state is approximately the input embedding -- the stack's
 contribution is not reaching the residual stream. That is the next thing to localise, and the
