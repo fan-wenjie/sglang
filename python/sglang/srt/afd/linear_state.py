@@ -182,11 +182,22 @@ class LinearStateService:
              b: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor) -> torch.Tensor:
         """Read the state with this token's query and update it, returning the layer's output.
 
-        The read and the update are one kernel here because the recurrence fuses them: a gated
-        delta rule's update needs the OLD state contracted against this token's key, so the two
-        cannot be separated without writing a different kernel. That fusion is also why this call
-        cannot be issued in the Early-Q window the way a softmax sweep can -- it needs this step's
-        key and value, which do not exist until the layer runs.
+        The read and the update are one kernel here because THIS KERNEL fuses them. They are not
+        inseparable, and an earlier version of this docstring said they were -- it read a property
+        of the kernel as a property of the recurrence, and on that basis the Early-Q window was
+        held to exist only at the one layer in four that sweeps a cache.
+
+        The recurrence is affine in the old state, so the reading comes apart from the update
+        exactly (`benchmark/afd/gdn_split.py`, checked against this kernel elementwise: 2.2e-3
+        relative on the output at bfloat16, 9.7e-8 on the state):
+
+            h_q = S q                                    a read, with the query alone
+            h_k = S k                                    a read, with the key alone
+            o   = alpha h_q + beta (v - alpha h_k)(k.q)  the two readings, mixed with scalars
+
+        Which means a linear layer's host side is a HISTORY READ, the same shape a softmax layer's
+        already is. `linear_history.py` is that split; this class stays because a pool that holds
+        the state whole still wants one call.
         """
         from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
             fused_recurrent_gated_delta_rule_packed_decode,
