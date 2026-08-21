@@ -8,6 +8,49 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, second run: the arrangement copies its input, and it is not the state
+
+The first run served 24 tokens and repeated the last prompt token. Two real faults were found and
+fixed on the way to the second run, and NEITHER of them was the cause.
+
+    OP_STATE_SCAN        a prefill chunk is one request's tokens and each reads what its
+                         predecessor wrote. Batched through OP_STATE_READ the state never
+                         advanced. Fixed, with a case against N separate read/update pairs.
+    route_frame          the pool recognised replies by the literal `== OP_STATE_READ`, so the
+                         scan's reply BOARDED as a feed-forward request: 122x6144 readings into a
+                         layer expecting 5120. Fixed by routing on INBOUND_OPS, with the test
+                         harness now calling the production router instead of a copy of it.
+
+What the second run measures, with the pool serving the same prompt colocated as the control:
+
+    prompt                  colocated                 the arrangement
+    "The capital of         " Paris.\nThe capital     " is is is is is is ..."
+     France is"              of Germany is Berlin."
+    input logprobs          -8.86 -0.464 -3.738       -30.465 -19.063 -30.939
+     (positions 1-3)                                   -0.590 -> -0.000 at position 4
+    "The" (one token)       " following"              "The"
+
+The single-token prompt is the one that decides it. With ZERO history the arrangement returns its
+own input token at -0.206. A state that never advances cannot produce that -- there is no state to
+advance yet. So the scan was a real bug and a different one, and the fault is in the per-token
+forward of the span itself.
+
+Alternatives killed, each by measurement rather than by argument:
+
+    the checkpoint          both ends: config md5 0ecc077f, identical shard manifest
+    the query shift         --afd-query-shift-layers 0 degenerates identically
+    the pool's weights      the pool serves " Paris." colocated from the same process
+    the host colocated      cannot be run as a control: the host card is 31.36 GiB and the model
+                            needs ~50, which is the premise of the arrangement and not a defect
+
+Copying the input means the final hidden state is approximately the input embedding -- the stack's
+contribution is not reaching the residual stream. That is the next thing to localise, and the
+instrument for it is the one this cut still does not have: the skill's check 3, a span run against
+the model's own layers in one process, with a control that moves the boundary. Both bugs above
+were found by a stack trace and a shape, not by that check, which is why they were found one at a
+time and after deployment rather than together and before it.
+
+
 ## Read this before any number below about the GROUP CUT
 
 The group cut -- sections 18, 19 and 20, and everything about spans -- **has never produced an end
