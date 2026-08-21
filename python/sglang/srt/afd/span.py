@@ -312,6 +312,15 @@ def _trace_mix(layer_id, *, hidden, alpha, beta, q_tilde, s, reading, core, gate
         return f"|{float(row.norm()):.5g}|"
 
     a, b = alpha[0].float(), beta[0].float()
+    # the dtype of every stage, because "the two sides compute in the same precision" has been an
+    # assumption throughout. The state is float32 on both sides by construction; what has never
+    # been checked is where each side ROUNDS -- this one converts the mixed core to the hidden
+    # state's dtype before the z-gated norm, and whether the model does the same is not knowable
+    # from this file.
+    logger.info(
+        "afd mix dtypes: layer %s -- hidden %s reading %s core %s gated %s out %s",
+        layer_id, hidden.dtype, reading.dtype, core.dtype, gated.dtype, out.dtype,
+    )
     logger.info(
         "afd mix: layer %s -- hidden %s | alpha mean %.5f min %.5f max %.5f | beta mean %.5f | "
         "q~ %s | reading %s | s %s | core %s | gated %s | out %s",
@@ -710,6 +719,9 @@ class SpanRunner:
             hidden = self._linear_attention(layer.linear_attn, request_ids, layer_id, hidden)
             hidden, residual = _add_and_norm(layer.post_attention_layernorm, hidden, residual)
             _trace_step("pre-mlp", layer_id, residual)
+            # the feed-forward's INPUT, the one step between layer 0 (exact) and layer 1 (6.3%
+            # high) that has never been compared. Its output has: 0.6% at layer 0.
+            _trace_step(f"mlp-in-L{layer_id}", layer_id, hidden)
             hidden = layer.mlp(hidden)
             # the feed-forward's own output, never compared until now. Layer 0's x + attn is exact
             # and layer 1's is 6.3% high, and layer 1's INPUT is layer 0's residual plus THIS. An

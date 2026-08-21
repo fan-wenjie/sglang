@@ -8,6 +8,36 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, precision is not the mismatch, and the divergence is a direction not a scale
+
+Every buffer and every stage, logged on both sides rather than assumed:
+
+    the model    ssm float32, conv bfloat16, hidden bfloat16
+    the pool     state float32, conv bfloat16, hidden bfloat16, reading float32,
+                 core bfloat16, gated bfloat16, out bfloat16
+
+The same. The pool contracts in float32 and rounds to bfloat16 after the mix; the model holds its
+state in float32 and its hidden in bfloat16. The 11% to 25% bfloat16 state error measured in
+`state_precision.py` does not apply, because neither side keeps its state in bfloat16.
+
+The like-for-like stream comparison, 122 rows, row 0:
+
+    embedding                 0.85246  against  0.85246   identical
+    layer 0, x + attn        28.773    against 28.775     exact
+    entering layer 1         38.501    against 38.750     -0.6%
+    layer 0 feed-forward in  11.570    against 11.587     -0.15%
+    layer 1, x + attn        54.736    against 51.493     +6.3%
+    layer 1 feed-forward in  11.554    against 12.047     -4.1%
+    entering layer 2         55.413    against 52.189     +6.2%
+
+Layer 1 is handed a stream 0.6% low and returns one 6.3% high, so the excess is its own attention
+contribution and not something it inherited.
+
+The last line is the informative one. `post_attention_layernorm` removes the scale, so its output
+is nearly dimensionless -- and it still differs by 4.1%. What leaves layer 1 is not the right
+vector made too large; it points somewhere else.
+
+
 ## 2026-08-21, the scan equals the chunked kernel, so the prefill algorithm is cleared
 
     scan against the chunked kernel          relative 0.0042   cos 0.999991

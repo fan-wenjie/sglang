@@ -247,6 +247,52 @@ def watch_colocated_residual(model) -> None:
     if hasattr(model.model, "embed_tokens"):
         model.model.embed_tokens.register_forward_hook(watch_embedding)
 
+    entering_seen = {}
+
+    def watch_entering(index):
+        """The residual stream ENTERING a layer: residual + hidden_states, before prepare_attn.
+
+        Not the same as the input to its linear attention, which is that stream normalised --
+        RMSNorm removes the scale, so two streams differing in magnitude give the same normalised
+        input, and layer 1's normalised input matching to 0.03% says nothing about the stream that
+        produced it. This is the quantity the span's `post-mlp` trace of the previous layer can be
+        set beside.
+        """
+        def hook(_module, args, kwargs):
+            hidden = kwargs.get("hidden_states")
+            residual = kwargs.get("residual")
+            if hidden is None:
+                return
+            key = (index, hidden.shape[0])
+            if entering_seen.get(key, 0) >= 1:
+                return
+            entering_seen[key] = 1
+            stream = hidden if residual is None else hidden + residual
+            row = stream[0].float()
+            logger.info("afd colocated entering: layer %s rows %s -- |%.5g| rms %.5g",
+                        index, stream.shape[0], float(row.norm()),
+                        float(row.pow(2).mean().sqrt()))
+        return hook
+
+    def watch_mlp_in(index):
+        """The feed-forward's INPUT: post_attention_layernorm's output.
+
+        Between layer 0's x + attn, which is exact, and layer 1's x + attn, which is 6.3% high,
+        sits this and the feed-forward itself. The feed-forward's OUTPUT was compared and agrees
+        to 0.6%; its input never was, and a normalisation between two agreeing quantities can
+        still differ if it is fed or weighted differently.
+        """
+        def hook(_module, args):
+            key = ("in", index, args[0].shape[0])
+            if entering_seen.get(key, 0) >= 1:
+                return
+            entering_seen[key] = 1
+            row = args[0][0].float()
+            logger.info("afd colocated mlp-in: layer %s rows %s -- |%.5g| rms %.5g",
+                        index, args[0].shape[0], float(row.norm()),
+                        float(row.pow(2).mean().sqrt()))
+        return hook
+
     def watch_mlp(index):
         def hook(_module, _args, output):
             if seen["n"] >= limit * 8:
@@ -261,8 +307,10 @@ def watch_colocated_residual(model) -> None:
 
     for index, layer in enumerate(model.model.layers):
         layer.register_forward_hook(watch(index))
+        layer.register_forward_pre_hook(watch_entering(index), with_kwargs=True)
         if hasattr(layer, "mlp"):
             layer.mlp.register_forward_hook(watch_mlp(index))
+            layer.mlp.register_forward_pre_hook(watch_mlp_in(index))
         # o_proj's INPUT is the attention output after the output gate -- the one quantity the
         # span computes from a gate it saved on a previous call, and the one this side has no
         # reference for. The span's gated output is 15x smaller than the attention output it
@@ -335,17 +383,36 @@ def watch_linear_attention(model, runner) -> None:
                 index = int(backend.forward_metadata.mamba_cache_indices[0])
                 before[layer_id] = (cache.conv[0][index].clone(),
                                     cache.temporal[index].clone())
-                # the model's own input to this layer's linear attention, which is the one
-                # quantity the span's `hidden` can be set beside. `watch_linear_attention` feeds
-                # the MODEL's hidden into both implementations, so it cannot see a span whose
-                # hidden is already wrong -- and the span's is its own layer 0 output, not this.
-                row = hidden[0].float()
-                logger.info("afd colocated attn-in: layer %s -- rows %s |%.5g| rms %.5g",
-                            layer_id, hidden.shape[0], float(row.norm()),
-                            float(row.pow(2).mean().sqrt()))
+                if layer_id < 2:
+                    logger.info(
+                        "afd colocated dtypes: layer %s -- ssm %s conv %s hidden %s",
+                        layer_id, cache.temporal.dtype, cache.conv[0].dtype, hidden.dtype)
+
             except Exception as e:                       # noqa: BLE001 -- diagnostic, reported
                 before[layer_id] = None
                 logger.info("afd linear: layer %s state not readable: %r", layer_id, e)
+        return hook
+
+    attn_in_seen = {}
+
+    def watch_attn_in(layer_id):
+        """The model's own input to a linear attention, on ANY call, with its row count.
+
+        Separate from the snapshot hook, which is gated on a single row. That gate put this line
+        on decode steps while the span logs its own input on a multi-row first prefill, so the two
+        sets were 1-row against 122-row -- the fifth time in this search that two correct
+        measurements of different occasions were about to be compared, and the first caught before
+        it produced a claim. The row count is printed so a reader can only pair like with like.
+        """
+        def hook(_module, args):
+            key = (layer_id, args[0].shape[0])
+            if attn_in_seen.get(key, 0) >= 1:
+                return
+            attn_in_seen[key] = 1
+            row = args[0][0].float()
+            logger.info("afd colocated attn-in: layer %s rows %s -- |%.5g| rms %.5g",
+                        layer_id, args[0].shape[0], float(row.norm()),
+                        float(row.pow(2).mean().sqrt()))
         return hook
 
     def compare(layer_id, attn):
@@ -462,6 +529,7 @@ def watch_linear_attention(model, runner) -> None:
         if attn is None:
             continue
         attn.register_forward_pre_hook(snapshot(index))
+        attn.register_forward_pre_hook(watch_attn_in(index))
         attn.register_forward_hook(compare(index, attn))
         installed += 1
     logger.info("afd linear: comparing the span against %s linear layer(s) of the model's own "
