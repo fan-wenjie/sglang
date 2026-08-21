@@ -55,6 +55,37 @@ def prologue(e, rid):
     runner.run_prologue([rid], e, positions)
     return runner._residual[rid].clone()
 
+VH_, DK_ = config.num_attention_heads, config.head_dim
+
+def whole_chain(e, rid):
+    """Every stage the pool runs, in order, with the host's attention output stood in for.
+
+    The host's half is a random tensor of the right shape rather than real attention: what is
+    being asked here is whether the POOL's chain carries a contribution into the residual, and a
+    stage that dropped it would drop it whatever the attention returned.
+    """
+    state.zero_()
+    runner._residual.clear(); runner._gate.clear()
+    runner.run_prologue([rid], e, positions)
+    after_prologue = runner._residual[rid].clone()
+    attn_out = torch.randn(rows, VH_ * DK_, device="cuda", dtype=torch.bfloat16) * 0.05
+    runner.run(spans[1][0], [rid], attn_out, positions) if False else runner.run(
+        [rid], spans[1][0], attn_out, positions)
+    after_middle = runner._residual[rid].clone()
+    final = runner.run_epilogue([rid], spans[2][0], attn_out)
+    return after_prologue, after_middle, final
+
+spans = group_layers(kinds)
+e0 = torch.randn(rows, H, device="cuda", dtype=torch.bfloat16)
+a, b, f = whole_chain(e0, 33)
+ef = e0.float()
+print("--- the pool's whole chain, each stage against the embedding it started from ---")
+for name, t in (("after prologue", a), ("after middle span", b), ("final (epilogue)", f)):
+    tf = t.float()
+    moved = (tf - ef).norm() / ef.norm()
+    cos = torch.nn.functional.cosine_similarity(tf.flatten(), ef.flatten(), dim=0)
+    print(f"  {name:20s} ||x-e||/||e|| = {moved:9.6f}   cos = {cos:9.6f}")
+
 e1 = torch.randn(rows, H, device="cuda", dtype=torch.bfloat16)
 e2 = torch.randn(rows, H, device="cuda", dtype=torch.bfloat16)
 x1, x2 = prologue(e1, 11), prologue(e2, 22)

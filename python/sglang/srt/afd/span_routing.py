@@ -157,6 +157,43 @@ class SpanClient:
                 *self.collect_kv(handle, device))
 
 
+_TRACED = {}
+
+
+def _trace(layer_id: int, hidden_states, *, q, k, v, attn, out) -> None:
+    """One line a head, the first few calls, when SGLANG_AFD_TRACE is set. Off otherwise.
+
+    The arrangement's fault is that its output is approximately its input, and every check that
+    could see WHERE that happens is either on the pool -- which the in-process probe has now
+    cleared end to end -- or absent. This prints the magnitude of each tensor crossing the host's
+    half, which is enough to say whether the attention output is empty, whether the query and the
+    key and value arrived, and whether the span's reply resembles what was sent into it.
+
+    Norms rather than hashes: the question is "is this tensor there at all", and two tensors that
+    differ are not interesting here while a tensor that is zero is the whole answer. It is capped
+    per layer because a decode step calls this 16 times and a generation calls it 16 times again.
+    """
+    import os
+
+    if not os.environ.get("SGLANG_AFD_TRACE"):
+        return
+    seen = _TRACED.get(layer_id, 0)
+    if seen >= int(os.environ.get("SGLANG_AFD_TRACE", "2")):
+        return
+    _TRACED[layer_id] = seen + 1
+
+    def size(t):
+        if t is None:
+            return "-"
+        f = t.float()
+        return f"{tuple(t.shape)} |{f.norm():.4g}| max {f.abs().max():.4g}"
+
+    logger.info(
+        "afd trace layer %s call %s: in %s | q %s | k %s | v %s | attn %s | out %s",
+        layer_id, seen, size(hidden_states), size(q), size(k), size(v), size(attn), size(out),
+    )
+
+
 class SpanRouting:
     """Replaces whole groups of layers with a call to the pool.
 
@@ -256,7 +293,10 @@ class SpanRouting:
 
             if closes:
                 last = self.client.issue(layer_id, attn_output, rows, positions, OP_SPAN_EXIT)
-                return self.client.collect_output(last, device)[0], None
+                out = self.client.collect_output(last, device)[0]
+                _trace(layer_id, hidden_states, q=q, k=k, v=v, attn=attn_output, out=out)
+                return out, None
+            _trace(layer_id, hidden_states, q=q, k=k, v=v, attn=attn_output, out=None)
             self._outstanding = self.client.issue(
                 layer_id, attn_output, rows, positions, OP_SPAN)
             self._returned = attn_output
