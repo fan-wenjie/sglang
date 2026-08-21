@@ -290,35 +290,40 @@ def watch_linear_attention(model, runner) -> None:
 
             from sglang.srt.afd.split_read_kernel import read_one, update_only
 
-            local = runner._local
-            slot = runner.states.slot_of(scratch)
-            state = runner.states.state[layer_id]
-
-            def ask_host(lid, request_ids, q_tilde, step=None):
-                slots = torch.full((q_tilde.shape[0],), slot, device=q_tilde.device,
-                                   dtype=torch.long)
-                return read_one(runner.states.state[lid], slots, q_tilde).float()
-
-            def defer_update(lid, request_ids, k, v, alpha, beta):
-                slots = torch.full((k.shape[0],), slot, device=k.device, dtype=torch.long)
-                update_only(runner.states.state[lid], slots, k=k, v=v, alpha=alpha, beta=beta)
-
-            local.ask_host, local.defer_update = ask_host, defer_update
-
-            # the ring is (channels, taps) a slot, and the convolution's channel count IS the
-            # conv weight's first axis -- the packed query, key and value together
-            channels, taps = attn.conv1d.weight.shape[0], attn.conv1d.weight.shape[-1]
-
-            def span_of(x):
-                state[slot].zero_()
-                runner.states.conv_buffer(
-                    layer_id, width=channels, taps=taps, dtype=x.dtype)[slot].zero_()
-                return runner._linear_attention(attn, [scratch], layer_id, x).float()
-
+            # `buffer(layer)`, not `.state[layer]`. LinearStates keeps its tensors in `_states`
+            # behind an allocator, and reaching for a public name that does not exist raised
+            # INSIDE a forward hook -- which took the scheduler down with it rather than skipping
+            # the diagnostic. Everything below is inside the try for the same reason: a
+            # measurement must not be able to kill the thing it is measuring.
             try:
+                slot = runner.states.slot_of(scratch)
+                state = runner.states.buffer(layer_id)
+                channels = attn.conv1d.weight.shape[0]
+                taps = attn.conv1d.weight.shape[-1]
+
+                def ask_host(lid, request_ids, q_tilde, step=None):
+                    slots = torch.full((q_tilde.shape[0],), slot, device=q_tilde.device,
+                                       dtype=torch.long)
+                    return read_one(runner.states.buffer(lid), slots, q_tilde).float()
+
+                def defer_update(lid, request_ids, k, v, alpha, beta):
+                    slots = torch.full((k.shape[0],), slot, device=k.device, dtype=torch.long)
+                    update_only(runner.states.buffer(lid), slots,
+                                k=k, v=v, alpha=alpha, beta=beta)
+
+                local = runner._local
+                local.ask_host, local.defer_update = ask_host, defer_update
+
+                def span_of(x):
+                    state[slot].zero_()
+                    runner.states.conv_buffer(
+                        layer_id, width=channels, taps=taps, dtype=x.dtype)[slot].zero_()
+                    return runner._linear_attention(attn, [scratch], layer_id, x).float()
+
                 mine = span_of(hidden)
                 theirs = output.float()
-                shuffled = span_of(hidden[:, torch.randperm(hidden.shape[1], device=hidden.device)])
+                order = torch.randperm(hidden.shape[1], device=hidden.device)
+                shuffled = span_of(hidden[:, order])
             except Exception as e:                       # noqa: BLE001 -- diagnostic, reported
                 logger.info("afd linear: layer %s could not be compared: %r", layer_id, e)
                 return
