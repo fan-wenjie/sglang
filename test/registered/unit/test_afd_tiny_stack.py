@@ -20,7 +20,7 @@ from afd_tiny_stack import TINY, build_tiny_stack
 
 class TestTheFixtureIsTheModelsOwnClasses(CustomTestCase):
     def setUp(self):
-        self.stack, self.config, self.kinds = build_tiny_stack()
+        self.stack, self.config, self.kinds = build_tiny_stack(device="cuda")
 
     def test_the_layers_are_the_models_own_decoder_classes(self):
         """Not a fake shaped like them. The class names are asserted because a fake that subclassed
@@ -38,7 +38,9 @@ class TestTheFixtureIsTheModelsOwnClasses(CustomTestCase):
         """What makes a group a span. If the softmax layer were first, the span would run from an
         attention output to the SAME attention's next input and the cut would not be the one that
         was measured at 2046 us."""
-        self.assertEqual(self.kinds, ["linear"] * 3 + ["full"] + ["linear"] * 3 + ["full"])
+        self.assertEqual(self.kinds,
+                         ["linear_attention"] * 3 + ["full_attention"]
+                         + ["linear_attention"] * 3 + ["full_attention"])
         self.assertEqual(self.config.full_attention_interval, 4)
 
     def test_the_projections_live_where_the_span_reaches_for_them(self):
@@ -78,6 +80,28 @@ class TestTheFixtureIsTheModelsOwnClasses(CustomTestCase):
         self.assertEqual(weight.dim(), 3, f"conv weight is {tuple(weight.shape)}")
         self.assertEqual(weight.shape[1], 1, "the middle axis is the one squeezed out")
         self.assertEqual(weight.shape[-1], TINY["linear_conv_kernel_dim"], "taps are last")
+
+    def test_no_parameter_is_still_zero(self):
+        """The constructor leaves them zero, and zero is not noise.
+
+        sglang allocates with `torch.empty` and expects a loader; on a fresh CUDA allocation that
+        is all-zero. 63 of this stack's 84 parameters came back zero, every projection among them,
+        and a span run against that returns its input UNCHANGED -- which is the exact signature of
+        the deployment bug this fixture exists to hunt. That reading was taken and nearly reported
+        as a reproduction. With values drawn, the same span moves its input by 51%.
+
+        So this is not a tautology about `copy_`. It is the guard on the difference between a
+        fixture that can fail and one that agrees with anything.
+        """
+        zero = [n for n, p in self.stack.named_parameters() if float(p.float().abs().max()) == 0.0]
+        self.assertEqual(zero, [], f"{len(zero)} parameter(s) never filled")
+
+    def test_the_norms_are_not_scaled_away(self):
+        """A norm weight near 0.02 like the projections would make every residual dwarf every
+        contribution -- the identity again, by a different route and just as quiet."""
+        for name, parameter in self.stack.named_parameters():
+            if "norm" in name and name.endswith("weight"):
+                self.assertGreater(float(parameter.float().abs().mean()), 0.5, name)
 
     def test_the_rope_is_mrope_with_three_axes(self):
         """positions is (3, tokens) on this model -- the rows are AXES, not tokens. Flattening it
