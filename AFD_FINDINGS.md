@@ -649,3 +649,86 @@ break-even, and the token budgets are arithmetic, and section 10 exists to recor
 last time arithmetic and a stopwatch disagreed here. The sweep window is also still shut --
 `SpanRouting.report()["sweep_window_open"]` is False -- so a timing taken today would be of a
 schedule with the overlap removed.
+
+## 19. Both ends run at once, so the comparison is a max -- and section 18's are not
+
+Section 18 reports step times built by ADDING the pool's work to the host's. The two machines run
+at the same time; the arrangement's step time is the larger of them, not their sum. Every figure in
+section 18 derived from a sum is superseded here, and so is every multiple anywhere above that was
+taken against the per-layer cut's 126.9 ms.
+
+    context      pool     host      max     host busy
+      1,024   37.3 ms   0.3 ms  37.3 ms           1%
+     28,449   37.3 ms   8.3 ms  37.3 ms          22%
+    131,072   37.3 ms  38.4 ms  38.4 ms         100%
+
+    colocated, bfloat16, measured               ~38 ms
+
+**The ceiling of this arrangement is parity with colocated, and it reaches it.** 30.0 of the pool's
+37.3 ms is reading the model's 50 GiB of weights once. A colocated server reads the same 50 GiB. No
+arrangement of two machines makes that read smaller, so no arrangement of two machines beats one
+machine at weight-bound decode.
+
+Everything reported earlier as "N times faster" was against the per-layer cut's 126.9 ms. That is a
+comparison against a bad implementation, not against a baseline. Fixing the per-layer cut does not
+beat colocated; it returns to colocated.
+
+The two ends balance near 131k context: below it the pool is the bottleneck and the host idles,
+above it the sweep is and more pool does not help.
+
+### What the idle host is for
+
+The host is 1% to 22% busy across the range that matters, which is capacity rather than waste. The
+same host, time-sharing more requests:
+
+    context   requests that fit   pool ms   host ms   bottleneck   tok/s
+      8,192            54           62.9      32.4      pool         858
+     28,449            15           39.9      31.2      pool         376
+     65,536             6           37.4      27.6      pool         160
+
+At 8k that is **7.9x the throughput of batch 4**, and the host is still not the bottleneck at any
+point in the table. What stops it is not time but KV memory.
+
+### Where the projections go: a trade worth 3% either way
+
+Moving the query and key/value projections to the pool costs 1.87 ms a step on the side that IS the
+bottleneck and gives the host back 3.12 GiB. Whether that pays depends on whether the freed memory
+buys another whole request:
+
+    context   projections on the pool   projections on the host
+      8,192          858 tok/s                 833 tok/s
+     28,449          376                       371
+     65,536          160                       169
+
+Pool-side at the lengths that fit meaningful concurrency, host-side at 65k where 3.12 GiB does not
+buy a seventh request. **The whole question is worth 3%**, which is inside this model's error, and
+it is settled on the pool for a reason that is not throughput: it leaves the host holding no weight
+matrix at all.
+
+### What that is actually worth: the host stops needing to be a big card
+
+    host weights   8 GiB   12 GiB   16 GiB   24 GiB   32 GiB
+    per-layer cut, 15.81   ----     ----     ----     ----     98,959 tokens
+    group cut,      2.37   ----     ----     57,016   188,088  319,160
+
+Under the per-layer cut nothing below a 32 GiB card could be a host at all -- the weights alone did
+not fit. Under the group cut a 16 GiB card is a host.
+
+Whether an 8 or 12 GiB card is one depends on a number this has not measured. The table above
+subtracts 10.2 GiB of non-weight, non-KV footprint, inferred from a single anchor: the per-layer
+cut on a 32 GiB card held 14.9 GiB of weights and 6.95 GiB of cache. But that anchor was taken with
+the host running the WHOLE model, feed-forward activations at intermediate_size 17408 included, and
+under the group cut the host runs attention and nothing else. The footprint should be far smaller
+and it is not known how much smaller. **Measure it before quoting a card.**
+
+The consequence worth more than the card price: a host that holds no weights makes KV capacity
+horizontally scalable. The pool is the bottleneck, it is sublinear in batch, and its departures
+already take riders from any socket -- so several cheap hosts against one pool needs no protocol
+change, and the 50 GiB read is still done once.
+
+### Every number in this section is arithmetic
+
+The only measurements here are the span (2046 us at batch 4) and the anchors it is combined with.
+The host's sweep is extrapolated linearly in batch from one point, which batched attention kernels
+almost certainly beat -- so the host is likely to have MORE headroom than shown, not less. Section
+10 records what happened the last time a cost model and a stopwatch disagreed in this tree.
