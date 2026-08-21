@@ -279,6 +279,37 @@ def _trace_step(tag, layer_id, value) -> None:
                 float(row.pow(2).mean().sqrt()), float(row.abs().max()))
 
 
+def _trace_mix(layer_id, *, hidden, alpha, beta, q_tilde, s, reading, core, gated, out) -> None:
+    """One linear layer's stages, row 0, when SGLANG_AFD_SELFCHECK is set.
+
+    Layer 0's output agrees with the model to five figures and layer 1's is 5% out, and on a first
+    prefill the recurrent state and the convolution ring are zero for both -- so nothing this side
+    CARRIES differs between them and the only difference is the input. These are the stages
+    between that input and the output, so whichever one first stops looking like its neighbour on
+    the other layer is where to look.
+    """
+    import os
+
+    if not os.environ.get("SGLANG_AFD_SELFCHECK"):
+        return
+    key = f"mix-L{layer_id}"
+    if _STEP_SEEN.get(key, 0) >= 1:
+        return
+    _STEP_SEEN[key] = 1
+
+    def one(t):
+        row = t[0].float().reshape(-1)
+        return f"|{float(row.norm()):.5g}|"
+
+    a, b = alpha[0].float(), beta[0].float()
+    logger.info(
+        "afd mix: layer %s -- hidden %s | alpha mean %.5f min %.5f max %.5f | beta mean %.5f | "
+        "q~ %s | reading %s | s %s | core %s | gated %s | out %s",
+        layer_id, one(hidden), float(a.mean()), float(a.min()), float(a.max()), float(b.mean()),
+        one(q_tilde), one(reading), one(s.unsqueeze(-1)), one(core), one(gated), one(out),
+    )
+
+
 _STEP_SEEN = {}
 
 
@@ -771,9 +802,16 @@ class SpanRunner:
             defer(layer_id, request_ids, k, v, alpha, beta)
 
         core = core.reshape(rows, -1).to(hidden.dtype)
-        core = attn.norm(core.reshape(-1, attn.head_v_dim),
-                         z.reshape(-1, attn.head_v_dim))
-        out, _ = attn.out_proj(core.reshape(rows, -1))
+        gated_core = attn.norm(core.reshape(-1, attn.head_v_dim),
+                               z.reshape(-1, attn.head_v_dim))
+        out, _ = attn.out_proj(gated_core.reshape(rows, -1))
+        # the stages of one layer, row 0 of a first prefill, so layer 0 and layer 1 can be read
+        # side by side. Layer 0 agrees with the model exactly and layer 1 is 5% out, and on a
+        # first prefill the state and the ring are zero for BOTH -- so nothing this side carries
+        # differs between them and only the input does.
+        if len(request_ids) > 1 and int(request_ids[0]) not in self._residual:
+            _trace_mix(layer_id, hidden=hidden, alpha=alpha, beta=beta, q_tilde=q_tilde, s=s,
+                       reading=reading, core=core, gated=gated_core, out=out)
         return out
 
     def _convolve(self, attn, qkv: torch.Tensor, request_ids, layer_id: int) -> torch.Tensor:
