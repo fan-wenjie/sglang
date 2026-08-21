@@ -38,9 +38,12 @@ TYPES = ["linear_attention"] * 3 + ["full_attention"] + \
 class Recorder:
     """A pool client that records what was asked and answers with shaped noise."""
 
-    def __init__(self):
+    def __init__(self, short_kv=False):
         self.issued = []
         self.collected = []
+        # a pool one protocol version behind, answering a span with one tensor where the key and
+        # value belong
+        self.short_kv = short_kv
 
     def issue_frame(self, request_id, layer, tensors, op):
         self.issued.append({"request_id": request_id, "layer": layer, "op": op,
@@ -50,12 +53,21 @@ class Recorder:
                                    request_id=request_id, layer=layer, **k))
 
     def collect_frame(self, handle, device):
+        """Answer by opcode, as the pool does: one tensor for the query, two for the key/value.
+
+        A stub that answered the same shape to both would let a caller that mixed the two halves
+        up pass, and mixing them up is the failure the opcodes exist to prevent.
+        """
         self.collected.append((handle.layer, handle.op))
-        return (torch.zeros(1, 4),)
+        if handle.op == OP_SPAN_Q:
+            return (torch.zeros(1, 4),)
+        if self.short_kv:
+            return (torch.zeros(1, 4),)
+        return (torch.zeros(1, 4), torch.zeros(1, 4))
 
 
-def a_client():
-    return SpanClient(Recorder(), reply_timeout_s=5.0)
+def a_client(short_kv=False):
+    return SpanClient(Recorder(short_kv), reply_timeout_s=5.0)
 
 
 class Layer(torch.nn.Module):
@@ -139,17 +151,25 @@ class TestTheTwoHalvesAreTakenUnderDifferentKeys(CustomTestCase):
 
     def test_the_read_point_is_collected_under_its_own_opcode(self):
         client = a_client()
-        handle = client.issue(3, torch.zeros(1, 4), torch.tensor([0]))
+        handle = client.issue(3, torch.zeros(1, 4), torch.tensor([0]), torch.tensor([5]))
         client.collect_read_point(handle, "cpu")
-        client.collect_output(handle, "cpu")
+        client.collect_kv(handle, "cpu")
         self.assertEqual(client.client.collected, [(3, OP_SPAN_Q), (3, OP_SPAN)])
 
     def test_the_order_is_read_point_first(self):
         """It is the half that arrives early; collecting it second discards the head start."""
         client = a_client()
-        handle = client.issue(3, torch.zeros(1, 4), torch.tensor([0]))
+        handle = client.issue(3, torch.zeros(1, 4), torch.tensor([0]), torch.tensor([5]))
         client.collect(handle, "cpu")
         self.assertEqual(client.client.collected[0][1], OP_SPAN_Q)
+
+    def test_a_reply_that_is_not_a_key_and_a_value_is_refused(self):
+        """Unpacking anyway would append something that is not a key to the cache."""
+        client = a_client(short_kv=True)
+        handle = client.issue(3, torch.zeros(1, 4), torch.tensor([0]), torch.tensor([5]))
+        with self.assertRaises(RuntimeError) as caught:
+            client.collect_kv(handle, "cpu")
+        self.assertIn("key and value", str(caught.exception))
 
 
 class TestTheRowIdsTravel(CustomTestCase):
@@ -158,12 +178,21 @@ class TestTheRowIdsTravel(CustomTestCase):
     def test_a_row_count_mismatch_is_refused(self):
         client = a_client()
         with self.assertRaises(ValueError) as caught:
-            client.issue(3, torch.zeros(4, 8), torch.tensor([0, 1]))
+            client.issue(3, torch.zeros(4, 8), torch.tensor([0, 1]), torch.tensor([5]))
         self.assertIn("row id", str(caught.exception))
+
+    def test_the_positions_ride_with_the_ids(self):
+        """The pool rotates the key and the query by them; a span without them attends nowhere."""
+        client = a_client()
+        client.issue(3, torch.zeros(2, 8), torch.tensor([5, 9]), torch.tensor([40, 41]))
+        pos = client.client.issued[0]["tensors"][2]
+        self.assertEqual(tuple(pos.shape), (2, 1))
+        self.assertEqual(pos.dtype, torch.int64)
+        self.assertEqual(pos.reshape(-1).tolist(), [40, 41])
 
     def test_the_ids_ride_as_a_column_of_int64(self):
         client = a_client()
-        client.issue(3, torch.zeros(2, 8), torch.tensor([5, 9]))
+        client.issue(3, torch.zeros(2, 8), torch.tensor([5, 9]), torch.tensor([1, 2]))
         ids = client.client.issued[0]["tensors"][1]
         self.assertEqual(tuple(ids.shape), (2, 1))
         self.assertEqual(ids.dtype, torch.int64)
@@ -173,7 +202,7 @@ class TestTheRowIdsTravel(CustomTestCase):
         """Frames are keyed by (request, layer, op); a reused id crosses two answers."""
         client = a_client()
         for _ in range(3):
-            client.issue(3, torch.zeros(1, 4), torch.tensor([0]))
+            client.issue(3, torch.zeros(1, 4), torch.tensor([0]), torch.tensor([5]))
         ids = [c["request_id"] for c in client.client.issued]
         self.assertEqual(len(set(ids)), 3)
 
@@ -186,7 +215,7 @@ class TestTheOpcodesNameTheThreeShapes(CustomTestCase):
 
     def test_the_opcode_travels_with_the_frame(self):
         client = a_client()
-        client.issue(0, torch.zeros(1, 4), torch.tensor([0]), OP_SPAN_ENTER)
+        client.issue(0, torch.zeros(1, 4), torch.tensor([0]), torch.tensor([0]), OP_SPAN_ENTER)
         self.assertEqual(client.client.issued[0]["op"], OP_SPAN_ENTER)
 
 

@@ -85,7 +85,8 @@ class SpanClient:
         self._ids = itertools.count(base + 1)
         self.calls = 0
 
-    def issue(self, group: int, o: torch.Tensor, row_ids: torch.Tensor, op: int = OP_SPAN):
+    def issue(self, group: int, o: torch.Tensor, row_ids: torch.Tensor, positions,
+              op: int = OP_SPAN):
         """Put a span on the wire and return without waiting for either half of its answer.
 
         `row_ids` travels because the pool holds a recurrent state per REQUEST and a decode batch
@@ -98,7 +99,10 @@ class SpanClient:
                 f"recurrent state it advances."
             )
         handle = self.client.issue_frame(
-            next(self._ids), group, (o, row_ids.reshape(-1, 1).to(torch.int64)), op
+            next(self._ids), group,
+            (o, row_ids.reshape(-1, 1).to(torch.int64),
+             positions.reshape(-1, 1).to(torch.int64)),
+            op,
         )
         self.calls += 1
         return handle
@@ -116,15 +120,31 @@ class SpanClient:
         early = handle._replace(op=OP_SPAN_Q)
         return self.client.collect_frame(early, device)[0]
 
-    def collect_output(self, handle, device) -> torch.Tensor:
-        return self.client.collect_frame(handle, device)[0]
+    def collect_output(self, handle, device):
+        return self.client.collect_frame(handle, device)
 
-    def collect(self, handle, device) -> tuple[torch.Tensor, torch.Tensor]:
+    def collect_kv(self, handle, device):
+        """The second half: this step's key and value, for the cache.
+
+        They arrive after the query because they read `x_l`, which is not complete until the
+        span's last feed-forward runs. That is not a delay this side pays for -- the sweep is
+        already running against the query by the time they land.
+        """
+        got = self.client.collect_frame(handle, device)
+        if len(got) != 2:
+            raise RuntimeError(
+                f"a span reply carried {len(got)} tensor(s) where the key and value were "
+                f"expected. The two sides are running different versions of the protocol, and "
+                f"unpacking anyway would append something that is not a key to the cache."
+            )
+        return got
+
+    def collect(self, handle, device):
         """Both halves, in order. Present for callers with nothing to put between them -- which is
-        not the arrangement: the point of splitting the reply is to project the query and sweep the
-        cache between these two lines."""
+        not the arrangement: the point of splitting the reply is to sweep the cache between these
+        two lines."""
         return (self.collect_read_point(handle, device),
-                self.collect_output(handle, device))
+                *self.collect_kv(handle, device))
 
 
 class SpanRouting:
@@ -148,6 +168,11 @@ class SpanRouting:
         self._outstanding = None
         # what the previous head returned, so the next one can check nothing ran in between
         self._returned = None
+        # the cache partition, built once a forward pass and shared by every sweep in it
+        from sglang.srt.afd.split_attention import PerPassIndex
+
+        self._index = PerPassIndex()
+        self.sweeps = 0
         self._install()
 
     def _install(self) -> None:
@@ -185,39 +210,76 @@ class SpanRouting:
         output and a throughput number about a different arrangement.
         """
         original = layer.forward
-        self._make_o_proj_transparent(layer)
 
         def head(positions, hidden_states, residual=None, forward_batch=None, **kwargs):
+            attn = layer.self_attention.attn
+            device = hidden_states.device
+            rows = self._row_ids(forward_batch)
             if opens:
                 handle = self.client.issue(
-                    layer_id, hidden_states, self._row_ids(forward_batch), OP_SPAN_ENTER)
+                    layer_id, hidden_states, rows, positions, OP_SPAN_ENTER)
             else:
                 self._check_untouched(layer_id, hidden_states)
                 handle = self._outstanding
-            read_point = self.client.collect_read_point(handle, hidden_states.device)
-            # h_(l+3) is the query's source under shift 1, normalised by this layer's own LN1 so
-            # the early stream gets exactly the normalisation the layer would have applied
-            layer._afd_q_hidden = layer.input_layernorm(read_point)
-            output = self.client.collect_output(handle, hidden_states.device)
-            # sglang's fused convention, and the pool sent the two halves it needs: the incoming
-            # residual is h_(l+3) and the incoming hidden is the span's last feed-forward, so this
-            # both adds them into x_l and normalises it
-            normed, _ = layer.input_layernorm(output, read_point)
-            try:
-                o = layer.self_attention(
-                    positions=positions, hidden_states=normed, forward_batch=forward_batch)
-            finally:
-                layer._afd_q_hidden = None
-            row_ids = self._row_ids(forward_batch)
+
+            # the query arrives ALREADY PROJECTED, one feed-forward before the key and value.
+            # Everything between this line and the next runs while the pool is still working.
+            q = self.client.collect_read_point(handle, device)
+            state = self._sweep(attn, forward_batch, q)
+
+            k, v = self.client.collect_kv(handle, device)
+            attn_output = self._join(attn, forward_batch, k, v, state, q)
+
             if closes:
-                last = self.client.issue(layer_id, o, row_ids, OP_SPAN_EXIT)
-                return self.client.collect_output(last, o.device), None
-            self._outstanding = self.client.issue(layer_id, o, row_ids, OP_SPAN)
-            self._returned = o
-            return o, None
+                last = self.client.issue(layer_id, attn_output, rows, positions, OP_SPAN_EXIT)
+                return self.client.collect_output(last, device)[0], None
+            self._outstanding = self.client.issue(
+                layer_id, attn_output, rows, positions, OP_SPAN)
+            self._returned = attn_output
+            return attn_output, None
 
         layer.forward = head
         self._undo.append(lambda ly=layer, o=original: setattr(ly, "forward", o))
+
+    def _sweep(self, attn, forward_batch, q):
+        """Attend the cache with the query alone. THIS is the window.
+
+        It runs between the two halves of the pool's reply, so the pool's last feed-forward --
+        298 us -- is spent while this reads the cache. The sweep is the variable-latency stage,
+        up to 2397 us at 128k, and starting it a feed-forward early is the only lever this side
+        has on it.
+
+        A backend that cannot be partitioned is refused rather than quietly fused: a fused call
+        here would be correct and would close the window, and the only symptom would be a
+        throughput number that reads as this arrangement's.
+        """
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        from sglang.srt.afd.split_attention import split_refusal, sweep
+
+        backend = get_attn_backend()
+        refusal = split_refusal(backend, attn, forward_batch)
+        if refusal is not None:
+            raise RuntimeError(
+                f"the attention backend cannot be split, so the sweep cannot be started before "
+                f"the key and value arrive: {refusal}. Running it fused would be a correct model "
+                f"with the window shut, and nothing downstream could tell."
+            )
+        self.sweeps += 1
+        return sweep(backend, attn, forward_batch, q=q, index=self._index)
+
+    def _join(self, attn, forward_batch, k, v, state, q):
+        """Fold this step's token into the swept cache, and write the cache."""
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        from sglang.srt.afd.split_attention import join
+
+        if state is None:
+            # no prefix to sweep: the first token of a request has nothing behind it. The fused
+            # path is the right one here and the window had nothing to hide anyway.
+            return attn(q, k, v, forward_batch)
+        return join(get_attn_backend(), attn, forward_batch, k=k, v=v, state=state,
+                    index=self._index)
 
     def _make_o_proj_transparent(self, layer) -> None:
         """The output projection is the pool's first act, so it must not happen here too.
@@ -281,14 +343,12 @@ class SpanRouting:
     def report(self) -> dict:
         return {"spans": len(self.spans), "layers_on_the_pool": len(self.passengers),
                 "attentions_here": len(self.heads), "calls": self.client.calls,
-                # NOT open. The pool sends the read point early and this host collects it and then
-                # immediately collects the output, with nothing in between -- so the head start
-                # exists on the wire and is not yet spent on anything. Opening it means projecting
-                # the query and launching the cache sweep between those two lines, which is what
-                # `sweep_ahead` and `split_attention` already do for the per-layer cut. Reported
-                # rather than left implicit: a run that quoted this arrangement's throughput while
-                # the window was shut would be quoting a number about a different schedule.
-                "sweep_window_open": False}
+                # the cache sweep runs between the two halves of the pool's reply, so the pool's
+                # last feed-forward is spent while this side reads its cache. Counted, not
+                # asserted: a window that stopped opening -- a backend that started refusing the
+                # split, a request with no prefix -- looks exactly like one that never shut, and
+                # the difference is the whole schedule.
+                "sweep_window_open": True, "sweeps": self.sweeps}
 
 
 def bus_size_note(riders: int) -> str:
