@@ -8,6 +8,49 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, the fourth fault: a chunk's rows shared one residual
+
+Found by matching two log lines that had never been printed side by side. Same request, same
+boundary, one value:
+
+    76.76   written leaving the prologue
+    18.833  read entering the next group
+
+The pool's residual and gate tables were keyed by REQUEST. A decode batch is one row a request, so
+that was right there and only there. A 122-token prefill is 122 rows of ONE request; each row
+overwrote the last, the FINAL token's residual survived, and the next span handed it back to all
+122 positions. Every position in the prompt ran the rest of the stack on the last token's state.
+
+Fixed in 27806f37 with five cases, red on the per-request table. Deployed, and the output CHANGED
+without becoming right:
+
+    "The capital of France is"   before  " is is is is is is"
+                                 after   " France is France is France is"
+    colocated                            " Paris.\nThe capital of France is Paris."
+
+It now echoes a longer stretch of the prompt instead of only its last token, which is what a
+partly-restored causal structure looks like. The single-token prompt is unchanged at "TheTheThe",
+and with one row this fault could not have applied to it -- so at least one more fault is present
+in the simplest case there is: one token, no history, tables trivially consistent, scan equal to
+read, convolution over a single position, attention attending to itself.
+
+Two suspects were cleared by measurement on the way here, and clearing them is what left this one
+visible:
+
+    the output gate         attenuates the attention output 15x, which looked damning until the
+                            model's own o_proj input was hooked in the same process: 3.40 at layer
+                            3 against the span's 2.14, 2.68 against 1.82, 2.47 against 2.25. A
+                            trained gate on this model is simply that closed
+    anti-correlation        the residual falling by two thirds was read as something being added
+                            against the stream. The cosines are mostly POSITIVE (+0.92, +0.67,
+                            +0.46). The inference was refused by the measurement it prompted
+
+Four faults now, each real, each verified red and green, none of them the whole answer. Every one
+was found by an instrument built after the previous one was fixed, and none by a check that
+existed before deployment. The next thing to build is still the same thing: the span against the
+model's own layers, on one row, where nothing else can be blamed.
+
+
 ## 2026-08-21, the residual against its own reference: the collapse is at the first middle span
 
 The pool holds the whole model and also runs the spans, so both sequences come from one process,
