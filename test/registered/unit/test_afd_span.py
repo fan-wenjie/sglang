@@ -30,7 +30,13 @@ class FusedNorm(torch.nn.Module):
 
     def __init__(self, scale: float):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.full((H,), scale))
+        # PER CHANNEL, not a constant. RMSNorm with a constant weight is idempotent --
+        # norm(norm(x)) == norm(x) -- so a fake built with `torch.full` cannot tell one
+        # application from two, and the final norm being applied twice went unnoticed by every
+        # case in this file. The deployed checkpoint's own final norm runs from -0.285 to 1.711,
+        # so it is the varying weight that is faithful and the constant that was the fake.
+        self.weight = torch.nn.Parameter(
+            scale * torch.linspace(0.4, 1.6, H))
 
     def forward(self, hidden, residual=None):
         if residual is None:
@@ -392,3 +398,70 @@ class TestTheTwoRecurrentStatesShareOneSlotTable(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheEpilogueHandsBackAResidualStream(CustomTestCase):
+    """The last thing the pool returns is normalised by the MODEL, not by the pool.
+
+    sglang's `Qwen3_5Model.forward` applies `self.norm` after its layer loop, and the closing head
+    hands it `residual=None`, so it takes the `self.norm(hidden_states)` branch on whatever comes
+    back over the wire. The pool normalised as well, so the final RMSNorm ran TWICE -- with a
+    learned weight w that is w squared elementwise, and the deployed checkpoint's
+    `model.language_model.norm.weight` runs from -0.285 to 1.711, so squaring flips the sign of
+    every negative channel and rescales the rest between 0.08x and 2.93x.
+
+    No case here caught it, and the reason is in `FusedNorm` above: it was built with a CONSTANT
+    weight, and RMSNorm with a constant weight is idempotent. The fake could not tell one
+    application from two. It now has a per-channel weight, which is what makes this case possible
+    at all.
+    """
+
+    def test_what_it_returns_is_not_already_normalised(self):
+        """A normalised vector's row RMS is pinned by the norm's weight and says nothing about its
+        input -- `rms(w * x/rms(x))` is `rms(w)` for every x. So two epilogues run on inputs of
+        very different magnitude have nearly equal row RMS if the pool normalised, and different
+        row RMS if what comes back is the residual stream.
+
+        The first version of this case asserted that the model's final norm CHANGES what came
+        back. That passes either way: this norm is not idempotent, so norming an
+        already-normalised vector changes it too. The assertion held on the bug and on the fix and
+        guarded nothing, which is why the discriminator here is a property of the norm's IMAGE
+        rather than of applying it once more.
+        """
+        stack, runner = a_runner()
+        small = self.an_epilogue(runner, stack, rid=7, scale=1.0)
+        large = self.an_epilogue(runner, stack, rid=9, scale=40.0)
+
+        def rms(t):
+            return float(t.pow(2).mean(-1).sqrt().mean())
+
+        ratio = rms(large) / rms(small)
+        self.assertGreater(
+            ratio, 3.0,
+            f"a 40x larger input moved the epilogue's output by {ratio:.2f}x. A residual stream "
+            f"tracks its input; a normalised vector does not, because the pool normalised what "
+            f"the model is about to normalise again",
+        )
+
+    def an_epilogue(self, runner, stack, *, rid, scale):
+        rows = 1
+        embedded = torch.randn(rows, H) * scale
+        positions = torch.zeros(3, rows, dtype=torch.long)
+        runner.run_prologue([rid], embedded, positions)
+        attn = torch.randn(rows, stack.model.layers[3].o_proj.w.shape[0]) * scale
+        return runner.run_epilogue([rid], 7, attn)
+
+    def test_the_norms_image_is_flat_so_the_case_above_can_fail(self):
+        """The control. If the norm's output RMS tracked its input, the ratio above would exceed 3
+        whether the pool normalised or not and the case would be guarding nothing -- which is
+        exactly what happened to its first version."""
+        stack, runner = a_runner()
+        small = stack.model.norm(torch.randn(4, H) * 1.0)
+        large = stack.model.norm(torch.randn(4, H) * 40.0)
+
+        def rms(t):
+            return float(t.pow(2).mean(-1).sqrt().mean())
+
+        self.assertLess(abs(rms(large) / rms(small) - 1.0), 0.2,
+                        "this norm does not flatten its input's scale, so the discriminator the "
+                        "case above relies on does not hold")

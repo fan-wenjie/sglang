@@ -483,9 +483,15 @@ class SpanRunner:
         hidden, residual = _add_and_norm(
             layers[head].post_attention_layernorm, attn_out, residual)
         hidden = layers[head].mlp(hidden)
-        hidden, _ = _add_and_norm(self.model.model.norm, hidden, residual)
+        # NOT normalised here. sglang's own forward applies `self.norm` after its layer loop, and
+        # the closing head hands it residual=None, so it takes the `self.norm(hidden_states)`
+        # branch on whatever this returns. Normalising here as well applied the final RMSNorm
+        # TWICE: with a learned weight w that is w squared elementwise, and this checkpoint's
+        # `model.language_model.norm.weight` runs from -0.285 to 1.711, so squaring flips the sign
+        # of every negative channel and rescales the rest between 0.08x and 2.93x. What this
+        # returns is the residual stream itself, which is what the model's own last layer returns.
         self.served += 1
-        return hidden
+        return residual + hidden
 
     def _linear_run(self, request_ids, layer_ids, hidden, residual):
         """Whole linear-attention layers, back to back, with nothing between them to interrupt."""
