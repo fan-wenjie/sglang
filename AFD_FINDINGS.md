@@ -8,6 +8,35 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, the state starts clean, so layer 1's 6.3% is the arithmetic and not the start
+
+The layer-0-exact-layer-1-off pattern has two shapes of explanation: the recurrence computes the
+wrong thing, or it computes the right thing from the wrong starting point. A slot handed to a new
+request without clearing would give exactly the second, and would leave layer 0 alone if that
+layer's buffer happened to be untouched.
+
+One number decides it. The first token of a request's FIRST chunk contracts a state nothing has
+written to, so its reading is exactly zero or the slot carries a previous occupant's history:
+
+    first-read layer 0   |0|   rms 0
+    first-read layer 1   |0|   rms 0
+    first-read layer 2   |0|   rms 0
+
+Exactly zero. The start is clean and stale state is out.
+
+The first version of that probe fired on any single-row call and read 6.21, which looks like the
+answer and is not: a single-row call is usually a DECODE step, whose state is legitimately
+non-zero. It is now gated on a multi-row chunk from a request with no residual yet, which is a
+first prefill and nothing else.
+
+Both allocators were read while forming this. `HistoryCache.release` zeroes state and conv for
+every layer unconditionally. `LinearStates.release` zeroes only the (slot, layer) pairs in
+`_touched`, and `note_touched` is called for the convolution and nowhere else -- which is correct
+only because the group cut puts the recurrent state on the host and the convolution on the pool.
+It is right by coincidence of who holds what, not by construction, and moving either would break
+it silently.
+
+
 ## 2026-08-21, layer 0 is exact and the divergence enters at layer 1
 
 The prologue bisect, comparing the same quantity on both sides at last:
