@@ -26,6 +26,8 @@ from sglang.srt.afd.pool_client import PoolClient
 from sglang.srt.afd.pool_server import Departure
 from sglang.srt.afd.protocol import (
     OP_SPAN,
+    OP_SPAN_ENTER,
+    OP_SPAN_Q,
     OP_STATE_READ,
     Frame,
     decode,
@@ -42,6 +44,11 @@ class Runner:
     def __init__(self, asks=3):
         self.asks = asks
         self.seen = []
+
+    def run_prologue(self, request_ids, embedded, positions, on_query=None):
+        """The layers below the first attention. Same shape as `run`, one argument fewer -- and
+        the arm that was never exercised, which is why the op mismatch survived every test."""
+        return self.run(request_ids, -1, embedded, positions, on_query=on_query)
 
     def run(self, request_ids, group, attn_output, positions, on_query=None):
         for layer in range(self.asks):
@@ -155,6 +162,57 @@ class TestASpanThatCallsBackCompletes(CustomTestCase):
                             "deadlocked with min_batch=1, which is what the deployment runs")
         finally:
             pool.close()
+
+
+class TestTheReplyCarriesTheOpItWasAskedWith(CustomTestCase):
+    """A prologue is asked as OP_SPAN_ENTER and must be answered as OP_SPAN_ENTER.
+
+    The reply table is keyed by (request, layer, op) -- which is what stops a span's two halves
+    being confused -- so answering a prologue with OP_SPAN files it under a key nobody is waiting
+    on. The caller then waits forever HAVING ALREADY RECEIVED the early half, and the picture is a
+    pool sitting idle with nothing queued beside a host blocked in collect_kv, which reads as a
+    deadlock and is not one.
+
+    That is what it did on the deployment, and no unit test could see it: each side was correct on
+    its own and only the pairing was wrong.
+    """
+
+    def a_client(self, pool):
+        client = PoolClient(f"127.0.0.1:{pool.port}", 5.0, reconnect=False)
+        client.serve = lambda frame: (torch.ones(1, 8),)
+        return client
+
+    def _round_trip(self, op):
+        pool = Pool(asks=1)
+        client = self.a_client(pool)
+        done, got = threading.Event(), {}
+
+        def call():
+            try:
+                handle = client.issue_frame(
+                    1, 0, (torch.zeros(1, 4), torch.zeros(1, 1), torch.zeros(1, 1)), op)
+                client.collect_frame(handle._replace(op=OP_SPAN_Q), "cpu")
+                got["kv"] = client.collect_frame(handle._replace(op=op), "cpu")
+            except BaseException as e:                    # noqa: BLE001
+                got["error"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=call, daemon=True).start()
+        try:
+            self.assertTrue(done.wait(DEADLINE),
+                            f"a span asked as op {op} was never answered under that op")
+            self.assertIsNone(got.get("error"), f"{got.get('error')}")
+            self.assertEqual(len(got["kv"]), 2)
+        finally:
+            pool.close()
+
+    def test_a_middle_span(self):
+        self._round_trip(OP_SPAN)
+
+    def test_a_prologue(self):
+        """The one that failed on the deployment."""
+        self._round_trip(OP_SPAN_ENTER)
 
 
 if __name__ == "__main__":

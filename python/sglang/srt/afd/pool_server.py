@@ -482,9 +482,13 @@ class Departure(threading.Thread):
                     f"waiting for it and sending the second half now would interleave two frames "
                     f"on one socket."
                 )
-            # the key and value together: they are read by the same append and there is nothing
-            # for the host to do between them
-            self._reply_pieces(riding, counts, group, (k, v), OP_SPAN)
+            # replied under the op it was ASKED with, not the literal OP_SPAN. The reply table
+            # is keyed by (request, layer, op) -- which is what stops a span's two halves being
+            # confused -- so a prologue asked as OP_SPAN_ENTER and answered as OP_SPAN is filed
+            # under a key nobody is waiting on. The caller then waits forever having already
+            # received the early half, which is exactly what it looked like: the pool idle with
+            # nothing queued, the host blocked in collect_kv.
+            self._reply_pieces(riding, counts, group, (k, v), op)
 
         self.departures.append(
             {"layer": group, "riders": len(riding), "tokens": int(joined.shape[0]),
