@@ -487,20 +487,27 @@ class SpanRunner:
                 f"either invent a state or hold one here -- the first is wrong and the second is "
                 f"the arrangement this cut replaced."
             )
-        qkv = attn.in_proj_qkv(hidden)
-        z = attn.in_proj_z(hidden)
-        a = attn.in_proj_a(hidden)
-        b = attn.in_proj_b(hidden)
-        mixed = self._convolve(attn, qkv, request_ids, layer_id)
-
-        width = attn.key_dim
+        # sglang's own names, not transformers'. The two libraries split this projection
+        # differently -- one fused `in_proj_qkvz` here against four separate ones there -- and
+        # writing the other library's names produced an AttributeError at the first token, which
+        # is the same shape of mistake as the state layout being transposed between them.
+        qkvz, _ = attn.in_proj_qkvz(hidden)
+        ba, _ = attn.in_proj_ba(hidden)
+        query, key, value, z, b, a = attn.fix_query_key_value_ordering(qkvz, ba)
         rows = hidden.shape[0]
-        q = mixed[:, :width].reshape(rows, attn.num_k_heads, attn.head_k_dim)
-        k = mixed[:, width : 2 * width].reshape(rows, attn.num_k_heads, attn.head_k_dim)
-        v = mixed[:, 2 * width :].reshape(rows, attn.num_v_heads, attn.head_v_dim)
+        flat = [t.reshape(rows, -1) for t in (query, key, value)]
+        mixed = self._convolve(attn, torch.cat(flat, dim=-1), request_ids, layer_id)
+
+        width = flat[0].shape[-1]
+        q = mixed[:, :width].reshape(rows, attn.num_k_heads // attn.attn_tp_size,
+                                     attn.head_k_dim)
+        k = mixed[:, width : 2 * width].reshape(rows, attn.num_k_heads // attn.attn_tp_size,
+                                                attn.head_k_dim)
+        v = mixed[:, 2 * width :].reshape(rows, attn.num_v_heads // attn.attn_tp_size,
+                                          attn.head_v_dim)
         alpha, beta = gates(a, b, attn.A_log, attn.dt_bias)
         q, k = normalise(q, k, scale=attn.head_k_dim ** -0.5)
-        heads = attn.num_v_heads
+        heads = attn.num_v_heads // attn.attn_tp_size
         q, k = expand_to_value_heads(q, heads), expand_to_value_heads(k, heads)
         q_tilde, s = query_coefficient(q, k, beta)
 
@@ -514,7 +521,8 @@ class SpanRunner:
             defer(layer_id, request_ids, k, v, alpha, beta)
 
         core = core.reshape(rows, -1).to(hidden.dtype)
-        core = attn.norm(core.reshape(-1, attn.head_v_dim), z.reshape(-1, attn.head_v_dim))
+        core = attn.norm(core.reshape(-1, attn.head_v_dim),
+                         z.reshape(-1, attn.head_v_dim))
         out, _ = attn.out_proj(core.reshape(rows, -1))
         return out
 
@@ -546,9 +554,11 @@ class SpanRunner:
         window = torch.cat([held[..., 1:], qkv.unsqueeze(-1)], dim=-1)
         ring.index_copy_(0, index, window)
         self.states.note_touched(slots, ("conv", layer_id))
-        out = (window * attn.conv1d.weight.squeeze(1)).sum(-1)
-        if attn.conv1d.bias is not None:
-            out = out + attn.conv1d.bias
+        # `conv1d` here is a ColumnParallelLinear whose weight is already (channels, taps) --
+        # not an nn.Conv1d with a (channels, 1, taps) weight, which is what transformers has and
+        # what an earlier version of this squeezed. It carries no bias: the model builds it with
+        # bias=False.
+        out = (window * attn.conv1d.weight).sum(-1)
         return torch.nn.functional.silu(out)
 
     def seed(self, request_id: int, residual: torch.Tensor) -> None:
