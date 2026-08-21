@@ -15,14 +15,21 @@ weights.
 
 ## The tour, and why the cut is where it is
 
-A group of requests fills one bus. It visits cities together where the reading is SHARED -- a
-feed-forward reads 2760 MiB of weights and reads them once for everybody aboard, so a rider who
-wandered off would make somebody do that read twice. It disperses where the reading is PRIVATE:
-a softmax attention reads the caller's own KV cache and there is nothing to amortise, so a 1k
-request and a 128k request have no reason to wait for each other.
+A group of requests fills one bus. It stays in formation wherever the stage it is passing through
+has FIXED latency, and disperses only where latency VARIES.
 
-That boundary is the cut. It is not "every four layers" -- four is what this model's layout makes
-it -- and `span.group_layers` reads it off the model rather than assuming the interval.
+    feed-forward       fixed     a weight read, the same for any context
+    linear attention   fixed     7.0 us at 1k, 32k and 256k alike
+    softmax attention  VARIES    19 us at 1k, 2397 us at 128k
+
+Holding a batch through a fixed-latency stage is free -- everybody finishes together. Holding it
+through a variable one makes every short-context rider wait for the longest, which is the only
+thing worth paying a round trip to avoid. So the cut goes where the latency stops being fixed.
+
+That it lands on "weights to the pool, KV cache to the host" is a fact about this model, where the
+variable-latency stage happens to be the one with the cache. The rule is the latency. It is also
+not "every four layers" -- four is what this layout makes it -- and `span.group_layers` reads the
+boundary off the model rather than assuming the interval.
 
 ## Two buses, and the reason to want them
 

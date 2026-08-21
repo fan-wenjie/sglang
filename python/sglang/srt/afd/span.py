@@ -21,6 +21,29 @@ key/value projections, the softmax attention, and the KV cache.
     round trips a step     16   (against 63 for the per-layer cut)
     span, measured       2046 us at batch 4 (benchmark/afd/span_cost.py)
 
+## The rule that decides where to cut: fixed latency against variable latency
+
+A batch only has to be re-formed where latency VARIES. That is the whole principle, and every
+other property of this arrangement follows from it.
+
+    stage                     does its cost depend on context?   measured
+    feed-forward              no                                 a weight read; context-free
+    linear attention          no                                 7.0 us at 1k, 32k and 256k alike
+    softmax attention         YES                                19 us at 1k, 2397 us at 128k
+
+Where latency is fixed, everybody in a batch finishes together and holding the batch costs
+nothing. Where it varies, one long-context rider makes every short-context rider wait -- so that
+is the only place worth paying to break formation.
+
+On this model the variable-latency stage is the softmax attention, and the softmax attentions are
+exactly where the KV cache is, which is why the cut looks like "weights on the pool". That is a
+coincidence of this model, not the rule. The rule is the latency.
+
+This is a different rule from the per-layer arrangement's, not a tuning of it. That one cut by
+OWNERSHIP -- a recurrent state belongs to the request, so it stays with the request -- which is
+why forty-eight linear-attention layers stayed on the host there and come here now. Their state is
+per-request and their latency is fixed, and under this rule the second fact is the one that counts.
+
 ## The bus, the station, and the waiting room
 
 A group's batch is formed once, at the aggregation point before `W_o`, and cannot change until the
@@ -46,6 +69,23 @@ after the last linear layer's attention and before its feed-forward. That value 
 feed-forward before the span's output does. So the pool sends it as soon as it has it, the host
 starts its query projection and its cache sweep against it, and the pool runs the last feed-forward
 while that happens. The span's own tail pays for the host's head start.
+
+What that tail is worth, measured rather than assumed:
+
+    4 x feed-forward     2040 MiB   74% of the span   298 us each
+    3 x linear attention  660 MiB   24%               129 us each
+    W_o                    60 MiB    2%                35 us
+    one round trip                                    628 us
+
+So the early message is covered by ONE feed-forward, 298 us of the 628 -- not by the span. The
+whole span covers the round trip 3.3 times over, but the early half is sent near the end and has
+only what follows it to hide behind.
+
+Shift 2 would move the read point to `h_{l+2}`, which exists before the last linear attention runs,
+and the cover would become 129 + 298 = 427 us. That is the one place where the linear attentions
+could be made to pay for the wire, and it is not taken here: the arrangement's standing constraint
+is that only the query moves and the shift stays at 1. Recorded as a knob with a known gain and a
+known cost, not as an oversight.
 
 The residual never travels. A group's input residual is the previous group's output, which the pool
 computed and can keep; sending it back and forth would be 5120 columns a direction for a value
