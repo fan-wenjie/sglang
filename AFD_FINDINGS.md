@@ -8,6 +8,42 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, a second transformation was found on the pool, and it was inert
+
+Asking whether the baseline also uses Early-K turned up something else. It does not -- the
+colocated model uses neither, and the arrangement moves only the softmax query: `q` and the gate
+come from the read point, `k` and `v` from the current `x` (span.py:665 and 685), and the linear
+layers take q, k and v entirely from the current hidden (span.py:772). So layer 1's divergence is
+not a designed difference.
+
+But the pool's own startup log said, every single time:
+
+    afd early-q installed: coverage=all, shift=1, 63 layer(s) moved, 0 clamped
+
+63 of 64 -- every layer except LAYER 0, which is exempt because nothing sits beneath it. The pool
+was installing the PER-LAYER early-q wiring and then running the GROUP cut over the same model,
+and the exempt layer is precisely the one layer that has matched the colocated model exactly
+throughout this search. It looked like the answer.
+
+It is not. With the per-layer wiring stood down, the pool's stream is unchanged to five figures:
+
+    layer 0, x + attn   28.773  (was 28.773)
+    layer 1, x + attn   54.736  (was 54.736)
+
+`install_early_q` converts by wrapping `layer.forward`, and the span never calls `layer.forward`
+-- it calls the submodules directly. The second transformation was real, was installed, and was
+inert for the path being measured.
+
+Fixed anyway: the group cut implements its own read point, so the per-layer wiring now converts
+nothing under `--afd-span-cut`. Two runs of a knob that means two different things on one model is
+a defect whether or not it currently bites.
+
+Also recorded: `--afd-coverage` appears nowhere in `span.py` or `span_routing.py`. Every run of
+this arrangement has passed `--afd-coverage all` and the group cut has ignored it, the same way it
+ignored `--afd-query-shift-layers` until that was wired. A run that reports a setting it never
+applied is the failure mode the skill names, and this is the second instance of it here.
+
+
 ## 2026-08-21, precision is not the mismatch, and the divergence is a direction not a scale
 
 Every buffer and every stage, logged on both sides rather than assumed:
