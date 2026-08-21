@@ -38,10 +38,30 @@ not once served a token.
 The per-layer cut (sections 1-17) is different: it ran, it was measured, and section 10's stopwatch
 is why the group cut exists at all. Do not read a group-cut figure as if it had the same standing.
 
-What blocks the end to end run is not the architecture. It is a sequence of integration faults --
-four so far in the prefill-versus-decode row shape, three deadlocks on one socket, two library
-naming collisions between sglang and transformers -- each of which produced a hang or a crash
-rather than a wrong number. The last one is open.
+### 2026-08-21: it runs, and the output is wrong
+
+Ten integration faults later the arrangement served its first tokens. It should not be read as
+more than it is:
+
+    prompt      "The history of computing begins"
+    output      " begins begins begins begins ..."   24 tokens, all the last prompt token
+    e2e         5.376 s for 24 tokens
+    the pool    zero failed departures
+
+**The plumbing works and the model does not.** Every fault before this one was a hang or a crash --
+a shape, a name, a thread, a protocol key -- and none could be mistaken for a working system. This
+one produces text.
+
+The symptom names its own prime suspect. `linear_history.prefill_scan`'s docstring says what
+treating a prefill chunk as a batch does: "runs every token against the same starting state, never
+advances it, and produces a model with no memory of its own prompt". Repeating the last prompt
+token is what no memory looks like. That is a hypothesis and it is written here as one; the state
+is advanced in three places now -- the pool's conv ring, the host's HistoryCache, the deferred
+OP_STATE_UPDATE -- and any of them failing to advance gives this.
+
+A previous round of this project spent four rounds on the same symptom under a different
+arrangement, concluded the pool was broken, and was wrong: the read point differed between the arms.
+So the first move is to check what the ARMS are, not to hunt in the pool.
 
 ---
 
