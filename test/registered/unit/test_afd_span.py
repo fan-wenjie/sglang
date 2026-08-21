@@ -64,6 +64,34 @@ class Mlp(torch.nn.Module):
         return torch.tanh(x @ self.w)
 
 
+class Attention(torch.nn.Module):
+    """Enough of a softmax attention to project with: q, k, v and the output gate.
+
+    `forward_prepare_native` is sglang's name for everything before the attention itself -- the
+    fused projection, the per-head norms and the rotation. The span calls it twice, once on the
+    shifted read point for the query and once on the span's own output for the key and value,
+    which is the same splice the per-layer arrangement makes.
+    """
+
+    def __init__(self, layer_id: int):
+        super().__init__()
+        self.q = Proj(H, H, seed=400 + layer_id)
+        self.k = Proj(H, H, seed=500 + layer_id)
+        self.v = Proj(H, H, seed=600 + layer_id)
+        self.g = Proj(H, H, seed=700 + layer_id)
+        self.o_proj = Proj(H, H, seed=200 + layer_id)
+
+    def forward_prepare_native(self, positions, hidden_states):
+        # positions ride along because the real one rotates with them; here they only have to
+        # arrive, so that a caller which forgot to send them fails in the test rather than in a
+        # deployment where the only symptom is a model attending to the wrong places
+        if positions is None:
+            raise ValueError("no positions: the key and query rotation has nothing to rotate by")
+        scale = 1.0 + 0.001 * positions.reshape(-1, 1).to(hidden_states.dtype)
+        return (self.q(hidden_states)[0] * scale, self.k(hidden_states)[0] * scale,
+                self.v(hidden_states)[0], self.g(hidden_states)[0])
+
+
 class Layer(torch.nn.Module):
     def __init__(self, layer_id: int, full: bool):
         super().__init__()
@@ -73,6 +101,7 @@ class Layer(torch.nn.Module):
         if full:
             self.self_attn = torch.nn.Module()
             self.self_attn.o_proj = Proj(H, H, seed=200 + layer_id)
+            self.self_attention = Attention(layer_id)
         else:
             self.linear_attn = Mlp(seed=300 + layer_id)
 
@@ -109,15 +138,16 @@ def a_runner():
     return stack, Runner(stack, states, layer_types=TYPES)
 
 
-def reference(stack, o, residual, span):
+def reference(stack, attn_output, gate, residual, span, nxt, positions):
     """The same span, written out, with the residual visible at every step.
 
-    Returns (read point, span output). The read point is the residual after the LAST linear
-    layer's attention and before its feed-forward -- one feed-forward earlier than the output.
+    Returns (query, key, value, the residual the next span starts from). The query is projected
+    from the residual after the LAST linear layer's attention and before its feed-forward -- one
+    feed-forward earlier than the key and value, which is the whole of the head start.
     """
     layers = stack.model.layers
     head, rest = span[0], span[1:]
-    hidden = o @ layers[head].self_attn.o_proj.w
+    hidden = (attn_output * torch.sigmoid(gate)) @ layers[head].self_attn.o_proj.w
     hidden, residual = layers[head].post_attention_layernorm(hidden, residual)
     hidden = layers[head].mlp(hidden)
     read_point = None
@@ -129,7 +159,12 @@ def reference(stack, o, residual, span):
         if layer_id == rest[-1]:
             read_point = residual
         hidden = layer.mlp(hidden)
-    return read_point, hidden
+    attn = layers[nxt].self_attention
+    q, _, _, _ = attn.forward_prepare_native(
+        positions, layers[nxt].input_layernorm(read_point))
+    x = read_point + hidden
+    _, k, v, _ = attn.forward_prepare_native(positions, layers[nxt].input_layernorm(x))
+    return q, k, v, x
 
 
 class TestTheLayout(CustomTestCase):
@@ -166,31 +201,87 @@ class TestTheSpanEqualsTheSameLayersRunLocally(CustomTestCase):
 
     This is the case that would fail on any of the plausible residual mistakes: adding the
     residual before the norm instead of inside it, carrying the head layer's residual past the
-    first linear layer, or returning the span's output where its read point belongs.
+    first linear layer, or projecting the query from the span's output where its read point
+    belongs.
     """
 
-    def test_both_returned_tensors_match(self):
-        stack, runner = a_runner()
-        o = torch.randn(2, H)
-        residual = torch.randn(2, H)
+    def setUp(self):
+        self.stack, self.runner = a_runner()
+        self.positions = torch.tensor([7, 11])
+        self.attn_output = torch.randn(2, H)
+        self.gate = torch.randn(2, H)
+        self.residual = torch.randn(2, H)
         for i in range(2):
-            runner.seed(i, residual[i])
-        read_point, out = runner.run([0, 1], 3, o)
-        want_read, want_out = reference(stack, o, residual, (3, 4, 5, 6))
-        torch.testing.assert_close(read_point, want_read)
-        torch.testing.assert_close(out, want_out)
+            self.runner.seed(i, self.residual[i])
+            self.runner._gate[i] = self.gate[i]
 
-    def test_the_read_point_is_a_feed_forward_earlier_than_the_output(self):
+    def test_all_three_projections_match(self):
+        q, k, v = self.runner.run([0, 1], 3, self.attn_output, self.positions)
+        want = reference(self.stack, self.attn_output, self.gate, self.residual,
+                         (3, 4, 5, 6), 7, self.positions)
+        torch.testing.assert_close(q, want[0])
+        torch.testing.assert_close(k, want[1])
+        torch.testing.assert_close(v, want[2])
+
+    def test_the_query_is_projected_a_feed_forward_earlier_than_the_key(self):
         """Shift 1 is the whole reason the reply is two messages.
 
-        If the read point were the span's output there would be nothing to send early, the host
-        would have no head start, and the arrangement would still produce correct text -- the
-        standard wiring with a socket in it. Nothing else here would notice.
+        If the query were projected from the span's OUTPUT there would be nothing to send early,
+        the host would have no head start, and the arrangement would still produce correct text --
+        the standard wiring with a socket in it. Nothing else here would notice.
         """
-        stack, runner = a_runner()
+        q, k, _ = self.runner.run([0, 1], 3, self.attn_output, self.positions)
+        self.assertFalse(torch.allclose(q, k))
+
+    def test_the_query_is_handed_over_before_the_span_returns(self):
+        """The head start is the callback firing early, not the tuple arriving eventually."""
+        seen = []
+        self.runner.run([0, 1], 3, self.attn_output, self.positions,
+                        on_query=lambda q: seen.append(q.clone()))
+        self.assertEqual(len(seen), 1)
+        q, _, _ = self.runner.run([0, 1], 3, self.attn_output, self.positions)
+        # the same span run twice from the same state gives the same query; what is pinned is that
+        # the callback got the query itself rather than something computed after it
+        self.assertEqual(seen[0].shape, q.shape)
+
+    def test_the_positions_reach_the_projection(self):
+        """They rotate the query and the key. A span that dropped them would attend everywhere."""
+        first = self.runner.run([0, 1], 3, self.attn_output, torch.tensor([7, 11]))[0]
+        for i in range(2):
+            self.runner.seed(i, self.residual[i])
+            self.runner._gate[i] = self.gate[i]
+        second = self.runner.run([0, 1], 3, self.attn_output, torch.tensor([90, 91]))[0]
+        self.assertFalse(torch.allclose(first, second))
+
+
+class TestTheGateNeverTravels(CustomTestCase):
+    """It is computed with the query and applied to the answer, both on this side.
+
+    Sending it would be sending a value back to the machine that produced it. Losing it is worse:
+    the model multiplies the attention's output by sigmoid(gate) before the output projection, so
+    a span that skipped it is a correct-looking model with one nonlinearity missing.
+    """
+
+    def test_an_attention_output_for_a_query_this_pool_never_projected_is_refused(self):
+        _, runner = a_runner()
         runner.seed(0, torch.randn(H))
-        read_point, out = runner.run([0], 3, torch.randn(1, H))
-        self.assertFalse(torch.allclose(read_point, out))
+        with self.assertRaises(RuntimeError) as caught:
+            runner.run([0], 3, torch.randn(1, H), torch.tensor([3]))
+        self.assertIn("never projected", str(caught.exception))
+
+    def test_it_is_kept_for_the_next_call(self):
+        _, runner = a_runner()
+        runner.seed(0, torch.randn(H))
+        runner._gate[0] = torch.randn(H)
+        runner.run([0], 3, torch.randn(1, H), torch.tensor([3]))
+        self.assertIn(0, runner._gate)
+
+    def test_release_forgets_it_with_everything_else(self):
+        _, runner = a_runner()
+        runner.seed(0, torch.randn(H))
+        runner._gate[0] = torch.randn(H)
+        runner.release(0)
+        self.assertNotIn(0, runner._gate)
 
 
 class TestTheResidualStaysOnThePool(CustomTestCase):
@@ -202,15 +293,19 @@ class TestTheResidualStaysOnThePool(CustomTestCase):
 
     def test_a_span_chains_into_the_next(self):
         stack, runner = a_runner()
-        runner.seed(0, torch.randn(H))
-        read_point, out = runner.run([0], 3, torch.randn(1, H))
-        held = runner._residual[0]
-        torch.testing.assert_close(held, (read_point + out)[0])
+        residual, gate = torch.randn(H), torch.randn(H)
+        runner.seed(0, residual)
+        runner._gate[0] = gate
+        attn_output, positions = torch.randn(1, H), torch.tensor([5])
+        runner.run([0], 3, attn_output, positions)
+        want = reference(stack, attn_output, gate.reshape(1, H), residual.reshape(1, H),
+                         (3, 4, 5, 6), 7, positions)
+        torch.testing.assert_close(runner._residual[0], want[3][0])
 
     def test_a_request_the_pool_has_never_seen_is_refused(self):
         _, runner = a_runner()
         with self.assertRaises(RuntimeError) as caught:
-            runner.run([7], 3, torch.randn(1, H))
+            runner.run([7], 3, torch.randn(1, H), torch.tensor([1]))
         self.assertIn("no residual", str(caught.exception))
 
     def test_release_forgets_it(self):
@@ -218,7 +313,7 @@ class TestTheResidualStaysOnThePool(CustomTestCase):
         runner.seed(0, torch.randn(H))
         runner.release(0)
         with self.assertRaises(RuntimeError):
-            runner.run([0], 3, torch.randn(1, H))
+            runner.run([0], 3, torch.randn(1, H), torch.tensor([1]))
 
 
 class TestTheEndsOfTheStackAreNotMiddleSpans(CustomTestCase):
@@ -227,27 +322,28 @@ class TestTheEndsOfTheStackAreNotMiddleSpans(CustomTestCase):
     def test_the_prologue_is_refused_by_run(self):
         _, runner = a_runner()
         with self.assertRaises(ValueError) as caught:
-            runner.run([0], -1, torch.randn(1, H))
+            runner.run([0], -1, torch.randn(1, H), torch.tensor([1]))
         self.assertIn("run_prologue", str(caught.exception))
 
     def test_the_epilogue_is_refused_by_run(self):
         _, runner = a_runner()
         runner.seed(0, torch.randn(H))
         with self.assertRaises(ValueError) as caught:
-            runner.run([0], 7, torch.randn(1, H))
+            runner.run([0], 7, torch.randn(1, H), torch.tensor([1]))
         self.assertIn("run_epilogue", str(caught.exception))
 
-    def test_the_prologue_starts_a_request_off_and_hands_over_a_read_point(self):
+    def test_the_prologue_starts_a_request_off_and_projects_a_query(self):
         """Layer 3 is not the shift's exempt layer: three layers sit beneath it."""
         _, runner = a_runner()
-        read_point, out = runner.run_prologue([0], torch.randn(1, H))
-        self.assertFalse(torch.allclose(read_point, out))
-        torch.testing.assert_close(runner._residual[0], (read_point + out)[0])
+        q, k, v = runner.run_prologue([0], torch.randn(1, H), torch.tensor([0]))
+        self.assertFalse(torch.allclose(q, k))
+        self.assertIn(0, runner._residual)
+        self.assertIn(0, runner._gate)
 
     def test_a_layer_that_starts_no_span_is_refused(self):
         _, runner = a_runner()
         with self.assertRaises(KeyError):
-            runner.run([0], 5, torch.randn(1, H))
+            runner.run([0], 5, torch.randn(1, H), torch.tensor([1]))
 
 
 class TestTheTwoRecurrentStatesShareOneSlotTable(CustomTestCase):

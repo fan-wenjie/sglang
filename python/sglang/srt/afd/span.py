@@ -10,16 +10,39 @@ is chosen to make that number small by making the unit large.
 Qwen3.8-27B's layers run `[linear, linear, linear, full] x 16`. Read from one full attention to the
 next, a group is:
 
-    W_o | FFN | linear attn | FFN | linear attn | FFN | linear attn | FFN | -> x for the next attn
-    ^                                                                     ^
-    the host's attention output                        the next attention's hidden input
+    gate | W_o | FFN | lin | FFN | lin | FFN | lin | FFN | W_q -> q,  W_kv -> k, v
+    ^                                                                             ^
+    the host's attention output                     the next attention's query, key and value
 
 Everything between those two arrows is weights and per-request recurrent state, and none of it is
-the KV cache. So the whole of it goes to the pool as ONE call, and the host keeps the query and
-key/value projections, the softmax attention, and the KV cache.
+the KV cache. So the whole of it goes to the pool as ONE call, and **the host keeps only the KV
+cache and the sweep over it**. It runs no weight matrix at all.
 
     round trips a step     16   (against 63 for the per-layer cut)
     span, measured       2046 us at batch 4 (benchmark/afd/span_cost.py)
+
+## What the two ends cost, which is the only comparison worth making
+
+They run in parallel, so the arrangement's step time is the MAX of the two, not the sum. Summing
+them was wrong twice in this arrangement's history and in the same direction both times.
+
+    context      pool     host      max     host busy
+      1,024   37.3 ms   0.3 ms  37.3 ms           1%
+     28,449   37.3 ms   8.3 ms  37.3 ms          22%
+    131,072   37.3 ms  38.4 ms  38.4 ms         100%
+
+    colocated, bfloat16, measured               ~38 ms
+
+**The ceiling is parity, and it is reached.** 30.0 of the pool's 37.3 ms is reading the model's
+50 GiB of weights once, and a colocated server reads the same 50 GiB -- no arrangement of two
+machines makes that read smaller. What disaggregation buys is that the 32 GiB card does not have
+to hold them, and that one pool's read can serve a busload of riders from several hosts.
+
+Every earlier "N times faster" figure here was against the per-layer cut's 126.9 ms, which is a
+comparison against a bad implementation rather than against a baseline.
+
+The two ends balance near 131k context. Below it the pool is the bottleneck and the host idles;
+above it the sweep is, and more pool does not help.
 
 ## The rule that decides where to cut: fixed latency against variable latency
 
@@ -66,9 +89,24 @@ runs.** That is the property the per-layer cut did not have.
 
 The read point is shift 1: the next full attention's query projects from `h_{l+3}`, the residual
 after the last linear layer's attention and before its feed-forward. That value exists one
-feed-forward before the span's output does. So the pool sends it as soon as it has it, the host
-starts its query projection and its cache sweep against it, and the pool runs the last feed-forward
-while that happens. The span's own tail pays for the host's head start.
+feed-forward before the span's output does -- so the query is projected there, HERE, and sent
+immediately. The host sweeps with it while this side spends the last feed-forward.
+
+The key and value follow, after that feed-forward, because they read `x_l` and `x_l` is not
+complete until it runs. They are not on the critical path: this step's join uses key and value the
+caller already has, and the cache only has to hold them by the NEXT step.
+
+Putting the query projection on this side rather than the host's is a TRADE, and it is worth
+writing down which way it runs, because under a sum it looks free and under a max it does not:
+
+    on the host   costs host time, of which there is 29 ms spare at 28k        free
+                  costs 3.12 GiB of a 32 GiB card                             scarce
+    on the pool   costs 1.87 ms a step on the side that IS the bottleneck      +5%
+                  gives the 3.12 GiB back: 70,689 tokens a request to 83,489   +18% context
+
+Taken, deliberately: on a consumer card the context length is the binding constraint, and the host
+that results holds no weights at all -- it can be a cheap large-memory card rather than a second
+copy of the pool.
 
 What that tail is worth, measured rather than assumed:
 
@@ -169,8 +207,19 @@ class SpanRunner:
     def __init__(self, model, states, *, layer_types: list[str]) -> None:
         self.model = model
         self.states = states
-        self.spans = {s[0]: s for s in group_layers(layer_types)}
+        ordered = group_layers(layer_types)
+        self.spans = {s[0]: s for s in ordered}
+        # which attention each span feeds. The query projection runs on this side, so the span has
+        # to know whose weights to project with -- and getting it from the NEXT span's head rather
+        # than from `layer_id + 1` is what keeps this right on a model whose attentions are not
+        # evenly spaced.
+        self.next_attention = {
+            span[-1]: nxt[0] for span, nxt in zip(ordered, ordered[1:])
+        }
         self._residual: dict[int, torch.Tensor] = {}
+        # the output gate for the query already sent. It is applied to the attention's output
+        # before W_o, and W_o is this side's first act on the next call, so it never travels.
+        self._gate: dict[int, torch.Tensor] = {}
         self._lock = threading.Lock()
         self.served = 0
 
@@ -201,10 +250,43 @@ class SpanRunner:
             for i, r in enumerate(request_ids):
                 self._residual[int(r)] = residual[i].clone()
 
+    def _gated(self, request_ids, attn_output: torch.Tensor) -> torch.Tensor:
+        """Apply the output gate this side computed with the query the host swept with.
+
+        The model multiplies the attention's output by `sigmoid(gate)` before the output
+        projection. The gate comes out of the same projection as the query, so this side has it,
+        and the output projection is this side's first act on the next call -- sending it would be
+        sending a value back to the machine that produced it and then receiving it again.
+        """
+        gate = self._take_gate(request_ids, attn_output)
+        return attn_output * torch.sigmoid(gate)
+
+    def _keep_gate(self, request_ids, gate: torch.Tensor) -> None:
+        with self._lock:
+            for i, r in enumerate(request_ids):
+                self._gate[int(r)] = gate[i].clone()
+
+    def _take_gate(self, request_ids, like: torch.Tensor) -> torch.Tensor:
+        """The gate for the query already sent, one row a rider, in the rider order."""
+        with self._lock:
+            rows = []
+            for r in request_ids:
+                held = self._gate.get(int(r))
+                if held is None:
+                    raise RuntimeError(
+                        f"request {r} sent back an attention output for a query this pool never "
+                        f"projected. The gate is applied to that output before W_o, so there is no "
+                        f"way to finish the layer -- and skipping it would be a correct-looking "
+                        f"model with one nonlinearity missing."
+                    )
+                rows.append(held)
+        return torch.stack(rows, dim=0).to(like.dtype)
+
     def release(self, request_id: int) -> int:
         """Forget one request. Returns how many recurrent slots were cleared."""
         with self._lock:
             self._residual.pop(int(request_id), None)
+            self._gate.pop(int(request_id), None)
         return self.states.release(int(request_id))
 
     # -- the span ---------------------------------------------------------------------------
@@ -219,12 +301,13 @@ class SpanRunner:
             )
         return span
 
-    def run(self, request_ids, group: int, o: torch.Tensor, on_read_point=None):
-        """From the group's `W_o` input to the next attention's hidden input.
+    def run(self, request_ids, group: int, attn_output: torch.Tensor, positions,
+            on_query=None):
+        """From the host's attention output to the next attention's query, key and value.
 
-        `on_read_point` is called with `h_{l+3}` the moment it exists, which is one feed-forward
-        before the return value does. It is how the host's query projection and cache sweep get
-        their head start; a caller that passes nothing simply gets both tensors at the end.
+        `on_query` is called with `q` the moment it exists, which is one feed-forward before the
+        key and value do. That is the head start: the host sweeps its cache with a query it did
+        not have to project, while this side spends the last feed-forward.
 
         This is the middle span, and there are fifteen of them on this model. The two at the ends
         of the stack are shaped differently and have their own methods -- an `if` here for each of
@@ -240,51 +323,86 @@ class SpanRunner:
                 f"the tail. They return different things and conflating them would report one "
                 f"arrangement's cost under another's name."
             )
-        residual = self._take_residual(request_ids, o.shape[0], o)
+        residual = self._take_residual(request_ids, attn_output.shape[0], attn_output)
 
-        # the head layer's tail: its output projection and its feed-forward. The attention itself
-        # ran on the host, which is the whole point of the cut
-        attn_out, _ = layers[head].self_attn.o_proj(o)
+        # the head layer's tail: the output gate, the output projection, the feed-forward. The
+        # attention itself ran on the host, which is the whole point of the cut -- and the gate
+        # was computed here on the previous call, so what comes back over the wire is the bare
+        # attention output and the nonlinearity is applied on this side
+        attn_out, _ = layers[head].self_attn.o_proj(
+            self._gated(request_ids, attn_output))
         hidden, residual = _add_and_norm(
             layers[head].post_attention_layernorm, attn_out, residual)
         hidden = layers[head].mlp(hidden)
 
         hidden, residual = self._linear_run(request_ids, rest[:-1], hidden, residual)
-        return self._finish(request_ids, rest[-1], hidden, residual, on_read_point)
+        return self._finish(request_ids, rest[-1], hidden, residual, on_query, positions)
 
-    def run_prologue(self, request_ids, embedded: torch.Tensor, on_read_point=None):
+    def run_prologue(self, request_ids, embedded: torch.Tensor, positions, on_query=None):
         """The layers below the first attention, fed by the embedding rather than by a `W_o`.
 
         On this model that is layers 0, 1 and 2, and it is where a request's residual starts.
 
-        It hands over a read point like any other span. The query it feeds belongs to layer 3, and
-        layer 3 is not the shift's exempt layer -- three layers sit beneath it, so under shift 1 it
-        reads `h_2` and there is a residual for it to read. Only layer 0 is exempt, and layer 0 is
-        inside this span rather than at its end.
+        It projects a query like any other span. The query belongs to layer 3, and layer 3 is not
+        the shift's exempt layer -- three layers sit beneath it, so under shift 1 it reads `h_2`
+        and there is a residual for it to read. Only layer 0 is exempt, and layer 0 is inside this
+        span rather than at its end.
         """
         span = self._span_of(-1)[1:]
         hidden, residual = self._linear_run(request_ids, span[:-1], embedded, None)
-        return self._finish(request_ids, span[-1], hidden, residual, on_read_point)
+        return self._finish(request_ids, span[-1], hidden, residual, on_query, positions)
 
-    def _finish(self, request_ids, layer_id: int, hidden, residual, on_read_point):
-        """The span's last linear layer, whose residual is the next attention's query source.
+    def _finish(self, request_ids, layer_id: int, hidden, residual, on_query, positions):
+        """The span's last linear layer, and the next attention's projections.
 
-        The read point exists BEFORE this layer's feed-forward, and handing it over there rather
-        than at the end is the whole of the overlap: the host projects its query and sweeps its
-        cache while the pool spends the last feed-forward of the span.
+        Where the query projection sits is not a detail -- it is the only place it can go. The
+        query's source is `h_(l+3)`, which this layer produces, and the projection has to happen on
+        the side that produces it or the source crosses the wire before it can be used. Run HERE,
+        between the last linear attention and the last feed-forward, three things follow:
+
+            the host receives a query it can sweep with immediately, rather than a hidden state it
+            must project first -- and a projection on the host is a GEMV on a machine that is
+            weight-read bound at decode, which is the finding this arrangement already confirmed
+
+            the send is covered by the last feed-forward, 298 us, so the host's sweep starts one
+            feed-forward earlier in the group. The sweep is the variable-latency stage, up to
+            2397 us at 128k, and starting it early is the only lever this side has on it
+
+            the host holds no projection weights at all, which is 3.12 GiB of a 32 GiB card given
+            back to the KV cache -- 70,689 tokens a request to 83,489, across a break-even the
+            arrangement otherwise sits exactly on
+
+        The key and value are projected after the feed-forward, because they read `x_l` and `x_l`
+        is not complete until it runs. That is not a problem: they are off the critical path. This
+        step's join uses key and value the caller already has, and the cache only has to hold them
+        by the NEXT step.
+
+        The output gate stays here. It is applied to the attention's output before `W_o`, and `W_o`
+        is the pool's first act on the next call, so sending the gate would be sending a value back
+        to the machine that computed it.
         """
-        last = self.model.model.layers[layer_id]
+        layers = self.model.model.layers
+        last = layers[layer_id]
         hidden, residual = _add_and_norm(last.input_layernorm, hidden, residual)
         hidden = self._linear_attention(last.linear_attn, request_ids, layer_id, hidden)
         hidden, read_point = _add_and_norm(last.post_attention_layernorm, hidden, residual)
-        if on_read_point is not None:
-            on_read_point(read_point)
+
+        nxt = layers[self.next_attention[layer_id]].self_attention
+        q, _, _, gate = nxt.forward_prepare_native(
+            positions, layers[self.next_attention[layer_id]].input_layernorm(read_point))
+        if on_query is not None:
+            on_query(q)
+
         hidden = last.mlp(hidden)
         # the next group's input residual is this one's output, and the pool is the one that has
         # it. It stays here rather than travelling both ways for a value neither end changed.
-        self._keep_residual(request_ids, read_point + hidden)
+        x = read_point + hidden
+        self._keep_residual(request_ids, x)
+        self._keep_gate(request_ids, gate)
+        _, k, v, _ = nxt.forward_prepare_native(
+            positions, layers[self.next_attention[layer_id]].input_layernorm(x))
         self.served += 1
-        return read_point, hidden
+        return q, k, v
 
     def run_epilogue(self, request_ids, group: int, o: torch.Tensor):
         """The last attention's tail: its output projection, its feed-forward, and the final norm.
@@ -296,7 +414,7 @@ class SpanRunner:
         layers = self.model.model.layers
         head = self._span_of(group)[0]
         residual = self._take_residual(request_ids, o.shape[0], o)
-        attn_out, _ = layers[head].self_attn.o_proj(o)
+        attn_out, _ = layers[head].self_attn.o_proj(self._gated(request_ids, o))
         hidden, residual = _add_and_norm(
             layers[head].post_attention_layernorm, attn_out, residual)
         hidden = layers[head].mlp(hidden)

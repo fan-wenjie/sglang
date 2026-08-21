@@ -410,9 +410,12 @@ class Departure(threading.Thread):
                 f"tell from the frames alone, which is what the HELLO exchange is for."
             )
         started = time.perf_counter()
+        self._expect_tensors(
+            riding[0][0], (3,), "SPAN: attention output, row ids, positions")
         counts = [f.tensors[0].shape[0] for f, _ in riding]
         joined = torch.cat([f.tensors[0] for f, _ in riding], dim=0).to(self.device)
         ids = torch.cat([f.tensors[1] for f, _ in riding], dim=0).reshape(-1).tolist()
+        positions = torch.cat([f.tensors[2] for f, _ in riding], dim=0).reshape(-1).to(self.device)
         if len(ids) != joined.shape[0]:
             raise RuntimeError(
                 f"{len(ids)} row id(s) for {joined.shape[0]} row(s) in group {group}'s span. Every "
@@ -422,7 +425,7 @@ class Departure(threading.Thread):
 
         if op == OP_SPAN_EXIT:
             out = self.span.run_epilogue(ids, group, joined)
-            self._reply_pieces(riding, counts, group, out, OP_SPAN_EXIT)
+            self._reply_pieces(riding, counts, group, (out,), OP_SPAN_EXIT)
         else:
             # both halves of the reply go down the SAME socket, and the early one is sent from
             # another thread. Two threads inside `send_frame` on one socket interleave a header
@@ -432,9 +435,11 @@ class Departure(threading.Thread):
             sent = threading.Event()
             handover = self._handover(riding, counts, group, sent)
             if op == OP_SPAN_ENTER:
-                _, out = self.span.run_prologue(ids, joined, on_read_point=handover)
+                _, k, v = self.span.run_prologue(
+                    ids, joined, positions, on_query=handover)
             else:
-                _, out = self.span.run(ids, group, joined, on_read_point=handover)
+                _, k, v = self.span.run(
+                    ids, group, joined, positions, on_query=handover)
             if not sent.wait(timeout=SPAN_HANDOVER_TIMEOUT_S):
                 raise RuntimeError(
                     f"group {group}'s read point was not on the wire "
@@ -442,7 +447,9 @@ class Departure(threading.Thread):
                     f"waiting for it and sending the second half now would interleave two frames "
                     f"on one socket."
                 )
-            self._reply_pieces(riding, counts, group, out, OP_SPAN)
+            # the key and value together: they are read by the same append and there is nothing
+            # for the host to do between them
+            self._reply_pieces(riding, counts, group, (k, v), OP_SPAN)
 
         self.departures.append(
             {"layer": group, "riders": len(riding), "tokens": int(joined.shape[0]),
@@ -476,7 +483,7 @@ class Departure(threading.Thread):
             def when_copied() -> None:
                 try:
                     copied.synchronize()
-                    self._reply_pieces(riding, counts, group, staged, OP_SPAN_Q)
+                    self._reply_pieces(riding, counts, group, (staged,), OP_SPAN_Q)
                 finally:
                     # set even on failure: the span thread is waiting on this before it sends the
                     # second half, and a handover that died silently would hang the pool rather
@@ -487,14 +494,14 @@ class Departure(threading.Thread):
 
         return hand_over
 
-    def _reply_pieces(self, riding, counts, group: int, out: torch.Tensor, op: int) -> None:
+    def _reply_pieces(self, riding, counts, group: int, out: tuple, op: int) -> None:
         """Cut one batched answer back into the rows each caller sent."""
         offset = 0
         for (frame, sock), n in zip(riding, counts):
-            piece = out[offset : offset + n]
+            pieces = tuple(t[offset : offset + n] for t in out)
             offset += n
             try:
-                send_frame(sock, Frame(frame.request_id, group, (piece,), op))
+                send_frame(sock, Frame(frame.request_id, group, pieces, op))
             except OSError:
                 logger.warning("caller for request %s group %s went away before its %s reply",
                                frame.request_id, group, OP_NAMES.get(op, op))
