@@ -135,19 +135,115 @@ class SpanRouting:
         self.heads = {s[0] for s in self.spans if s[0] >= 0}
         self.passengers = {i for s in self.spans for i in s[1:]}
         self._undo: list = []
+        # the span issued by the previous head and not yet collected. One at a time per pass:
+        # the host has nothing to do between issuing at layer l and collecting at layer l+4, so
+        # depth here would buy nothing until several requests are in flight at once
+        self._outstanding = None
+        # what the previous head returned, so the next one can check nothing ran in between
+        self._returned = None
         self._install()
 
     def _install(self) -> None:
         layers = self.model.model.layers
+        ordered = [s[0] for s in self.spans if s[0] >= 0]
         for span in self.spans:
             for layer_id in span[1:]:
                 self._make_pass_through(layers[layer_id], layer_id)
+        for position, layer_id in enumerate(ordered):
+            self._make_head(
+                layers[layer_id], layer_id,
+                # the first head has no span behind it, so it opens one with the embedding it was
+                # handed; the last has no span in front, so it closes the stack instead
+                opens=(position == 0), closes=(position == len(ordered) - 1),
+            )
         logger.info(
             "afd host: %s span(s), %s layer(s) served entirely by the pool, %s attention(s) kept "
             "here. Round trips a step: %s, against %s under the per-layer cut.",
             len(self.spans), len(self.passengers), len(self.heads),
             len(self.spans), len(layers) - 1,
         )
+
+    def _make_head(self, layer, layer_id: int, *, opens: bool, closes: bool) -> None:
+        """The one layer of a span that stays here: its attention, and nothing else.
+
+        The residual stream does NOT arrive through sglang's layer loop. It arrives from the pool,
+        which is the only end that has it -- the three layers in between did not run here. So this
+        forward ignores the `hidden_states` and `residual` it is passed, EXCEPT at the first head,
+        where what is passed is the embedding and there is no span behind it yet.
+
+        Ignoring an argument is the kind of thing that works until an install half fails, so it is
+        checked rather than assumed: each head records the tensor it returned and the next head
+        refuses anything else. A pass-through that did not take -- one layer of forty-eight missed
+        by the install, which is a mistake this tree has made -- would otherwise show up as fluent
+        output and a throughput number about a different arrangement.
+        """
+        original = layer.forward
+        self._make_o_proj_transparent(layer)
+
+        def head(positions, hidden_states, residual=None, forward_batch=None, **kwargs):
+            if opens:
+                handle = self.client.issue(
+                    layer_id, hidden_states, self._row_ids(forward_batch), OP_SPAN_ENTER)
+            else:
+                self._check_untouched(layer_id, hidden_states)
+                handle = self._outstanding
+            read_point = self.client.collect_read_point(handle, hidden_states.device)
+            # h_(l+3) is the query's source under shift 1, normalised by this layer's own LN1 so
+            # the early stream gets exactly the normalisation the layer would have applied
+            layer._afd_q_hidden = layer.input_layernorm(read_point)
+            output = self.client.collect_output(handle, hidden_states.device)
+            # sglang's fused convention, and the pool sent the two halves it needs: the incoming
+            # residual is h_(l+3) and the incoming hidden is the span's last feed-forward, so this
+            # both adds them into x_l and normalises it
+            normed, _ = layer.input_layernorm(output, read_point)
+            try:
+                o = layer.self_attention(
+                    positions=positions, hidden_states=normed, forward_batch=forward_batch)
+            finally:
+                layer._afd_q_hidden = None
+            row_ids = self._row_ids(forward_batch)
+            if closes:
+                last = self.client.issue(layer_id, o, row_ids, OP_SPAN_EXIT)
+                return self.client.collect_output(last, o.device), None
+            self._outstanding = self.client.issue(layer_id, o, row_ids, OP_SPAN)
+            self._returned = o
+            return o, None
+
+        layer.forward = head
+        self._undo.append(lambda ly=layer, o=original: setattr(ly, "forward", o))
+
+    def _make_o_proj_transparent(self, layer) -> None:
+        """The output projection is the pool's first act, so it must not happen here too.
+
+        Made transparent rather than deleted: `self_attention` calls it and the call site is
+        sglang's. What comes back from the attention is then the pre-projection output, which is
+        exactly what the span wants sent. The weights behind it are the host's copy and are never
+        read -- the pool holds the ones that run.
+        """
+        attn = layer.self_attention
+        original = attn.o_proj.forward
+        attn.o_proj.forward = lambda x, *args, **kwargs: (x, None)
+        self._undo.append(lambda a=attn, o=original: setattr(a.o_proj, "forward", o))
+
+    def _check_untouched(self, layer_id: int, hidden_states) -> None:
+        if self._returned is None or hidden_states is not self._returned:
+            raise RuntimeError(
+                f"layer {layer_id} was handed a hidden state the previous head did not return, so "
+                f"a layer between them ran. Under the group cut those layers belong to the pool "
+                f"and their weights are on the meta device here; one of them running locally "
+                f"means the pass-through install missed it. The output would stay fluent."
+            )
+
+    @staticmethod
+    def _row_ids(forward_batch) -> torch.Tensor:
+        """Whose recurrent state each row advances.
+
+        sglang's own per-request handle for cache slots. A decode batch carries one token from
+        each of several requests, and the pool keys both recurrent states by request -- a row sent
+        under the wrong id advances somebody else's memory with this token, and neither end has
+        any way to notice.
+        """
+        return forward_batch.req_pool_indices
 
     def _make_pass_through(self, layer, layer_id: int):
         """A layer the pool runs. Its forward returns its input untouched.
@@ -177,7 +273,15 @@ class SpanRouting:
 
     def report(self) -> dict:
         return {"spans": len(self.spans), "layers_on_the_pool": len(self.passengers),
-                "attentions_here": len(self.heads), "calls": self.client.calls}
+                "attentions_here": len(self.heads), "calls": self.client.calls,
+                # NOT open. The pool sends the read point early and this host collects it and then
+                # immediately collects the output, with nothing in between -- so the head start
+                # exists on the wire and is not yet spent on anything. Opening it means projecting
+                # the query and launching the cache sweep between those two lines, which is what
+                # `sweep_ahead` and `split_attention` already do for the per-layer cut. Reported
+                # rather than left implicit: a run that quoted this arrangement's throughput while
+                # the window was shut would be quoting a number about a different schedule.
+                "sweep_window_open": False}
 
 
 def bus_size_note(riders: int) -> str:
