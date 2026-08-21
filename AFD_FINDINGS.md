@@ -8,6 +8,33 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, the residual grows again, and the prologue is the only span left out of line
+
+The residual comparison was last run BEFORE the row-keying fix. Rerun after it, against the same
+per-layer reference from the same process:
+
+    the arrangement, per span boundary      the model, per layer
+    span 0  (after layer 2)   76.76         layer 2    68.93      +11.4%
+    span 1  (after layer 6)  110.65         layer 6   112.00       -1.2%
+    span 2  (after layer 10) 168.15         layer 10  170.32       -1.3%
+
+The collapse is gone -- it was the tables keyed by request, and 34.73 at span 1 has become 110.65
+against the model's 112.00. Spans 1 and 2 now agree to about one percent, which is the size of the
+linear attention's own accumulation noise.
+
+Span 0 does not. It is 11% HIGH, and it is the only span produced by a different function:
+`run_prologue` starts from the embedding and has no `W_o`, no output gate and no attention output
+at its head, where every other span begins with all three. Every other span agreeing to 1% while
+the one with its own code path sits at 11% is the sharpest single reading this search has
+produced.
+
+The linear attention itself was compared against the model's own in the same process, seeded from
+the model's own state, and the difference is 3 to 18 percent with a per-channel ratio near one and
+a few percent of scatter -- the shape of bfloat16 accumulation over a 128x128 contraction plus a
+rank-one update, not of a wrong factor. Layer 0 agrees to 0.0003. That is consistent with the
+composition being right and leaves the assembly around it as what to look at.
+
+
 ## 2026-08-21, the composition compared at last, and the confound in the first reading
 
 Every piece of `SpanRunner._linear_attention` had been checked against something outside itself and
