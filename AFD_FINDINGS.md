@@ -8,6 +8,49 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, the residual against its own reference: the collapse is at the first middle span
+
+The pool holds the whole model and also runs the spans, so both sequences come from one process,
+one set of weights and one prompt. The model's own per-layer residual, row 0 of a 122-token
+prefill, against the residual the span keeps at each boundary:
+
+    the model, per layer          the span, per boundary
+    layer 0    28.8
+    layer 1    51.5
+    layer 2    68.9              span 0 (after layer 2)      76.8      +11%
+    layer 3    83.2
+    layer 4    86.0
+    layer 5    90.5
+    layer 6   112.0              span 1 (after layer 6)      34.7      -69%
+    layer 7   110.9              span 2                      40.4
+    ...                          ... rising slowly to 242.7 at span 15
+
+The model's residual grows monotonically, 28.8 to 237 over twenty layers, which is what a residual
+stream does. The arrangement's FALLS by two thirds across its first middle span and then climbs
+back from a floor it should never have reached.
+
+Adding vectors cannot halve a norm unless what is added points against what it is added to. So the
+first middle span contributes something strongly anti-correlated with the stream it joins -- and
+the first middle span is the first one whose attention output came from the HOST. The prologue,
+which has no host attention in it, is 11% off rather than 69%.
+
+That is the tightest localisation this search has had. What it does NOT yet say is which of the
+three things only a middle span does is responsible: the output gate applied to an attention
+output computed elsewhere, `W_o` on that output, or the residual taken from the pool's own table
+rather than carried in the call.
+
+Two instrument errors were made getting here and both are worth more than the reading:
+
+    the trace walked ROWS     `_RESIDUAL_SEEN` incremented once a row, so a 122-token prefill
+                             logged 122 lines from ONE span. The sequence was read as span
+                             boundaries and compared against a per-layer reference: 76.8, 44.2,
+                             30.9 falling against 28.8, 51.5, 68.9 rising. Two correct
+                             measurements of different quantities, and a comparison of neither
+    the norm is gemma-style  it scales by (1 + w), not w. The final hidden's RMS is 1.99 and
+                             rms(1 + w) is 1.95. The double-norm fix is unaffected, but what it
+                             was said to cost -- a sign flip on negative channels -- was wrong
+
+
 ## 2026-08-21, second run: the arrangement copies its input, and it is not the state
 
 The first run served 24 tokens and repeated the last prompt token. Two real faults were found and
