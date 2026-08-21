@@ -735,3 +735,53 @@ The only measurements here are the span (2046 us at batch 4) and the anchors it 
 The host's sweep is extrapolated linearly in batch from one point, which batched attention kernels
 almost certainly beat -- so the host is likely to have MORE headroom than shown, not less. Section
 10 records what happened the last time a cost model and a stopwatch disagreed in this tree.
+
+## 20. Which key may be early, decided against a rule fixed before the numbers
+
+`benchmark/afd/EARLY_K_PREREGISTRATION.md` states the conjecture and freezes the decision rule.
+This section records the outcome. The rule is repeated here as it was written, not as it reads
+after the fact:
+
+    SURVIVES        mixed within 0.5% of exact in bits per byte, AND all_early at least 4x
+                    further from exact than mixed is
+    FAILS           mixed worse than 0.5% -- the coefficient's key is not free either, and
+                    Early-K is unavailable at any granularity
+    UNINFORMATIVE   all_early ALSO within 0.5% -- the corpus is too short to show a state error,
+                    which saturates only after about 1/(1-alpha) steps, and the question has to be
+                    re-asked over a long generation
+
+### The conjecture
+
+A key that feeds a state REUSED ACROSS TIME must be the current one; every other use may take the
+early one. One operator appears twice in a linear layer:
+
+    P(k) = I - beta k k^T
+
+    state    S_t = alpha S_(t-1) P(k) + beta v k^T      survives the step
+    output   o_t = alpha S_(t-1) P(k) q + beta (k.q) v  does not
+
+so the arms are three evaluations of the same operator: `exact` current in both, `mixed` early in
+the output only, `all_early` early in both.
+
+### Two defects the arms had before they measured anything
+
+Both would have produced a publishable-looking number about something else, and both were caught
+only because the pre-registration required the `exact` arm to reproduce the stock function first.
+
+**A transposed state.** transformers holds the recurrent state as (heads, KEY dim, VALUE dim) and
+sglang holds it as (value heads, head_v_dim, head_k_dim) -- its own comment says "to match what the
+decode kernel expects". Both dimensions are 128 on this model, so no shape check can tell them
+apart. Written against the wrong one, the state was 0.96 out and the model disagreed with itself on
+eight positions in thirteen.
+
+**A whole-sequence forward.** The harness scored each document in one call, which takes the CHUNKED
+prefill kernel. The arms patch the recurrent step, which that kernel does not contain, so all three
+would have returned the SAME number -- and a null result reads as "the approximation is harmless".
+
+The second is the more dangerous shape and it is worth naming: a check that cannot see the thing it
+is checking fails by passing.
+
+### Result
+
+    (to be filled from the run; exact = 0.6232 bits per byte over 72,261 bytes of fineweb-edu,
+    12 documents, one token at a time)
