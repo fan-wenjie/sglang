@@ -764,6 +764,7 @@ class ModelRunner:
             model=self.model,
             shift_layers=self.server_args.afd_query_shift_layers,
             coverage=self.server_args.afd_coverage,
+            span_cut=self.server_args.afd_span_cut,
             hf_config=self.model_config.hf_config,
             split_attention=self.server_args.afd_split_attention,
             verify_split=self.server_args.afd_verify_split,

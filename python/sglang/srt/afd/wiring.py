@@ -348,7 +348,7 @@ def _report(plan: ReadPlan, coverage: str, n_stashed: int) -> None:
 
 
 def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
-                    coverage=None, hf_config=None, split_attention=None,
+                    coverage=None, span_cut=False, hf_config=None, split_attention=None,
                     verify_split=None) -> InstalledWiring:
     """Move the query's read point, on every layer or on the softmax ones alone.
 
@@ -361,6 +361,27 @@ def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
     `layer_types` is derived from the built stack when not given, so a caller in a frozen
     orchestrator can ask for the wiring without computing its inputs.
     """
+    if span_cut:
+        # The GROUP cut implements the read point itself, in `SpanRunner._finish`: it projects the
+        # next group's query from the residual between the last linear attention and the last
+        # feed-forward. Installing this wiring as well applies the shift TWICE to one model, and
+        # not harmlessly -- this converts by wrapping `layer.forward` and hooking
+        # `post_attention_layernorm`, which is the module the span calls to advance its own
+        # residual stream.
+        #
+        # It WAS installed, on the pool, alongside the span. The log read "coverage=all, shift=1,
+        # 63 layer(s) moved" -- every layer except layer 0, which is exempt because nothing sits
+        # beneath it to read. And layer 0 was the one layer whose output matched the colocated
+        # model exactly, while every other layer sat a few percent out in a direction that was not
+        # a rescaling. The span was measured for days as though it were the only transformation on
+        # the model it was running on.
+        logger.info(
+            "afd: --afd-span-cut implements its own read point, so the per-layer early-q wiring "
+            "stands down. --afd-query-shift-layers=%s is honoured by the span itself.",
+            shift_layers,
+        )
+        return None
+
     shift_layers, coverage = _resolve_settings(shift_layers, coverage, hf_config)
     if shift_layers == 0:
         # nothing to install. Returning an empty wiring rather than None keeps the caller from
