@@ -8,6 +8,27 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, the prefill and decode paths are not the same call, and only decode has a reference
+
+Reading what the model actually calls, rather than assuming the two paths agree:
+
+    the gate      `g = -exp(A_log) * softplus(a + dt_bias)`, alpha = exp(g), beta = sigmoid(b).
+                  Identical to `linear_history.gates`. Ruled out.
+    decode        `fused_recurrent_gated_delta_rule_packed_decode(..., scale=None,
+                  use_qk_l2norm_in_kernel=True)` -- the kernel normalises q and k itself
+    prefill       `self._prefill_fn(..., scale=None, use_qk_l2norm_in_kernel=False)`, with
+                  `q_fi = l2norm_fwd(q[0])` and `k_fi = l2norm_fwd(k[0])` done OUTSIDE it
+
+Same recurrence, two implementations, and the normalisation crosses the kernel boundary in
+opposite directions between them. `gdn_split.py` verifies the span against the DECODE one. The
+model's prefill uses the other, and nothing has ever compared the span to it.
+
+That is where the next measurement goes, and the shape of it matters: the span walks a chunk token
+by token through `read_one`/`update_only` while the model runs a chunked delta rule over the whole
+chunk at once. Those are equal in exact arithmetic and need not be in bfloat16, and "need not be"
+has to be measured rather than argued -- with a control, because a loose threshold passes anything.
+
+
 ## 2026-08-21, the stages of a linear layer, and where the divergence cannot be
 
 Layer 0's stages beside layer 1's and layer 2's, row 0 of a first prefill:
