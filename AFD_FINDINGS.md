@@ -599,10 +599,13 @@ chosen. Above 16 a span stops being a weight read and starts being a matrix mult
 
 Its internal split, which answers who pays for the wire:
 
-    4 x feed-forward     2040 MiB   74% of the span   298 us each
-    3 x linear attention  660 MiB   24%               129 us each
+    4 x feed-forward     2040 MiB   74% of the span   361 us each   measured
+    3 x linear attention  660 MiB   24%               200 us each   measured
     W_o                    60 MiB    2%                35 us
     one round trip                                    628 us
+
+(The per-layer figures were first divided out of the weight bytes as 298 and 129. Measured they are
+361 and 200 -- 22% and 55% low. `benchmark/afd/span_parts.py`.)
 
 A span covers a round trip 3.3 times over. The per-layer cut's feed-forward covered it 0.57 times
 -- 359 us of work against 628 us of overhead -- and that ratio is the whole of why section 10

@@ -110,14 +110,30 @@ copy of the pool.
 
 What that tail is worth, measured rather than assumed:
 
-    4 x feed-forward     2040 MiB   74% of the span   298 us each
-    3 x linear attention  660 MiB   24%               129 us each
+    4 x feed-forward     2040 MiB   74% of the span   361 us each   measured
+    3 x linear attention  660 MiB   24%               200 us each   measured
     W_o                    60 MiB    2%                35 us
     one round trip                                    628 us
 
-So the early message is covered by ONE feed-forward, 298 us of the 628 -- not by the span. The
-whole span covers the round trip 3.3 times over, but the early half is sent near the end and has
-only what follows it to hide behind.
+The per-layer figures are MEASURED (`benchmark/afd/span_parts.py`); dividing the weight bytes gave
+298 and 129, which is 22% and 55% low. The linear attention is much further from its weight-read
+floor than the feed-forward is, because it is three small matrices and a recurrence rather than one
+large read.
+
+That measurement is also the sharpest statement of why the cut is where it is:
+
+    one feed-forward                                361 us
+    one linear attention plus one round trip        828 us     2.29x the feed-forward
+    three linear attentions plus one round trip    1227 us     0.85x of four feed-forwards
+
+**At LAYER granularity the wire costs more than twice the work it enables. At SPAN granularity it
+fits inside the feed-forward chain with 15% to spare.** Same wire, same layers, opposite sign --
+which is the whole of what changed between the two cuts.
+
+The early message is covered by one feed-forward: 361 us against the ~105 us the query itself
+spends on the wire, so the query is at the host and being swept with well before the span ends.
+The pool still waits for the host's answer afterwards -- that wait is the "host busy 22%" line in
+section 19, and it is what a second tour group fills.
 
 Shift 2 would move the read point to `h_{l+2}`, which exists before the last linear attention runs,
 and the cover would become 129 + 298 = 427 us. That is the one place where the linear attentions
