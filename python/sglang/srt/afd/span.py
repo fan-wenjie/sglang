@@ -745,6 +745,16 @@ class SpanRunner:
         # contraction the query coefficient bought.
         step = (k, v, alpha, beta)
         reading = ask(layer_id, request_ids, q_tilde, step=step)
+        # The FIRST token of a request's FIRST chunk reads a state nothing has written to, so this
+        # is exactly zero or the slot carries someone else's history. One number, and it decides
+        # between "the recurrence is wrong" and "the recurrence is right and started wrong".
+        #
+        # Gated on both conditions. The first version logged row 0 of any single-row call, and a
+        # single-row call is usually a DECODE step, whose state is legitimately non-zero -- it read
+        # 6.21 and decided nothing. Keyed per layer as well: one key for all of them spent the
+        # whole budget on layer 0.
+        if len(request_ids) > 1 and int(request_ids[0]) not in self._residual:
+            _trace_step(f"first-read-L{layer_id}", layer_id, reading[0:1].reshape(1, -1))
         core = alpha.unsqueeze(-1) * reading + s.unsqueeze(-1) * v.float()
 
         # the state's own copy of the key, deferred: it only has to be applied before the NEXT
