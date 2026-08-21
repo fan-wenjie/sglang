@@ -27,6 +27,34 @@ First reading, one row, the model against the span:
 19% to 84% relative, against bf16 rounding of 0.003 in the convolution comparison. The span is
 nearer than the shuffled control but nowhere near the model.
 
+CORRECTED, and the corrected reading is below. The paragraph that follows was right to refuse the
+first one.
+
+With the state seeded from the model's own -- a PRE-hook, because a forward hook fires after the
+layer has advanced its cache -- and reaching the LINEAR backend rather than the hybrid wrapper
+that holds no forward_metadata of its own:
+
+    layer 0   rel 0.000293  cos 1.0000    control 3.50    seeded state |222.67|  conv |735.26|
+    layer 1   rel 0.0493    cos 0.9993    control 0.91                  |4.50|        |69.21|
+    layer 2   rel 0.1793    cos 0.9861    control 1.22                  |2.63|        |73.49|
+    layer 4   rel 0.0768    cos 0.9979    control 1.20                  |2.48|        |84.60|
+    layer 5   rel 0.0576    cos 0.9996    control 1.21                  |1.51|        |82.05|
+    layer 6   rel 0.0339    cos 0.9995    control 1.82                  |2.94|        |88.04|
+
+Layer 0 is exact to bf16 rounding. Every other layer is 3% to 18% off at a cosine of 0.986 to
+0.9996 -- so what differs is mostly MAGNITUDE and hardly at all direction.
+
+The state's magnitude was logged to decide a fork: if the error appeared only where the state is
+non-zero, the suspect would be the seeding rather than the span. It resolves the other way. Layer
+0 carries the LARGEST state of all (222.67 against 1.5 to 4.5) and is the one that agrees exactly,
+so the error does not track the state at all and the seeding is not what it measures.
+
+What distinguishes layer 0 from every other linear layer is now the question. It is the first
+layer of the stack, its convolution history is ten times the others', and it is the only one whose
+span input comes from the embedding rather than from a previous layer's output.
+
+The refused first reading, kept because refusing it was the right call:
+
 THIS IS NOT YET A FINDING. The span's state and ring are ZEROED for the comparison and the model's
 are whatever its own mamba cache holds -- and the warmup ran before this, on the same slots. Two
 recurrences started from different states differ for that reason alone, and the size of the

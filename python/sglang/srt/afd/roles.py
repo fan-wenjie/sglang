@@ -299,7 +299,12 @@ def watch_linear_attention(model, runner) -> None:
             if hidden.dim() != 2 or hidden.shape[0] != 1:
                 return
             try:
+                # the LINEAR backend, not the hybrid wrapper around it. `get_attn_backend()`
+                # returns a HybridLinearAttnBackend on this model, which holds a full-attention
+                # and a linear-attention backend side by side and has no forward_metadata of its
+                # own -- reaching for one gets an AttributeError naming the wrapper.
                 backend = get_attn_backend()
+                backend = getattr(backend, "linear_attn_backend", backend)
                 cache = backend.req_to_token_pool.mamba2_layer_cache(layer_id)
                 index = int(backend.forward_metadata.mamba_cache_indices[0])
                 before[layer_id] = (cache.conv[0][index].clone(),
@@ -380,10 +385,17 @@ def watch_linear_attention(model, runner) -> None:
                 c = float(torch.nn.functional.cosine_similarity(a, b, dim=0))
                 return f"rel {d:.6g} cos {c:+.4f}"
 
+            # the seeded state's own magnitude, because the fork this decides is whether the
+            # residual error appears only where the state is NON-zero. If it does, the suspect is
+            # the state -- and the first suspect there is this seeding, not the span: sglang keeps
+            # (value heads, head_v, head_k) and a reshape onto a differently-ordered layout
+            # permutes silently, which is a mistake this tree has made between two libraries
+            # already.
             logger.info(
-                "afd linear: layer %s -- span against the model %s | the control, a shuffled "
-                "input, gives %s",
+                "afd linear: layer %s -- span against the model %s | control %s | seeded state "
+                "|%.5g| conv |%.5g|",
                 layer_id, against(mine, theirs), against(shuffled, theirs),
+                float(ssm_before.float().norm()), float(conv_before.float().norm()),
             )
         return hook
 
