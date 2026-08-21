@@ -29,11 +29,15 @@ checkpoint and is not going to start: they are 48 floats each on this model, so 
 frame -- 384 bytes against a 165 KiB payload, which is 0.2% -- and the pool never has to be told
 about a model, kept in sync with one, or restarted when one changes.
 
-## What stays on the host
+## What stays on the host, and under which cut
 
-The causal convolution before the projection has its own per-request state, and it stays. It is
-about 60 KiB a layer a request against the recurrent state's 1.5 MiB, so moving it would add a
-second round trip for a fortieth of the memory. `mixed_qkv` arrives here already convolved.
+The causal convolution before the projection has its own per-request state. Under the PER-LAYER
+cut it stays on the host: it is about 60 KiB a layer a request against the recurrent state's
+1.5 MiB, so moving it would add a second round trip for a fortieth of the memory, and `mixed_qkv`
+arrives here already convolved.
+
+Under the GROUP cut (`span.py`) it moves here with everything else, because there is no host-side
+call left to run it in. `conv_buffer` below serves that arrangement, on this class's slot table.
 """
 
 from __future__ import annotations
@@ -118,23 +122,51 @@ class LinearStates:
             self._states[layer] = made
             return made
 
-    def note_touched(self, slots, layer: int) -> None:
+    def conv_buffer(self, layer: int, *, width: int, taps: int, dtype) -> torch.Tensor:
+        """The short convolution's own per-request state, on the SAME slot table.
+
+        Under the group cut the pool runs the linear layer whole, so the convolution runs here too
+        and its state has to be here with it. It is small -- `width x taps`, about 60 KiB a layer a
+        request against the recurrence's 1.5 MiB -- which is why the note above says it stays on
+        the host: that was true of the per-layer cut, where moving it would have bought a fortieth
+        of the memory for a second round trip. It is not true of the span, where the host is not in
+        the loop to run it.
+
+        Sharing `_slot_of` with the recurrent state is the point. Two slot tables that disagree
+        would fold one request's convolution into another request's recurrence, and there is no
+        symptom for that: both states are the whole history compressed, so a swap produces fluent
+        text conditioned on somebody else's prompt.
+        """
+        key = ("conv", layer)
+        with self._lock:
+            found = self._states.get(key)
+            if found is not None:
+                return found
+            made = torch.zeros((self.slots, width, taps), device=self.device, dtype=dtype)
+            self._states[key] = made
+            return made
+
+    def note_touched(self, slots, layer) -> None:
         with self._lock:
             for slot in slots:
                 self._touched.add((int(slot), layer))
 
     def report(self) -> dict:
         with self._lock:
-            per_layer = 0
-            if self._states:
-                one = next(iter(self._states.values()))
-                per_layer = one.numel() * one.element_size()
+            # summed rather than one-times-count: the conv buffers are a different shape from the
+            # recurrent ones, so multiplying any single buffer by the layer count reports a number
+            # wrong by whatever the mix happens to be
+            recurrent = {k: b for k, b in self._states.items() if not isinstance(k, tuple)}
+            conv = {k: b for k, b in self._states.items() if isinstance(k, tuple)}
+            total = lambda d: sum(b.numel() * b.element_size() for b in d.values())
             return {
                 "slots": self.slots,
                 "slots_in_use": self.slots - len(self._free),
-                "layers_allocated": len(self._states),
-                "bytes": per_layer * len(self._states),
-                "bytes_a_layer": per_layer,
+                "layers_allocated": len(recurrent),
+                "conv_layers_allocated": len(conv),
+                "bytes": total(recurrent) + total(conv),
+                "bytes_recurrent": total(recurrent),
+                "bytes_conv": total(conv),
             }
 
 

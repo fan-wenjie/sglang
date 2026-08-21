@@ -202,8 +202,10 @@ class PoolClient:
     NEEDS_FEED_FORWARD = 1
     NEEDS_CACHE = 2
     NEEDS_KV_PROJECTION = 4
+    NEEDS_SPANS = 8
     _NEED_NAMES = {1: "a feed-forward", 2: "a cache to sweep and append",
-                   4: "the key and value projections"}
+                   4: "the key and value projections",
+                   8: "whole spans, four layers a call"}
 
     def require(self, needs: int, timeout_s: float = 15.0) -> int:
         """Ask the pool what it does, and refuse now if it is not what this host needs.

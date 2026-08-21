@@ -39,6 +39,10 @@ from sglang.srt.afd.protocol import (
     OP_HELLO,
     OP_LINEAR,
     OP_SWEEP_Q,
+    OP_SPAN,
+    OP_SPAN_ENTER,
+    OP_SPAN_EXIT,
+    OP_SPAN_Q,
     unpack_positions,
     Frame,
     decode,
@@ -47,6 +51,13 @@ from sglang.srt.afd.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# How long the span thread waits for the early read point to reach the wire before calling it a
+# failure. It is normally set inside the last feed-forward, so any real wait here means the sending
+# thread is stuck rather than slow -- generous enough never to fire on a busy pool, short enough
+# that a stuck one fails instead of hanging every caller behind it.
+SPAN_HANDOVER_TIMEOUT_S = 30.0
 
 
 class Departure(threading.Thread):
@@ -70,6 +81,10 @@ class Departure(threading.Thread):
         # the pre-length behaviour, where a sweep is answered against whatever is held and the
         # transport is trusted to have ordered it.
         self.parked = None
+        # set when this pool serves the GROUP cut: a whole span of layers a call, rather than
+        # one feed-forward a call. None means it serves the per-layer cut, and a span frame is
+        # refused by name rather than half-served.
+        self.span = None
         # set when this pool also holds recurrent states, which is the linear-attention half of
         # the same idea: a per-request read belongs with the data. None means it answers sweeps
         # and appends only, and a LINEAR frame is refused rather than half-served.
@@ -96,17 +111,24 @@ class Departure(threading.Thread):
         1  feed-forward
         2  a cache: sweeps and appends
         4  the key/value projection with the cache
+        8  whole spans: the group cut, four layers a call
 
         Sent in reply to a HELLO so a host learns at STARTUP that it has reached a pool which does
         not do what it was configured to ask for. Without it the mismatch surfaces as the first
         frame the far end cannot parse, the connection thread dies, and the host reports "closed
         mid-call" -- which describes the socket and not the configuration that broke it.
+
+        The span bit matters more than the others because the two cuts differ in what the HOST
+        holds. A host built for the group cut has no feed-forward weights and no recurrent state;
+        pointed at a per-layer pool it would run out of layers to ask for rather than fail.
         """
         bits = 1
         if self.cache is not None:
             bits |= 2
         if self.attention is not None:
             bits |= 2 | 4
+        if self.span is not None:
+            bits |= 8
         return bits
 
     def answer_directly(self, frame: Frame, sock: socket.socket) -> bool:
@@ -351,6 +373,133 @@ class Departure(threading.Thread):
             self._depart(layer, riding)
 
     def _depart(self, layer: int, riding: list[tuple[Frame, socket.socket]]) -> None:
+        """Serve one batch. Which kind of batch is decided by the riders' opcode.
+
+        Riders are queued by layer, so a pool serving both cuts at once could put a feed-forward
+        frame and a span frame for the same layer in one queue. They are different jobs with
+        different replies, and mixing them would answer one caller with the other's arithmetic --
+        refused rather than dispatched on the first rider.
+        """
+        ops = {f.op for f, _ in riding}
+        if len(ops) != 1:
+            raise RuntimeError(
+                f"layer {layer}'s departure mixes {sorted(OP_NAMES.get(o, o) for o in ops)}. A "
+                f"departure serves one job; these callers asked for different ones and answering "
+                f"them from one batch would give each the other's arithmetic."
+            )
+        if ops <= {OP_SPAN, OP_SPAN_ENTER, OP_SPAN_EXIT}:
+            return self._depart_span(layer, ops.pop(), riding)
+        return self._depart_feed_forward(layer, riding)
+
+    def _depart_span(self, group: int, op: int, riding) -> None:
+        """One bus: a whole group of layers for everybody who boarded before it left.
+
+        The batch is fixed for the span's whole 2046 us -- four feed-forwards read 2760 MiB of
+        weights once, and a rider joining halfway would need that read done again. At the far end
+        the riders disperse: each host computes its own softmax attention, taking as long as its
+        own context takes, and boards whichever later bus it is in time for. That is what lets one
+        pool serve a 1k request and a 128k one without the short one waiting on the long one.
+
+        There is no departure timer to tune here. The previous span IS the timer: riders accumulate
+        while it runs, and the next bus leaves with whoever is waiting when the pool comes free.
+        """
+        if self.span is None:
+            raise RuntimeError(
+                f"a span frame for group {group} reached a pool with no span runner. This pool "
+                f"serves the per-layer cut; the host is speaking the group cut. Neither end can "
+                f"tell from the frames alone, which is what the HELLO exchange is for."
+            )
+        started = time.perf_counter()
+        counts = [f.tensors[0].shape[0] for f, _ in riding]
+        joined = torch.cat([f.tensors[0] for f, _ in riding], dim=0).to(self.device)
+        ids = torch.cat([f.tensors[1] for f, _ in riding], dim=0).reshape(-1).tolist()
+        if len(ids) != joined.shape[0]:
+            raise RuntimeError(
+                f"{len(ids)} row id(s) for {joined.shape[0]} row(s) in group {group}'s span. Every "
+                f"row has to say whose recurrent state it advances, and a mismatch folds one "
+                f"request's token into another's memory with no symptom in the output."
+            )
+
+        if op == OP_SPAN_EXIT:
+            out = self.span.run_epilogue(ids, group, joined)
+            self._reply_pieces(riding, counts, group, out, OP_SPAN_EXIT)
+        else:
+            # both halves of the reply go down the SAME socket, and the early one is sent from
+            # another thread. Two threads inside `send_frame` on one socket interleave a header
+            # with somebody else's payload, and the far end reads the remainder as the next
+            # frame's header -- so the second half waits for the first to be on the wire. The
+            # wait costs nothing: it is spent inside the last feed-forward either way.
+            sent = threading.Event()
+            handover = self._handover(riding, counts, group, sent)
+            if op == OP_SPAN_ENTER:
+                _, out = self.span.run_prologue(ids, joined, on_read_point=handover)
+            else:
+                _, out = self.span.run(ids, group, joined, on_read_point=handover)
+            if not sent.wait(timeout=SPAN_HANDOVER_TIMEOUT_S):
+                raise RuntimeError(
+                    f"group {group}'s read point was not on the wire "
+                    f"{SPAN_HANDOVER_TIMEOUT_S}s after the span finished. The host is blocked "
+                    f"waiting for it and sending the second half now would interleave two frames "
+                    f"on one socket."
+                )
+            self._reply_pieces(riding, counts, group, out, OP_SPAN)
+
+        self.departures.append(
+            {"layer": group, "riders": len(riding), "tokens": int(joined.shape[0]),
+             "started": started, "seconds": time.perf_counter() - started,
+             "op": OP_NAMES.get(op, op)}
+        )
+        if self.riders_path and len(self.departures) % 200 == 0:
+            self._write_riders()
+
+    def _handover(self, riding, counts, group: int, sent: threading.Event):
+        """Send the shifted read point without waiting for the feed-forward behind it.
+
+        The read point exists one feed-forward before the span's output. Copying it to the host
+        with a plain `.cpu()` would synchronise the stream at exactly that moment -- BEFORE the
+        last feed-forward has been issued -- so the pool would sit idle for the length of the copy
+        and the send, and then start the feed-forward. That closes the window this whole two-part
+        reply exists to open, and it closes it silently: the answers stay right and the overlap
+        just is not there. The same mistake, in the same direction, cost this arrangement a round
+        of measurements on the host side.
+
+        So the copy is queued on the stream, an event is recorded after it, and this returns
+        immediately. The caller issues the last feed-forward on top; a second thread waits on the
+        event -- which fires when the COPY is done, not when the feed-forward is -- and sends. The
+        GPU is busy with the feed-forward for the whole of the send.
+        """
+        def hand_over(read_point: torch.Tensor) -> None:
+            staged = read_point.to("cpu", non_blocking=True)
+            copied = torch.cuda.Event()
+            copied.record()
+
+            def when_copied() -> None:
+                try:
+                    copied.synchronize()
+                    self._reply_pieces(riding, counts, group, staged, OP_SPAN_Q)
+                finally:
+                    # set even on failure: the span thread is waiting on this before it sends the
+                    # second half, and a handover that died silently would hang the pool rather
+                    # than fail it
+                    sent.set()
+
+            threading.Thread(target=when_copied, daemon=True, name="afd-span-q").start()
+
+        return hand_over
+
+    def _reply_pieces(self, riding, counts, group: int, out: torch.Tensor, op: int) -> None:
+        """Cut one batched answer back into the rows each caller sent."""
+        offset = 0
+        for (frame, sock), n in zip(riding, counts):
+            piece = out[offset : offset + n]
+            offset += n
+            try:
+                send_frame(sock, Frame(frame.request_id, group, (piece,), op))
+            except OSError:
+                logger.warning("caller for request %s group %s went away before its %s reply",
+                               frame.request_id, group, OP_NAMES.get(op, op))
+
+    def _depart_feed_forward(self, layer: int, riding: list[tuple[Frame, socket.socket]]) -> None:
         started = time.perf_counter()
         widths = {f.tensor.shape[1] for f, _ in riding}
         if len(widths) != 1:

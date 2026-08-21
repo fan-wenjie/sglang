@@ -71,9 +71,25 @@ OP_LINEAR = 8     # a linear-attention layer's decode step, run where its recurr
                   # Carries the convolved projection, the two gates and the layer's two learned
                   # constants: the pool holds no checkpoint, and 384 bytes of constants a call is
                   # cheaper than teaching it about a model and keeping it in sync with one
+OP_SPAN = 9       # a whole group of layers: the host's attention output at a full-attention layer
+                  # -> the hidden state the NEXT full attention reads. Four feed-forwards and
+                  # three linear attentions, uninterrupted, with the batch fixed for all of it.
+                  # `layer` names the full-attention layer the span starts at
+OP_SPAN_Q = 10    # the first half of a span's reply: h_(l+3), the shifted read point, sent the
+                  # moment it exists -- one feed-forward before the span's own output does. The
+                  # host projects its query and sweeps its cache against it while the pool spends
+                  # that feed-forward. Never a request; only ever a reply
+OP_SPAN_ENTER = 11  # the layers BELOW the first full attention, fed by the embedding rather than
+                  # by an output projection. It is where a request's residual on the pool begins,
+                  # which is why it is a separate opcode: a span that silently started from zero
+                  # would be correct arithmetic over a history the request does not have
+OP_SPAN_EXIT = 12  # the last full attention's tail: output projection, feed-forward, final norm.
+                  # Returns the normalised hidden state, not logits, so that whether the
+                  # language-model head runs on the pool stays a separate and measurable choice
 OP_NAMES = {OP_FFN: "ffn", OP_SWEEP: "sweep", OP_HEAD: "head", OP_RELEASE: "release",
             OP_KVPROJ: "kvproj", OP_SWEEP_Q: "sweep_q", OP_APPEND: "append",
-            OP_HELLO: "hello", OP_LINEAR: "linear"}
+            OP_HELLO: "hello", OP_LINEAR: "linear", OP_SPAN: "span", OP_SPAN_Q: "span_q",
+            OP_SPAN_ENTER: "span_enter", OP_SPAN_EXIT: "span_exit"}
 
 
 class Frame(NamedTuple):
