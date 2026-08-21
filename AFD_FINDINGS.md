@@ -38,7 +38,11 @@ forward of the span itself.
 Alternatives killed, each by measurement rather than by argument:
 
     the checkpoint          both ends: config md5 0ecc077f, identical shard manifest
-    the query shift         --afd-query-shift-layers 0 degenerates identically
+    the query shift         at a REAL 0. The first attempt at this control was void: the span
+                            never read the flag -- `W_q` moved to the pool with the group cut, so
+                            the pool decides the read point, and the flag was on the host. Wired
+                            in bd4082eb, rerun, and the arrangement copies its input at 0 exactly
+                            as at 1. NOW excluded
     the pool's weights      the pool serves " Paris." colocated from the same process
     the host colocated      cannot be run as a control: the host card is 31.36 GiB and the model
                             needs ~50, which is the premise of the arrangement and not a defect
