@@ -193,6 +193,9 @@ class SpanRouting:
 
         self._index = PerPassIndex()
         self.sweeps = 0
+        # prefill calls, which have no window to open. Kept apart from `sweeps` so a report can
+        # say whether a run's windows were absent or merely shut.
+        self.fused = 0
         self._install()
 
     def _install(self) -> None:
@@ -281,11 +284,19 @@ class SpanRouting:
         backend = get_attn_backend()
         refusal = split_refusal(backend, attn, forward_batch)
         if refusal is not None:
-            raise RuntimeError(
-                f"the attention backend cannot be split, so the sweep cannot be started before "
-                f"the key and value arrive: {refusal}. Running it fused would be a correct model "
-                f"with the window shut, and nothing downstream could tell."
-            )
+            if forward_batch.forward_mode.is_decode():
+                # at DECODE the window is the schedule. Running fused here would be a correct
+                # model with the window shut and nothing downstream could tell, so it is fatal.
+                raise RuntimeError(
+                    f"the attention backend cannot be split at decode, so the sweep cannot be "
+                    f"started before the key and value arrive: {refusal}."
+                )
+            # at PREFILL there is no window to open: the key and the value arrive with the query,
+            # so there is nothing for a head start to be ahead OF. The fused path is the right one
+            # and skipping the split costs nothing -- but it is COUNTED, because a run whose
+            # window never opened must not be indistinguishable from one whose window is shut.
+            self.fused += 1
+            return None
         self.sweeps += 1
         return sweep(backend, attn, forward_batch, q=q, index=self._index)
 
@@ -383,7 +394,7 @@ class SpanRouting:
                 # asserted: a window that stopped opening -- a backend that started refusing the
                 # split, a request with no prefix -- looks exactly like one that never shut, and
                 # the difference is the whole schedule.
-                "sweep_window_open": True, "sweeps": self.sweeps}
+                "sweep_window_open": True, "sweeps": self.sweeps, "fused_prefills": self.fused}
 
 
 def bus_size_note(riders: int) -> str:
