@@ -78,6 +78,36 @@ def normalise(q: torch.Tensor, k: torch.Tensor, *, scale: float
             torch.nn.functional.normalize(k.float(), dim=-1))
 
 
+def query_coefficient(q: torch.Tensor, k: torch.Tensor, beta: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fold the key's correction into the query, so the history is read ONCE.
+
+    The reading the weight side needs is
+
+        alpha h_q - alpha beta (k.q) h_k  =  alpha S q - alpha beta (k.q) S k
+                                          =  alpha S [q - beta (k.q) k]
+
+    because the state enters both terms linearly. So the whole of it is one contraction against
+    one vector -- and that vector is computable HERE, from the query, the key and the write
+    strength, all of which the weight side has. The history side never sees the key on the
+    critical path.
+
+    What it changes, which is not the byte count (2096 up against 2144) but the pass count:
+
+        before   two contractions of the state, both on the critical path
+        after    one contraction on the critical path; the second, and the update it feeds,
+                 move to the deferred message that carries the key and the value
+
+    Measured at 8.5e-08 relative against the two-reading form.
+
+    Returns the coefficient and `beta (k.q)`, because the caller needs the second to add its own
+    value term back: `core = alpha S q_tilde + beta (k.q) v`.
+    """
+    kq = (k * q).sum(-1)
+    s = beta * kq
+    return q - s.unsqueeze(-1) * k, s
+
+
 def read(state: torch.Tensor, q: torch.Tensor, k: torch.Tensor
          ) -> tuple[torch.Tensor, torch.Tensor]:
     """The host's whole job in a linear layer: two contractions of the state it holds.

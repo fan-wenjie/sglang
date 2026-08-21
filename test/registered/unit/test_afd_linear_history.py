@@ -303,3 +303,51 @@ class TestTheHostSideCache(CustomTestCase):
                                        alpha=torch.ones(2, VH), beta=torch.zeros(2, VH))
         self.assertEqual(h_q[0, 0, 0].item(), 1.0)
         self.assertEqual(h_q[1, 0, 0].item(), 2.0)
+
+
+class TestTheQueryCoefficient(CustomTestCase):
+    """One contraction of the state where there were two, because the state enters linearly.
+
+    alpha h_q - alpha beta (k.q) h_k = alpha S [q - beta (k.q) k]. The bracket is computable on the
+    weight side, so the history side reads once and never sees the key on the critical path.
+
+    The failure this guards is a sign or a factor: the coefficient is a SUBTRACTION of the key's
+    own correction, and getting it wrong produces a model that reads its history with a query
+    nobody wrote -- fluent, and not the model.
+    """
+
+    def test_one_reading_equals_the_two_it_replaces(self):
+        from sglang.srt.afd.linear_history import query_coefficient
+
+        for seed in range(3):
+            with self.subTest(seed=seed):
+                step = a_step(seed)
+                alpha, beta = gates(step["a"], step["b"], step["A_log"], step["dt_bias"])
+                q, k = normalise(step["q"], step["k"], scale=KD**-0.5)
+                q, k = expand_to_value_heads(q, VH), expand_to_value_heads(k, VH)
+                h_q, h_k = read(step["state"], q, k)
+                want = mix(h_q, h_k, v=step["v"], k=k, q=q, alpha=alpha, beta=beta)
+                qt, s = query_coefficient(q, k, beta)
+                hist = alpha.unsqueeze(-1) * torch.einsum("bhvk,bhk->bhv", step["state"], qt)
+                got = hist + s.unsqueeze(-1) * step["v"].float()
+                torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-6)
+
+    def test_the_coefficient_is_the_query_minus_the_keys_correction(self):
+        from sglang.srt.afd.linear_history import query_coefficient
+
+        q = torch.zeros(1, VH, KD); q[..., 0] = 1.0
+        k = torch.zeros(1, VH, KD); k[..., 0] = 1.0
+        qt, s = query_coefficient(q, k, torch.full((1, VH), 0.25))
+        # k.q is 1 here, so the coefficient is q - 0.25 k
+        self.assertAlmostEqual(qt[0, 0, 0].item(), 0.75, places=6)
+        self.assertAlmostEqual(s[0, 0].item(), 0.25, places=6)
+
+    def test_a_key_orthogonal_to_the_query_leaves_it_alone(self):
+        """No overlap, no correction -- and a sign error would show here as a change."""
+        from sglang.srt.afd.linear_history import query_coefficient
+
+        q = torch.zeros(1, VH, KD); q[..., 0] = 1.0
+        k = torch.zeros(1, VH, KD); k[..., 1] = 1.0
+        qt, s = query_coefficient(q, k, torch.full((1, VH), 0.5))
+        torch.testing.assert_close(qt, q)
+        self.assertEqual(s.abs().max().item(), 0.0)
