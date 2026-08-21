@@ -8,6 +8,41 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## Read this before any number below about the GROUP CUT
+
+The group cut -- sections 18, 19 and 20, and everything about spans -- **has never produced an end
+to end number.** Its identities are verified and its parts are timed; the arrangement itself has
+not once served a token.
+
+    verified, against the kernel or a reference       what it says
+    the read comes apart from the update  2.2e-03     a linear layer can wear a softmax layer's
+                                          9.7e-08     interface
+    the query coefficient                 8.5e-08     one contraction where there were two
+    the one-pass kernel                   1e-06       260 us against the 252 of the kernel it
+                                                      replaces, while emitting one more tensor
+    a prefill chunk equals N decodes      exact       the difference three bugs turned on
+    Early-K in the coefficient only       +0.013% bpb pre-registered, and it survived
+
+    measured, on hardware                             what it says
+    a span at batch 1..64                 2046 us     flat to 16; the bus size follows from this
+    a span's parts                        361 / 200   feed-forward against linear attention
+    the state read, split and fused       3.6-5.4x    why the fused kernel is required
+    fp32 against bf16 for the state       11-25%      float32 stays
+
+    NOT measured                                      why it matters
+    step time, throughput, tokens         --          every figure in sections 18-19 is arithmetic
+    token-identical against a local
+    control                               --          the arrangement has never been shown correct
+                                                      end to end
+
+The per-layer cut (sections 1-17) is different: it ran, it was measured, and section 10's stopwatch
+is why the group cut exists at all. Do not read a group-cut figure as if it had the same standing.
+
+What blocks the end to end run is not the architecture. It is a sequence of integration faults --
+four so far in the prefill-versus-decode row shape, three deadlocks on one socket, two library
+naming collisions between sglang and transformers -- each of which produced a hang or a crash
+rather than a wrong number. The last one is open.
+
 ---
 
 ## 1. The read point costs what the study said, and only where the decode rule looks
