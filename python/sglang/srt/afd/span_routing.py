@@ -151,8 +151,12 @@ class SpanRouting:
     """Replaces whole groups of layers with a call to the pool.
 
     Installed over sglang's decoder layers: the full-attention layer that heads a span keeps its
-    attention and gives up its output projection and everything after it; the linear layers in the
-    span do not run at all.
+    attention and gives up everything else -- its projections included, so it does not even
+    compute the query it attends with. The linear layers in the span do not run at all.
+
+    The pieces it does use are named off the DECODER LAYER (`layer.attn`), not off a submodule.
+    `self_attention` is a method on that layer, not an object, and reaching through it for `.attn`
+    is an attribute error at the first token rather than at install.
     """
 
     def __init__(self, model, client: SpanClient, layer_types: list[str]):
@@ -212,7 +216,7 @@ class SpanRouting:
         original = layer.forward
 
         def head(positions, hidden_states, residual=None, forward_batch=None, **kwargs):
-            attn = layer.self_attention.attn
+            attn = layer.attn
             device = hidden_states.device
             rows = self._row_ids(forward_batch)
             if opens:
@@ -280,19 +284,6 @@ class SpanRouting:
             return attn(q, k, v, forward_batch)
         return join(get_attn_backend(), attn, forward_batch, k=k, v=v, state=state,
                     index=self._index)
-
-    def _make_o_proj_transparent(self, layer) -> None:
-        """The output projection is the pool's first act, so it must not happen here too.
-
-        Made transparent rather than deleted: `self_attention` calls it and the call site is
-        sglang's. What comes back from the attention is then the pre-projection output, which is
-        exactly what the span wants sent. The weights behind it are the host's copy and are never
-        read -- the pool holds the ones that run.
-        """
-        attn = layer.self_attention
-        original = attn.o_proj.forward
-        attn.o_proj.forward = lambda x, *args, **kwargs: (x, None)
-        self._undo.append(lambda a=attn, o=original: setattr(a.o_proj, "forward", o))
 
     def _check_untouched(self, layer_id: int, hidden_states) -> None:
         if self._returned is None or hidden_states is not self._returned:

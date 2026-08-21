@@ -345,8 +345,7 @@ class SpanRunner:
         # attention itself ran on the host, which is the whole point of the cut -- and the gate
         # was computed here on the previous call, so what comes back over the wire is the bare
         # attention output and the nonlinearity is applied on this side
-        attn_out, _ = layers[head].self_attn.o_proj(
-            self._gated(request_ids, attn_output))
+        attn_out, _ = layers[head].o_proj(self._gated(request_ids, attn_output))
         hidden, residual = _add_and_norm(
             layers[head].post_attention_layernorm, attn_out, residual)
         hidden = layers[head].mlp(hidden)
@@ -403,9 +402,12 @@ class SpanRunner:
         hidden = self._linear_attention(last.linear_attn, request_ids, layer_id, hidden)
         hidden, read_point = _add_and_norm(last.post_attention_layernorm, hidden, residual)
 
-        nxt = layers[self.next_attention[layer_id]].self_attention
+        # the projections live on the DECODER LAYER, not on a submodule: `self_attention` is a
+        # method that runs them. Naming a submodule that does not exist fails at the first token,
+        # not at install, which is where this cost a deployment round.
+        nxt = layers[self.next_attention[layer_id]]
         q, _, _, gate = nxt.forward_prepare_native(
-            positions, layers[self.next_attention[layer_id]].input_layernorm(read_point))
+            positions, nxt.input_layernorm(read_point))
         if on_query is not None:
             on_query(q)
 
@@ -415,8 +417,7 @@ class SpanRunner:
         x = read_point + hidden
         self._keep_residual(request_ids, x)
         self._keep_gate(request_ids, gate)
-        _, k, v, _ = nxt.forward_prepare_native(
-            positions, layers[self.next_attention[layer_id]].input_layernorm(x))
+        _, k, v, _ = nxt.forward_prepare_native(positions, nxt.input_layernorm(x))
         self.served += 1
         return q, k, v
 
@@ -430,7 +431,7 @@ class SpanRunner:
         layers = self.model.model.layers
         head = self._span_of(group)[0]
         residual = self._take_residual(request_ids, o.shape[0], o)
-        attn_out, _ = layers[head].self_attn.o_proj(self._gated(request_ids, o))
+        attn_out, _ = layers[head].o_proj(self._gated(request_ids, o))
         hidden, residual = _add_and_norm(
             layers[head].post_attention_layernorm, attn_out, residual)
         hidden = layers[head].mlp(hidden)

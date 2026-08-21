@@ -64,8 +64,15 @@ class Mlp(torch.nn.Module):
         return torch.tanh(x @ self.w)
 
 
-class Attention(torch.nn.Module):
-    """Enough of a softmax attention to project with: q, k, v and the output gate.
+class Layer(torch.nn.Module):
+    """Shaped like `Qwen3HybridAttentionDecoderLayer`, which is the point of this class.
+
+    The projections and the attention hang off the DECODER LAYER; `self_attention` is a METHOD on
+    it, not a submodule. An earlier version of this fake put them on a `self_attention` object and
+    a `self_attn` object, and every case here passed against a structure the model does not have --
+    the span reached through `layer.self_attention.attn` and died at the first token with
+    "'function' object has no attribute 'attn'". A fake whose shape differs from the real one
+    tests the fake.
 
     `forward_prepare_native` is sglang's name for everything before the attention itself -- the
     fused projection, the per-head norms and the rotation. The span calls it twice, once on the
@@ -73,13 +80,19 @@ class Attention(torch.nn.Module):
     which is the same splice the per-layer arrangement makes.
     """
 
-    def __init__(self, layer_id: int):
+    def __init__(self, layer_id: int, full: bool):
         super().__init__()
-        self.q = Proj(H, H, seed=400 + layer_id)
-        self.k = Proj(H, H, seed=500 + layer_id)
-        self.v = Proj(H, H, seed=600 + layer_id)
-        self.g = Proj(H, H, seed=700 + layer_id)
-        self.o_proj = Proj(H, H, seed=200 + layer_id)
+        self.input_layernorm = FusedNorm(1.0 + 0.01 * layer_id)
+        self.post_attention_layernorm = FusedNorm(1.0 + 0.02 * layer_id)
+        self.mlp = Mlp(seed=100 + layer_id)
+        if full:
+            self.q = Proj(H, H, seed=400 + layer_id)
+            self.k = Proj(H, H, seed=500 + layer_id)
+            self.v = Proj(H, H, seed=600 + layer_id)
+            self.g = Proj(H, H, seed=700 + layer_id)
+            self.o_proj = Proj(H, H, seed=200 + layer_id)
+        else:
+            self.linear_attn = Mlp(seed=300 + layer_id)
 
     def forward_prepare_native(self, positions, hidden_states):
         # positions ride along because the real one rotates with them; here they only have to
@@ -90,20 +103,6 @@ class Attention(torch.nn.Module):
         scale = 1.0 + 0.001 * positions.reshape(-1, 1).to(hidden_states.dtype)
         return (self.q(hidden_states)[0] * scale, self.k(hidden_states)[0] * scale,
                 self.v(hidden_states)[0], self.g(hidden_states)[0])
-
-
-class Layer(torch.nn.Module):
-    def __init__(self, layer_id: int, full: bool):
-        super().__init__()
-        self.input_layernorm = FusedNorm(1.0 + 0.01 * layer_id)
-        self.post_attention_layernorm = FusedNorm(1.0 + 0.02 * layer_id)
-        self.mlp = Mlp(seed=100 + layer_id)
-        if full:
-            self.self_attn = torch.nn.Module()
-            self.self_attn.o_proj = Proj(H, H, seed=200 + layer_id)
-            self.self_attention = Attention(layer_id)
-        else:
-            self.linear_attn = Mlp(seed=300 + layer_id)
 
 
 class Stack(torch.nn.Module):
@@ -147,7 +146,7 @@ def reference(stack, attn_output, gate, residual, span, nxt, positions):
     """
     layers = stack.model.layers
     head, rest = span[0], span[1:]
-    hidden = (attn_output * torch.sigmoid(gate)) @ layers[head].self_attn.o_proj.w
+    hidden = (attn_output * torch.sigmoid(gate)) @ layers[head].o_proj.w
     hidden, residual = layers[head].post_attention_layernorm(hidden, residual)
     hidden = layers[head].mlp(hidden)
     read_point = None
@@ -159,11 +158,10 @@ def reference(stack, attn_output, gate, residual, span, nxt, positions):
         if layer_id == rest[-1]:
             read_point = residual
         hidden = layer.mlp(hidden)
-    attn = layers[nxt].self_attention
-    q, _, _, _ = attn.forward_prepare_native(
-        positions, layers[nxt].input_layernorm(read_point))
+    attn = layers[nxt]
+    q, _, _, _ = attn.forward_prepare_native(positions, attn.input_layernorm(read_point))
     x = read_point + hidden
-    _, k, v, _ = attn.forward_prepare_native(positions, layers[nxt].input_layernorm(x))
+    _, k, v, _ = attn.forward_prepare_native(positions, attn.input_layernorm(x))
     return q, k, v, x
 
 
