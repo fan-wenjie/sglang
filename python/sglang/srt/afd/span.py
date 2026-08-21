@@ -521,16 +521,25 @@ class SpanRunner:
     def _convolve(self, attn, qkv: torch.Tensor, request_ids, layer_id: int) -> torch.Tensor:
         """The short convolution, against a ring this side keeps.
 
-        The ring is the last three steps of THIS side's own projections -- values the pool
-        computed itself -- so keeping it here costs no round trip and no history. It is 60 KiB a
-        layer a request against the recurrent state's 3.00 MiB, which is 2% of what a request
-        remembers, and it is the only per-request thing this side holds.
+        The kernel is depthwise and causal, K = 4, each channel filtered on its own:
+
+            out[c] = silu( bias[c] + sum over t of w[c,t] * x[c, n-K+1+t] )
+
+        so the ring holds K entries, not K-1: the window IS `[ring[1:], x_new]`, which is K wide
+        against a K-wide weight. An earlier version here allocated K-1 and built a window of three
+        against four -- caught by writing the formula down rather than by a test, because the span
+        path has none yet.
+
+        The ring is this side's own last K projections -- values the pool computed itself -- so
+        keeping it here costs no round trip and no history. It is 80 KiB a layer a request against
+        the recurrent state's 3.00 MiB, 2% of what a request remembers, and it is the only
+        per-request thing this side holds.
         """
         from sglang.srt.afd.linear_state import LinearStates  # noqa: F401 -- slot table only
 
         slots = [self.states.slot_of(int(r)) for r in request_ids]
         ring = self.states.conv_buffer(
-            layer_id, width=qkv.shape[-1], taps=attn.conv1d.weight.shape[-1] - 1,
+            layer_id, width=qkv.shape[-1], taps=attn.conv1d.weight.shape[-1],
             dtype=qkv.dtype)
         index = torch.tensor(slots, device=qkv.device, dtype=torch.long)
         held = ring.index_select(0, index)
