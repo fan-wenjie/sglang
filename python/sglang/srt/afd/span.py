@@ -228,6 +228,23 @@ def _add_and_norm(norm, hidden: torch.Tensor, residual: torch.Tensor | None):
     return out
 
 
+def _runs_of(request_ids) -> list[tuple[int, int, int]]:
+    """(request id, first row, row count) for each consecutive run of the same request.
+
+    A decode batch is one row a request, so every run has length one and this is the identity. A
+    PREFILL chunk is many rows of ONE request -- its own consecutive tokens -- and that is the case
+    the tables below were written without.
+    """
+    runs = []
+    for index, r in enumerate(request_ids):
+        rid = int(r)
+        if runs and runs[-1][0] == rid:
+            runs[-1][2] += 1
+        else:
+            runs.append([rid, index, 1])
+    return [(rid, start, count) for rid, start, count in runs]
+
+
 _HEAD_SEEN = {}
 
 
@@ -346,29 +363,45 @@ class SpanRunner:
     # -- what a request remembers between spans ---------------------------------------------
 
     def _take_residual(self, request_ids, rows: int, like: torch.Tensor) -> torch.Tensor:
-        """The residual entering this group, one row a rider, in the rider order.
+        """The residual entering this group, ONE ROW A ROW, in the caller's row order.
 
         A request making its first call has none, which is the headless span at the bottom of the
         stack; anything else means a group ran out of order and the answer would be a correct
         forward pass over the wrong history.
+
+        Per ROW rather than per request, which is what this was and what it cost. `request_ids` has
+        one entry a row: a decode batch is one row a request, so keeping a single row under the
+        request id was right there and only there. A 122-token prefill is 122 rows of ONE request,
+        each row overwrote the last, and what survived was the FINAL token's residual -- handed
+        back to all 122 positions on the next call. Measured at the boundary: 76.76 written
+        leaving the prologue, 18.833 read entering the next group, same request, same boundary.
+        Every position in the prompt then ran the rest of the stack on the last token's state.
         """
         with self._lock:
             rows_out = []
-            for r in request_ids:
-                held = self._residual.get(int(r))
+            for rid, _start, count in _runs_of(request_ids):
+                held = self._residual.get(rid)
                 if held is None:
                     raise RuntimeError(
-                        f"request {r} has no residual on the pool, so this is not its first span "
+                        f"request {rid} has no residual on the pool, so this is not its first span "
                         f"and the group before it never ran here. The forward would be correct "
                         f"arithmetic over a history this request does not have."
                     )
+                if held.shape[0] != count:
+                    raise RuntimeError(
+                        f"request {rid} kept {held.shape[0]} row(s) of residual and is asking for "
+                        f"{count} back. A chunk's rows are its own consecutive tokens and each has "
+                        f"its own residual; a mismatch here would broadcast one token's state over "
+                        f"the others and stay fluent."
+                    )
                 rows_out.append(held)
-        return torch.stack(rows_out, dim=0).to(like.dtype)
+        return torch.cat(rows_out, dim=0).to(like.dtype)
 
     def _keep_residual(self, request_ids, residual: torch.Tensor) -> None:
+        """Keep every row, not one a request. See `_take_residual` for what the one row cost."""
         with self._lock:
-            for i, r in enumerate(request_ids):
-                self._residual[int(r)] = residual[i].clone()
+            for rid, start, count in _runs_of(request_ids):
+                self._residual[rid] = residual[start : start + count].clone()
         _trace_residual(self, request_ids, residual)
 
     def _gated(self, request_ids, attn_output: torch.Tensor) -> torch.Tensor:
@@ -391,33 +424,41 @@ class SpanRunner:
         return flat * torch.sigmoid(gate)
 
     def _keep_gate(self, request_ids, gate: torch.Tensor) -> None:
-        """Kept FLAT, because the attention output it multiplies is flat.
+        """Kept FLAT and per ROW.
 
-        `forward_prepare_native` hands the gate back head-shaped on this model --
-        (rows, heads, head dim) -- while the attention output comes off the wire as
-        (rows, heads x head dim). Storing the gate as it arrives means the two disagree at the
-        multiply, which is one file away from either of the two places that chose a shape.
+        `forward_prepare_native` hands the gate back head-shaped on this model, and the attention
+        output it multiplies arrives flat, so the reshape happens once here rather than at every
+        use. Per row for the reason in `_take_residual`.
         """
         flat = gate.reshape(gate.shape[0], -1)
         with self._lock:
-            for i, r in enumerate(request_ids):
-                self._gate[int(r)] = flat[i].clone()
+            for rid, start, count in _runs_of(request_ids):
+                self._gate[rid] = flat[start : start + count].clone()
 
     def _take_gate(self, request_ids, like: torch.Tensor) -> torch.Tensor:
-        """The gate for the query already sent, one row a rider, in the rider order."""
+        """The gate for the query already sent, one row A ROW, in the caller's row order.
+
+        Same shape of table as the residual and the same correction: a prefill chunk's rows are one
+        request's own tokens, and a gate kept per request would apply the last token's gate to all
+        of them.
+        """
         with self._lock:
             rows = []
-            for r in request_ids:
-                held = self._gate.get(int(r))
+            for rid, _start, count in _runs_of(request_ids):
+                held = self._gate.get(rid)
                 if held is None:
                     raise RuntimeError(
-                        f"request {r} sent back an attention output for a query this pool never "
+                        f"request {rid} sent back an attention output for a query this pool never "
                         f"projected. The gate is applied to that output before W_o, so there is no "
                         f"way to finish the layer -- and skipping it would be a correct-looking "
                         f"model with one nonlinearity missing."
                     )
+                if held.shape[0] != count:
+                    raise RuntimeError(
+                        f"request {rid} kept {held.shape[0]} gate row(s) and is asking for {count}."
+                    )
                 rows.append(held)
-        return torch.stack(rows, dim=0).to(like.dtype)
+        return torch.cat(rows, dim=0).to(like.dtype)
 
     def release(self, request_id: int) -> int:
         """Forget one request. Returns how many recurrent slots were cleared."""
@@ -733,7 +774,15 @@ class SpanRunner:
 
 
     def seed(self, request_id: int, residual: torch.Tensor) -> None:
-        """Give a request its first residual: the embedding, for the headless span."""
+        """Give a request its first residual: the embedding, for the headless span.
+
+        Stored with a ROW axis even for one row, because that is what the table holds now -- a
+        prefill chunk keeps one row a token. A bare vector seeded here would be read back as a
+        chunk of `hidden_size` rows, and the refusal it earns names a row count rather than a
+        shape, so it is normalised at the door.
+        """
+        if residual.dim() == 1:
+            residual = residual.unsqueeze(0)
         with self._lock:
             self._residual[int(request_id)] = residual.clone()
 

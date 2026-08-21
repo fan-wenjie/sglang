@@ -221,7 +221,7 @@ class TestTheSpanEqualsTheSameLayersRunLocally(CustomTestCase):
         self.residual = torch.randn(2, H)
         for i in range(2):
             self.runner.seed(i, self.residual[i])
-            self.runner._gate[i] = self.gate[i]
+            self.runner._gate[i] = self.gate[i].reshape(1, -1)
 
     def test_all_three_projections_match(self):
         q, k, v = self.runner.run([0, 1], 3, self.attn_output, self.positions)
@@ -257,7 +257,7 @@ class TestTheSpanEqualsTheSameLayersRunLocally(CustomTestCase):
         first = self.runner.run([0, 1], 3, self.attn_output, torch.tensor([7, 11]))[0]
         for i in range(2):
             self.runner.seed(i, self.residual[i])
-            self.runner._gate[i] = self.gate[i]
+            self.runner._gate[i] = self.gate[i].reshape(1, -1)
         second = self.runner.run([0, 1], 3, self.attn_output, torch.tensor([90, 91]))[0]
         self.assertFalse(torch.allclose(first, second))
 
@@ -280,14 +280,14 @@ class TestTheGateNeverTravels(CustomTestCase):
     def test_it_is_kept_for_the_next_call(self):
         _, runner = a_runner()
         runner.seed(0, torch.randn(H))
-        runner._gate[0] = torch.randn(H)
+        runner._gate[0] = torch.randn(1, H)
         runner.run([0], 3, torch.randn(1, H), torch.tensor([3]))
         self.assertIn(0, runner._gate)
 
     def test_release_forgets_it_with_everything_else(self):
         _, runner = a_runner()
         runner.seed(0, torch.randn(H))
-        runner._gate[0] = torch.randn(H)
+        runner._gate[0] = torch.randn(1, H)
         runner.release(0)
         self.assertNotIn(0, runner._gate)
 
@@ -301,14 +301,14 @@ class TestTheResidualStaysOnThePool(CustomTestCase):
 
     def test_a_span_chains_into_the_next(self):
         stack, runner = a_runner()
-        residual, gate = torch.randn(H), torch.randn(H)
+        residual, gate = torch.randn(1, H), torch.randn(1, H)
         runner.seed(0, residual)
         runner._gate[0] = gate
         attn_output, positions = torch.randn(1, H), torch.tensor([5])
         runner.run([0], 3, attn_output, positions)
         want = reference(stack, attn_output, gate.reshape(1, H), residual.reshape(1, H),
                          (3, 4, 5, 6), 7, positions)
-        torch.testing.assert_close(runner._residual[0], want[3][0])
+        torch.testing.assert_close(runner._residual[0], want[3][0].reshape(1, H))
 
     def test_a_request_the_pool_has_never_seen_is_refused(self):
         _, runner = a_runner()
@@ -465,3 +465,65 @@ class TestTheEpilogueHandsBackAResidualStream(CustomTestCase):
         self.assertLess(abs(rms(large) / rms(small) - 1.0), 0.2,
                         "this norm does not flatten its input's scale, so the discriminator the "
                         "case above relies on does not hold")
+
+
+class TestAChunksRowsEachKeepTheirOwnResidual(CustomTestCase):
+    """A prefill chunk is one request's tokens, and each token has its own residual.
+
+    The tables were keyed by REQUEST. A decode batch is one row a request, so that was right there
+    and only there. A 122-token prefill is 122 rows of one request: each row overwrote the last,
+    the FINAL token's residual survived, and the next span handed it back to all 122 positions.
+    Every position in the prompt then ran the rest of the stack on the last token's state.
+
+    Measured at the boundary on the deployed model before this was fixed: 76.76 written leaving
+    the prologue, 18.833 read entering the next group, same request, same boundary. Nothing
+    raised; the arrangement served fluent, wrong text.
+    """
+
+    def test_each_row_comes_back_as_itself(self):
+        _, runner = a_runner()
+        rows = 4
+        kept = torch.randn(rows, H)
+        runner._keep_residual([3] * rows, kept)
+        got = runner._take_residual([3] * rows, rows, kept)
+        torch.testing.assert_close(got, kept)
+
+    def test_the_last_row_is_not_broadcast_over_the_others(self):
+        """The control. If the table still held one row a request, the line above would compare a
+        broadcast final row against itself on the last position and pass on three quarters of a
+        wrong answer."""
+        _, runner = a_runner()
+        rows = 4
+        kept = torch.randn(rows, H)
+        runner._keep_residual([3] * rows, kept)
+        got = runner._take_residual([3] * rows, rows, kept)
+        self.assertFalse(
+            torch.allclose(got[0], got[-1]),
+            "row 0 came back equal to the last row, which is what keying by request did",
+        )
+
+    def test_two_requests_in_one_batch_keep_their_own_rows(self):
+        _, runner = a_runner()
+        ids = [3, 3, 7]
+        kept = torch.randn(3, H)
+        runner._keep_residual(ids, kept)
+        torch.testing.assert_close(runner._take_residual(ids, 3, kept), kept)
+        self.assertEqual(runner._residual[3].shape[0], 2)
+        self.assertEqual(runner._residual[7].shape[0], 1)
+
+    def test_asking_for_a_different_row_count_is_refused(self):
+        """Within a step the prologue writes the rows the rest of the step reads, so a mismatch
+        means the arrangement lost track of who is in the batch. Refused rather than broadcast."""
+        _, runner = a_runner()
+        kept = torch.randn(4, H)
+        runner._keep_residual([3] * 4, kept)
+        with self.assertRaises(RuntimeError) as caught:
+            runner._take_residual([3], 1, kept[:1])
+        self.assertIn("kept 4 row(s)", str(caught.exception))
+
+    def test_the_gate_is_kept_per_row_too(self):
+        _, runner = a_runner()
+        rows = 3
+        gate = torch.randn(rows, H)
+        runner._keep_gate([5] * rows, gate)
+        torch.testing.assert_close(runner._take_gate([5] * rows, gate), gate)
