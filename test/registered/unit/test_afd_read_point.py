@@ -187,3 +187,59 @@ class TestCoverage(CustomTestCase):
 
         plan = plan_read_points(1, 64, convertible=full_attention_layers(QWEN38_27B_LAYER_TYPES))
         self.assertEqual(len(plan.moved), 16)
+
+
+class TestTheEarlyProjectionReadsOnlyItsOwnRows(CustomTestCase):
+    """The early stream takes the query, which is an eighth of a 16384-wide fused projection.
+
+    Running the whole thing to keep an eighth reads 87.5% of a 160 MiB weight for nothing, twice a
+    layer, on 48 of 64 layers. The rows are sliced once at install and the slice must be a VIEW --
+    a copy would put a second 160 MiB weight resident per layer, which is the opposite of the
+    saving.
+    """
+
+    def a_fake_attn(self, out=16, hidden=8, key_dim=4, contiguous=True):
+        import torch
+
+        from types import SimpleNamespace
+
+        weight = torch.randn(out, hidden)
+        if not contiguous:
+            weight = weight.t()
+        return SimpleNamespace(
+            in_proj_qkvz=SimpleNamespace(weight=weight), key_dim=key_dim, attn_tp_size=1)
+
+    def test_the_slice_is_a_view_of_the_original(self):
+        from sglang.srt.afd.wiring import _query_rows
+
+        attn = self.a_fake_attn()
+        rows = _query_rows(attn)
+        self.assertIsNotNone(rows)
+        self.assertEqual(rows.shape[0], 4)
+        self.assertEqual(rows.data_ptr(), attn.in_proj_qkvz.weight.data_ptr())
+
+    def test_it_projects_what_the_full_projection_would_have(self):
+        import torch
+
+        from sglang.srt.afd.wiring import _query_rows
+
+        attn = self.a_fake_attn()
+        x = torch.randn(3, 8)
+        full = torch.nn.functional.linear(x, attn.in_proj_qkvz.weight)
+        early = torch.nn.functional.linear(x, _query_rows(attn))
+        torch.testing.assert_close(early, full[:, :4])
+
+    def test_a_weight_it_cannot_slice_falls_back_rather_than_refusing(self):
+        """A quantised or sharded parameter is slower here, not broken.
+
+        Refusing would turn a speed optimisation into a load failure on checkpoints this has
+        never been run against, which is a worse trade than reading some bytes twice.
+        """
+        from sglang.srt.afd.wiring import _query_rows
+
+        self.assertIsNone(_query_rows(self.a_fake_attn(contiguous=False)))
+
+    def test_a_query_wider_than_the_projection_is_refused(self):
+        from sglang.srt.afd.wiring import _query_rows
+
+        self.assertIsNone(_query_rows(self.a_fake_attn(out=2, key_dim=4)))
