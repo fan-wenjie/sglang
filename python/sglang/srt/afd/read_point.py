@@ -194,6 +194,13 @@ def layer_types_of(model) -> list[str]:
     layer is answers the question both ways round and cannot disagree with what is actually there
     -- a config field says what was requested, the module list says what was constructed.
     """
+    if not hasattr(model, "model"):
+        raise TypeError(
+            f"layer_types_of takes the loaded model, not a config: got "
+            f"{type(model).__name__}. The whole point of this function is that it asks the built "
+            f"module list rather than a config field, because a config says what was requested "
+            f"and the module list says what was constructed."
+        )
     kinds = []
     for index, layer in enumerate(model.model.layers):
         try:

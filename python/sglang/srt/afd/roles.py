@@ -175,7 +175,7 @@ def make_span_runner(model, *, device):
     from sglang.srt.afd.span import SpanRunner, group_layers
 
     config = model.config
-    layer_types = layer_types_of(config)
+    layer_types = layer_types_of(model)
     states = LinearStates(
         slots=max_requests,
         num_v_heads=config.linear_num_value_heads,
@@ -328,7 +328,7 @@ def install_span_routing(model, client: PoolClient, *, sweep_ahead,
     routing = SpanRouting(
         model,
         SpanClient(client, reply_timeout_s=reply_timeout_s),
-        layer_types_of(model.config),
+        layer_types_of(model),
     )
     logger.info("afd host: the group cut is installed. %s", routing.report())
     if sweep_ahead is not None:
