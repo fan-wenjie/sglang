@@ -298,3 +298,60 @@ class HistoryCache:
         return {"slots": self.slots, "slots_in_use": self.slots - len(self._free),
                 "reads": self.reads, "bytes_recurrent": held, "bytes_conv": conv,
                 "bytes_a_request": (held + conv) // max(self.slots, 1)}
+
+
+def prefill_scan(state: torch.Tensor, *, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                 alpha: torch.Tensor, beta: torch.Tensor):
+    """One request's chunk of tokens, in order, advancing one state.
+
+    A prefill row is a TOKEN, not a request, and the tokens of one chunk are sequentially
+    dependent: the state after token n is what token n+1 reads. Treating the chunk as a batch --
+    which is what a decode step is, one token from each of several requests -- runs every token
+    against the same starting state and never advances it. The output is fluent and the model has
+    no memory of its own prompt.
+
+    That mistake was made three times in this arrangement, in three places, because in DECODE a
+    row is a request AND a token and the two are indistinguishable. This function exists so the
+    difference has a name and a test.
+
+    Shapes are (tokens, value heads, dim) with the state (value heads, value dim, key dim) for
+    ONE request. Returns the readings, one a token, and the state after the last of them.
+    """
+    if q.shape != k.shape:
+        raise ValueError(
+            f"query {tuple(q.shape)} against key {tuple(k.shape)}: a chunk's tokens are read with "
+            f"both, and a mismatch would scan a different number of steps for each."
+        )
+    readings = []
+    for t in range(q.shape[0]):
+        h_q, h_k = read(state.unsqueeze(0), q[t : t + 1], k[t : t + 1])
+        readings.append(
+            mix(h_q, h_k, v=v[t : t + 1], k=k[t : t + 1], q=q[t : t + 1],
+                alpha=alpha[t : t + 1], beta=beta[t : t + 1])[0])
+        state = update(state.unsqueeze(0), h_k, v=v[t : t + 1], k=k[t : t + 1],
+                       alpha=alpha[t : t + 1], beta=beta[t : t + 1])[0]
+    return torch.stack(readings, dim=0), state
+
+
+def prefill_convolve(ring: torch.Tensor, x: torch.Tensor, weight: torch.Tensor):
+    """A chunk's causal convolution, and the ring it leaves behind.
+
+    `ring` is (channels, taps) -- the K entries before this chunk -- and `x` is (tokens, channels).
+    The convolution is depthwise and causal, so a chunk is one `conv1d` over the ring followed by
+    the chunk, and the new ring is the last K of that sequence.
+
+    Scanning it token by token would give the same answer and cost a kernel launch each; treating
+    it as a batch would give a DIFFERENT answer, because every token would be convolved against
+    the pre-chunk ring instead of against its own predecessors.
+    """
+    taps = weight.shape[-1]
+    if ring.shape[-1] != taps:
+        raise ValueError(
+            f"a ring of {ring.shape[-1]} against a {taps}-tap kernel. The window is "
+            f"[ring[1:], x] and it has to be as wide as the weight; K-1 was the first version of "
+            f"this and it is the shape that does not raise, it broadcasts."
+        )
+    seq = torch.cat([ring[:, 1:], x.transpose(0, 1)], dim=-1).unsqueeze(0)
+    out = torch.nn.functional.conv1d(
+        seq, weight.unsqueeze(1), groups=weight.shape[0])[0].transpose(0, 1)
+    return torch.nn.functional.silu(out), seq[0, :, -taps:]

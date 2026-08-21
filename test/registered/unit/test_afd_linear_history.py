@@ -351,3 +351,95 @@ class TestTheQueryCoefficient(CustomTestCase):
         qt, s = query_coefficient(q, k, torch.full((1, VH), 0.5))
         torch.testing.assert_close(qt, q)
         self.assertEqual(s.abs().max().item(), 0.0)
+
+
+class TestAPrefillChunkEqualsTheSameTokensDecodedOneAtATime(CustomTestCase):
+    """The test that was missing three times, in three places.
+
+    In DECODE a row is a request and a token at once, so code written for one works for the other
+    and nothing says which was meant. In PREFILL a row is a token and a chunk's tokens are
+    sequentially dependent. Treating the chunk as a batch runs every token against the same
+    starting state, never advances it, and produces a model with no memory of its own prompt --
+    fluent, and wrong from the first generated token onward.
+    """
+
+    def a_chunk(self, n=5, seed=1):
+        g = torch.Generator().manual_seed(seed)
+        r = lambda *s: torch.randn(*s, generator=g)
+        return dict(q=r(n, VH, KD), k=r(n, VH, KD), v=r(n, VH, VD),
+                    alpha=torch.rand(n, VH, generator=g) * 0.5 + 0.5,
+                    beta=torch.rand(n, VH, generator=g))
+
+    def test_the_scan_matches_the_same_tokens_one_at_a_time(self):
+        from sglang.srt.afd.linear_history import prefill_scan
+
+        chunk = self.a_chunk()
+        start = torch.randn(VH, VD, KD) * 0.1
+
+        got, got_state = prefill_scan(start.clone(), **chunk)
+
+        state, wanted = start.clone(), []
+        for t in range(chunk["q"].shape[0]):
+            one = {key: val[t : t + 1] for key, val in chunk.items()}
+            h_q, h_k = read(state.unsqueeze(0), one["q"], one["k"])
+            wanted.append(mix(h_q, h_k, v=one["v"], k=one["k"], q=one["q"],
+                              alpha=one["alpha"], beta=one["beta"])[0])
+            state = update(state.unsqueeze(0), h_k, v=one["v"], k=one["k"],
+                           alpha=one["alpha"], beta=one["beta"])[0]
+        torch.testing.assert_close(got, torch.stack(wanted, dim=0))
+        torch.testing.assert_close(got_state, state)
+
+    def test_treating_the_chunk_as_a_batch_gives_a_different_answer(self):
+        """The bug this guards, made explicit. If these ever agree the test is worthless."""
+        from sglang.srt.afd.linear_history import prefill_scan
+
+        chunk = self.a_chunk()
+        start = torch.randn(VH, VD, KD) * 0.1
+        scanned, _ = prefill_scan(start.clone(), **chunk)
+        n = chunk["q"].shape[0]
+        as_batch, _ = read(start.unsqueeze(0).expand(n, -1, -1, -1), chunk["q"], chunk["k"])
+        batched = mix(as_batch, _, v=chunk["v"], k=chunk["k"], q=chunk["q"],
+                      alpha=chunk["alpha"], beta=chunk["beta"])
+        self.assertFalse(torch.allclose(scanned, batched))
+
+    def test_a_chunk_of_one_is_a_decode_step(self):
+        from sglang.srt.afd.linear_history import prefill_scan
+
+        chunk = self.a_chunk(n=1)
+        start = torch.randn(VH, VD, KD) * 0.1
+        got, _ = prefill_scan(start.clone(), **chunk)
+        h_q, h_k = read(start.unsqueeze(0), chunk["q"], chunk["k"])
+        want = mix(h_q, h_k, v=chunk["v"], k=chunk["k"], q=chunk["q"],
+                   alpha=chunk["alpha"], beta=chunk["beta"])
+        torch.testing.assert_close(got, want)
+
+
+class TestAChunksConvolutionEqualsTheSameStepsOneAtATime(CustomTestCase):
+    """Same difference, in the other stateful piece of the layer."""
+
+    def test_the_chunk_matches_the_ring_advanced_token_by_token(self):
+        from sglang.srt.afd.linear_history import prefill_convolve
+
+        torch.manual_seed(2)
+        C, K, n = 6, 4, 5
+        weight = torch.randn(C, K)
+        ring = torch.randn(C, K)
+        x = torch.randn(n, C)
+
+        got, got_ring = prefill_convolve(ring.clone(), x, weight)
+
+        held, wanted = ring.clone(), []
+        for t in range(n):
+            window = torch.cat([held[:, 1:], x[t].unsqueeze(-1)], dim=-1)
+            wanted.append(torch.nn.functional.silu((window * weight).sum(-1)))
+            held = window
+        torch.testing.assert_close(got, torch.stack(wanted, dim=0), rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(got_ring, held, rtol=1e-5, atol=1e-6)
+
+    def test_a_ring_of_the_wrong_width_is_refused(self):
+        """K-1 was the first version, and it does not raise -- it broadcasts."""
+        from sglang.srt.afd.linear_history import prefill_convolve
+
+        with self.assertRaises(ValueError) as caught:
+            prefill_convolve(torch.zeros(6, 3), torch.zeros(2, 6), torch.zeros(6, 4))
+        self.assertIn("it broadcasts", str(caught.exception))
