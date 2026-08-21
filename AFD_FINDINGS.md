@@ -8,6 +8,39 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, the composition compared at last, and the confound in the first reading
+
+Every piece of `SpanRunner._linear_attention` had been checked against something outside itself and
+every piece was right. The composition had not, because the comparison needs a real ForwardBatch
+and a span never runs inside a model forward. The pool has one on its own port: during a colocated
+request `Qwen3_5GatedDeltaNet.forward(hidden, forward_batch)` is the real thing, so a hook there
+can run the span's reimplementation on the same tensor, in the same process, on the same weights.
+
+First reading, one row, the model against the span:
+
+    layer 0   rel 0.194  cos +0.987      control (shuffled input)  rel 0.462  cos +0.889
+    layer 1   rel 0.644  cos +0.883                                rel 0.765  cos +0.792
+    layer 2   rel 0.748  cos +0.665                                rel 1.139  cos -0.070
+    layer 4   rel 0.770  cos +0.914                                rel 0.954  cos +0.686
+    layer 5   rel 0.839  cos +0.615                                rel 0.977  cos +0.217
+
+19% to 84% relative, against bf16 rounding of 0.003 in the convolution comparison. The span is
+nearer than the shuffled control but nowhere near the model.
+
+THIS IS NOT YET A FINDING. The span's state and ring are ZEROED for the comparison and the model's
+are whatever its own mamba cache holds -- and the warmup ran before this, on the same slots. Two
+recurrences started from different states differ for that reason alone, and the size of the
+difference says nothing until they start from the same one.
+
+The fix is available and specific: the hook already receives `forward_batch`, which carries the
+cache indices, so the span can be seeded from the model's own conv and recurrent state rather than
+from zero. Until that is done these numbers are a measurement of an uncontrolled difference.
+
+The hook also has to be unable to kill what it measures. Its first version reached for
+`LinearStates.state`, which does not exist -- the class keeps `_states` behind `buffer(layer)` --
+and raising inside a forward hook took the scheduler down rather than skipping the diagnostic.
+
+
 ## 2026-08-21, four suspects cleared and no fault found
 
 A round that eliminated rather than fixed. Each of these was a plausible per-token fault -- wrong
