@@ -86,10 +86,27 @@ OP_SPAN_ENTER = 11  # the layers BELOW the first full attention, fed by the embe
 OP_SPAN_EXIT = 12  # the last full attention's tail: output projection, feed-forward, final norm.
                   # Returns the normalised hidden state, not logits, so that whether the
                   # language-model head runs on the pool stays a separate and measurable choice
+OP_STATE_READ = 13    # POOL TO HOST, and the only op that travels that way. The pool holds a
+                  # linear layer's weights and the host holds its recurrent state, so the pool
+                  # asks: here is one query coefficient, give me the state contracted against it.
+                  # Carries q~ and the row ids; the reply is the raw reading, without the decay,
+                  # because the decay is a per-head scalar the pool has and a value that crossed
+                  # the wire to be multiplied there and back is a value that should not have gone
+OP_STATE_UPDATE = 14  # POOL TO HOST, off the critical path. The key, the value and the gates, so
+                  # the host can advance the state it holds. Deferred on purpose: the state only
+                  # has to be right by the NEXT step, which is the same argument OP_APPEND makes
+                  # for a KV cache, and it is what keeps the value off the critical path entirely
 OP_NAMES = {OP_FFN: "ffn", OP_SWEEP: "sweep", OP_HEAD: "head", OP_RELEASE: "release",
             OP_KVPROJ: "kvproj", OP_SWEEP_Q: "sweep_q", OP_APPEND: "append",
             OP_HELLO: "hello", OP_LINEAR: "linear", OP_SPAN: "span", OP_SPAN_Q: "span_q",
-            OP_SPAN_ENTER: "span_enter", OP_SPAN_EXIT: "span_exit"}
+            OP_SPAN_ENTER: "span_enter", OP_SPAN_EXIT: "span_exit",
+            OP_STATE_READ: "state_read", OP_STATE_UPDATE: "state_update"}
+
+# What the POOL sends to the HOST, rather than the other way round. A client's reader has to tell
+# these from replies: they arrive interleaved with the answers it is waiting for, on the same
+# socket, and storing one in the reply table would hang the caller it belongs to and answer a
+# different caller with a state reading.
+INBOUND_OPS = frozenset({OP_STATE_READ, OP_STATE_UPDATE})
 
 
 class Frame(NamedTuple):

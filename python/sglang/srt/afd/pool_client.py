@@ -27,7 +27,16 @@ import time
 from typing import NamedTuple
 
 import torch
-from sglang.srt.afd.protocol import CLOSE, OP_FFN, OP_HELLO, Frame, decode, send_frame
+from sglang.srt.afd.protocol import (
+    CLOSE,
+    INBOUND_OPS,
+    OP_FFN,
+    OP_HELLO,
+    OP_NAMES,
+    Frame,
+    decode,
+    send_frame,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +107,10 @@ class PoolClient:
         # the wrong shape cannot be handed to a caller expecting the other
         self._replies: dict[tuple[int, int], tuple] = {}
         self._hello: float | None = None
+        # set by a host that holds state the pool has to call back for. None means this client
+        # only ever receives replies, and an inbound request against it is a configuration
+        # disagreement rather than a protocol error -- so it is named as one.
+        self.serve = None
         self._failure: BaseException | None = None
         # bounded: an hour of decode is millions of entries, and overlap_report used to slice a
         # list that only ever grew. The report is windowed anyway.
@@ -151,12 +164,42 @@ class PoolClient:
         self._receiver.start()
         return True
 
+    def _answer_inbound(self, frame) -> None:
+        """A REQUEST arriving on the reply socket, because the pool needs something this end has.
+
+        Under the group cut the pool runs a linear layer's weights and this end holds its recurrent
+        state, so the pool calls back mid-span. The call arrives interleaved with the replies this
+        client is waiting for, and telling them apart is the reader's job: an inbound request
+        stored in the reply table would hang the caller it was keyed as, and hand a state reading
+        to whoever asked for that key.
+
+        Answered ON THE READER THREAD, deliberately. The pool is blocked waiting for this and will
+        send nothing else until it has it, so there is no reply being delayed -- and a handoff to a
+        worker would add a scheduler round trip to a call whose whole budget is one feed-forward.
+        The send takes the same lock every other send takes, because a reply going out from here
+        can interleave with one going out from a caller's thread.
+        """
+        if self.serve is None:
+            raise RuntimeError(
+                f"the pool sent a {OP_NAMES.get(frame.op, frame.op)} and this client has no "
+                f"handler for it. The two ends disagree about who holds the recurrent state: this "
+                f"one was built expecting the pool to hold it, and the pool expects this one to."
+            )
+        answer = self.serve(frame)
+        if answer is None:
+            return
+        with self._send_lock:
+            send_frame(self._sock, Frame(frame.request_id, frame.layer, tuple(answer), frame.op))
+
     def _receive(self) -> None:
         try:
             while True:
                 frame = decode(self._sock)
                 if frame is None:
                     break
+                if frame.op in INBOUND_OPS:
+                    self._answer_inbound(frame)
+                    continue
                 with self._cond:
                     if frame.op == OP_HELLO:
                         self._hello = float(frame.tensor[0, 0])
