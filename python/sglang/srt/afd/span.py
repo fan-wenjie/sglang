@@ -248,18 +248,21 @@ def _trace_residual(runner, request_ids, residual) -> None:
 
     if not os.environ.get("SGLANG_AFD_SELFCHECK"):
         return
-    for i, r in enumerate(request_ids):
-        rid = int(r)
-        step = _RESIDUAL_SEEN.get(rid, 0)
-        if step >= int(os.environ.get("SGLANG_AFD_SELFCHECK", "20")):
-            continue
-        _RESIDUAL_SEEN[rid] = step + 1
-        row = residual[i].float()
-        logger.info(
-            "afd residual: request %s boundary %s -- rows %s wide %s |%.5g| rms %.5g max %.5g",
-            rid, step, residual.shape[0], row.numel(),
-            float(row.norm()), float(row.pow(2).mean().sqrt()), float(row.abs().max()),
-        )
+    # ROW 0 ONLY, and one line a CALL. The first version incremented per row, so a 122-token
+    # prefill logged 122 lines from a single span and they were read as 122 span boundaries --
+    # a sequence across TOKEN POSITIONS compared against a reference across LAYERS. Both were
+    # correct measurements of different quantities, and the comparison was of neither.
+    rid = int(request_ids[0])
+    step = _RESIDUAL_SEEN.get(rid, 0)
+    if step >= int(os.environ.get("SGLANG_AFD_SELFCHECK", "20")):
+        return
+    _RESIDUAL_SEEN[rid] = step + 1
+    row = residual[0].float()
+    logger.info(
+        "afd residual: request %s span %s -- rows %s wide %s |%.5g| rms %.5g max %.5g",
+        rid, step, residual.shape[0], row.numel(),
+        float(row.norm()), float(row.pow(2).mean().sqrt()), float(row.abs().max()),
+    )
 
 
 class SpanRunner:
