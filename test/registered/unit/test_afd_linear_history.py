@@ -182,10 +182,23 @@ class TestTheGatesAreTheLayersOwn(CustomTestCase):
     """
 
     def test_the_decay_is_in_the_unit_interval(self):
-        alpha, beta = gates(torch.randn(4, VH) * 5, torch.randn(4, VH) * 5,
-                            torch.randn(VH), torch.randn(VH))
-        self.assertTrue(bool(((alpha > 0) & (alpha <= 1)).all()))
-        self.assertTrue(bool(((beta > 0) & (beta < 1)).all()))
+        """alpha lies in [0, 1] -- CLOSED at zero, which is not a rounding concession.
+
+        Both bounds are CLOSED, and that is not a rounding concession. alpha =
+        exp(-exp(A_log) * softplus(a + dt_bias)) underflows to exactly zero when A_log and the
+        gate are both large -- the head forgets everything and keeps only this step -- and
+        sigmoid saturates to exactly 1.0 in float32 at about |b| > 17. An earlier version
+        asserted open bounds on UNSEEDED inputs and went red about once a run on legitimate
+        values, which is a flaky test guarding nothing.
+
+        What is worth pinning is that the formula is not INVERTED: a decay outside [0, 1] grows
+        the state without bound, and one that ran backwards would remember the future.
+        """
+        g = torch.Generator().manual_seed(3)
+        r = lambda *s: torch.randn(*s, generator=g) * 5
+        alpha, beta = gates(r(4, VH), r(4, VH), r(VH) / 5, r(VH) / 5)
+        self.assertTrue(bool(((alpha >= 0) & (alpha <= 1)).all()))
+        self.assertTrue(bool(((beta >= 0) & (beta <= 1)).all()))
 
     def test_the_bias_moves_the_decay(self):
         args = (torch.zeros(2, VH), torch.zeros(2, VH), torch.zeros(VH))
