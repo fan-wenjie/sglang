@@ -6,6 +6,8 @@ under the wrong request id -- none of them raise, and none of them show up in th
 up in a throughput number that gets quoted as this arrangement's.
 """
 
+import socket
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -15,7 +17,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-from sglang.srt.afd.protocol import OP_SPAN, OP_SPAN_ENTER, OP_SPAN_EXIT, OP_SPAN_Q
+from sglang.srt.afd.pool_client import PoolClient, PoolClosed
+from sglang.srt.afd.pool_server import Departure
+from sglang.srt.afd.protocol import (
+    OP_SPAN,
+    OP_SPAN_ENTER,
+    OP_SPAN_EXIT,
+    OP_SPAN_Q,
+    Frame,
+    decode,
+    send_frame,
+)
 from sglang.srt.afd.span_routing import SpanClient, SpanRouting
 from sglang.test.test_utils import CustomTestCase
 
@@ -176,6 +188,104 @@ class TestTheOpcodesNameTheThreeShapes(CustomTestCase):
         client = a_client()
         client.issue(0, torch.zeros(1, 4), torch.tensor([0]), OP_SPAN_ENTER)
         self.assertEqual(client.client.issued[0]["op"], OP_SPAN_ENTER)
+
+
+class Pool:
+    """A pool that serves spans, or does not, answering HELLO and nothing else."""
+
+    def __init__(self, span=None):
+        self.departure = Departure(lambda b, l: b, 1, 0.005, "cpu")
+        self.departure.span = span
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            while True:
+                frame = decode(conn)
+                if frame is None:
+                    return
+                if not self.departure.answer_directly(frame, conn):
+                    send_frame(conn, Frame.one(frame.request_id, frame.layer, frame.tensor))
+        except OSError:
+            return
+
+    def close(self):
+        self.sock.close()
+
+
+class TestBothEndsHaveToAgreeOnTheCut(CustomTestCase):
+    """--afd-span-cut changes what each END holds, not only what they say to each other.
+
+    A host under the group cut has no feed-forward weights and no recurrent state. Pointed at a
+    per-layer pool it would not fail with a bad frame -- it would ask for spans nobody serves,
+    which arrives as "closed mid-call", a message about a socket that names neither side's
+    configuration. That is the failure this capability bit exists to replace, and it is the same
+    failure the other three bits were added for.
+    """
+
+    def test_a_per_layer_pool_does_not_claim_spans(self):
+        pool = Pool(span=None)
+        client = PoolClient(f"127.0.0.1:{pool.port}", 5.0)
+        try:
+            with self.assertRaises(PoolClosed) as caught:
+                client.require(PoolClient.NEEDS_SPANS)
+            self.assertIn("spans", str(caught.exception))
+        finally:
+            pool.close()
+
+    def test_a_span_pool_satisfies_a_span_host(self):
+        pool = Pool(span=object())
+        client = PoolClient(f"127.0.0.1:{pool.port}", 5.0)
+        try:
+            served = client.require(PoolClient.NEEDS_SPANS)
+            self.assertEqual(served & PoolClient.NEEDS_SPANS, PoolClient.NEEDS_SPANS)
+        finally:
+            pool.close()
+
+    def test_a_span_pool_still_serves_feed_forwards(self):
+        """The bit is added to the others, not swapped for them: the weights are still here."""
+        pool = Pool(span=object())
+        client = PoolClient(f"127.0.0.1:{pool.port}", 5.0)
+        try:
+            client.require(PoolClient.NEEDS_FEED_FORWARD | PoolClient.NEEDS_SPANS)
+        finally:
+            pool.close()
+
+
+class TestOneDepartureServesOneJob(CustomTestCase):
+    """Riders queue by layer, so a feed-forward frame and a span frame can share a queue.
+
+    They are different jobs with different replies. Dispatching on the first rider would answer
+    one caller with the other's arithmetic, and both replies are tensors of plausible shape.
+    """
+
+    def test_a_mixed_queue_is_refused(self):
+        departure = Departure(lambda b, l: b, 1, 0.005, "cpu")
+        riding = [(Frame.one(1, 3, torch.zeros(1, 4), OP_SPAN), None),
+                  (Frame.one(2, 3, torch.zeros(1, 4)), None)]
+        with self.assertRaises(RuntimeError) as caught:
+            departure._depart(3, riding)
+        self.assertIn("mixes", str(caught.exception))
+
+    def test_a_span_frame_at_a_pool_without_a_runner_is_refused_by_name(self):
+        departure = Departure(lambda b, l: b, 1, 0.005, "cpu")
+        riding = [(Frame(1, 3, (torch.zeros(1, 4), torch.zeros(1, 1)), OP_SPAN), None)]
+        with self.assertRaises(RuntimeError) as caught:
+            departure._depart(3, riding)
+        self.assertIn("no span runner", str(caught.exception))
 
 
 if __name__ == "__main__":

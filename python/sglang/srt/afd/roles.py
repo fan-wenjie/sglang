@@ -123,6 +123,80 @@ def attach_cache_pool(sweep_ahead, *, addr, connect_timeout_s: float = 30.0):
     return client
 
 
+def span_cut_wanted() -> bool:
+    """Whether this process was launched for the group cut.
+
+    Read from the global server args rather than passed down, for the reason `absent_ffn` reads it
+    the same way: the pool role is set up inside the scheduler process, which is spawned, and a
+    module-level flag set in the parent does not cross that boundary. That failure was silent once
+    already here -- the feed-forward weights were built after the flag said not to -- so the value
+    is fetched where it is used.
+    """
+    from sglang.srt.server_args import get_global_server_args
+
+    return bool(get_global_server_args().afd_span_cut)
+
+
+def _span_slots() -> int:
+    """How many requests the pool can hold recurrent state for.
+
+    Taken from `--max-running-requests` rather than guessed. A slot table that ran out would refuse
+    a request mid-generation, and a number invented here would put that cliff somewhere the
+    operator never chose. If sglang has not resolved the limit yet there is nothing to derive from,
+    and refusing at startup beats picking one.
+    """
+    from sglang.srt.server_args import get_global_server_args
+
+    limit = get_global_server_args().max_running_requests
+    if limit is None:
+        raise ValueError(
+            "--afd-span-cut needs --max-running-requests to size the pool's recurrent state "
+            "table. A recurrent state is the whole history compressed and cannot be rebuilt from "
+            "a prefix, so the table refuses rather than evicts -- and where that refusal falls "
+            "has to be a number somebody chose."
+        )
+    return int(limit)
+
+
+def make_span_runner(model, *, device):
+    """The pool's span runner, if --afd-span-cut asked for one. None otherwise.
+
+    Sized by `max_requests` because a recurrent state cannot be evicted and rebuilt from a prefix
+    the way a KV cache can -- it is the whole history compressed -- so the slot table refuses a
+    request rather than dropping one, and the refusal has to be far from the working point.
+    """
+    if not span_cut_wanted():
+        return None
+    # after the switch, never before it: a pool serving the per-layer cut has no recurrent state
+    # to size and must not be refused for a limit it does not need
+    max_requests = _span_slots()
+    from sglang.srt.afd.linear_state import LinearStates
+    from sglang.srt.afd.read_point import layer_types_of
+    from sglang.srt.afd.span import SpanRunner, group_layers
+
+    config = model.config
+    layer_types = layer_types_of(config)
+    states = LinearStates(
+        slots=max_requests,
+        num_v_heads=config.linear_num_value_heads,
+        head_k_dim=config.linear_key_head_dim,
+        head_v_dim=config.linear_value_head_dim,
+        device=device,
+    )
+    runner = SpanRunner(model, states, layer_types=layer_types)
+    spans = group_layers(layer_types)
+    logger.info(
+        "afd pool: the group cut. %s span(s) a decode step against %s per-layer calls, %s "
+        "layer(s) served here entire, both recurrent states held here for up to %s request(s). "
+        "The batch riding a span is fixed for its whole length: every stage in it has "
+        "context-free latency, so there is nothing inside a span worth re-forming a batch for.",
+        len(spans), len(layer_types) - 1,
+        sum(len(s) for s in spans) - len([s for s in spans if s[0] >= 0]),
+        max_requests,
+    )
+    return runner
+
+
 def make_sweep_service(model, *, enabled, max_context: int, device):
     """The pool's cache and sweep, if --afd-kv-on-pool asked for them. None otherwise."""
     if not enabled:
@@ -224,10 +298,44 @@ def install_host_routing(model, pool_addr: str, sweep_ahead, connect_timeout_s: 
         )
         return None, None
     client = PoolClient(pool_addr, connect_timeout_s)
+    if span_cut_wanted():
+        # asked for by name at the HELLO. The two cuts differ in what each END holds, not only in
+        # what they say to each other: a host built for the group cut has no feed-forward weights
+        # and no recurrent state, so against a per-layer pool it would not fail, it would run out
+        # of layers to ask for. The capability bit is what turns that into a startup error.
+        client.require(PoolClient.NEEDS_SPANS)
+        return client, install_span_routing(model, client, sweep_ahead=sweep_ahead)
     client.require(PoolClient.NEEDS_FEED_FORWARD)
     return client, install_pool_routing(
         model, client, routable_layers(model), sweep_ahead=sweep_ahead
     )
+
+
+def install_span_routing(model, client: PoolClient, *, sweep_ahead,
+                         reply_timeout_s: float = 60.0):
+    """Give whole groups of layers to the pool, keeping only the attentions here.
+
+    `sweep_ahead` is accepted and NOT yet used, and that is deliberate rather than forgotten. The
+    window under this cut sits between the two halves of a span's reply -- the pool hands over the
+    query's source one feed-forward before the span's output, and the host should spend that
+    feed-forward projecting the query and sweeping the cache. It does not yet; it collects both
+    halves back to back. `SpanRouting.report()["sweep_window_open"]` says so, so a timing taken
+    now cannot be quoted as this arrangement's without the report contradicting it.
+    """
+    from sglang.srt.afd.read_point import layer_types_of
+    from sglang.srt.afd.span_routing import SpanClient, SpanRouting
+
+    routing = SpanRouting(
+        model,
+        SpanClient(client, reply_timeout_s=reply_timeout_s),
+        layer_types_of(model.config),
+    )
+    logger.info("afd host: the group cut is installed. %s", routing.report())
+    if sweep_ahead is not None:
+        # it would otherwise fire from the per-layer prepare_mlp hook, on layers that no longer
+        # run here at all -- a sweep launched for a feed-forward this host never issues
+        sweep_ahead.routed_layers = set(routing.passengers) | set(routing.heads)
+    return routing
 
 
 def run_pool(model, host: str, port: int, min_batch: int, max_wait_ms: int,
@@ -239,6 +347,7 @@ def run_pool(model, host: str, port: int, min_batch: int, max_wait_ms: int,
 
     departure = serve(
         forward=make_pool_forward(model),
+        span=make_span_runner(model, device=device),
         host=host,
         port=port,
         min_batch=min_batch,

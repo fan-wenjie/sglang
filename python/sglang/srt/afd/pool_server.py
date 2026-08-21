@@ -602,6 +602,7 @@ def serve(
     attention=None,
     cache=None,
     park_timeout_s: float | None = None,
+    span=None,
 ) -> Departure:
     """Run a pool until the process is killed. Returns the departure thread for inspection.
 
@@ -617,6 +618,7 @@ def serve(
                          name="afd-pool-park-timeout").start()
     departure.attention = attention
     departure.cache = cache
+    departure.span = span
     departure.start()
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

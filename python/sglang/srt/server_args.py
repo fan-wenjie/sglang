@@ -3162,6 +3162,11 @@ class ServerArgs:
         "How long the pool waits for --afd-min-batch before departing anyway. Without it the last caller of a draining workload waits for a partner that never arrives.",
         NS("afd"),
     ] = 5
+    afd_span_cut: A[
+        bool,
+        'Cut the model into spans rather than into layers. A span runs from one softmax attention\'s output projection to the next one\'s hidden input -- on Qwen3.8-27B that is four feed-forwards and three linear attentions in one call, so a decode step makes 17 round trips instead of 63. The rule behind the cut is that a batch only has to be re-formed where latency VARIES: a feed-forward and a linear attention cost the same whatever the context, and only the softmax attention does not. BOTH ends must be given this flag -- it changes what each side holds, not just how they talk, and a host that has it against a pool that does not is refused at the HELLO rather than at the first token.',
+        NS("afd"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # PD disaggregation
