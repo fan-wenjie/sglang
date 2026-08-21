@@ -214,6 +214,9 @@ def watch_colocated_residual(model) -> None:
             if residual is None:
                 return
             seen["n"] += 1
+            from sglang.srt.afd.span import _dump
+
+            _dump("model", f"pre-mlp {index}", residual)
             row = residual[0].float()
             logger.info(
                 "afd colocated: layer %s -- rows %s wide %s |%.5g| rms %.5g max %.5g",
@@ -268,6 +271,9 @@ def watch_colocated_residual(model) -> None:
                 return
             entering_seen[key] = 1
             stream = hidden if residual is None else hidden + residual
+            from sglang.srt.afd.span import _dump
+
+            _dump("model", f"entering {index} rows {stream.shape[0]}", stream)
             row = stream[0].float()
             logger.info("afd colocated entering: layer %s rows %s -- |%.5g| rms %.5g",
                         index, stream.shape[0], float(row.norm()),

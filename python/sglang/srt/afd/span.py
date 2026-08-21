@@ -245,6 +245,31 @@ def _runs_of(request_ids) -> list[tuple[int, int, int]]:
     return [(rid, start, count) for rid, start, count in runs]
 
 
+def _dump(side: str, tag: str, value) -> None:
+    """Save a tensor so the two sides can be diffed ELEMENTWISE, not by magnitude.
+
+    Norms have carried this search as far as they can. They cannot separate "the right vector,
+    scaled" from "a different vector of the same length" -- and the last reading said the
+    difference is the second kind: layer 1's feed-forward input is `post_attention_layernorm`'s
+    output, whose scale is removed by construction, and it still differed by 4.1%.
+
+    So both sides write row 0 of each boundary to SGLANG_AFD_DUMP and the comparison happens
+    offline, per element. Same prompt through the colocated model and through the arrangement
+    gives the same embedding, so the tensors line up index for index.
+    """
+    import os
+
+    where = os.environ.get("SGLANG_AFD_DUMP")
+    if not where:
+        return
+    import torch as _t
+
+    path = os.path.join(where, f"{side}__{tag}.pt")
+    if os.path.exists(path):
+        return
+    _t.save(value.detach()[0].float().cpu(), path)
+
+
 def _trace_step(tag, layer_id, value) -> None:
     """One tensor on the way through a span, when SGLANG_AFD_SELFCHECK is set.
 
@@ -273,6 +298,7 @@ def _trace_step(tag, layer_id, value) -> None:
     if seen >= int(os.environ.get("SGLANG_AFD_SELFCHECK", "3")):
         return
     _STEP_SEEN[tag] = seen + 1
+    _dump("span", tag, value)
     row = value[0].float()
     logger.info("afd step: %s layer %s -- rows %s |%.5g| rms %.5g max %.5g",
                 tag, layer_id, value.shape[0], float(row.norm()),
