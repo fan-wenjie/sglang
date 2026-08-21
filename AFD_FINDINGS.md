@@ -30,6 +30,30 @@ satisfy -- and each is now measured rather than argued.
                             and gutted all 48 linear layers -- which fits the symptoms exactly, and
                             is not what the code does
 
+The convolution is cleared too, and now has the coverage it never had. `_convolve` against
+sglang's own `causal_conv1d_update` and `causal_conv1d_fn` on the tiny stack: 0.0029 relative for
+one token against an empty ring, 0.0025 for a chunk of four where every tap participates, both at
+bf16 rounding. The control reverses the taps on ONE side and gives 1.40 and 1.45 -- the first
+version reversed them on both, which changes the same tap in each and agrees again. That is the
+second control in this line of work that could not fail, and the second caught by looking at what
+it actually discriminates. The checkpoint has 48 conv1d tensors and no bias, so the span adding
+none is right; its docstring says `bias[c]` and is wrong about a model that has none.
+
+With that, every PIECE of `_linear_attention` has been checked against something outside itself:
+the projection split (bit-identical), the convolution (here), the query and key scaling and the
+gates and the recurrence (`gdn_split.py`, against the fused kernel), the head expansion
+(`repeat_interleave`, matching that same reference), the z-gated norm and the output projection
+(the model's own tail). What has NOT been checked is the COMPOSITION -- correct pieces in the
+wrong order, or with one missing, is still wrong -- and that needs a real ForwardBatch, which the
+pool never has because it is not inside a model forward.
+
+The way to get one without building it: the pool serves colocated requests on its own port, and
+during such a forward `linear_attn.forward(hidden, forward_batch)` runs with a real one. An
+env-gated hook there can run the span's `_linear_attention` on the same hidden states and compare,
+in the same process, on the same weights, against the real thing.
+
+The older note this replaces:
+
 What that leaves is the one part of the linear attention that NO check covers. `gdn_split.py`
 starts from `mixed`, which is the projection AFTER the convolution, so the span's `_convolve` has
 never been compared to anything. With one token and an empty ring the convolution is decided
