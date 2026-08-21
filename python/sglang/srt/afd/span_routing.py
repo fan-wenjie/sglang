@@ -317,14 +317,27 @@ class SpanRouting:
 
     @staticmethod
     def _row_ids(forward_batch) -> torch.Tensor:
-        """Whose recurrent state each row advances.
+        """Whose recurrent state each ROW advances -- one id a row, not one a request.
 
-        sglang's own per-request handle for cache slots. A decode batch carries one token from
-        each of several requests, and the pool keys both recurrent states by request -- a row sent
-        under the wrong id advances somebody else's memory with this token, and neither end has
-        any way to notice.
+        `req_pool_indices` is sglang's per-REQUEST handle, and in decode the two coincide because
+        a decode batch carries one token from each request. In prefill they do not: 122 tokens
+        from one request is 122 rows and one index, and sending that pair is how this failed at
+        its first token, twice.
+
+        So the index is repeated by each request's extend length. A row sent under the wrong id
+        advances somebody else's memory with this token, and neither end has any way to notice.
         """
-        return forward_batch.req_pool_indices
+        ids = forward_batch.req_pool_indices
+        lengths = forward_batch.extend_seq_lens
+        if lengths is None:
+            return ids                                   # decode: one row a request already
+        if lengths.shape[0] != ids.shape[0]:
+            raise RuntimeError(
+                f"{lengths.shape[0]} extend length(s) for {ids.shape[0]} request(s); the batch "
+                f"disagrees with itself about how many requests it holds, and expanding it "
+                f"anyway would attribute one request's tokens to another."
+            )
+        return ids.repeat_interleave(lengths.to(ids.device))
 
     def _make_pass_through(self, layer, layer_id: int):
         """A layer the pool runs. Its forward returns its input untouched.

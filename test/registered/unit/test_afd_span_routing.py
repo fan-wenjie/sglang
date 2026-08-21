@@ -319,3 +319,29 @@ class TestOneDepartureServesOneJob(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRowIdsAreOneARowNotOneARequest(CustomTestCase):
+    """A prefill of 122 tokens from one request is 122 rows and ONE request index.
+
+    Sending that pair is how the deployment failed at its first token, twice: the row ids and the
+    rows disagree, and the check that caught it is the only thing between that and 122 tokens all
+    advancing slot zero's history. In decode the two coincide, which is why it survived every
+    decode-shaped test.
+    """
+
+    def test_decode_is_already_one_a_row(self):
+        got = SpanRouting._row_ids(
+            SimpleNamespace(req_pool_indices=torch.tensor([3, 7]), extend_seq_lens=None))
+        self.assertEqual(got.tolist(), [3, 7])
+
+    def test_prefill_repeats_each_request_by_its_extend_length(self):
+        got = SpanRouting._row_ids(SimpleNamespace(
+            req_pool_indices=torch.tensor([3, 7]), extend_seq_lens=torch.tensor([4, 2])))
+        self.assertEqual(got.tolist(), [3, 3, 3, 3, 7, 7])
+
+    def test_a_batch_that_disagrees_with_itself_is_refused(self):
+        with self.assertRaises(RuntimeError) as caught:
+            SpanRouting._row_ids(SimpleNamespace(
+                req_pool_indices=torch.tensor([3, 7]), extend_seq_lens=torch.tensor([4])))
+        self.assertIn("disagrees with itself", str(caught.exception))
