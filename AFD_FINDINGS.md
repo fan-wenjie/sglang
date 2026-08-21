@@ -8,6 +8,30 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, every early read turned off, and the arrangement is still wrong
+
+    colocated              " Paris.\nThe capital of Germany is Berlin.\nThe"
+    arrangement, shift 1   " France is France is France is France is"
+    arrangement, shift 0   " France is France is France is France is"
+
+The linear layers never had an early read in this cut -- `_linear_attention` takes q, k and v from
+the current hidden (span.py:772) -- and the per-layer wiring that did convert 63 layers now stands
+down, with the per-layer stream unchanged to five figures when it does. So shift 0 turns off the
+last of it: the softmax query, projected from the current `x` like everything else.
+
+Still wrong. The fault is in the span's plumbing and not in any early read.
+
+This control is worth something the earlier one was not. The first shift-0 run was taken before
+the flag was wired into the span, so it was not a shift-0 run at all; this one is, and it is also
+after the row-keyed tables and the double transformation were fixed.
+
+One observation, unexplained and recorded rather than interpreted: shift 0 and shift 1 produce
+identical greedy text for twelve tokens. Two different models agreeing token for token is possible
+when both have collapsed onto the same attractor, and it is also what a shift that reaches nothing
+would look like. The span's `_finish` does branch on `query_shift`, and the branch was verified by
+reading; whether it changes the output has not been measured on its own.
+
+
 ## 2026-08-21, a second transformation was found on the pool, and it was inert
 
 Asking whether the baseline also uses Early-K turned up something else. It does not -- the
