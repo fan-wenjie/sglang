@@ -228,6 +228,40 @@ def _add_and_norm(norm, hidden: torch.Tensor, residual: torch.Tensor | None):
     return out
 
 
+_RESIDUAL_SEEN = {}
+
+
+def _trace_residual(runner, request_ids, residual) -> None:
+    """The residual stream leaving each span, when SGLANG_AFD_SELFCHECK is set. Off otherwise.
+
+    This is the pool's half of a localisation the arrangement still needs. Its final hidden state
+    sits at cosine 0.451 to the colocated model's on the same single-token prompt, with almost the
+    same norm -- so it is not empty and not rescaled, it has turned. A turn that large arrives
+    somewhere, and the residual at each span boundary is the sequence that says where.
+
+    A span boundary is a LAYER boundary: the value kept here entering group g is the model's own
+    hidden state at the group's first layer, so this sequence is directly comparable to a
+    colocated forward's per-layer hidden states. Norms first because a stage that drops or doubles
+    a contribution shows up in the magnitude before it shows up anywhere else.
+    """
+    import os
+
+    if not os.environ.get("SGLANG_AFD_SELFCHECK"):
+        return
+    for i, r in enumerate(request_ids):
+        rid = int(r)
+        step = _RESIDUAL_SEEN.get(rid, 0)
+        if step >= int(os.environ.get("SGLANG_AFD_SELFCHECK", "20")):
+            continue
+        _RESIDUAL_SEEN[rid] = step + 1
+        row = residual[i].float()
+        logger.info(
+            "afd residual: request %s boundary %s -- rows %s wide %s |%.5g| rms %.5g max %.5g",
+            rid, step, residual.shape[0], row.numel(),
+            float(row.norm()), float(row.pow(2).mean().sqrt()), float(row.abs().max()),
+        )
+
+
 class SpanRunner:
     """Runs one group's span on the pool's own weights.
 
@@ -285,6 +319,7 @@ class SpanRunner:
         with self._lock:
             for i, r in enumerate(request_ids):
                 self._residual[int(r)] = residual[i].clone()
+        _trace_residual(self, request_ids, residual)
 
     def _gated(self, request_ids, attn_output: torch.Tensor) -> torch.Tensor:
         """Apply the output gate this side computed with the query the host swept with.
