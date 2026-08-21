@@ -8,6 +8,34 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, four suspects cleared and no fault found
+
+A round that eliminated rather than fixed. Each of these was a plausible per-token fault -- wrong
+in the simplest case, one token and no history, which is the constraint the remaining fault has to
+satisfy -- and each is now measured rather than argued.
+
+    the fused split         `Qwen3_5GatedDeltaNet.forward` takes a FUSED branch when
+                            num_v_heads // num_k_heads is in _GDN_FUSED_QKVZBA_RATIOS, which on
+                            CUDA is (1, 2, 3, 4). The deployed model is 48/16 = 3, so it does; the
+                            span always calls `fix_query_key_value_ordering`, the other branch.
+                            Both are pure functions of the projections, so the comparison needed no
+                            ForwardBatch: mixed_qkv, z, b and a are BIT-IDENTICAL between them
+    the z gate at the tail  the model applies `self.norm(core_attn_out, z)` before `out_proj`. The
+                            span does the same, on the same reshape
+    the output gate         cleared last round and restated here: 15x attenuation, matching the
+                            model's own o_proj input in the same process
+    the q/k scale           `normalise` applies `head_k_dim ** -0.5` to the QUERY only, and leaves
+                            the key at unit norm. That is what `gdn_split.py` verified against the
+                            fused kernel. Scaling both would have made every (k.q) 11x too small
+                            and gutted all 48 linear layers -- which fits the symptoms exactly, and
+                            is not what the code does
+
+What that leaves is the one part of the linear attention that NO check covers. `gdn_split.py`
+starts from `mixed`, which is the projection AFTER the convolution, so the span's `_convolve` has
+never been compared to anything. With one token and an empty ring the convolution is decided
+entirely by the last tap, and taking the wrong one is wrong in exactly the simplest case.
+
+
 ## 2026-08-21, the fourth fault: a chunk's rows shared one residual
 
 Found by matching two log lines that had never been printed side by side. Same request, same
