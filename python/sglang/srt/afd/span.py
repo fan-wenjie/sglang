@@ -231,7 +231,7 @@ def _add_and_norm(norm, hidden: torch.Tensor, residual: torch.Tensor | None):
 _HEAD_SEEN = {}
 
 
-def _trace_head(group, residual, *, attn_output, gated, projected) -> None:
+def _trace_head(group, request_ids, residual, *, attn_output, gated, projected) -> None:
     """The three things only a MIDDLE span does, against the stream they join.
 
     The residual leaving the first middle span is 34.7 where the model's own is 112.0 -- it fell by
@@ -263,9 +263,14 @@ def _trace_head(group, residual, *, attn_output, gated, projected) -> None:
         cos = torch.nn.functional.cosine_similarity(row, stream, dim=0)
         return f"|{float(row.norm()):.5g}| cos {float(cos):+.4f}"
 
+    # the request id, so this line can be matched against `_trace_head`'s. Without it the
+    # residual taken here (18.8 at group 3) and the residual kept after the prologue (76.8) could
+    # not be told apart as "the table handed back the wrong value" from "these are two different
+    # requests", and that difference is the whole question.
     logger.info(
-        "afd head: group %s call %s -- residual |%.5g| | attn %s | gated %s | projected %s",
-        group, seen, float(stream.norm()),
+        "afd head: request %s group %s call %s -- residual |%.5g| rows %s | attn %s | gated %s "
+        "| projected %s",
+        int(request_ids[0]), group, seen, float(stream.norm()), residual.shape[0],
         against(attn_output), against(gated), against(projected),
     )
 
@@ -463,7 +468,8 @@ class SpanRunner:
         # attention output and the nonlinearity is applied on this side
         gated = self._gated(request_ids, attn_output)
         attn_out, _ = layers[head].o_proj(gated)
-        _trace_head(group, residual, attn_output=attn_output, gated=gated, projected=attn_out)
+        _trace_head(group, request_ids, residual,
+                    attn_output=attn_output, gated=gated, projected=attn_out)
         hidden, residual = _add_and_norm(
             layers[head].post_attention_layernorm, attn_out, residual)
         hidden = layers[head].mlp(hidden)
