@@ -193,6 +193,22 @@ def group_layers(layer_types: list[str]) -> list[tuple[int, ...]]:
     return spans
 
 
+def _runs(request_ids) -> list[tuple[int, int, int]]:
+    """The batch as (request, first row, row count), in order.
+
+    A decode bus has one row a request and every run is length one. A prefill bus has one row a
+    TOKEN, so a request's rows are a contiguous run that has to be walked in order. A bus carrying
+    both has runs of both lengths, which is why this is not a `forward_mode` question: the mode
+    describes the batch and the runs describe the rows.
+    """
+    runs, start = [], 0
+    for i, r in enumerate(request_ids):
+        if i + 1 == len(request_ids) or int(request_ids[i + 1]) != int(r):
+            runs.append((int(r), start, i + 1 - start))
+            start = i + 1
+    return runs
+
+
 def _add_and_norm(norm, hidden: torch.Tensor, residual: torch.Tensor | None):
     """sglang's fused add-and-normalise, and the residual it returns.
 
@@ -511,7 +527,20 @@ class SpanRunner:
         q, k = expand_to_value_heads(q, heads), expand_to_value_heads(k, heads)
         q_tilde, s = query_coefficient(q, k, beta)
 
-        reading = ask(layer_id, request_ids, q_tilde)
+        # One call for the whole bus when every run is one row -- that is decode, and the rows
+        # are independent. A run longer than one row is a request's own tokens in order, and the
+        # far end has to advance its state between them, so those go one call a run.
+        #
+        # Which means a mixed bus pays for its prefill riders in ROUND TRIPS rather than in span
+        # time: the feed-forwards and the projections, which are 74% of the cost, still run once
+        # for everybody. That is the whole reason the leftover tokens are worth carrying.
+        runs = _runs(request_ids)
+        if all(n == 1 for _, _, n in runs):
+            reading = ask(layer_id, request_ids, q_tilde)
+        else:
+            reading = torch.cat(
+                [ask(layer_id, [r] * n, q_tilde[start : start + n])
+                 for r, start, n in runs], dim=0)
         core = alpha.unsqueeze(-1) * reading + s.unsqueeze(-1) * v.float()
 
         # the state's own copy of the key, deferred: it only has to be applied before the NEXT
@@ -545,21 +574,36 @@ class SpanRunner:
         """
         from sglang.srt.afd.linear_state import LinearStates  # noqa: F401 -- slot table only
 
-        slots = [self.states.slot_of(int(r)) for r in request_ids]
         ring = self.states.conv_buffer(
             layer_id, width=qkv.shape[-1], taps=attn.conv1d.weight.shape[-1],
             dtype=qkv.dtype)
-        index = torch.tensor(slots, device=qkv.device, dtype=torch.long)
-        held = ring.index_select(0, index)
-        window = torch.cat([held[..., 1:], qkv.unsqueeze(-1)], dim=-1)
-        ring.index_copy_(0, index, window)
+        runs = _runs(request_ids)
+        slots = [self.states.slot_of(r) for r, _, _ in runs]
         self.states.note_touched(slots, ("conv", layer_id))
-        # `conv1d` here is a ColumnParallelLinear whose weight is already (channels, taps) --
-        # not an nn.Conv1d with a (channels, 1, taps) weight, which is what transformers has and
-        # what an earlier version of this squeezed. It carries no bias: the model builds it with
-        # bias=False.
-        out = (window * attn.conv1d.weight).sum(-1)
-        return torch.nn.functional.silu(out)
+        if all(n == 1 for _, _, n in runs):
+            # decode: one row a request, so the ring update is a scatter and every row is
+            # independent of every other
+            index = torch.tensor(slots, device=qkv.device, dtype=torch.long)
+            held = ring.index_select(0, index)
+            window = torch.cat([held[..., 1:], qkv.unsqueeze(-1)], dim=-1)
+            ring.index_copy_(0, index, window)
+            out = (window * attn.conv1d.weight).sum(-1)
+            return torch.nn.functional.silu(out)
+
+        # prefill, or a bus carrying both: a request's rows are its own tokens IN ORDER, and each
+        # is convolved against its predecessors rather than against the pre-chunk ring. Scattering
+        # them would write the same slot several times, which is undefined, and would filter every
+        # token with the same history.
+        from sglang.srt.afd.linear_history import prefill_convolve
+
+        pieces = []
+        for slot, (_, start, count) in zip(slots, runs):
+            got, tail = prefill_convolve(ring[slot], qkv[start : start + count],
+                                         attn.conv1d.weight)
+            ring[slot] = tail
+            pieces.append(got)
+        return torch.cat(pieces, dim=0)
+
 
     def seed(self, request_id: int, residual: torch.Tensor) -> None:
         """Give a request its first residual: the embedding, for the headless span."""
