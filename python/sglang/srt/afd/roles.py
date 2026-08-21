@@ -335,6 +335,14 @@ def watch_linear_attention(model, runner) -> None:
                 index = int(backend.forward_metadata.mamba_cache_indices[0])
                 before[layer_id] = (cache.conv[0][index].clone(),
                                     cache.temporal[index].clone())
+                # the model's own input to this layer's linear attention, which is the one
+                # quantity the span's `hidden` can be set beside. `watch_linear_attention` feeds
+                # the MODEL's hidden into both implementations, so it cannot see a span whose
+                # hidden is already wrong -- and the span's is its own layer 0 output, not this.
+                row = hidden[0].float()
+                logger.info("afd colocated attn-in: layer %s -- rows %s |%.5g| rms %.5g",
+                            layer_id, hidden.shape[0], float(row.norm()),
+                            float(row.pow(2).mean().sqrt()))
             except Exception as e:                       # noqa: BLE001 -- diagnostic, reported
                 before[layer_id] = None
                 logger.info("afd linear: layer %s state not readable: %r", layer_id, e)

@@ -820,6 +820,7 @@ class SpanRunner:
         # first prefill the state and the ring are zero for BOTH -- so nothing this side carries
         # differs between them and only the input does.
         if len(request_ids) > 1 and int(request_ids[0]) not in self._residual:
+            _trace_step(f"attn-in-L{layer_id}", layer_id, hidden)
             _trace_mix(layer_id, hidden=hidden, alpha=alpha, beta=beta, q_tilde=q_tilde, s=s,
                        reading=reading, core=core, gated=gated_core, out=out)
         return out
