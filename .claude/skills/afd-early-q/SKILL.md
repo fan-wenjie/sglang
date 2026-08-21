@@ -47,7 +47,7 @@ current position still has to be folded into the swept state.
 which is the standard wiring with extra steps; a port that quietly does that produces a correct
 model with no overlap and no error message.
 
-## What `--afd-q-shift-layers` means
+## What `--afd-query-shift-layers` means
 
 The knob is a layer count `N`. Three things are the same number, which is why it is one knob:
 
@@ -132,7 +132,7 @@ Follow `disaggregation_*`. Concretely:
 --afd-mode {null,host,pool}          mirrors --disaggregation-mode {null,prefill,decode}
 --afd-pool-addr HOST:PORT            where the host reaches the pool
 --afd-bootstrap-port PORT            mirrors --disaggregation-bootstrap-port
---afd-q-shift-layers N               the read point: N-0.5 layers back; 0 is standard
+--afd-query-shift-layers N               the read point: N-0.5 layers back; 0 is standard
 --afd-transfer-backend {tcp,...}     mirrors --disaggregation-transfer-backend
 ```
 

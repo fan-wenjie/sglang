@@ -3122,14 +3122,14 @@ class ServerArgs:
         "Port an --afd-mode=pool server listens on. Default is 8999.",
         NS("afd"),
     ] = 8999
-    afd_q_shift_layers: A[
+    afd_query_shift_layers: A[
         Optional[int],
-        "Where each layer's query is read from, as a layer count N: the offset is N-0.5 layers, the source is h_(l-N), the span is N layers, and the study's unit is 2N-1 half-layers. Unset takes the checkpoint's own afd_q_shift_layers, or 0 if it states none; passing a value that contradicts the checkpoint warns, because serving a repaired checkpoint at the wrong read point gives its query projection an input it was not trained on. 0 is a real value meaning the standard wiring.",
+        "DANGEROUS. This flag changes what the model computes, and a wrong value fails silently: the server starts, generation is fluent, and the text is from a model nobody trained. Nothing downstream can detect it. Where each layer's query is read from, as a layer count N -- the offset is N-0.5 layers, the source is h_(l-N), the span is N layers, and the study's unit is 2N-1 half-layers. LEAVE IT UNSET unless you are running a measurement: unset reads the checkpoint's own query_shift_layers, which is the value its weights were repaired for, or 0 if it states none. Setting it is only correct for measuring what the rewiring costs BEFORE repair; every other use serves a query projection an input it was not trained on, so every such path warns. 0 is a real value meaning the standard wiring, which is why the default is unset rather than 0.",
         NS("afd"),
     ] = None
     afd_coverage: A[
         Optional[Literal["all", "softmax"]],
-        'Which layers the query shift reaches. "all" is every layer that has a query, including linear attention -- 63 of 64 on Qwen3.8-27B, and what a deployment converts. "softmax" is only the layers whose attention sweeps a cache, 16 of 64: an ablation, and a different number.',
+        'DANGEROUS for the same reason as --afd-query-shift-layers: it overrides a statement the checkpoint made about its own weights, and getting it wrong is fluent rather than loud. Unset reads query_shift_coverage from the checkpoint, which is what its weights were repaired for. Which layers the query shift reaches. "all" is every layer that has a query, including linear attention -- 63 of 64 on Qwen3.8-27B, and what a deployment converts. "softmax" is only the layers whose attention sweeps a cache, 16 of 64: an ablation, and a different number.',
         NS("afd"),
     ] = None
     afd_split_attention: A[

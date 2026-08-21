@@ -1,6 +1,6 @@
 """Where each layer's query is read from, and the bookkeeping that keeps that honest.
 
-`--afd-q-shift-layers N` is one number wearing four hats, which is why it is one knob:
+`--afd-query-shift-layers N` is one number wearing four hats, which is why it is one knob:
 
     offset      = N - 0.5 layers      how far back the query is read
     source      = h_{l-N}             the residual it is read from
@@ -97,12 +97,12 @@ def plan_read_points(
     """
     if not isinstance(shift_layers, int) or isinstance(shift_layers, bool):
         raise TypeError(
-            f"--afd-q-shift-layers is a layer count, got {shift_layers!r}. There is no fractional "
+            f"--afd-query-shift-layers is a layer count, got {shift_layers!r}. There is no fractional "
             f"setting: a query read between a block's two sub-layers is read from a point where "
             f"the residual stream has no value."
         )
     if shift_layers < 0:
-        raise ValueError(f"--afd-q-shift-layers must not be negative, got {shift_layers}")
+        raise ValueError(f"--afd-query-shift-layers must not be negative, got {shift_layers}")
     if n_layers <= 0:
         raise ValueError(f"a stack has at least one layer, got {n_layers}")
     if shift_layers == 0:

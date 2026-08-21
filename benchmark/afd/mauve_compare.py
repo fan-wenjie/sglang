@@ -41,7 +41,12 @@ import sys
 
 import numpy as np
 
-MODEL = "/home/user/experiment/models/Qwen3.8-27B-FP8"
+from sglang.srt.afd.under_test import model_path
+
+# named once, in the environment, and checked for quantisation before the weights
+# load. It was written down separately in eight tools, which is eight chances to
+# leave one on the old checkpoint and report its numbers under the new one's name.
+MODEL = model_path()
 TOKENS = "/home/user/experiment/v6/run/tokens/val_Qwen_Qwen3.8-27B.u32"
 N, PROMPT_LEN, GEN_LEN = 500, 32, 128
 SAMPLING = {"temperature": 1.0, "top_p": 0.95, "max_new_tokens": GEN_LEN}
@@ -64,7 +69,7 @@ def generate(shift, prompts, draws):
 
     engine = sgl.Engine(
         model_path=MODEL, tp_size=1, mem_fraction_static=0.80, disable_cuda_graph=True,
-        attention_backend="triton", log_level="warning", afd_q_shift_layers=shift,
+        attention_backend="triton", log_level="warning", afd_query_shift_layers=shift,
         afd_coverage="all", afd_split_attention=True)
     out = []
     try:

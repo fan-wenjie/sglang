@@ -145,7 +145,19 @@ def install_kv_on_pool(model, *, client, mode):
 
         "cache"       the pool holds the cache and sweeps it; the host joins this step's token
         "projection"  the pool holds W_k and W_v; the host keeps the cache and the whole attention
+
+    A null client is the reversed arrangement, where there is no weights pool for the key and
+    value to move to. Checked before `mode`, because a run that asked for one of these lines and
+    has nowhere to draw it should say so rather than quietly serving the unconverted stack.
     """
+    if client is None:
+        if mode:
+            raise ValueError(
+                f"--afd-pool-attention={mode!r} moves part of attention to a weights pool and "
+                f"--afd-pool-addr names none. Either name one or drop the setting; installing "
+                f"nothing here would serve the ordinary attention under this flag's name."
+            )
+        return None
     if not mode:
         return None
     from sglang.srt.afd.read_point import layer_types_of
@@ -193,7 +205,24 @@ def serve_pool_in_background(model, port: int, min_batch: int, max_wait_ms: int,
 
 
 def install_host_routing(model, pool_addr: str, sweep_ahead, connect_timeout_s: float = 30.0):
-    """Point every routable layer's feed-forward at the pool, and open the sweep window."""
+    """Point every routable layer's feed-forward at the pool, and open the sweep window.
+
+    A host with no weights pool is a real arrangement, not a misconfiguration: the reversed one,
+    where the feed-forward stays put and only the sweep travels, to a cache pool named by
+    --afd-cache-addr. It was unreachable until now because this function was the only door into
+    host mode and it required an address, so the arrangement the budget table ranks first at long
+    context had never once been run.
+
+    Returning (None, None) rather than raising is what makes it reachable, and the two callers
+    that use the result already treat None as "no pool" -- `install_kv_on_pool` refuses a null
+    client, and the router is simply not installed.
+    """
+    if not pool_addr:
+        logger.info(
+            "afd host: no weights pool. The feed-forward stays on this machine and only the "
+            "sweep travels, which is the reversed arrangement."
+        )
+        return None, None
     client = PoolClient(pool_addr, connect_timeout_s)
     client.require(PoolClient.NEEDS_FEED_FORWARD)
     return client, install_pool_routing(
@@ -206,7 +235,9 @@ def run_pool(model, host: str, port: int, min_batch: int, max_wait_ms: int,
     """Serve until killed. Blocks."""
     logger.info("afd pool: %s layers, min_batch=%s, max_wait=%sms",
                 len(model.model.layers), min_batch, max_wait_ms)
-    return serve(
+    import os
+
+    departure = serve(
         forward=make_pool_forward(model),
         host=host,
         port=port,
@@ -216,6 +247,11 @@ def run_pool(model, host: str, port: int, min_batch: int, max_wait_ms: int,
         ready=ready,
         attention=attention,
     )
+    # An operator asks for the riders histogram by naming a path. Without one the pool keeps the
+    # record in memory and the health check reports "unknown" rather than guessing at a number
+    # that decides whether this arrangement is paying for itself.
+    departure.riders_path = os.environ.get("AFD_RIDERS_PATH")
+    return departure
 
 
 class PoolRouting:
@@ -289,10 +325,12 @@ class PoolRouting:
                 # be averaged back into looking fine
                 report = self.client.overlap_report(last=REPORT_EVERY)
                 logger.info(
-                    "afd host: %s pool call(s); last %s: mean outstanding %.2f ms, mean blocked "
-                    "%.2f ms, hidden %.1f%%",
+                    "afd host: %s pool call(s); last %s: build %.2f ms, send %.2f ms, "
+                    "outstanding %.2f ms, blocked %.2f ms, hidden %.1f%%",
                     self._calls,
                     REPORT_EVERY,
+                    1e3 * report.get("mean_build_s", 0.0),
+                    1e3 * report.get("mean_send_s", 0.0),
                     1e3 * report["mean_outstanding_s"],
                     1e3 * report["mean_blocked_s"],
                     100.0 * (1.0 - report["mean_blocked_s"] / report["mean_outstanding_s"])

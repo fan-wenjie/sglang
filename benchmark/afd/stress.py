@@ -28,7 +28,12 @@ import statistics
 import sys
 import time
 
-MODEL = "/home/user/experiment/models/Qwen3.8-27B-FP8"
+from sglang.srt.afd.under_test import model_path
+
+# named once, in the environment, and checked for quantisation before the weights
+# load. It was written down separately in eight tools, which is eight chances to
+# leave one on the old checkpoint and report its numbers under the new one's name.
+MODEL = model_path()
 PROMPTS = [
     "The capital of France is",
     "List the first eight prime numbers, separated by commas:",
@@ -67,7 +72,7 @@ def main() -> int:
     engine = sgl.Engine(
         model_path=MODEL, tp_size=1, mem_fraction_static=0.78, disable_cuda_graph=True,
         attention_backend="triton", log_level="warning", afd_mode="host",
-        afd_pool_addr=a.weights, afd_q_shift_layers=1, afd_coverage="all", **extra)
+        afd_pool_addr=a.weights, afd_query_shift_layers=1, afd_coverage="all", **extra)
 
     rows, failures = [], []
     try:

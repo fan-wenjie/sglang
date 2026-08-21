@@ -128,30 +128,81 @@ class KVHolder:
 
 
 def sweep_cache(q: torch.Tensor, k_cached: torch.Tensor, v_cached: torch.Tensor,
-                *, scaling: float, kv_group: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Attention over the cached positions, as (output, log partition).
+                *, scaling: float, kv_group: int, seen: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attention over the cached positions for EVERY token at once, as (output, log partition).
 
-    Grouped-query: each key-value head serves `kv_group` query heads, expanded here rather than
-    materialised in the cache, so the cache stores what the projection produced.
+    `q` is (tokens, heads, head_dim); `k_cached` and `v_cached` are (kv_heads, positions, dim).
+    `seen` gives each token's causal boundary -- how many cached positions it may read -- and None
+    means every token reads all of them, which is what decode does.
 
-    Returns the log partition as well as the output because the host has to merge this with its
-    own rank-1 join, and a softmax partitioned without its log partition cannot be merged -- the
-    weight each half carries is exactly the ratio of the two.
+    Returns the log partition as well as the output because the host has to merge this with its own
+    rank-1 join, and a softmax partitioned without its log partition cannot be merged: the weight
+    each half carries is exactly the ratio of the two.
+
+    ## Neither the group nor the token loop is materialised, and both used to be
+
+    Grouped-query attention has `kv_group` query heads share one key-value head. Expanding that
+    with repeat_interleave writes the shared head out `kv_group` times -- at 32k context, 4 key
+    heads at head_dim 256 promoted to float32 become 805 MiB for the keys and as much again for
+    the values -- and the previous version did it inside a Python loop over tokens, so a batch of
+    eight at sixteen softmax layers materialised on the order of two hundred gigabytes a step.
+    That is what the reversed arrangement's first end-to-end measurement measured: 21.8 tokens a
+    second at 32k, degrading with context exactly as a materialisation would.
+
+    The group is a reshape instead. Reading q as (tokens, kv_heads, kv_group, dim) lets the einsum
+    contract against k's kv_heads axis directly, so each key head is read once and serves its whole
+    group, and the tokens ride along as another batch axis rather than as iterations.
+
+    This is the third time this specific arithmetic has been written the expensive way in this
+    tree. The two earlier ones were in measurement tools, where the cost showed up as a number
+    nobody believed; this one was in the serving path, where it showed up as an architecture that
+    looked refuted.
     """
-    heads = q.shape[0]
-    if k_cached.shape[0] * kv_group != heads:
+    tokens, heads, head_dim = q.shape
+    kv_heads, positions, _ = k_cached.shape
+    if kv_heads * kv_group != heads:
         raise RuntimeError(
-            f"the sweep was given {heads} query head(s) and {k_cached.shape[0]} key head(s) at a "
-            f"group size of {kv_group}; the cache and the query disagree about the model"
+            f"the sweep was given {heads} query head(s) and {kv_heads} key head(s) at a group "
+            f"size of {kv_group}; the cache and the query disagree about the model"
         )
-    # accumulate at least in float32 -- a bfloat16 softmax over thousands of positions loses the
-    # tail -- but never DOWN-cast, so a float64 caller checking exactness gets float64 back
+    # The SOFTMAX accumulates in at least float32 -- a bfloat16 sum over thousands of positions
+    # loses the tail -- but the CACHE is not upcast to get there. Promoting k and v allocated a
+    # float32 copy of the whole history on every sweep: 4 MiB a request at 1k context and 134 MiB
+    # at 32k, per layer, per step. The scores are 5x smaller than the cache at 1k and stay smaller
+    # as the context grows, so they are what gets promoted.
+    #
+    # Contracting in the cache's own dtype is not a precision loss where it matters: a bfloat16
+    # matmul accumulates in float32 on every tensor core this runs on, and what needed the wider
+    # type was the reduction over positions, which is now done after the promotion. A float64
+    # caller checking exactness still gets float64 throughout, because promote_types keeps it.
     acc = torch.promote_types(q.dtype, torch.float32)
-    k = k_cached.repeat_interleave(kv_group, dim=0).to(acc)
-    v = v_cached.repeat_interleave(kv_group, dim=0).to(acc)
-    scores = torch.einsum("hd,hjd->hj", q.to(acc), k) * scaling
+    qg = q.view(tokens, kv_heads, kv_group, head_dim)
+    if q.dtype != k_cached.dtype:
+        qg = qg.to(k_cached.dtype)
+
+    scores = torch.einsum("thgd,hjd->thgj", qg, k_cached).to(acc) * scaling
+    if seen is not None:
+        # a chunk's tokens have different causal boundaries. Masking states that per token instead
+        # of slicing the cache per token, which is what the loop was doing.
+        j = torch.arange(positions, device=q.device).view(1, 1, 1, positions)
+        scores = scores.masked_fill(j >= seen.view(tokens, 1, 1, 1), float("-inf"))
     lse = torch.logsumexp(scores, dim=-1)
-    out = torch.einsum("hj,hjd->hd", torch.softmax(scores, dim=-1), v)
+    weights = torch.softmax(scores, dim=-1)
+    # the weights are cast down to meet v rather than v being cast up to meet them: weights are
+    # (tokens, kv_heads, group, positions) and v is (kv_heads, positions, dim), so at head_dim 256
+    # v is the larger of the two by a factor of the head dimension over the group size
+    out = torch.einsum("thgj,hjd->thgd", weights.to(v_cached.dtype), v_cached).to(acc)
+
+    v_head_dim = v_cached.shape[-1]
+    out = out.reshape(tokens, heads, v_head_dim)
+    lse = lse.reshape(tokens, heads)
+    # a token that may read nothing has an empty sum: -inf partition, zero output, so the host's
+    # join takes its own token whole. logsumexp over an all -inf row already gives -inf; softmax
+    # over it gives nan, so the output is zeroed rather than left to propagate.
+    empty = torch.isinf(lse) & (lse < 0)
+    if empty.any():
+        out = torch.where(empty.unsqueeze(-1), torch.zeros_like(out), out)
     return out, lse
 
 
@@ -295,17 +346,16 @@ class SweepService:
 
         tokens = q.shape[0]
         q3 = q.view(tokens, heads, head_dim)
-        outs, lses = [], []
-        for t in range(tokens):
-            # everything strictly before this token's own position, which for a chunk includes the
-            # earlier tokens of the same chunk -- they are already in the cache
-            seen = k_all.shape[POSITION_AXIS] - (tokens - 1 - t) - 1
-            o, lse = sweep_cache(q3[t], k_all[:, :seen], v_all[:, :seen],
-                                 scaling=attn.scaling, kv_group=heads // kv_heads)
-            outs.append(o)
-            lses.append(lse)
-        return (torch.stack(outs).reshape(tokens, heads * v_head_dim).to(q.dtype),
-                torch.stack(lses).to(torch.float32))
+        # everything strictly before this token's own position, which for a chunk includes the
+        # earlier tokens of the same chunk -- they are already in the cache. Stated per token as a
+        # boundary rather than by slicing the cache once per token: the loop that did the latter
+        # also materialised the grouped-query expansion inside itself, and the two together are
+        # what made the reversed arrangement's first measurement a measurement of allocation.
+        held = k_all.shape[POSITION_AXIS]
+        seen = torch.arange(held - tokens, held, device=q.device, dtype=torch.long).clamp_(min=0)
+        o, lse = sweep_cache(q3, k_all, v_all, scaling=attn.scaling,
+                             kv_group=heads // kv_heads, seen=seen)
+        return (o.reshape(tokens, heads * v_head_dim).to(q.dtype), lse.to(torch.float32))
 
     def serve(self, request_id: int, layer_id: int, q: torch.Tensor, hidden: torch.Tensor,
               positions: torch.Tensor):
@@ -388,6 +438,11 @@ class CachePool:
         caller that already has one -- not a requirement, which is the point.
         """
         self.holder = holder
+        # A slotted holder keeps one buffer a layer, so every row of a frame is one contraction.
+        # The per-request holder cannot do that -- its histories are separate tensors -- and the
+        # loop that resulted was 2.67 ms of a 3.6 ms sweep on the live pool. Both are supported
+        # because the unslotted one is what the tests pin the arithmetic with.
+        self.slotted = hasattr(holder, "gather")
         if isinstance(geometry, LayerGeometry):
             self.geometry, self._per_layer = geometry, None
         elif hasattr(geometry, "__len__") and len(geometry) and isinstance(
@@ -422,6 +477,8 @@ class CachePool:
         the sweep's causal boundary is positional within it.
         """
         ids = [int(r) for r in request_ids]
+        if self.slotted:
+            return self._sweep_slotted(ids, layer_id, q, expect)
         if len(ids) != q.shape[0]:
             raise RuntimeError(
                 f"{len(ids)} request id(s) for {q.shape[0]} row(s); every row has to say whose "
@@ -446,6 +503,8 @@ class CachePool:
     def append_rows(self, request_ids, layer_id: int, k: torch.Tensor, v: torch.Tensor):
         """Append a batch whose rows belong to different requests."""
         ids = [int(r) for r in request_ids]
+        if self.slotted:
+            return self.append_rows_slotted(ids, layer_id, k, v)
         if len(ids) != k.shape[0]:
             raise RuntimeError(
                 f"{len(ids)} request id(s) for {k.shape[0]} row(s); a mismatch here files one "
@@ -501,20 +560,49 @@ class CachePool:
                              dtype=torch.float32)
             return o, lse
         q3 = q.view(tokens, heads, head_dim)
-        outs, lses = [], []
-        for t in range(tokens):
-            seen = k_all.shape[POSITION_AXIS] - (tokens - 1 - t)
-            if seen <= 0:
-                outs.append(torch.zeros(heads, v_head_dim, device=q.device, dtype=torch.float32))
-                lses.append(torch.full((heads,), float("-inf"), device=q.device,
-                                       dtype=torch.float32))
-                continue
-            o, lse = sweep_cache(q3[t], k_all[:, :seen], v_all[:, :seen],
-                                 scaling=g.scaling, kv_group=heads // kv_heads)
-            outs.append(o)
-            lses.append(lse)
-        return (torch.stack(outs).reshape(tokens, heads * v_head_dim).to(q.dtype),
-                torch.stack(lses).to(torch.float32))
+        # Each token of a chunk sees one position fewer than the token after it: the last one sees
+        # the whole cache, and the boundary is stated per token rather than by slicing the cache
+        # once per token, which is what a loop here used to do.
+        held = k_all.shape[POSITION_AXIS]
+        seen = torch.arange(held - tokens + 1, held + 1, device=q.device, dtype=torch.long)
+        o, lse = sweep_cache(q3, k_all, v_all, scaling=g.scaling,
+                             kv_group=heads // kv_heads,
+                             seen=None if tokens == 1 else seen.clamp_(min=0))
+        return (o.reshape(tokens, heads * v_head_dim).to(q.dtype), lse.to(torch.float32))
+
+    def _sweep_slotted(self, ids: list, layer_id: int, q: torch.Tensor, expect):
+        """One contraction over every row, against the slots they name.
+
+        `expect` still says how far each row reads -- the length is the caller's, not the cache's,
+        for the one step where an append is in flight -- and it is used as the mask's boundary
+        rather than as a count to compare against. Where it is absent the rows read everything the
+        slot holds, which is the pre-length behaviour.
+        """
+        from sglang.srt.afd.slotted_kv import sweep_slots
+
+        if len(ids) != q.shape[0]:
+            raise RuntimeError(
+                f"{len(ids)} request id(s) for {q.shape[0]} row(s); every row has to say whose "
+                f"history it belongs to, and a mismatch here sweeps one request's token against "
+                f"another's past"
+            )
+        g = self._geometry(layer_id)
+        slots, held, buf_k, buf_v = self.holder.gather(ids, layer_id)
+        lengths = held if expect is None else torch.tensor(
+            [int(e) for e in expect], device=held.device, dtype=torch.long)
+        o, lse = sweep_slots(q.view(q.shape[0], g.q_heads, g.head_dim), slots, lengths,
+                             buf_k, buf_v, scaling=g.scaling,
+                             kv_group=g.q_heads // g.kv_heads)
+        return (o.reshape(q.shape[0], g.q_heads * g.v_head_dim).to(q.dtype),
+                lse.to(torch.float32))
+
+    def append_rows_slotted(self, request_ids, layer_id: int, k: torch.Tensor, v: torch.Tensor):
+        """In-place append for a slotted holder; returns positions held per request."""
+        g = self._geometry(layer_id)
+        rows = k.shape[0]
+        return self.holder.append(
+            request_ids, layer_id,
+            k.view(rows, g.kv_heads, g.head_dim), v.view(rows, g.kv_heads, g.v_head_dim))
 
     def append(self, request_id: int, layer_id: int, k: torch.Tensor, v: torch.Tensor):
         g = self._geometry(layer_id)

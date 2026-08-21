@@ -139,7 +139,7 @@ def run_arm(model_path: str, shift: int, prompts, mem_fraction: float,
         disable_cuda_graph=True,
         attention_backend="triton",
         log_level="warning",
-        afd_q_shift_layers=shift,
+        afd_query_shift_layers=shift,
         afd_coverage=coverage,
         afd_split_attention=split,
     )

@@ -32,9 +32,9 @@ def _config(shift=None, coverage=None, nested=True):
     cfg = FakeConfig()
     target = FakeText() if nested else cfg
     if shift is not None:
-        target.afd_q_shift_layers = shift
+        target.query_shift_layers = shift
     if coverage is not None:
-        target.afd_coverage = coverage
+        target.query_shift_coverage = coverage
     if nested:
         cfg.text_config = target
     return cfg
@@ -130,8 +130,8 @@ class TestStamp(CustomTestCase):
         from sglang.srt.afd.checkpoint import stamp
 
         out = stamp({"text_config": {"num_hidden_layers": 64}}, shift=1, coverage="all")
-        self.assertEqual(out["text_config"]["afd_q_shift_layers"], 1)
-        self.assertEqual(out["text_config"]["afd_coverage"], "all")
+        self.assertEqual(out["text_config"]["query_shift_layers"], 1)
+        self.assertEqual(out["text_config"]["query_shift_coverage"], "all")
         self.assertEqual(out["text_config"]["num_hidden_layers"], 64, "the rest is untouched")
 
     def test_stamping_does_not_mutate_the_input(self):
@@ -139,7 +139,51 @@ class TestStamp(CustomTestCase):
 
         original = {"text_config": {"a": 1}}
         stamp(original, shift=1, coverage="all")
-        self.assertNotIn("afd_q_shift_layers", original["text_config"])
+        self.assertNotIn("query_shift_layers", original["text_config"])
+
+
+class TestRetiredKeys(CustomTestCase):
+    """A config written against the pre-rename spelling is refused rather than ignored.
+
+    The rename from `afd_query_shift_layers` to `query_shift_layers` could have been made silently, by
+    simply reading the new name. A checkpoint carrying only the old one would then have resolved to
+    shift 0 -- its query projection, repaired to read h_(l-1), handed x_l instead -- and the model
+    would have served fluent output with nothing raised anywhere. That is the exact failure the
+    whole read-point module exists to prevent, so the rename may not introduce it.
+    """
+
+    def test_the_old_shift_spelling_is_refused(self):
+        from sglang.srt.afd.checkpoint import resolve_shift
+
+        cfg = FakeConfig()
+        cfg.afd_query_shift_layers = 1
+        with self.assertRaises(ValueError) as caught:
+            resolve_shift(None, cfg)
+        self.assertIn("query_shift_layers", str(caught.exception))
+
+    def test_the_old_coverage_spelling_is_refused(self):
+        from sglang.srt.afd.checkpoint import resolve_coverage
+
+        cfg = FakeConfig()
+        cfg.afd_coverage = "softmax"
+        with self.assertRaises(ValueError):
+            resolve_coverage(None, cfg)
+
+    def test_a_checkpoint_carrying_both_takes_the_new_one(self):
+        """A conversion tool that writes both spellings during a transition is not an error."""
+        from sglang.srt.afd.checkpoint import resolve_shift
+
+        cfg = FakeConfig()
+        cfg.afd_query_shift_layers = 1
+        cfg.query_shift_layers = 2
+        self.assertEqual(resolve_shift(None, cfg), 2)
+
+    def test_an_unconverted_checkpoint_still_says_nothing(self):
+        """The guard must not fire on the ordinary case, which states neither spelling."""
+        from sglang.srt.afd.checkpoint import resolve_shift
+
+        self.assertEqual(resolve_shift(None, FakeConfig()), 0)
+
 
 
 if __name__ == "__main__":

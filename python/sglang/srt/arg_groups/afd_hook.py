@@ -27,26 +27,34 @@ MAX_REASONABLE_SHIFT = 64
 
 def handle_afd(server_args: ServerArgs) -> None:
     """Raise on a configuration that cannot mean what it says; warn on one that can but rarely does."""
+    if server_args.afd_mode in ("host", "pool"):
+        # Which of sglang's own features this arrangement can be run beside, refused by name
+        # before a model loads. Everything unsupported fails the same way when unchecked: the
+        # server starts, the tokens are fluent, and the measurement is of something else.
+        from sglang.srt.afd.compatibility import check as check_compatibility
+
+        check_compatibility(server_args)
+
     if server_args.afd_mode not in ("null", "host", "pool"):
         raise ValueError(
             f"--afd-mode must be null, host or pool; got {server_args.afd_mode!r}"
         )
 
-    shift = server_args.afd_q_shift_layers
+    shift = server_args.afd_query_shift_layers
     if shift is None:
         # unset: the checkpoint's own read point is resolved at load, where its config is in hand
         return _check_pool_args(server_args)
     if not isinstance(shift, int) or isinstance(shift, bool):
         raise TypeError(
-            f"--afd-q-shift-layers is a layer count, got {shift!r}. There is no fractional "
+            f"--afd-query-shift-layers is a layer count, got {shift!r}. There is no fractional "
             f"setting: a query read between a block's two sub-layers would be read from a point "
             f"where the residual stream has no value."
         )
     if shift < 0:
-        raise ValueError(f"--afd-q-shift-layers must not be negative, got {shift}")
+        raise ValueError(f"--afd-query-shift-layers must not be negative, got {shift}")
     if shift > MAX_REASONABLE_SHIFT:
         raise ValueError(
-            f"--afd-q-shift-layers={shift} is deeper than any stack this serves. The offset is "
+            f"--afd-query-shift-layers={shift} is deeper than any stack this serves. The offset is "
             f"N-0.5 layers, so N is a layer count and not a half-layer count -- the study's unit "
             f"is 2N-1, and a value that looks like a half-layer count here would silently run "
             f"twice the depth it names."
@@ -56,14 +64,14 @@ def handle_afd(server_args: ServerArgs) -> None:
 
     if shift > 0 and server_args.afd_mode == "null":
         logger.warning(
-            "--afd-q-shift-layers=%s with the two sides colocated: the query is read early and "
+            "--afd-query-shift-layers=%s with the two sides colocated: the query is read early and "
             "there is no pool call for it to overlap. This measures what the rewiring costs, "
             "which is a real question, but it is not what the arrangement buys.",
             shift,
         )
     if shift == 0 and server_args.afd_mode != "null":
         logger.info(
-            "afd %s with --afd-q-shift-layers=0: the standard read point, so the host waits for "
+            "afd %s with --afd-query-shift-layers=0: the standard read point, so the host waits for "
             "each feed-forward before its next attention. This is the synchronous baseline.",
             server_args.afd_mode,
         )
@@ -85,17 +93,32 @@ def _check_pool_args(server_args) -> None:
         )
         server_args.sleep_on_idle = True
 
+    if server_args.afd_mode == "host" and server_args.afd_pool_addr:
+        logger.info(
+            "afd host: the feed-forward goes to %s, so its weights are built on the meta device "
+            "and never allocated here. The loader reads this from the server args, not from a "
+            "flag set here: the model loads in a scheduler process this one spawns.",
+            server_args.afd_pool_addr,
+        )
+
     if server_args.afd_mode == "host":
-        if not server_args.afd_pool_addr:
+        # A host needs somewhere for SOMETHING to go, and there are two somewheres. Requiring the
+        # weights pool specifically made the reversed arrangement unreachable -- feed-forward
+        # local, only the sweep on a cache pool -- which is the arrangement the budget table ranks
+        # first at long context and which had therefore never been run.
+        if not server_args.afd_pool_addr and not server_args.afd_cache_addr:
             raise ValueError(
-                "--afd-mode=host needs --afd-pool-addr HOST:PORT. A host with nowhere to send "
-                "its feed-forward should fail here, not at the first token."
+                "--afd-mode=host needs --afd-pool-addr or --afd-cache-addr. A host with nowhere "
+                "to send anything is the ordinary stack wearing a flag, and it should fail here "
+                "rather than at the first token."
             )
-        host, _, port = server_args.afd_pool_addr.rpartition(":")
-        if not host or not port.isdigit():
-            raise ValueError(
-                f"--afd-pool-addr wants HOST:PORT, got {server_args.afd_pool_addr!r}"
-            )
+        for flag, value in (("--afd-pool-addr", server_args.afd_pool_addr),
+                            ("--afd-cache-addr", server_args.afd_cache_addr)):
+            if not value:
+                continue
+            host, _, port = value.rpartition(":")
+            if not host or not port.isdigit():
+                raise ValueError(f"{flag} wants HOST:PORT, got {value!r}")
 
     if server_args.afd_mode == "pool" and server_args.afd_pool_addr:
         logger.warning(

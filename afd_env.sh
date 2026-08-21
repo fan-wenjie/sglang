@@ -13,7 +13,12 @@
 # nvidia-cuda-nvcc. They arrived as 13.0 and 13.3 and CCCL refuses the pair with "CUDA compiler
 # and CUDA toolkit headers are incompatible", which reads like a broken install and is a version
 # skew between two wheels.
-export SGLANG_SRC=/home/user/experiment/sglang
+# Derived from this script's own location rather than written down. The absolute path was right
+# on the machine it was written on and wrong on the second one: the checkout there is at
+# /home/user/sglang, so PYTHONPATH pointed at a directory that did not exist and every launch
+# failed with "No module named sglang" -- a machine-specific constant in a file that gets copied
+# between machines.
+export SGLANG_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export CU13=/home/user/.conda/envs/sglang/lib/python3.12/site-packages/nvidia/cu13
 export CUDA_HOME="$CU13"
 export PATH="$CU13/bin:/home/user/.conda/envs/sglang/bin:$PATH"

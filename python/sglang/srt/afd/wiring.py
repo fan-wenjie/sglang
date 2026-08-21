@@ -253,7 +253,7 @@ def _plan_for(model, *, shift_layers: int, coverage: str, layer_types) -> ReadPl
     plan = plan_read_points(shift_layers, n_layers, convertible=convertible)
     if not plan.moved:
         raise RuntimeError(
-            f"--afd-q-shift-layers={shift_layers} moves no layer of this {n_layers}-layer "
+            f"--afd-query-shift-layers={shift_layers} moves no layer of this {n_layers}-layer "
             f"stack. A conversion that hooks nothing costs nothing, and a cost of zero reads as "
             f"tolerance rather than as a wiring that never installed."
         )
@@ -461,7 +461,7 @@ def install_early_q_hf(model, shift_layers: int, layer_types: list[str]) -> HFEa
     plan = plan_read_points(shift_layers, len(layers), convertible=convertible)
     if shift_layers > 0 and not plan.moved:
         raise RuntimeError(
-            f"--afd-q-shift-layers={shift_layers} moves no layer of this {len(layers)}-layer stack"
+            f"--afd-query-shift-layers={shift_layers} moves no layer of this {len(layers)}-layer stack"
         )
     logger.info(
         "afd early-q (hf): shift=%s, %s moved, %s clamped",

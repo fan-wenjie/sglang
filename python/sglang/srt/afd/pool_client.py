@@ -103,6 +103,7 @@ class PoolClient:
         # list that only ever grew. The report is windowed anyway.
         self._waits: collections.deque = collections.deque(maxlen=WAIT_HISTORY)
         self._closed = False
+        self._issues = collections.deque(maxlen=4096)
         self._receiver = threading.Thread(target=self._receive, name="afd-pool-recv", daemon=True)
         self._receiver.start()
 
@@ -177,11 +178,26 @@ class PoolClient:
             self._cond.notify_all()
 
     def issue(self, request_id: int, layer: int, hidden: torch.Tensor) -> Handle:
-        """Send one layer's work. Returns immediately; the reply lands in a slot."""
+        """Send one layer's work. Returns without waiting for a reply -- but not for free.
+
+        `issue` is timed in two parts because they have different causes and different fixes.
+        Building the frame copies the hidden state to host memory, and a device-to-host copy of an
+        unpinned tensor SYNCHRONISES the stream: it waits for every kernel queued before it, which
+        in a decode step is this layer's whole attention. So the window this call is supposed to
+        open does not start when `issue` is called; it starts when the GPU has drained.
+
+        The measurements say a layer costs 1260 us more than the model predicts, and this is the
+        first candidate. It is separated here rather than argued about.
+        """
+        began = time.perf_counter()
         frame = Frame.one(request_id, layer, hidden)
+        built = time.perf_counter()
         with self._send_lock:
             send_frame(self._sock, frame)
-        return Handle(request_id, layer, time.perf_counter())
+        sent = time.perf_counter()
+        with self._cond:
+            self._issues.append({"build_s": built - began, "send_s": sent - built})
+        return Handle(request_id, layer, sent)
 
     NEEDS_FEED_FORWARD = 1
     NEEDS_CACHE = 2
@@ -310,6 +326,10 @@ class PoolClient:
             waits = waits[-last:]
         if not waits:
             return {"calls": 0}
+        with self._cond:
+            issues = list(self._issues)
+        if last:
+            issues = issues[-last:]
         outstanding = [w["outstanding_s"] for w in waits]
         blocked = [w["blocked_s"] for w in waits]
         hidden = [o - b for o, b in zip(outstanding, blocked)]
@@ -320,6 +340,11 @@ class PoolClient:
             # what the caller got done while the pool worked. Zero means the call was issued and
             # immediately waited on, which is the synchronous arrangement wearing this one's name.
             "mean_hidden_s": sum(hidden) / len(hidden),
+            # what the issue itself cost. `build` is the device-to-host copy, which synchronises
+            # the stream; `send` is the socket. A build time that tracks the layer's own compute
+            # is a window that opens late by exactly that much.
+            "mean_build_s": (sum(i["build_s"] for i in issues) / len(issues)) if issues else 0.0,
+            "mean_send_s": (sum(i["send_s"] for i in issues) / len(issues)) if issues else 0.0,
         }
 
     def close(self) -> None:

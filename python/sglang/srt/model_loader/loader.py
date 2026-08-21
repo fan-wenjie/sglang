@@ -342,7 +342,19 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    return model_class(**kwargs)
+    # A host that routes its feed-forward to a pool must not allocate it on the way past. The
+    # allocation happens inside construction -- create_weights calls torch.empty without naming a
+    # device, so it takes the default one -- and a 52 GiB checkpoint is therefore materialised
+    # before anything is routed anywhere, which is an out-of-memory on a card smaller than the
+    # model and the one thing this arrangement exists to avoid.
+    #
+    # Here, and not at a caller: sixteen loaders call this function and the first attempt patched
+    # one of them, which is a change fifteen build paths never see. The docstring above says this
+    # is the only place a model class is instantiated, so this is the only place it belongs.
+    from sglang.srt.afd.absent_ffn import feed_forward_build_context
+
+    with feed_forward_build_context():
+        return model_class(**kwargs)
 
 
 def _post_load_weights(model: nn.Module) -> None:

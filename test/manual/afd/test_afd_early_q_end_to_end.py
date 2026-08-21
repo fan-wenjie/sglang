@@ -40,7 +40,7 @@ def _build_runner(shift: int):
         mem_fraction_static=0.70,
         disable_cuda_graph=True,
         attention_backend="triton",
-        afd_q_shift_layers=shift,
+        afd_query_shift_layers=shift,
     )
     port_args = PortArgs.init_new(server_args)
     model_config = ModelConfig.from_server_args(server_args)

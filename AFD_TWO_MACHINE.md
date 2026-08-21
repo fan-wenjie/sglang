@@ -87,7 +87,7 @@ backgrounded through ssh hangs the ssh client rather than the job. Through `afd_
     # on the host machine, at the pool's INTERNAL address
     ./afd_run.sh python -m sglang.launch_server --model-path <path> \
         --afd-mode host --afd-pool-addr 172.20.19.32:8999 \
-        --afd-q-shift-layers 1 --afd-coverage all --attention-backend triton --disable-cuda-graph
+        --afd-query-shift-layers 1 --afd-coverage all --attention-backend triton --disable-cuda-graph
 
 `--afd-min-batch 1` on the pool when one host calls it. A pool that waits for a partner that never
 arrives spends `--afd-max-wait-ms` on every call, and the arm is then mostly the timeout.

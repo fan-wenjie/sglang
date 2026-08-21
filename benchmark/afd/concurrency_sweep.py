@@ -17,7 +17,12 @@ import json
 import sys
 import time
 
-MODEL = "/home/user/experiment/models/Qwen3.8-27B-FP8"
+from sglang.srt.afd.under_test import model_path
+
+# named once, in the environment, and checked for quantisation before the weights
+# load. It was written down separately in eight tools, which is eight chances to
+# leave one on the old checkpoint and report its numbers under the new one's name.
+MODEL = model_path()
 PROMPT = "Write a detailed technical explanation of how a modern GPU schedules work:"
 LEVELS = [4, 8, 16, 24]
 TOKENS = 64
@@ -29,7 +34,7 @@ def arm(label, mem, pool_addr=None):
     extra = {"afd_mode": "host", "afd_pool_addr": pool_addr} if pool_addr else {}
     engine = sgl.Engine(
         model_path=MODEL, tp_size=1, mem_fraction_static=mem, disable_cuda_graph=True,
-        attention_backend="triton", log_level="warning", afd_q_shift_layers=1,
+        attention_backend="triton", log_level="warning", afd_query_shift_layers=1,
         afd_coverage="all", afd_split_attention=True, **extra)
     out = {}
     try:

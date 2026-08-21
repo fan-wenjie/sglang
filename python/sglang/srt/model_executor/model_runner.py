@@ -753,7 +753,7 @@ class ModelRunner:
         self.maybe_init_afd_roles()
 
     def maybe_init_afd_early_q(self):
-        """Move each softmax layer's query read point, if --afd-q-shift-layers asks for it.
+        """Move each softmax layer's query read point, if --afd-query-shift-layers asks for it.
 
         Wired here because this is where a loaded model may be transformed, and because the model
         lives in the scheduler process: a caller holding an Engine cannot reach it.
@@ -762,7 +762,7 @@ class ModelRunner:
 
         self.afd_early_q = install_early_q(
             model=self.model,
-            shift_layers=self.server_args.afd_q_shift_layers,
+            shift_layers=self.server_args.afd_query_shift_layers,
             coverage=self.server_args.afd_coverage,
             hf_config=self.model_config.hf_config,
             split_attention=self.server_args.afd_split_attention,

@@ -8,8 +8,8 @@ longer match their wiring, and nothing that fails.
 So the read point belongs to the checkpoint, and the config file is where a checkpoint says
 things about itself:
 
-    "afd_q_shift_layers": 1,
-    "afd_coverage": "all"
+    "query_shift_layers": 1,
+    "query_shift_coverage": "all"
 
 Either at the top level or inside `text_config`; both are read, the text config wins, because on
 a vision-language wrapper the text stack is what was converted.
@@ -37,7 +37,7 @@ Every path that serves weights at a read point they were not repaired for warns;
 does. A warning here means the command line asked for something only a specific intent wants, and
 if that intent is a measurement campaign the line is the record of it.
 
-The command line cannot be silently right: `--afd-q-shift-layers` defaults to None, meaning "take
+The command line cannot be silently right: `--afd-query-shift-layers` defaults to None, meaning "take
 the checkpoint's", and 0 is a real value meaning "serve the standard wiring even if the checkpoint
 was converted". A default of 0 would have made "unset" and "explicitly standard" the same, and the
 override warning would never fire for the case it exists for.
@@ -49,8 +49,38 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-SHIFT_KEY = "afd_q_shift_layers"
-COVERAGE_KEY = "afd_coverage"
+# A checkpoint's config is the CHECKPOINT's vocabulary, not this subsystem's. It spells things
+# out -- num_attention_heads, not num_attn_heads -- so these do too, and neither carries the
+# server's own flag namespace.
+SHIFT_KEY = "query_shift_layers"
+COVERAGE_KEY = "query_shift_coverage"
+
+# What these were called before the rename. A checkpoint that states a read point must never have
+# it silently ignored -- that is the one failure this whole file exists to prevent -- so an old
+# name is refused rather than skipped over.
+RETIRED_KEYS = {"afd_query_shift_layers": SHIFT_KEY, "afd_coverage": COVERAGE_KEY}
+
+
+def _refuse_retired_keys(hf_config) -> None:
+    """A config written against the old spelling is refused, not ignored.
+
+    Ignoring it would serve a repaired checkpoint at the standard read point -- its query
+    projection handed an input it was never trained on -- and the output would read fluently. A
+    rename that can silently do that is worse than no rename.
+    """
+    for old, new in RETIRED_KEYS.items():
+        if _has(hf_config, old) and not _has(hf_config, new):
+            raise ValueError(
+                f"this checkpoint states {old!r}, which was renamed to {new!r}. It is refused "
+                f"rather than ignored: a checkpoint that says where its query is read from must "
+                f"not be served as though it had said nothing, because the result reads fluently "
+                f"and is a model nobody trained."
+            )
+
+
+def _has(hf_config, key: str) -> bool:
+    text = getattr(hf_config, "text_config", None)
+    return (text is not None and hasattr(text, key)) or hasattr(hf_config, key)
 
 
 def _from_config(hf_config, key: str):
@@ -71,6 +101,7 @@ def _from_config(hf_config, key: str):
 
 def resolve_shift(requested, hf_config) -> int:
     """The read point to serve at, from the checkpoint and whatever the caller asked for."""
+    _refuse_retired_keys(hf_config)
     stated = _from_config(hf_config, SHIFT_KEY)
     if stated is not None and not isinstance(stated, int):
         raise TypeError(
@@ -92,7 +123,7 @@ def resolve_shift(requested, hf_config) -> int:
         if requested == 0:
             return 0
         logger.warning(
-            "afd: --afd-q-shift-layers=%s on a checkpoint that states no read point. Its query "
+            "afd: --afd-query-shift-layers=%s on a checkpoint that states no read point. Its query "
             "projection was trained to read x_l and is being given h_(l-%s), so this serves a "
             "model nothing has repaired -- valid as a measurement of what the rewiring costs "
             "before repair, and wrong as a deployment. Serving at %s.",
@@ -104,7 +135,7 @@ def resolve_shift(requested, hf_config) -> int:
         return requested
 
     logger.warning(
-        "afd: --afd-q-shift-layers=%s OVERRIDES the checkpoint's own %s. Two things look like "
+        "afd: --afd-query-shift-layers=%s OVERRIDES the checkpoint's own %s. Two things look like "
         "this and only one is intended: measuring a shift the checkpoint was not repaired for, "
         "or serving a repaired checkpoint at the wrong read point -- in which case its query "
         "projection is being given an input it was not trained on, and the output will read "
@@ -116,6 +147,7 @@ def resolve_shift(requested, hf_config) -> int:
 
 def resolve_coverage(requested, hf_config) -> str:
     """Which layers the shift reaches, resolved the same way."""
+    _refuse_retired_keys(hf_config)
     stated = _from_config(hf_config, COVERAGE_KEY)
     if stated is not None and stated not in ("all", "softmax"):
         raise ValueError(

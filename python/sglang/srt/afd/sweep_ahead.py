@@ -151,6 +151,9 @@ class SweepAhead:
         self.releases = 0
         self.n_projections = 0
         self.n_joins = 0
+        self.n_mirror_skips = 0
+        # per layer, how far the pool's sweep is from the same sweep run here
+        self.sweep_gap: dict[int, dict] = {}
         self.n_fallbacks = 0
         self.refusals: Counter = Counter()
         # --afd-verify-split: recompute each join the fused way and keep the worst disagreement
@@ -309,6 +312,17 @@ class SweepAhead:
             return
         ids = row_request_ids(self._forward_batch)
         if ids.shape[0] != k.shape[0]:
+            # Counted and named, not skipped quietly. This return is the only thing standing
+            # between a prefill and the pool's copy of its history, and skipping it produces a
+            # pool whose history begins after the prompt -- which decodes fluently and answers a
+            # question about primes with "Paris, Paris, Paris". A mismatch here has to be visible
+            # in the record, because nothing downstream can see it.
+            self.n_mirror_skips += 1
+            self._refuse(
+                f"layer {target}: {ids.shape[0]} row id(s) for {k.shape[0]} key row(s), so this "
+                f"chunk was NOT mirrored to the cache pool. The pool's history for these "
+                f"requests is missing these positions and every later sweep covers a gap."
+            )
             return
         self.cache_client.issue_frame(0, target, (k, v, ids.view(-1, 1)), OP_APPEND)
         if self.ledger is not None:
@@ -324,6 +338,8 @@ class SweepAhead:
         from sglang.srt.afd.remote_attention import join_scored
 
         o_swept, lse = self.cache_client.collect_frame(state.handle, device)
+        if self.verify_path is not None:
+            self._verify_sweep(target, o_swept, lse, state)
         out = join_scored(o_swept, lse, state.q, k, v, attn=attn)
         # keyed per row, like the sweep that preceded it: the batch carries one token from each of
         # several requests and each belongs to its own history
@@ -336,6 +352,47 @@ class SweepAhead:
                 self.ledger.record(request_id, target, count)
         self.n_joins += 1
         return out
+
+    def _verify_sweep(self, target: int, o_remote, lse_remote, state) -> None:
+        """The pool's sweep against the same sweep run here, on the host's own cache.
+
+        The end-to-end verifier compares the JOINED output, which folds two things together: what
+        the pool swept and how the host merged it. When that number came back at a relative one --
+        not a rounding, a different answer -- it could not say which half was wrong. This asks the
+        narrower question, and the two halves have different fixes: a sweep that disagrees means
+        the pool's history is not the host's, and a join that disagrees means the merge is.
+
+        The local sweep reads the HOST's cache, which in the remote arrangement is written by the
+        prefill fallback and by nothing else. If that is the difference, this is where it shows.
+        """
+        from sglang.srt.afd.split_attention import sweep as local_sweep
+
+        try:
+            local = local_sweep(get_attn_backend(), self.layers[target].attn,
+                                self._forward_batch, q=state.q, index=self.index)
+        except Exception as e:                     # a backend that refuses says so once
+            self._refuse(f"layer {target}: cannot sweep locally to compare -- {e}")
+            return
+        if local is None:
+            return
+        record = self.sweep_gap.setdefault(
+            target, {"o_max_rel": 0.0, "lse_max_abs": 0.0, "compared": 0})
+        record["compared"] += 1
+        # the pool answers with the flat (tokens, heads*v_head_dim) the wire carries and the local
+        # sweep with (tokens, heads, v_head_dim); flattened here so the comparison is of values
+        # rather than of layouts
+        if local.o is not None:
+            mine = local.o.reshape(o_remote.shape[0], -1).float()
+            theirs = o_remote.reshape(o_remote.shape[0], -1).float()
+            scale = float(mine.abs().max())
+            if scale > 0.0:
+                record["o_max_rel"] = max(record["o_max_rel"],
+                                          float((theirs - mine).abs().max()) / scale)
+        if local.lse is not None:
+            a = lse_remote.reshape(lse_remote.shape[0], -1).float()
+            b = local.lse.reshape(lse_remote.shape[0], -1).float()
+            record["lse_max_abs"] = max(record["lse_max_abs"],
+                                        float((a - b).abs().max()))
 
     def _refuse(self, reason: str) -> None:
         """Count it, and say it once. A refusal that only lands in a counter is a schedule that
@@ -379,7 +436,21 @@ class SweepAhead:
                     f"step's token with q_b is not attention with either."
                 )
             if self.cache_client is not None:
-                return self._join_remote(target, attn, state, k, v, q.device)
+                out = self._join_remote(target, attn, state, k, v, q.device)
+                if self.verify_path is not None:
+                    # The remote join used to return here, above the verifier, so --afd-verify-split
+                    # covered the LOCAL partition only. The exactness figure in the record is a
+                    # local one, and the reversed arrangement -- whose whole point is that the
+                    # sweep happens somewhere else -- was the one path nothing checked. It was
+                    # producing wrong tokens for four rounds of measurement while every run
+                    # reported a speed.
+                    self._verify(target, out,
+                                 original,
+                                 q,
+                                 k.view(-1, attn.tp_k_head_num, attn.qk_head_dim),
+                                 v.view(-1, attn.tp_v_head_num, attn.v_head_dim),
+                                 forward_batch)
+                return out
             k = k.view(-1, attn.tp_k_head_num, attn.qk_head_dim)
             v = v.view(-1, attn.tp_v_head_num, attn.v_head_dim)
             out = join(get_attn_backend(), attn, forward_batch, k=k, v=v,
@@ -424,6 +495,7 @@ class SweepAhead:
                 {
                     "layers": {str(k): v for k, v in sorted(self.verify.items())},
                     "worst_rel": max((v["max_rel"] for v in self.verify.values()), default=0.0),
+                    "sweep_gap": {str(k): v for k, v in sorted(self.sweep_gap.items())},
                     "record": self.record(),
                 },
                 f,

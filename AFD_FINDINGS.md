@@ -246,3 +246,306 @@ only after it had already been used to recommend something.
   converted layer makes a synchronous round trip the colocated model does not make, and the
   overlap so far recovers a fraction of it. Whether disaggregation pays is a ratio between an
   interconnect and a feed-forward, and one pair of machines answers it for one pair of machines.
+
+## 10. The measured ladder contradicts section 9, and section 9 is the one to distrust
+
+Section 9 is arithmetic over a cost model. This is a stopwatch on the two machines. They disagree
+about the sign.
+
+Qwen3.8-27B-FP8, host RTX PRO 6000 against the RTX 5090 pool over 10 GbE, 8 concurrent requests,
+decode measured as the difference between a 36-token and a 4-token generation on a warmed prompt:
+
+| context | colocated | A, feed-forward on the pool | A / colocated |
+|---|---|---|---|
+| 1024 | 170.1 tok/s (47.0 ms a step) | 40.7 tok/s (196.3 ms) | **0.240x** |
+| 8192 | 171.5 tok/s (46.6 ms) | 41.0 tok/s (195.3 ms) | **0.239x** |
+| 32768 | 176.9 tok/s (45.2 ms) | 63.2 tok/s (126.6 ms) | **0.357x** |
+
+Section 9 predicted A at 1.17x at 1k and better beyond. Measured, A is between two and four times
+SLOWER, everywhere. The gap is not small and it is not noise.
+
+**Why the model was wrong is stated in the model.** Its per-layer figure is the MAX of the two
+sides "provided the round trip is covered", and the same table says covering it at 1k needs 15.7
+items in flight. Eight requests do not supply that, and nothing in the implementation pipelines
+across layers to make up the difference. So the model reports a ceiling reachable at a pipeline
+depth this code does not have, and the stopwatch reports what the code does. Both numbers are
+correct about different things; only one of them is about the software that would be merged.
+
+**The ratio does improve with context, and by less than it needs to.** From 0.239x at 8k to 0.357x
+at 32k -- A's step time falls from 195.3 ms to 126.6 ms while colocated stays flat. Per converted
+layer that is 2.33 ms of remote overhead at 8k against 1.27 ms at 32k. The obvious reading is that
+a longer sweep hides more of the round trip, which is what the schedule is for; that reading is a
+hypothesis until `overlap_report()` is read on this run, and it is not measured here.
+
+**Colocated decode is flat from 1k to 32k** (47.0 -> 45.2 ms). Three of every four layers in this
+model are linear attention, whose cost does not grow with history, so context is a much weaker
+lever on this model than the budget model's sweep term assumes. An arrangement that needs context
+to grow in order to win has less room here than section 9 suggests.
+
+### The harness fix that changed the baseline
+
+An earlier run of this ladder reported colocated at 304.7 tok/s at 1k. That number was wrong. The
+warm-up ran only at the short length, so the timed short run absorbed the unfinished warm-up,
+which shrank `t_long - t_short` and inflated the rate by 1.8x -- in the direction that flattered
+the colocated arm. The warm-up now runs at the longest shape first and the timed pair is discarded
+once. The same defect stopped the A arm outright, with 4 steps taking 33.5s against 36 steps
+taking 8.4s, which the harness's own check caught and refused to report.
+
+## 11. A second model family does not install, and the gap is granularity
+
+`check_supported` was run against a built Llama-3.2-1B-Instruct stack. It refused, and what it
+refused over is not a missing capability but a difference in where the same capabilities live:
+
+    contract expects                     Llama has
+    layer.attn                           layer.self_attn.attn
+    layer.forward_prepare_* (four)       layer.self_attn.forward_prepare_native, _npu (two)
+    layer.layer_communicator.prepare_mlp absent; the residual is done inline in the layer
+
+Counted across this checkout by `python -m sglang.srt.afd.portability`:
+
+    216 model files
+     91 (42.1%) have input_layernorm
+     32 (14.8%) have layer_communicator
+     30 (13.9%) have prepare_mlp
+      7 ( 3.2%) have forward_prepare_native
+      1 ( 0.5%) have all four prepare variants -- qwen3_5, the model this was written against
+
+The wiring installs on the intersection, so today that is one model file. A second family is a
+port, not a flag: it needs the read point and the query projection located per family instead of
+assumed. That is a design change to the wiring and it has not been made.
+
+Running this check also exposed a defect in the check. A layer it could not classify ended that
+layer's probe, so a new family saw the first gate only and would have learned the rest one launch
+at a time -- the discovery process the module exists to replace -- and findings were listed per
+layer, so one problem repeated sixteen times and truncated at twelve would hide a second and third
+behind it. Findings are now grouped by message across layer ranges, and an unclassified layer is
+probed against both kinds so the report says which side's names it does have.
+
+## 12. The reversed arrangement, measured end to end, against a control that is the same model
+
+Sections 9 to 11 rank arrangement E first at long context on the strength of a cost model. This is
+a stopwatch, on two machines, with neither side quantised and with the tokens checked before any
+rate was read.
+
+Qwen3.8-27B in bfloat16 -- NOT the FP8 checkpoint the earlier sections used -- host RTX PRO 6000
+against an RTX 5090 cache pool over a 10 GbE overlay, 8 concurrent requests, shift 1:
+
+| context | stock | local split | E | E / local | local / stock |
+|---|---|---|---|---|---|
+| 1024 | 209.6 tok/s | 157.9 | 85.1 | **0.539x** | 0.753x |
+| 8192 | 202.2 | 160.6 | 84.8 | **0.528x** | 0.794x |
+| 32768 | 177.7 | 147.2 | 50.3 | **0.341x** | 0.829x |
+
+    tokens identical across three prompts: local split == E
+
+**The control had to change, and finding that out cost most of a session.** E was first compared
+against stock and produced different text -- "The capital of France is Paris. The capital of France
+is Paris." against stock's "...Germany is Berlin. ...Italy is Rome." That was read as a broken pool
+and chased through the protocol, the cache and the kernels. It was the read point. Stock serves
+shift 0 and E serves shift 1, and on a checkpoint nothing has repaired those are two different
+models -- which the launch warns about, in a warning this tree wrote. Against a shift-1 local split
+arm, E is token-identical.
+
+So there are two costs and they were folded together in every earlier number:
+
+    local / stock    0.75 - 0.83x    moving the read point and partitioning the attention
+    E / local        0.34 - 0.54x    moving the sweep to another machine
+
+Only the second is what disaggregation costs, and it is the one this section measures.
+
+### The unquantised model is FASTER, which inverts an assumption
+
+Colocated decode at bfloat16 runs 209.6 / 202.2 / 177.7 tok/s against the FP8 checkpoint's 171.7 /
+168.4 / 174.4. Twice the weight bytes and it is quicker: FP8's block-wise dequantisation costs more
+here than the bandwidth it saves, with CUDA graphs off and the Triton backend. Dropping
+quantisation for comparability made the baseline harder to beat rather than easier.
+
+### Where the time goes, measured on the pool rather than inferred
+
+    a sweep, before batching       3609 us    of which 934 us was transport
+    a sweep, after batching        1452 us    of which 934 us is transport
+    an append                       632 us    fired and never waited on
+    raw TCP echo, same bytes        972 us    a round trip's floor on this link
+    NCCL send/recv, same bytes      746 us
+    NCCL gather, one direction      151 us
+
+The pool's per-request loop was 2670 us of the first figure and did not move when the context grew
+from 1k to 8k, because it was per REQUEST. Replacing it with one contraction over a slotted buffer
+is section 13. Transport is now 64% of a sweep and was 26%.
+
+### What is NOT explained, and is therefore not concluded
+
+E adds 2712 us per softmax layer at 1k, 2782 us at 8k, and **6549 us at 32k**. The pool's own sweep
+grows only from 1452 us to 1788 us across the same range, so the jump at 32k is not the sweep. It
+may be the slot buffer meeting its 33000-position ceiling, or host memory pressure changing the
+batching. Until that is measured the 0.341x at 32k is a reading with an unexplained shape in it,
+and this section does not rank anything on it.
+
+Separately, 1260 us of the 2712 us at 1k has no owner: the pool answers a sweep in 1452 us and the
+host loses 2712 us to it. The issue, the wait, the merge and the append's share of the link are
+between those two numbers and none of them is measured yet.
+
+## 13. Three defects the reversed arrangement's first real run exposed
+
+**The verifier never covered the path it was needed on.** `--afd-verify-split` recomputes each join
+the fused way and reports the worst disagreement. `_join_remote` returned above the call, so the
+flag covered the LOCAL partition only -- the exactness figure of 7.8e-3 in the record is a local
+number, and the arrangement whose entire premise is that the sweep happens elsewhere was the one
+path nothing checked. Fixed, with the caveat that its reference reads the host's KV cache, which
+the remote arrangement does not write during decode; the verifier is therefore still not usable on
+E until the reference has a history to read.
+
+**The pool's sweep was two loops deep.** A Python loop over tokens with a `repeat_interleave` of
+the grouped-query expansion inside it, materialising 805 MiB of keys in float32 at 32k context per
+token per layer; and a loop over requests around that. The first is the same arithmetic written the
+expensive way for the THIRD time in this tree -- twice before in measurement tools, where it looked
+like a number nobody believed, and here in the serving path, where it looked like an architecture
+that had been refuted.
+
+**The cache grew by concatenation.** `torch.cat` per append copies the whole history to add one
+position. Replaced by a slotted buffer written in place, which is also what lets a batch be one
+kernel. The slotted and per-request paths agree bit for bit in float64.
+
+## 14. What the transport can and cannot be made to do
+
+Measured on the link rather than assumed, after the recorded 4.4 Gbit/s turned out to be neither
+the link's capacity nor what the protocol achieves:
+
+    8 parallel streams, one way    9.91 Gbit/s     the physical ceiling; this is a 10 GbE overlay
+    1 stream, one way              4.58 - 6.62
+    request-response at 193 KiB    3.56            what any synchronous protocol gets
+    our SWEEP_Q, transport only    1.69
+
+    1-byte round trip, TCP          130 us
+    1-byte round trip, UDP          139 us         the latency is the overlay's, not TCP's
+    snd_cwnd under load          209 KiB           2.2x one frame: congestion control is not the limit
+
+Four things were tried and three were refused by measurement:
+
+    sharding one frame over N connections    873 -> 1577 us. Worse: the bytes in flight do not
+                                             change and the syscalls multiply
+    UDP                                      934 -> 2358 us. Worse: TCP segments in the kernel,
+                                             UDP forces 142 datagrams into user space. 0% loss
+    zero-copy and io_uring                   they act on 20.7% of the round trip of which 8.9 us
+                                             is our encoding; the ceiling is about 3%
+    FP8 on the wire                          would halve the payload and change what the model
+                                             computes, so a timing taken with it is not comparable
+                                             to one taken without. Withdrawn
+
+The binding constraint is the bandwidth-delay product: 9.91 Gbit/s at 130 us is 157 KiB, and one
+sweep is 96 KiB out and 97 KiB back. A message smaller than the pipe cannot fill it, and this is
+Little's law rather than an implementation.
+
+**The one number that changes the conclusion is NCCL's gather at 151 us**, against 746 us for its
+own send/recv and 934 us for ours. That is one DIRECTION of 96 KiB at close to line rate, and it
+says the round trip costs 2.5x two one-way transfers. The lever is therefore to stop taking round
+trips -- issue layer l+1's query while layer l's output is still arriving -- and that is worth more
+than any change of library. For the arrangement that does not exist yet, several hosts sharing one
+pool, gather is also the right primitive for the inbound and `all_gather` at 571 us is the wrong
+one.
+
+Neither machine has InfiniBand or libibverbs, so NCCL falls back to sockets and GPUDirect is
+unavailable: the bytes still travel GPU to host to socket to host to GPU. What was measured is
+NCCL's C++ path and its multiple sockets, not a shorter route.
+
+## 15. Communication against the work it displaces, and the ratio that decides everything
+
+The arrangement's whole proposition is that a feed-forward is worth sending away. So the number
+that decides it is the round trip against the feed-forward it buys, and every part of that was
+measured on this pair rather than derived.
+
+One routed feed-forward, taken apart. The host's own measurement of the same feed-forward
+computed locally is 360.8 us, which is what the pool's column should be compared against:
+
+| batch | round trip | wire | pool's ffn | our protocol | wire / ffn |
+|---|---|---|---|---|---|
+| 1 | 716 us | 221 | 379 | 116 | **0.58x** |
+| 4 | 987 us | 480 | 359 | 148 | **1.34x** |
+| 8 | 1152 us | 707 | 361 | 84 | **1.96x** |
+| 16 | 1520 us | 970 | 364 | 186 | **2.67x** |
+
+**The feed-forward does not grow with the batch and the wire does.** A decode-time feed-forward is
+a weight read: the same 510 MiB whether one row rides along or sixteen, so it sits at 360 us in
+every row of that table. The payload is `batch x hidden x 2 bytes` each way and rises linearly.
+
+That is the arrangement's central tension in one table. The host wants a large batch, because its
+own weight reads are fixed and every extra row is free -- measured, batch 1 to 8 at a flat 49 ms a
+step and 7.94x the throughput. The wire wants a small one. They are the same number.
+
+The crossover is at batch 2: below it the wire is cheaper than the work it displaces, above it the
+wire costs more than the work is worth. Every deployment-shaped configuration is above it.
+
+### What a better fabric does to that ratio
+
+Wire at batch 4, against the same 359 us of feed-forward:
+
+    this overlay, measured     480 us     1.34x
+    10 GbE RoCE                 69 us     0.19x
+    25 GbE RoCE                 29 us     0.08x
+    100 GbE RoCE                10 us     0.03x
+
+RDMA does not make the arrangement fast. It makes the wire stop being the subject: at 0.19x the
+question returns to whether one weight read serving several hosts is worth a round trip, which is
+a question about how many hosts there are and not about the network.
+
+### Our own protocol is 8 to 15 percent and is not where the cost is
+
+The `protocol` column above is everything this project adds on top of the wire and the work: frame
+headers, the device-to-host copy, the departure queue, the reply's copy back. It is 84 to 186 us.
+Four transports were tried against it and three were refused by measurement -- sharding a frame
+across connections (worse), UDP (2.5x worse, 0% loss, lost on syscalls), NCCL send/recv (970 us
+against our 934, level). The remaining candidate is a collective spelling that measured 11% better
+and costs a fixed communicator, which a pool serving dynamic callers cannot have.
+
+## 16. The measurement that was wrong for four rounds, and what it was hiding
+
+Every figure in section 12 and every "the arrangement is N times slower" statement before it was
+taken with the pool waiting for eight callers. That setting was made deliberately, for the
+amortisation test in section 17, and never put back. There has only ever been one caller, so every
+layer waited out the full 4 ms departure timeout.
+
+    pool setting            outstanding   host blocked   window hid   decode
+    min_batch 8 (stale)        5.70 ms        5.19 ms         9.0%    2.0 tok/s
+    min_batch 1 (correct)      1.06 ms        0.85 ms        20.0%    8.1 tok/s
+
+**Four times.** And `outstanding` at min_batch 1 is 1.06 ms against the 987 us the same round trip
+measures when probed on its own -- a 7% gap, where there had been a 5.8x one.
+
+What it invalidates: the four "real host with synthetic fillers" numbers (2.0 / 1.9 / 2.2 / 2.0
+tok/s), the conclusion drawn from them that batching does not reach a real host, and the estimate
+built on that conclusion that layer alignment would need hundreds of hosts. The amortisation
+measurement itself stands, because there the setting and the intent agreed.
+
+This is the fourth failure of the same kind in this arrangement's history -- a verifier that never
+covered the remote path, a construction hook that reached one of sixteen loaders, a module flag
+that did not cross a process boundary, and now a setting left over from another experiment. Each
+produced a plausible number and nothing that could have said otherwise. The fix is the same in
+every case and it is not a code fix: **a measurement has to report the configuration it ran under,
+in the same breath as the number.** The tools now print the pool's departure settings before their
+first line.
+
+## 17. What the window actually hides, measured across context
+
+On the clean baseline, the same host, the same pool:
+
+    prompt tokens   batch   ms a step   tok/s   window hid
+               33       1      136.7ms     7.3      20.0%
+              833       1      114.1ms     8.8         --
+             6657       1      109.8ms     9.1      21.9%
+            28449       4      126.9ms    31.5      18.7%
+
+The step time falls as the prompt grows, which is the direction the corrected model predicts: the
+host's sweep is the one term that grows with context, and it is what fills the window.
+
+**But the hidden fraction does not grow.** It sits between 18.7% and 21.9% across a range where
+the sweep alone should have moved it from about 5% to about 25%. The window is real -- the host
+logs 63 of them a step, 16 carrying a cache sweep -- and it is not scaling the way the sweep
+scales. That is unexplained, and the reason it is written here rather than resolved is that the
+last four rounds of this arrangement's history were spent explaining numbers whose configuration
+was wrong. This one is on a clean baseline and it still does not fit.
+
+Until it is understood, the corrected model in section 14 predicts break-even at 71,000 tokens on
+this overlay, and the longest context this hardware can hold on the attention side is 28,449 at
+batch 4 -- the host is a 32 GiB card carrying 14.9 GiB of weights. **The arrangement cannot be
+shown to break even on the machines it was measured on.** That is a statement about the machines.
+
