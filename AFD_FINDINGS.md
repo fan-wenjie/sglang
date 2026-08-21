@@ -549,3 +549,103 @@ this overlay, and the longest context this hardware can hold on the attention si
 batch 4 -- the host is a 32 GiB card carrying 14.9 GiB of weights. **The arrangement cannot be
 shown to break even on the machines it was measured on.** That is a statement about the machines.
 
+
+## 18. The group cut, and the memory that decides it
+
+Section 17 ends by saying the arrangement cannot be shown to break even on these machines: the
+corrected model puts break-even at 71,000 tokens and the host can hold 28,449 at batch 4, because
+it is a 32 GiB card carrying 14.9 GiB of weights. That sentence is about how much of the host is
+NOT cache, and the group cut changes exactly that.
+
+### The cut
+
+A span runs from one softmax attention's output projection to the next one's input: on this model
+four feed-forwards and three linear attentions, in one call. 17 round trips a decode step instead
+of 63.
+
+The rule is not "weights to the pool". It is that **a batch only has to be re-formed where latency
+varies**:
+
+| stage | cost depends on context? | measured |
+|---|---|---|
+| feed-forward | no | a weight read |
+| linear attention | no | 7.0 us at 1k, 32k and 256k alike |
+| softmax attention | **yes** | 19 us at 1k, 2397 us at 128k |
+
+Through a fixed-latency stage everybody in a batch finishes together and holding the batch is free.
+Through a variable one, one long-context rider makes every short one wait. So the cut goes where
+latency stops being fixed, and on this model that happens to be where the KV cache is.
+
+The per-layer arrangement cut by OWNERSHIP instead -- a recurrent state belongs to its request, so
+it stays with the request -- which is why 48 linear-attention layers stayed on the host there. Their
+state is per-request AND their latency is fixed; under this rule the second fact decides, and they
+move. **That is what frees the memory**, and it is the reason the two cuts are different
+arrangements rather than the same one at two granularities.
+
+### The span, measured before anything was built on it
+
+`benchmark/afd/span_cost.py`, synthetic weights at the real shapes, so the launch count is real:
+
+    riders     span     a rider    over the sum of its weight reads
+         1   2070 us   2070 us     455 us
+         4   2046 us    512 us     431 us
+        16   2249 us    141 us     634 us
+        32   2849 us     89 us    1234 us   <- no longer launch overhead
+        64   3927 us     61 us    2312 us
+
+The arithmetic over weight bytes said 1683 us. Measured is 2046 at batch 4, **22% higher**, and the
+flat part of the curve ends at 16 -- which is how large a batch should be, measured rather than
+chosen. Above 16 a span stops being a weight read and starts being a matrix multiply.
+
+Its internal split, which answers who pays for the wire:
+
+    4 x feed-forward     2040 MiB   74% of the span   298 us each
+    3 x linear attention  660 MiB   24%               129 us each
+    W_o                    60 MiB    2%                35 us
+    one round trip                                    628 us
+
+A span covers a round trip 3.3 times over. The per-layer cut's feed-forward covered it 0.57 times
+-- 359 us of work against 628 us of overhead -- and that ratio is the whole of why section 10
+measured a loss. **5.7x more work per round trip** is the change.
+
+### What the host stops holding, and what that is worth
+
+Computed from the checkpoint's own shapes, anchored on the measured 28,449 at batch 4:
+
+| the host holds | weights | freed | tokens a request at batch 4 |
+|---|---|---|---|
+| per-layer cut (measured) | 15.81 GiB | -- | 28,449 |
+| group cut | 5.49 GiB | 10.31 | 70,689 |
+| group cut, and the query projection also on the pool | 2.37 GiB | 13.44 | 83,489 |
+| | | | *break-even: 71,000* |
+
+The computed 15.81 GiB against the measured 14.9 is 6% out, so these are estimates and the last
+column inherits that. But the gap between the rows is far larger than the error in any of them, and
+it says something section 17 could not: **the group cut lands ON the break-even point and does not
+clear it.** 70,689 against 71,000 is a coin toss.
+
+Moving the query and key/value projections to the pool as well is what clears it, by 18%. It also
+finishes the GEMV finding -- host decode is weight-read bound, and `qkv_proj` and `o_proj` are the
+last two GEMVs the host still runs at decode. After that the host runs no weight matrix at all: it
+holds a cache and sweeps it.
+
+Two ways to arrange that, and they differ by less than they look:
+
+    A  host drives   host sends o, receives q early and then k, v      14,336 columns a group
+    B  pool drives   pool sends q early, host returns o_hist and lse   12,312 columns a group
+
+B is 2,024 columns cheaper, which at batch 4 is 16 KiB and **13 us on this link** -- 0.6% of a
+span. It costs the host's forward pass: under B the host no longer runs sglang's model loop at all,
+it is a cache server. A is taken. Thirteen microseconds is not worth a fork.
+
+Both take the key/value append off the critical path, which `OP_APPEND` was written for and nothing
+had used: this step's join uses key and value the caller already has, and the cache only has to
+hold them by the NEXT step.
+
+### What is not yet measured
+
+Everything above about the group cut except the span itself. The 17-round-trip step time, the
+break-even, and the token budgets are arithmetic, and section 10 exists to record what happened the
+last time arithmetic and a stopwatch disagreed here. The sweep window is also still shut --
+`SpanRouting.report()["sweep_window_open"]` is False -- so a timing taken today would be of a
+schedule with the overlap removed.
