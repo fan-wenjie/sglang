@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 from sglang.srt.afd.pool_client import PoolClient
-from sglang.srt.afd.pool_server import Departure
+from sglang.srt.afd.pool_server import Departure, route_frame
 from sglang.srt.afd.protocol import (
     OP_SPAN,
     OP_SPAN_ENTER,
@@ -86,12 +86,10 @@ class Pool:
                 frame = decode(conn)
                 if frame is None:
                     return
-                if frame.op == OP_STATE_READ:
-                    self.departure.file_reading(conn, frame)
-                    continue
-                if self.departure.answer_directly(frame, conn):
-                    continue
-                self.departure.offer(frame, conn)
+                # the PRODUCTION router, not a copy of it. A copy stood here, with the same
+                # `== OP_STATE_READ` literal the production loop had, so it reproduced the bug
+                # instead of catching it and the scan case below passed against it.
+                route_frame(self.departure, frame, conn)
         except BaseException as e:                       # noqa: BLE001 -- reported, not swallowed
             self.error = e
 
@@ -217,3 +215,62 @@ class TestTheReplyCarriesTheOpItWasAskedWith(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScanRunner(Runner):
+    """A span whose rider carries three rows, which is what a prefill chunk is.
+
+    `ask_host` picks the opcode off the rider's row count: one row is a decode and keeps the
+    read/update split, more than one is a chunk whose tokens read each other's updates and must
+    travel as OP_STATE_SCAN. So this fake exercises the scan opcode by carrying rows, not by
+    naming it -- the same way the real runner does.
+    """
+
+    def run(self, request_ids, group, attn_output, positions, on_query=None):
+        rows = 3
+        q = torch.zeros(rows, 2, 4)
+        step = (torch.zeros(rows, 2, 4), torch.zeros(rows, 2, 4),
+                torch.ones(rows, 2), torch.ones(rows, 2))
+        for layer in range(self.asks):
+            self.seen.append(tuple(self._local.ask_host(layer, request_ids, q, step=step).shape))
+        if on_query is not None:
+            on_query(torch.zeros(rows, 4))
+        return torch.zeros(rows, 4), torch.zeros(rows, 4), torch.zeros(rows, 4)
+
+
+class TestAScansReplyIsRecognisedAsAReply(CustomTestCase):
+    """The frame coming back from a scan is a REPLY, and the pool has to know that.
+
+    It knew it for OP_STATE_READ, by a literal. Adding OP_STATE_SCAN to the protocol left the
+    scan's reply falling through to `offer`, where it boarded as a feed-forward request: 122 rows
+    of 48x128 readings went into a MoE layer expecting 5120-wide hidden states, and the arrangement
+    died on a shape error naming nothing in the routing at all. Fails here by timing out -- the
+    span waits for a reading that was queued as a passenger.
+    """
+
+    def test_a_three_row_rider_completes(self):
+        pool = Pool(asks=2)
+        pool.runner.__class__ = ScanRunner
+        client = PoolClient(f"127.0.0.1:{pool.port}", 5.0, reconnect=False)
+        client.serve = lambda frame: (torch.ones(frame.tensor.shape[0], 8),)
+        done, result = threading.Event(), {}
+
+        def call():
+            try:
+                handle = client.issue_frame(
+                    1, 0, (torch.zeros(3, 4), torch.zeros(3, 1), torch.zeros(3, 1)), OP_SPAN)
+                result["reply"] = client.collect_frame(handle._replace(op=OP_SPAN), "cpu")
+            except BaseException as e:                   # noqa: BLE001
+                result["error"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=call, daemon=True).start()
+        try:
+            self.assertTrue(done.wait(DEADLINE),
+                            "the scan's reply was never filed as a reply, so the span that asked "
+                            "for it is still waiting and the reading is sitting in the queue")
+            self.assertIsNone(result.get("error"), f"{result.get('error')}")
+            self.assertEqual(pool.runner.seen, [(3, 2, 4), (3, 2, 4)])
+        finally:
+            pool.close()

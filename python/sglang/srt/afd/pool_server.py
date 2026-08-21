@@ -43,6 +43,7 @@ from sglang.srt.afd.protocol import (
     OP_SPAN_ENTER,
     OP_SPAN_EXIT,
     OP_SPAN_Q,
+    INBOUND_OPS,
     OP_STATE_READ,
     OP_STATE_SCAN,
     OP_STATE_UPDATE,
@@ -730,6 +731,33 @@ def _expire_parked(departure: Departure) -> None:
             )
 
 
+def route_frame(departure: Departure, frame, sock) -> None:
+    """Decide what an arriving frame IS, and hand it to whoever wants it.
+
+    Three kinds arrive on one socket and nothing but the opcode separates them: a reply to a call
+    this pool made, a question answerable without a batch, and a rider boarding a bus.
+
+    A REPLY is filed rather than read by the span that wants it, because two readers on one socket
+    deadlock the moment the departure is taken by the timer thread rather than by the connection
+    thread. It is recognised by INBOUND_OPS -- the same set the far end answers -- and NOT by a
+    literal. A literal was here, `== OP_STATE_READ`, and adding OP_STATE_SCAN to the protocol left
+    a scan's reply falling through to `offer`, where it boarded as if it were a feed-forward
+    request. What raised was `mat1 and mat2 shapes cannot be multiplied (122x6144 and 5120x34816)`
+    six frames deep inside a MoE layer, naming nothing in this file: 6144 is 48 value heads of
+    128, which is what a reading is and what a hidden state is not.
+
+    Extracted so the tests run THIS rather than a copy of it. The copy in the test harness carried
+    the same literal, so the case that should have caught the scan passed against a fake with the
+    identical bug.
+    """
+    if frame.op in INBOUND_OPS:
+        departure.file_reading(sock, frame)
+        return
+    if departure.answer_directly(frame, sock):
+        return
+    departure.offer(frame, sock)
+
+
 def serve(
     forward: Callable[[torch.Tensor, int], torch.Tensor],
     host: str,
@@ -776,15 +804,7 @@ def serve(
                 frame = decode(sock)
                 if frame is None:
                     return
-                if frame.op == OP_STATE_READ:
-                    # a REPLY, on the socket the connection thread owns. Filed rather than read
-                    # by the span that wants it, because two readers on one socket deadlock the
-                    # moment the departure is taken by the timer thread.
-                    departure.file_reading(sock, frame)
-                    continue
-                if departure.answer_directly(frame, sock):
-                    continue
-                departure.offer(frame, sock)
+                route_frame(departure, frame, sock)
         finally:
             sock.close()
 

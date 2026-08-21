@@ -25,6 +25,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 from sglang.srt.afd.pool_client import PoolClient, PoolClosed
 from sglang.srt.afd.protocol import (
+    OP_STATE_SCAN,
     INBOUND_OPS,
     OP_FFN,
     OP_STATE_READ,
@@ -169,7 +170,12 @@ class TestTheOpcodeListIsTheOnlyThingSeparatingThem(CustomTestCase):
 
     def test_inbound_ops_are_not_reply_ops(self):
         self.assertNotIn(OP_FFN, INBOUND_OPS)
-        self.assertEqual(INBOUND_OPS, frozenset({OP_STATE_READ, OP_STATE_UPDATE}))
+        self.assertEqual(
+            INBOUND_OPS, frozenset({OP_STATE_READ, OP_STATE_UPDATE, OP_STATE_SCAN}),
+            "an op was added to the protocol without deciding which direction it travels. This "
+            "list is the only thing that separates a reply from a request on a socket that "
+            "carries both, and the ends disagreeing about one op is a hang or a passenger that "
+            "is really a reading.")
 
 
 if __name__ == "__main__":
