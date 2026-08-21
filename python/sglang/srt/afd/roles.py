@@ -158,6 +158,33 @@ def _span_slots() -> int:
     return int(limit)
 
 
+def _span_query_shift() -> int:
+    """How far back this pool reads the next group's query. Read HERE, on the pool.
+
+    The knob is `--afd-query-shift-layers` and it looks like a host setting, because on the
+    per-layer cut it was one. Under the group cut the query projection moved to the pool with
+    `W_q`, so the pool is the side that decides where the query is read from and the host's copy
+    of the flag decides nothing at all.
+
+    That was not wired, and the span read the shifted point unconditionally. The cost was not a
+    wrong model -- shift 1 is the operating point either way -- it was a lost control: a run
+    launched with `--afd-query-shift-layers 0` to ask what the shift costs got a shifted read
+    anyway, reported no difference, and the difference had never been asked for. Both ends must be
+    given the same value until the protocol carries it.
+    """
+    from sglang.srt.server_args import get_global_server_args
+
+    shift = get_global_server_args().afd_query_shift_layers
+    if shift not in (0, 1):
+        raise ValueError(
+            f"--afd-query-shift-layers={shift} under the group cut. This cut reads the query from "
+            f"between the last linear attention and the last feed-forward of a group, which is "
+            f"shift 1, or from the group's output, which is shift 0. A deeper shift is a "
+            f"different cut and would have to move the read point across a group boundary."
+        )
+    return int(shift)
+
+
 def make_span_runner(model, *, device):
     """The pool's span runner, if --afd-span-cut asked for one. None otherwise.
 
@@ -183,7 +210,8 @@ def make_span_runner(model, *, device):
         head_v_dim=config.linear_value_head_dim,
         device=device,
     )
-    runner = SpanRunner(model, states, layer_types=layer_types)
+    runner = SpanRunner(
+        model, states, layer_types=layer_types, query_shift=_span_query_shift())
     spans = group_layers(layer_types)
     logger.info(
         "afd pool: the group cut. %s span(s) a decode step against %s per-layer calls, %s "

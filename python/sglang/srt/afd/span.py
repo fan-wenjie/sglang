@@ -236,9 +236,10 @@ class SpanRunner:
     the length of a generation.
     """
 
-    def __init__(self, model, states, *, layer_types: list[str]) -> None:
+    def __init__(self, model, states, *, layer_types: list[str], query_shift: int) -> None:
         self.model = model
         self.states = states
+        self.query_shift = query_shift
         ordered = group_layers(layer_types)
         self.spans = {s[0]: s for s in ordered}
         # which attention each span feeds. The query projection runs on this side, so the span has
@@ -441,18 +442,30 @@ class SpanRunner:
         # method that runs them. Naming a submodule that does not exist fails at the first token,
         # not at install, which is where this cost a deployment round.
         nxt = layers[self.next_attention[layer_id]]
-        q, _, _, gate = nxt.forward_prepare_native(
-            positions, nxt.input_layernorm(read_point))
-        if on_query is not None:
-            on_query(q)
+        if self.query_shift == 1:
+            # the read point, one feed-forward before the group's output. The send is covered by
+            # that feed-forward, which is the window.
+            q, _, _, gate = nxt.forward_prepare_native(
+                positions, nxt.input_layernorm(read_point))
+            if on_query is not None:
+                on_query(q)
 
         hidden = last.mlp(hidden)
         # the next group's input residual is this one's output, and the pool is the one that has
         # it. It stays here rather than travelling both ways for a value neither end changed.
         x = read_point + hidden
+        normed = nxt.input_layernorm(x)
+        if self.query_shift == 0:
+            # STANDARD WIRING, and the control the shifted read has to be measured against. The
+            # query comes from the same tensor as the key and value, so there is nothing to send
+            # early and the window is shut -- which is the point: a run at 0 is asking what the
+            # shift buys, and it can only answer if the read actually moved.
+            q, _, _, gate = nxt.forward_prepare_native(positions, normed)
+            if on_query is not None:
+                on_query(q)
         self._keep_residual(request_ids, x)
         self._keep_gate(request_ids, gate)
-        _, k, v, _ = nxt.forward_prepare_native(positions, nxt.input_layernorm(x))
+        _, k, v, _ = nxt.forward_prepare_native(positions, normed)
         self.served += 1
         return q, k, v
 

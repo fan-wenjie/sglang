@@ -134,7 +134,11 @@ def a_runner():
     stack = Stack(TYPES)
     states = LinearStates(slots=4, num_v_heads=2, head_k_dim=2, head_v_dim=2,
                           device=torch.device("cpu"))
-    return stack, Runner(stack, states, layer_types=TYPES)
+    # shift 1 is the operating point and the value every case below was written against. Given
+    # explicitly because the span no longer assumes it: a run at 0 reads the query from the
+    # group's output instead, and a default here would let a caller that forgot to choose get
+    # whichever the last edit happened to prefer.
+    return stack, Runner(stack, states, layer_types=TYPES, query_shift=1)
 
 
 def reference(stack, attn_output, gate, residual, span, nxt, positions):
