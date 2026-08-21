@@ -305,9 +305,17 @@ class SpanRunner:
         return flat * torch.sigmoid(gate)
 
     def _keep_gate(self, request_ids, gate: torch.Tensor) -> None:
+        """Kept FLAT, because the attention output it multiplies is flat.
+
+        `forward_prepare_native` hands the gate back head-shaped on this model --
+        (rows, heads, head dim) -- while the attention output comes off the wire as
+        (rows, heads x head dim). Storing the gate as it arrives means the two disagree at the
+        multiply, which is one file away from either of the two places that chose a shape.
+        """
+        flat = gate.reshape(gate.shape[0], -1)
         with self._lock:
             for i, r in enumerate(request_ids):
-                self._gate[int(r)] = gate[i].clone()
+                self._gate[int(r)] = flat[i].clone()
 
     def _take_gate(self, request_ids, like: torch.Tensor) -> torch.Tensor:
         """The gate for the query already sent, one row a rider, in the rider order."""
