@@ -275,9 +275,39 @@ def watch_linear_attention(model, runner) -> None:
         return
     import torch
 
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
     seen = {}
     limit = 1
     scratch = 10_000_019          # far from any real request id
+
+    before = {}
+
+    def snapshot(layer_id):
+        """The model's own conv and recurrent state BEFORE it runs, one slot's worth.
+
+        Taken in a PRE-hook. A forward hook fires after the layer has already advanced its cache,
+        so seeding from what it finds there would start the two recurrences a step apart -- a
+        subtler version of the confound this exists to remove. The first reading of this comparison
+        seeded the span from ZERO while the model carried whatever the warmup had left on the same
+        slot, and 19% to 84% relative difference followed from that alone.
+        """
+        def hook(_module, args):
+            if seen.get(layer_id, 0) >= limit:
+                return
+            hidden = args[0]
+            if hidden.dim() != 2 or hidden.shape[0] != 1:
+                return
+            try:
+                backend = get_attn_backend()
+                cache = backend.req_to_token_pool.mamba2_layer_cache(layer_id)
+                index = int(backend.forward_metadata.mamba_cache_indices[0])
+                before[layer_id] = (cache.conv[0][index].clone(),
+                                    cache.temporal[index].clone())
+            except Exception as e:                       # noqa: BLE001 -- diagnostic, reported
+                before[layer_id] = None
+                logger.info("afd linear: layer %s state not readable: %r", layer_id, e)
+        return hook
 
     def compare(layer_id, attn):
         def hook(_module, args, output):
@@ -314,10 +344,24 @@ def watch_linear_attention(model, runner) -> None:
                 local = runner._local
                 local.ask_host, local.defer_update = ask_host, defer_update
 
+                held = before.get(layer_id)
+                if held is None:
+                    logger.info("afd linear: layer %s has no snapshot; not compared", layer_id)
+                    return
+                conv_before, ssm_before = held
+
                 def span_of(x):
-                    state[slot].zero_()
-                    runner.states.conv_buffer(
-                        layer_id, width=channels, taps=taps, dtype=x.dtype)[slot].zero_()
+                    # SEEDED from the model's own state rather than zeroed. Two recurrences
+                    # started from different states differ for that reason alone, and the size of
+                    # the difference says nothing until they start from the same one.
+                    state[slot].copy_(ssm_before.reshape(state[slot].shape).to(state.dtype))
+                    ring = runner.states.conv_buffer(
+                        layer_id, width=channels, taps=taps, dtype=x.dtype)
+                    # sglang keeps K-1 columns of history; this side keeps K, whose newest column
+                    # the call writes itself. The history lines up at the OLD end.
+                    ring[slot].zero_()
+                    history = conv_before.reshape(channels, -1).to(ring.dtype)
+                    ring[slot][..., 1:] = history[..., -(taps - 1):]
                     return runner._linear_attention(attn, [scratch], layer_id, x).float()
 
                 mine = span_of(hidden)
@@ -348,6 +392,7 @@ def watch_linear_attention(model, runner) -> None:
         attn = getattr(layer, "linear_attn", None)
         if attn is None:
             continue
+        attn.register_forward_pre_hook(snapshot(index))
         attn.register_forward_hook(compare(index, attn))
         installed += 1
     logger.info("afd linear: comparing the span against %s linear layer(s) of the model's own "
