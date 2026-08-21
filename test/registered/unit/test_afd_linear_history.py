@@ -196,3 +196,97 @@ class TestTheGatesAreTheLayersOwn(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheHostSideCache(CustomTestCase):
+    """The host holds both states, reads them, advances them. The pool holds none of it.
+
+    Every case here guards a slot-table failure, and slot-table failures in a linear layer have no
+    output symptom: both states ARE the whole history compressed, so a request served from the
+    wrong slot produces fluent text conditioned on somebody else's prompt.
+    """
+
+    def a_cache(self, slots=2, layers=2):
+        from sglang.srt.afd.linear_history import HistoryCache
+
+        return HistoryCache(slots=slots, layers=layers, value_heads=VH, head_k_dim=KD,
+                            head_v_dim=VD, conv_width=8, conv_taps=3,
+                            device=torch.device("cpu"))
+
+    def test_it_reproduces_the_reference_step(self):
+        """The same identity as above, through the object that holds the state."""
+        cache = self.a_cache()
+        step = a_step()
+        cache.state[0, 0] = step["state"][0]
+        alpha, beta = gates(step["a"], step["b"], step["A_log"], step["dt_bias"])
+        q, k = normalise(step["q"], step["k"], scale=KD**-0.5)
+        q, k = expand_to_value_heads(q, VH), expand_to_value_heads(k, VH)
+        h_q, h_k = cache.read_and_update(
+            [7], 0, q=q[:1], k=k[:1], v=step["v"][:1], alpha=alpha[:1], beta=beta[:1])
+        want_q, want_k = read(step["state"][:1], q[:1], k[:1])
+        torch.testing.assert_close(h_q, want_q)
+        torch.testing.assert_close(h_k, want_k)
+
+    def test_the_reading_is_of_the_state_before_the_update(self):
+        """Reading after advancing is the fused kernel with extra steps -- correct, and no window."""
+        cache = self.a_cache()
+        step = a_step()
+        cache.state[0, 0] = step["state"][0]
+        before = cache.state[0, 0].clone()
+        alpha, beta = gates(step["a"][:1], step["b"][:1], step["A_log"], step["dt_bias"])
+        q, k = normalise(step["q"][:1], step["k"][:1], scale=KD**-0.5)
+        q, k = expand_to_value_heads(q, VH), expand_to_value_heads(k, VH)
+        h_q, _ = cache.read_and_update([7], 0, q=q, k=k, v=step["v"][:1],
+                                       alpha=alpha, beta=beta)
+        torch.testing.assert_close(h_q, torch.einsum("hvk,hk->hv", before, q[0]).unsqueeze(0))
+        self.assertFalse(torch.allclose(cache.state[0, 0], before))
+
+    def test_a_slot_is_stable_across_layers_and_steps(self):
+        cache = self.a_cache()
+        first = cache.slot_of(11)
+        self.assertEqual(cache.slot_of(11), first)
+        self.assertNotEqual(cache.slot_of(22), first)
+
+    def test_release_zeroes_both_states(self):
+        cache = self.a_cache()
+        slot = cache.slot_of(11)
+        cache.state[:, slot].fill_(3.0)
+        cache.conv[:, slot].fill_(5.0)
+        self.assertTrue(cache.release(11))
+        self.assertEqual(cache.state[:, slot].abs().sum().item(), 0.0)
+        self.assertEqual(cache.conv[:, slot].abs().sum().item(), 0.0)
+
+    def test_a_reused_slot_starts_from_nothing(self):
+        """The failure with no symptom: the next occupant inheriting a stranger's memory."""
+        cache = self.a_cache(slots=1)
+        slot = cache.slot_of(11)
+        cache.state[:, slot].fill_(3.0)
+        cache.release(11)
+        self.assertEqual(cache.slot_of(22), slot)
+        self.assertEqual(cache.state[:, slot].abs().sum().item(), 0.0)
+
+    def test_a_full_table_refuses_rather_than_evicts(self):
+        cache = self.a_cache(slots=1)
+        cache.slot_of(11)
+        with self.assertRaises(RuntimeError) as caught:
+            cache.slot_of(22)
+        self.assertIn("cannot be evicted", str(caught.exception))
+
+    def test_row_ids_that_do_not_match_the_rows_are_refused(self):
+        cache = self.a_cache()
+        with self.assertRaises(RuntimeError) as caught:
+            cache.read_and_update([7], 0, q=torch.zeros(2, VH, KD), k=torch.zeros(2, VH, KD),
+                                  v=torch.zeros(2, VH, VD), alpha=torch.zeros(2, VH),
+                                  beta=torch.zeros(2, VH))
+        self.assertIn("whose history it reads", str(caught.exception))
+
+    def test_two_requests_do_not_read_each_others_history(self):
+        cache = self.a_cache()
+        cache.state[0, cache.slot_of(11)].fill_(1.0)
+        cache.state[0, cache.slot_of(22)].fill_(2.0)
+        q = torch.zeros(2, VH, KD); q[:, :, 0] = 1.0
+        h_q, _ = cache.read_and_update([11, 22], 0, q=q, k=torch.zeros(2, VH, KD),
+                                       v=torch.zeros(2, VH, VD),
+                                       alpha=torch.ones(2, VH), beta=torch.zeros(2, VH))
+        self.assertEqual(h_q[0, 0, 0].item(), 1.0)
+        self.assertEqual(h_q[1, 0, 0].item(), 2.0)

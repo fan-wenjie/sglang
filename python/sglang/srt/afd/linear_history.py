@@ -137,3 +137,118 @@ def expand_to_value_heads(x: torch.Tensor, value_heads: int) -> torch.Tensor:
             f"factor is not an integer and no rounding of it is the model."
         )
     return x.repeat_interleave(value_heads // heads, dim=1)
+
+
+class HistoryCache:
+    """What a request remembers in a linear layer, held where a KV cache is held.
+
+    The softmax side of this arrangement has the host hold a KV cache and sweep it. This is the
+    same thing for the other three layers in four: the host holds the recurrent state and the
+    convolution's, reads them when the pool asks, and returns the reading.
+
+    ## Why it is here and not on the pool
+
+    The pool is stateless, which is the property it is a separate process for -- a caller that
+    stalls stops calling and blocks nobody, and the pool need not be reserved for a request between
+    that request's calls. A recurrent state on the pool would reserve it.
+
+    It also puts the update where sglang's own prefill path already is. A pool holding the state
+    would need a chunked delta rule for prefill and a recurrent one for decode; a host holding it
+    runs the model it already has.
+
+    ## What it costs, measured
+
+    Every linear layer then needs a round trip that the span did not: 64 a decode step against 17.
+    Under a max-of-both-ends accounting that is +19% of step time at batch 4 and at batch 16, and
+    the link binds beyond about batch 29 on this 10 GbE overlay. Almost all of the 19% is the
+    148 us of protocol a round trip costs, not the wire and not the latency -- so it is a transport
+    number, and on a fabric where a round trip is tens of microseconds it goes to about 2%.
+
+    ## The two states share one slot table
+
+    Deliberately. Two tables that disagreed would fold one request's convolution into another's
+    recurrence, and both states ARE the whole history compressed -- there is no length that would
+    exclude a stale entry. The output stays fluent and is conditioned on somebody else's prompt.
+    """
+
+    def __init__(self, *, slots: int, layers: int, value_heads: int, head_k_dim: int,
+                 head_v_dim: int, conv_width: int, conv_taps: int, device,
+                 dtype=torch.float32, conv_dtype=torch.bfloat16) -> None:
+        if slots <= 0:
+            raise ValueError(f"slots={slots}: a host with no room for a request holds nothing")
+        self.slots = slots
+        self.device = device
+        self.value_heads = value_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        # float32 for the recurrence because it accumulates across every step of a generation and
+        # a bfloat16 accumulator drifts over thousands of updates in a way one step never shows
+        self.state = torch.zeros(layers, slots, value_heads, head_v_dim, head_k_dim,
+                                 device=device, dtype=dtype)
+        self.conv = torch.zeros(layers, slots, conv_width, conv_taps,
+                                device=device, dtype=conv_dtype)
+        self._slot_of: dict[int, int] = {}
+        self._free = list(range(slots))
+        self.reads = 0
+
+    def slot_of(self, request_id: int) -> int:
+        slot = self._slot_of.get(request_id)
+        if slot is not None:
+            return slot
+        if not self._free:
+            raise RuntimeError(
+                f"all {self.slots} history slot(s) are taken and request {request_id} wants one. "
+                f"A recurrent state cannot be evicted and rebuilt from a prefix the way a KV cache "
+                f"can -- it is the whole history compressed -- so this refuses rather than "
+                f"dropping one."
+            )
+        slot = self._free.pop(0)
+        self._slot_of[request_id] = slot
+        return slot
+
+    def release(self, request_id: int) -> bool:
+        """Free a request's slot and ZERO both its states.
+
+        Zeroed, unlike a KV cache where a length of zero already excludes stale positions. These
+        states have no length: whatever is in the buffer IS the history, so a slot handed over
+        without clearing gives the next request the previous one's memory, and nothing about the
+        output says so.
+        """
+        slot = self._slot_of.pop(request_id, None)
+        if slot is None:
+            return False
+        self.state[:, slot].zero_()
+        self.conv[:, slot].zero_()
+        self._free.append(slot)
+        return True
+
+    def read_and_update(self, request_ids, layer: int, *, q, k, v, alpha, beta):
+        """The host's whole job in a linear layer: read the old state twice, then advance it.
+
+        `q` and `k` arrive normalised and expanded to the value heads -- the pool does that,
+        because the scale and the head expansion are the layer's own and the side holding the
+        history should not have to know which model it is holding.
+
+        Returns the two readings. The caller mixes them, because the mixing needs `v` and the
+        gates and those belong with the weights.
+        """
+        slots = [self.slot_of(int(r)) for r in request_ids]
+        if len(slots) != q.shape[0]:
+            raise RuntimeError(
+                f"{len(slots)} request id(s) for {q.shape[0]} row(s); every row has to say whose "
+                f"history it reads, and a mismatch folds one request's token into another's."
+            )
+        index = torch.tensor(slots, device=self.state.device, dtype=torch.long)
+        held = self.state[layer].index_select(0, index)
+        h_q, h_k = read(held, q, k)
+        self.state[layer].index_copy_(
+            0, index, update(held, h_k, v=v, k=k, alpha=alpha, beta=beta))
+        self.reads += 1
+        return h_q, h_k
+
+    def report(self) -> dict:
+        held = self.state.numel() * self.state.element_size()
+        conv = self.conv.numel() * self.conv.element_size()
+        return {"slots": self.slots, "slots_in_use": self.slots - len(self._free),
+                "reads": self.reads, "bytes_recurrent": held, "bytes_conv": conv,
+                "bytes_a_request": (held + conv) // max(self.slots, 1)}
