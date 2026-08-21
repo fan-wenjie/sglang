@@ -8,6 +8,24 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, the scan equals the chunked kernel, so the prefill algorithm is cleared
+
+    scan against the chunked kernel          relative 0.0042   cos 0.999991
+    control, two rows swapped on one side    relative 0.5412   cos 0.852554
+
+`chunk_gated_delta_rule` over a chunk of eight against the token-by-token `read_one`/`update_only`
+scan, zero initial state, at Qwen3.8-27B's own head shapes. bfloat16 rounding, with a control that
+moves by two orders of magnitude. The prefill algorithm is not the fault, and the reference gap
+named in the entry below is now closed -- in the direction of no fault.
+
+One correction to that entry. The asymmetry it records belongs to the FlashInfer kernel, and this
+deployment runs `linear_attn_backend='triton'`, whose `extend` calls `chunk_gated_delta_rule(...,
+use_qk_l2norm_in_kernel=True)` -- normalising inside the kernel, the same as decode. The entry
+below described a path the deployment does not take.
+
+Kept as `test/registered/unit/test_afd_prefill_scan.py`, because the two implementations are free
+to drift apart under any upstream change to either and nothing else in the tree would notice.
+
 ## 2026-08-21, the prefill and decode paths are not the same call, and only decode has a reference
 
 Reading what the model actually calls, rather than assuming the two paths agree:
