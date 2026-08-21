@@ -8,6 +8,37 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, layer 0 is exact and the divergence enters at layer 1
+
+The prologue bisect, comparing the same quantity on both sides at last:
+
+    embedding             0.85246  against  0.85246   identical
+    layer 0, x + attn    28.773    against 28.775     exact to bfloat16
+    layer 1, x + attn    54.736    against 51.493     +6.3%
+
+The first attempt at this compared the arrangement's x + attn + mlp against the model's x + attn
+and called it +34%. sglang's layer returns the stream BEFORE its own feed-forward -- 
+`postprocess_layer` hands back (mlp output, x + attn) and the next layer's `prepare_attn` does the
+addition -- so those are different quantities. That is the THIRD time in this search that two
+correct measurements of different things were compared: a trace that walked rows against a
+reference that walked layers, a control that reversed a filter on both sides at once, and this.
+
+With that fixed, the reading is sharp. The embedding the host sends is exactly what the model
+computes, layer 0 agrees to five figures, and layer 1 does not.
+
+AND IT RETRACTS THE PREVIOUS ENTRY'S CONCLUSION. The linear attention compared against the model's
+own, seeded from the model's own state, gave 0.0003 at layer 0 and 3 to 18 percent everywhere
+else; that was read as bfloat16 accumulation noise because the per-channel ratios were scattered
+rather than constant. The same pattern -- layer 0 exact, every other layer a few percent off --
+now appears in a completely independent measurement. Noise does not come out systematically zero
+at one particular layer in two unrelated comparisons. It is not noise.
+
+So the question is what layer 0 has that layer 1 does not, in the span's path. Both run the same
+loop in `_linear_run`; the visible difference is that layer 0 is entered with `residual=None`
+while layer 1 is entered with a real residual, and that layer 0's state and convolution ring are
+the first to be touched for the request.
+
+
 ## 2026-08-21, the residual grows again, and the prologue is the only span left out of line
 
 The residual comparison was last run BEFORE the row-keying fix. Rerun after it, against the same

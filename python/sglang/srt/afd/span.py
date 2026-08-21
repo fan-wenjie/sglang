@@ -253,10 +253,17 @@ def _trace_step(tag, layer_id, value) -> None:
     with its own code path -- it starts from the embedding and has no W_o, no output gate and no
     attention output at its head.
 
-    What is logged after a layer is `residual + hidden`, the layer's OUTPUT residual, because that
-    is what the model's forward hook on the same layer returns. Logging the stream before the
-    feed-forward is folded in would be a different quantity and the comparison would say nothing --
-    which is the mistake the row-versus-span trace already made once in this file.
+    BOTH sides of the feed-forward are logged, because the model's own layer returns the stream
+    BEFORE its feed-forward is folded in: `postprocess_layer` hands back (mlp output, x + attn) and
+    the NEXT layer's `prepare_attn` does the addition. So a forward hook on the model's layer gives
+    x + attn, and `residual + hidden` here gives x + attn + mlp. Comparing those two was the first
+    reading of this bisect -- 38.5 against 28.8, called +34% -- and they are different quantities.
+    The pre-mlp line is the one that lines up; the post-mlp line is kept so the difference between
+    them is visible rather than assumed.
+
+    This is the third time in this search that two correct measurements of different quantities
+    were compared. The other two: a trace that walked rows against a reference that walked layers,
+    and a control that reversed a filter on both sides at once.
     """
     import os
 
@@ -661,8 +668,9 @@ class SpanRunner:
             hidden, residual = _add_and_norm(layer.input_layernorm, hidden, residual)
             hidden = self._linear_attention(layer.linear_attn, request_ids, layer_id, hidden)
             hidden, residual = _add_and_norm(layer.post_attention_layernorm, hidden, residual)
+            _trace_step("pre-mlp", layer_id, residual)
             hidden = layer.mlp(hidden)
-            _trace_step("linear_run", layer_id, residual + hidden)
+            _trace_step("post-mlp", layer_id, residual + hidden)
         return hidden, residual
 
     def _linear_attention(self, attn, request_ids, layer_id: int, hidden: torch.Tensor):
