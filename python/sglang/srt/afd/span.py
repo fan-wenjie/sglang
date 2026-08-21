@@ -550,17 +550,19 @@ class SpanRunner:
         # Which means a mixed bus pays for its prefill riders in ROUND TRIPS rather than in span
         # time: the feed-forwards and the projections, which are 74% of the cost, still run once
         # for everybody. That is the whole reason the leftover tokens are worth carrying.
-        runs = _runs(request_ids)
-        if all(n == 1 for _, _, n in runs):
-            reading = ask(layer_id, request_ids, q_tilde)
-        else:
-            reading = torch.cat(
-                [ask(layer_id, [r] * n, q_tilde[start : start + n])
-                 for r, start, n in runs], dim=0)
+        # A run longer than one row is a request's own tokens in order, and the far end has to
+        # advance its state BETWEEN them -- so those carry the key, the value and the gates in the
+        # same message. A deferred update cannot serve them: token n reads what token n-1 wrote,
+        # and the deferral has not arrived. Single-row runs keep the split, which is the one
+        # contraction the query coefficient bought.
+        step = (k, v, alpha, beta)
+        reading = ask(layer_id, request_ids, q_tilde, step=step)
         core = alpha.unsqueeze(-1) * reading + s.unsqueeze(-1) * v.float()
 
         # the state's own copy of the key, deferred: it only has to be applied before the NEXT
         # step, which is the argument OP_APPEND already makes for a KV cache
+        # single-row riders only; a multi-row one advanced inside its scan and applying the same
+        # tokens again would fold each of them into the history twice
         defer = getattr(self._local, "defer_update", None)
         if defer is not None:
             defer(layer_id, request_ids, k, v, alpha, beta)

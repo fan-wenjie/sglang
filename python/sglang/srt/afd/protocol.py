@@ -96,17 +96,25 @@ OP_STATE_UPDATE = 14  # POOL TO HOST, off the critical path. The key, the value 
                   # the host can advance the state it holds. Deferred on purpose: the state only
                   # has to be right by the NEXT step, which is the same argument OP_APPEND makes
                   # for a KV cache, and it is what keeps the value off the critical path entirely
+OP_STATE_SCAN = 15    # POOL TO HOST, for a run of MORE THAN ONE row -- a prefill chunk, whose
+                  # tokens are one request's and sequentially dependent. Carries everything a
+                  # step needs at once (the coefficient, the key, the value, both gates) because
+                  # the read and the update cannot be separated here: token n reads the state
+                  # token n-1 advanced, and a deferred update has not arrived yet. Splitting them
+                  # is what OP_STATE_READ and OP_STATE_UPDATE do, and it is correct only for a
+                  # decode row, where a request contributes exactly one token to the batch
 OP_NAMES = {OP_FFN: "ffn", OP_SWEEP: "sweep", OP_HEAD: "head", OP_RELEASE: "release",
             OP_KVPROJ: "kvproj", OP_SWEEP_Q: "sweep_q", OP_APPEND: "append",
             OP_HELLO: "hello", OP_LINEAR: "linear", OP_SPAN: "span", OP_SPAN_Q: "span_q",
             OP_SPAN_ENTER: "span_enter", OP_SPAN_EXIT: "span_exit",
-            OP_STATE_READ: "state_read", OP_STATE_UPDATE: "state_update"}
+            OP_STATE_READ: "state_read", OP_STATE_UPDATE: "state_update",
+            OP_STATE_SCAN: "state_scan"}
 
 # What the POOL sends to the HOST, rather than the other way round. A client's reader has to tell
 # these from replies: they arrive interleaved with the answers it is waiting for, on the same
 # socket, and storing one in the reply table would hang the caller it belongs to and answer a
 # different caller with a state reading.
-INBOUND_OPS = frozenset({OP_STATE_READ, OP_STATE_UPDATE})
+INBOUND_OPS = frozenset({OP_STATE_READ, OP_STATE_UPDATE, OP_STATE_SCAN})
 
 
 class Frame(NamedTuple):

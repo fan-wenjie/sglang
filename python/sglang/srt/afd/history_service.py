@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 
 import torch
-from sglang.srt.afd.protocol import OP_STATE_READ, OP_STATE_UPDATE
+from sglang.srt.afd.protocol import OP_STATE_READ, OP_STATE_SCAN, OP_STATE_UPDATE
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,8 @@ class HistoryService:
         self.updates = 0
 
     def __call__(self, frame):
+        if frame.op == OP_STATE_SCAN:
+            return (self._scan(frame),)
         if frame.op == OP_STATE_READ:
             return (self._read(frame),)
         if frame.op == OP_STATE_UPDATE:
@@ -64,6 +66,56 @@ class HistoryService:
         self.reads += 1
         return read_one(self.cache.state[frame.layer], slots, q_tilde).reshape(
             q_tilde.shape[0], -1)
+
+    def _scan(self, frame) -> torch.Tensor:
+        """A prefill chunk: read AND advance, one token at a time, in order.
+
+        This is where the arrangement's first wrong output came from. `_read` contracts every row
+        against the slot's state in one call, which is right for a decode batch -- one token from
+        each of several requests, no two sharing a slot -- and wrong for a chunk, where all the
+        rows are ONE request's and each reads what its predecessor wrote. Batched, the state never
+        advances and the model has no memory of its own prompt: it repeats the last prompt token,
+        fluently, with nothing raising.
+
+        What it returns is the RAW reading, one a token, exactly as `_read` does -- not the mixed
+        output. `linear_history.prefill_scan` computes the mix, which is the same arithmetic seen
+        from the weight side, and wiring it here made the pool mix a mixed value. The two are one
+        function apart and neither raises; the test below is against N separate read/update pairs
+        for that reason, because that pair IS what a scan has to equal.
+        """
+        from sglang.srt.afd.split_read_kernel import read_one, update_only
+
+        if len(frame.tensors) != 5:
+            raise RuntimeError(
+                f"a scan carried {len(frame.tensors)} tensor(s) where the coefficient, the key, "
+                f"the value and the two gates were expected. A chunk cannot be advanced by a "
+                f"subset of them, and reading without advancing is the bug this op exists for."
+            )
+        q, k, v, alpha, beta = frame.tensors
+        q = self._as_heads(q, frame)
+        k = self._as_heads(k, frame)
+        v = self._as_heads(v, frame, value=True)
+        slots = self._slots(frame, q.shape[0])
+        one = int(slots[0])
+        if not bool((slots == slots[0]).all()):
+            raise RuntimeError(
+                f"a scan for layer {frame.layer} spans more than one slot. A chunk is one "
+                f"request's own tokens; rows from different requests are independent and belong "
+                f"in a read, not a scan, and scanning them would thread one request's history "
+                f"through another's."
+            )
+        device = self.cache.state.device
+        alpha, beta = alpha.to(device).float(), beta.to(device).float()
+        state = self.cache.state[frame.layer]
+        readings = []
+        for t in range(q.shape[0]):
+            one_slot = slots[t : t + 1]
+            readings.append(read_one(state, one_slot, q[t : t + 1]))
+            update_only(state, one_slot, k=k[t : t + 1], v=v[t : t + 1],
+                        alpha=alpha[t : t + 1], beta=beta[t : t + 1])
+        self.reads += 1
+        self.updates += 1
+        return torch.cat(readings, dim=0).reshape(q.shape[0], -1)
 
     def _update(self, frame) -> None:
         from sglang.srt.afd.split_read_kernel import update_only

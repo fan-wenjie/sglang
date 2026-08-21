@@ -15,7 +15,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.afd.history_service import HistoryService
 from sglang.srt.afd.linear_history import HistoryCache
-from sglang.srt.afd.protocol import OP_STATE_READ, OP_STATE_UPDATE, Frame
+from sglang.srt.afd.protocol import (
+    OP_STATE_READ,
+    OP_STATE_SCAN,
+    OP_STATE_UPDATE,
+    Frame,
+)
 from sglang.test.test_utils import CustomTestCase
 
 VH, D = 3, 4
@@ -119,3 +124,73 @@ class TestAnOpThisSideDoesNotHold(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAScanAdvancesTheStateBetweenAChunksTokens(CustomTestCase):
+    """The bug that produced the arrangement's first wrong output, pinned at this boundary.
+
+    `_read` contracts every row against the slot's state in one call. That is right for a decode
+    batch -- one token from each of several requests, no two sharing a slot -- and wrong for a
+    prefill chunk, where all the rows are ONE request's and each reads what its predecessor wrote.
+    Batched, the state never advances: the model has no memory of its own prompt and repeats the
+    last prompt token, fluently, with nothing raising.
+    """
+
+    def a_chunk(self, n=4, seed=5):
+        g = torch.Generator().manual_seed(seed)
+        r = lambda *s: torch.randn(*s, generator=g)
+        return (r(n, VH * D), r(n, VH * D), r(n, VH * D),
+                torch.rand(n, VH, generator=g) * 0.5 + 0.5, torch.rand(n, VH, generator=g))
+
+    def test_it_equals_the_same_tokens_read_one_at_a_time(self):
+        from sglang.srt.afd.linear_history import gates  # noqa: F401 -- shape parity only
+
+        n = 4
+        cache, service = a_service(ids=(11,) * n)
+        slot = cache.slot_of(11)
+        start = torch.randn(VH, D, D) * 0.1
+        cache.state[0, slot] = start.clone()
+        q, k, v, alpha, beta = self.a_chunk(n)
+
+        got = service(Frame(1, 0, (q, k, v, alpha, beta), OP_STATE_SCAN))[0]
+
+        # the same tokens, one message each, with the update applied between them
+        other, one_at_a_time = a_service(ids=(11,))
+        other.state[0, other.slot_of(11)] = start.clone()
+        wanted = []
+        for t in range(n):
+            wanted.append(one_at_a_time(Frame(1, 0, (q[t : t + 1],), OP_STATE_READ))[0])
+            one_at_a_time(Frame(1, 0, (k[t : t + 1], v[t : t + 1],
+                                       alpha[t : t + 1], beta[t : t + 1]), OP_STATE_UPDATE))
+        torch.testing.assert_close(got, torch.cat(wanted, dim=0), rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(cache.state[0, slot],
+                                   other.state[0, other.slot_of(11)], rtol=1e-4, atol=1e-5)
+
+    def test_a_batched_read_of_the_same_chunk_differs(self):
+        """If these ever agree, this file has stopped guarding the bug it was written for."""
+        n = 4
+        cache, service = a_service(ids=(11,) * n)
+        start = torch.randn(VH, D, D) * 0.1
+        cache.state[0, cache.slot_of(11)] = start.clone()
+        q, k, v, alpha, beta = self.a_chunk(n)
+        scanned = service(Frame(1, 0, (q, k, v, alpha, beta), OP_STATE_SCAN))[0]
+
+        other, batched = a_service(ids=(11,) * n)
+        other.state[0, other.slot_of(11)] = start.clone()
+        as_batch = batched(Frame(1, 0, (q,), OP_STATE_READ))[0]
+        self.assertFalse(torch.allclose(scanned, as_batch))
+
+    def test_a_scan_spanning_two_requests_is_refused(self):
+        """A chunk is one request's tokens; scanning two threads one history through the other."""
+        cache, service = a_service(ids=(11, 22))
+        q, k, v, alpha, beta = self.a_chunk(2)
+        with self.assertRaises(RuntimeError) as caught:
+            service(Frame(1, 0, (q, k, v, alpha, beta), OP_STATE_SCAN))
+        self.assertIn("more than one slot", str(caught.exception))
+
+    def test_a_scan_missing_a_tensor_is_refused(self):
+        cache, service = a_service(ids=(11, 11))
+        q, k, v, alpha, _ = self.a_chunk(2)
+        with self.assertRaises(RuntimeError) as caught:
+            service(Frame(1, 0, (q, k, v, alpha), OP_STATE_SCAN))
+        self.assertIn("cannot be advanced by a subset", str(caught.exception))

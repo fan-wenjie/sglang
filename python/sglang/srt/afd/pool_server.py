@@ -44,6 +44,7 @@ from sglang.srt.afd.protocol import (
     OP_SPAN_EXIT,
     OP_SPAN_Q,
     OP_STATE_READ,
+    OP_STATE_SCAN,
     OP_STATE_UPDATE,
     unpack_positions,
     Frame,
@@ -509,23 +510,48 @@ class Departure(threading.Thread):
         Set per THREAD on the runner. Several groups can be departing at once and an instance
         attribute would hand one span's sockets to another's rows.
         """
-        def ask_host(layer_id, request_ids, q_tilde):
+        def ask_host(layer_id, request_ids, q_tilde, step=None):
+            """Ask each rider's host for its reading. One message a rider, all sent before any
+            is collected, so the wait is one round trip rather than one per rider.
+
+            A rider carrying MORE THAN ONE row is a prefill chunk: its rows are one request's own
+            tokens and they are sequentially dependent, so the reading cannot be separated from
+            the update -- token n reads what token n-1 advanced. Those go as OP_STATE_SCAN with
+            everything a step needs. A single row is a decode row and keeps the split, which is
+            the one contraction the query coefficient bought.
+            """
             pending = []
             offset = 0
             for (frame, sock), n in zip(riding, counts):
-                piece = q_tilde[offset : offset + n].reshape(n, -1)
+                sl = slice(offset, offset + n)
                 offset += n
-                send_frame(sock, Frame(frame.request_id, layer_id, (piece,), OP_STATE_READ))
+                if n == 1 or step is None:
+                    body = (q_tilde[sl].reshape(n, -1),)
+                    op = OP_STATE_READ
+                else:
+                    k, v, alpha, beta = step
+                    body = (q_tilde[sl].reshape(n, -1), k[sl].reshape(n, -1),
+                            v[sl].reshape(n, -1), alpha[sl], beta[sl])
+                    op = OP_STATE_SCAN
+                send_frame(sock, Frame(frame.request_id, layer_id, body, op))
                 pending.append((sock, frame.request_id, layer_id))
             out = [self._await_reading(sock, rid, lid) for sock, rid, lid in pending]
             joined = torch.cat(out, dim=0) if len(out) > 1 else out[0]
             return joined.reshape(q_tilde.shape[0], q_tilde.shape[1], -1).float()
 
         def defer_update(layer_id, request_ids, k, v, alpha, beta):
+            """Advance the state, later. Only for SINGLE-row riders.
+
+            A multi-row rider already advanced its state inside the scan, because it had to: its
+            tokens read each other's updates. Sending a deferred update for it as well would apply
+            the same tokens twice.
+            """
             offset = 0
             for (frame, sock), n in zip(riding, counts):
                 sl = slice(offset, offset + n)
                 offset += n
+                if n != 1:
+                    continue
                 send_frame(sock, Frame(
                     frame.request_id, layer_id,
                     (k[sl].reshape(n, -1), v[sl].reshape(n, -1),
