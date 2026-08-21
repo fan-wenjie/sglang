@@ -105,9 +105,16 @@ def main() -> int:
         began = time.perf_counter()
         for i, text in enumerate(docs):
             ids = tok(text, return_tensors="pt").input_ids.cuda()
-            with torch.no_grad():
-                logits = model(ids).logits.float()
-            lp = torch.log_softmax(logits[0, :-1], dim=-1)
+            # ONE TOKEN AT A TIME. A whole-sequence forward takes the chunked prefill kernel,
+            # which does not contain the recurrent step the arms patch -- every arm would then
+            # report the same number and the measurement would look like a null result.
+            past, logits = None, []
+            for i in range(ids.shape[1]):
+                with torch.no_grad():
+                    out = model(ids[:, i : i + 1], past_key_values=past, use_cache=True)
+                past = out.past_key_values
+                logits.append(out.logits[:, -1].float())
+            lp = torch.log_softmax(torch.cat(logits, 0)[:-1], dim=-1)
             nll += -lp.gather(1, ids[0, 1:, None]).sum().item()
             n_bytes += len(text.encode("utf-8"))
             n_tok += ids.shape[1] - 1

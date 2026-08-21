@@ -86,15 +86,96 @@ def _recurrent(query, key, value, g, beta, initial_state, output_final_state,
     return out, (S_new.to(initial_state.dtype) if output_final_state else initial_state)
 
 
+def _convolve(attn, x, ring, *, write: bool):
+    """One step of the depthwise causal convolution, optionally without touching the ring.
+
+    `ring` is (batch, channels, kernel) holding the last steps. The read-only form is what the
+    conjecture requires of the early key: the ring is a state reused across three steps, so a key
+    written into it would survive, and the whole claim is that only per-step values may be early.
+
+    In the `all_early` arm the early key MUST write, or the two arms differ in one place instead
+    of two and the control is not a control.
+    """
+    window = torch.cat([ring[..., 1:], x.unsqueeze(-1)], dim=-1)
+    out = (window * attn.conv1d.weight.squeeze(1)).sum(-1)
+    if attn.conv1d.bias is not None:
+        out = out + attn.conv1d.bias
+    if write:
+        ring.copy_(window)
+    return F.silu(out)
+
+
+def _early_key_and_beta(layer, attn, h_prev, *, write_ring):
+    """Project a key and a write strength from the SHIFTED residual, as the read point does.
+
+    Runs the layer's own input norm and input projections against `h_(l-1)` instead of `x_l`, then
+    the same convolution -- a key that skipped the convolution would be early AND unfiltered,
+    which is two changes wearing one name.
+
+    Only the KEY's channels are convolved. `in_proj_qkv` emits query, key and value concatenated
+    and the convolution is depthwise, so each channel is filtered independently and a slice of it
+    is a legitimate thing to take on its own.
+    """
+    ring = attn._afd_ring
+    if ring is None:
+        return None
+    if ring.dim() != 3:
+        raise RuntimeError(
+            f"the convolution ring is {tuple(ring.shape)} where (batch, channels, taps) was "
+            f"expected. Convolving the early key against the wrong layout would filter it with a "
+            f"neighbour's history, and the arms would then differ by that rather than by the key."
+        )
+    normed = layer.input_layernorm(h_prev)
+    mixed = attn.in_proj_qkv(normed)[:, -1]
+    b = attn.in_proj_b(normed)[:, -1]
+    convolved = _convolve(attn, mixed, ring, write=write_ring)
+    width = attn.key_dim
+    k_conv = convolved[:, width : 2 * width].reshape(-1, attn.num_k_heads, attn.head_k_dim)
+    rep = attn.num_v_heads // attn.num_k_heads
+    if rep > 1:
+        k_conv = k_conv.repeat_interleave(rep, dim=1)
+    return k_conv, b.sigmoid()
+
+
 def install_arm(model, arm: str):
     """Replace every linear layer's recurrence with this arm's. Returns an undo callable."""
     if arm not in ARMS:
         raise ValueError(f"{arm!r} is not one of {ARMS}")
     undo = []
-    for layer in model.model.layers:
+    stash = {}
+
+    for index, layer in enumerate(model.model.layers):
+        # h_l is the input to the post-attention norm: the residual after this layer's attention
+        # and before its feed-forward, which is the value the read point reads
+        def keep(_m, args, _i=index):
+            stash[_i] = args[0].detach()
+
+        handle = layer.post_attention_layernorm.register_forward_pre_hook(keep)
+        undo.append(handle.remove)
+
+    for index, layer in enumerate(model.model.layers):
         attn = getattr(layer, "linear_attn", None)
         if attn is None:
             continue
+        attn._afd_ring = None
+
+        def before(_m, args, kwargs, _a=attn, _l=layer, _i=index):
+            _a._afd_early = None
+            if _a._afd_arm == "exact":
+                return None
+            h_prev = stash.get(_i - 1)
+            if h_prev is None:                    # the first layer has nothing beneath it
+                return None
+            cache = kwargs.get("cache_params")
+            if cache is None or not cache.has_previous_state(_a.layer_idx):
+                return None                       # the first token has no ring to convolve against
+            _a._afd_ring = cache.layers[_a.layer_idx].conv_states
+            _a._afd_early = _early_key_and_beta(
+                _l, _a, h_prev, write_ring=(_a._afd_arm == "all_early"))
+            return None
+
+        handle = attn.register_forward_pre_hook(before, with_kwargs=True)
+        undo.append(handle.remove)
         original = attn.recurrent_gated_delta_rule
         attn._afd_arm = arm
         attn._afd_early = None                                # set by the hook, per step
