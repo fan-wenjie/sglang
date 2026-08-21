@@ -237,6 +237,9 @@ class SpanRunner:
         # before W_o, and W_o is this side's first act on the next call, so it never travels.
         self._gate: dict[int, torch.Tensor] = {}
         self._lock = threading.Lock()
+        # the callbacks a span uses to reach the history, per THREAD: several groups can be in
+        # flight at once and an instance attribute would cross one span's callback into another's
+        self._local = threading.local()
         self.served = 0
 
     # -- what a request remembers between spans ---------------------------------------------
@@ -451,41 +454,93 @@ class SpanRunner:
         return hidden, residual
 
     def _linear_attention(self, attn, request_ids, layer_id: int, hidden: torch.Tensor):
-        """One linear-attention layer, whole, against state this pool holds.
+        """One linear-attention layer: everything but the history, which is the host's.
 
-        sglang's own path for this reads its state out of a `ForwardBatch`'s cache. There is no
-        forward batch here -- the pool serves frames, not requests -- so the projection and the
-        gating are the model's own modules and the two stateful steps are called against slot
-        buffers indexed the same way sglang indexes its own.
+        The weights are here and the recurrent state is not, so the layer is split at the one
+        place the recurrence allows. `linear_history` proves the identity and
+        `benchmark/afd/gdn_split.py` measures it against the fused kernel; what happens here is
+        the arrangement of it across two machines:
+
+            here        input projection, gates, normalisation, the convolution -- and the QUERY
+                        COEFFICIENT q~ = q - beta (k.q) k, which folds the key's correction into
+                        the query so the far end contracts the state ONCE
+            over there  r = S q~, one contraction of a state this end does not hold
+            here        core = alpha r + beta (k.q) v, and the value never crossed the wire
+            over there  the key, the value and the gates, deferred, to advance the state
+
+        The decay is applied HERE, to what comes back. Sending it would be sending a per-head
+        scalar across so it could be multiplied and sent back, and the reading is the same shape
+        either way.
         """
-        from sglang.srt.layers.attention.linear.gdn_backend import causal_conv1d_update
+        from sglang.srt.afd.linear_history import (
+            expand_to_value_heads,
+            gates,
+            normalise,
+            query_coefficient,
+        )
 
-        from sglang.srt.afd.linear_state import LinearStateService
+        ask = getattr(self._local, "ask_host", None)
+        if ask is None:
+            raise RuntimeError(
+                f"layer {layer_id} has no way to reach the history. The recurrent state lives on "
+                f"the caller's side under this cut, so a span with no callback would have to "
+                f"either invent a state or hold one here -- the first is wrong and the second is "
+                f"the arrangement this cut replaced."
+            )
+        qkv = attn.in_proj_qkv(hidden)
+        z = attn.in_proj_z(hidden)
+        a = attn.in_proj_a(hidden)
+        b = attn.in_proj_b(hidden)
+        mixed = self._convolve(attn, qkv, request_ids, layer_id)
 
-        qkvz, _ = attn.in_proj_qkvz(hidden)
-        ba, _ = attn.in_proj_ba(hidden)
-        query, key, value, z, b, a = attn.fix_query_key_value_ordering(qkvz, ba)
-        query, key, value = (t.reshape(t.shape[0], -1) for t in (query, key, value))
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
+        width = attn.key_dim
+        rows = hidden.shape[0]
+        q = mixed[:, :width].reshape(rows, attn.num_k_heads, attn.head_k_dim)
+        k = mixed[:, width : 2 * width].reshape(rows, attn.num_k_heads, attn.head_k_dim)
+        v = mixed[:, 2 * width :].reshape(rows, attn.num_v_heads, attn.head_v_dim)
+        alpha, beta = gates(a, b, attn.A_log, attn.dt_bias)
+        q, k = normalise(q, k, scale=attn.head_k_dim ** -0.5)
+        heads = attn.num_v_heads
+        q, k = expand_to_value_heads(q, heads), expand_to_value_heads(k, heads)
+        q_tilde, s = query_coefficient(q, k, beta)
+
+        reading = ask(layer_id, request_ids, q_tilde)
+        core = alpha.unsqueeze(-1) * reading + s.unsqueeze(-1) * v.float()
+
+        # the state's own copy of the key, deferred: it only has to be applied before the NEXT
+        # step, which is the argument OP_APPEND already makes for a KV cache
+        defer = getattr(self._local, "defer_update", None)
+        if defer is not None:
+            defer(layer_id, request_ids, k, v, alpha, beta)
+
+        core = core.reshape(rows, -1).to(hidden.dtype)
+        core = attn.norm(core.reshape(-1, attn.head_v_dim), z.reshape(-1, attn.head_v_dim))
+        out, _ = attn.out_proj(core.reshape(rows, -1))
+        return out
+
+    def _convolve(self, attn, qkv: torch.Tensor, request_ids, layer_id: int) -> torch.Tensor:
+        """The short convolution, against a ring this side keeps.
+
+        The ring is the last three steps of THIS side's own projections -- values the pool
+        computed itself -- so keeping it here costs no round trip and no history. It is 60 KiB a
+        layer a request against the recurrent state's 3.00 MiB, which is 2% of what a request
+        remembers, and it is the only per-request thing this side holds.
+        """
+        from sglang.srt.afd.linear_state import LinearStates  # noqa: F401 -- slot table only
 
         slots = [self.states.slot_of(int(r)) for r in request_ids]
-        indices = torch.tensor(slots, device=hidden.device, dtype=torch.int32)
-        conv = self.states.conv_buffer(
-            layer_id, width=mixed_qkv.shape[-1],
-            taps=attn.conv_weights.shape[-1] - 1, dtype=mixed_qkv.dtype)
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv, conv, attn.conv_weights, attn.bias, attn.activation,
-            conv_state_indices=indices,
-        )
+        ring = self.states.conv_buffer(
+            layer_id, width=qkv.shape[-1], taps=attn.conv1d.weight.shape[-1] - 1,
+            dtype=qkv.dtype)
+        index = torch.tensor(slots, device=qkv.device, dtype=torch.long)
+        held = ring.index_select(0, index)
+        window = torch.cat([held[..., 1:], qkv.unsqueeze(-1)], dim=-1)
+        ring.index_copy_(0, index, window)
         self.states.note_touched(slots, ("conv", layer_id))
-
-        service = LinearStateService(self.states, scale=attn.head_k_dim ** -0.5)
-        core = service.step(request_ids, layer_id, mixed_qkv, a, b, attn.A_log, attn.dt_bias)
-
-        core = attn.norm(core.reshape(-1, attn.head_v_dim), z.reshape(-1, z.shape[-1]))
-        core = core.reshape(hidden.shape[0], -1)
-        out, _ = attn.out_proj(core)
-        return out
+        out = (window * attn.conv1d.weight.squeeze(1)).sum(-1)
+        if attn.conv1d.bias is not None:
+            out = out + attn.conv1d.bias
+        return torch.nn.functional.silu(out)
 
     def seed(self, request_id: int, residual: torch.Tensor) -> None:
         """Give a request its first residual: the embedding, for the headless span."""
