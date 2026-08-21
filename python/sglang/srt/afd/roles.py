@@ -278,7 +278,7 @@ def watch_linear_attention(model, runner) -> None:
     from sglang.srt.model_executor.forward_context import get_attn_backend
 
     seen = {}
-    limit = 1
+    limit = int(os.environ.get("SGLANG_AFD_SELFCHECK", "1"))
     scratch = 10_000_019          # far from any real request id
 
     before = {}
@@ -391,11 +391,34 @@ def watch_linear_attention(model, runner) -> None:
             # (value heads, head_v, head_k) and a reshape onto a differently-ordered layout
             # permutes silently, which is a mistake this tree has made between two libraries
             # already.
+            def shape_of_the_error(a, b):
+                """Is the difference a single scale, or is it structured?
+
+                A cosine of 0.999 with 3 to 18 percent relative error is mostly magnitude, and
+                magnitude has two very different explanations: ONE number wrong everywhere, which
+                names a missing or doubled factor, or a spread, which does not. The per-channel
+                ratio separates them -- a pure scale has every channel at the same value.
+
+                Channels where the reference is tiny are dropped: their ratio is dominated by
+                rounding and would widen the spread whatever the cause.
+                """
+                a, b = a.reshape(-1), b.reshape(-1)
+                keep = b.abs() > 0.05 * b.abs().max()
+                if int(keep.sum()) < 8:
+                    return "too few channels above the noise"
+                ratio = (a[keep] / b[keep]).float()
+                q = torch.quantile(ratio, torch.tensor([0.25, 0.5, 0.75], device=ratio.device))
+                lo, mid, hi = (float(x) for x in q)
+                spread = (hi - lo) / (abs(mid) + 1e-9)
+                return (f"ratio median {mid:+.4f} iqr [{lo:+.4f}, {hi:+.4f}] "
+                        f"spread {spread:.3f} over {int(keep.sum())} channels")
+
             logger.info(
-                "afd linear: layer %s -- span against the model %s | control %s | seeded state "
-                "|%.5g| conv |%.5g|",
-                layer_id, against(mine, theirs), against(shuffled, theirs),
+                "afd linear: layer %s call %s -- span against the model %s | control %s | state "
+                "|%.5g| conv |%.5g| | %s",
+                layer_id, seen[layer_id] - 1, against(mine, theirs), against(shuffled, theirs),
                 float(ssm_before.float().norm()), float(conv_before.float().norm()),
+                shape_of_the_error(mine, theirs),
             )
         return hook
 
