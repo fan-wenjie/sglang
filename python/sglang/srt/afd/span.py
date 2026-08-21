@@ -297,8 +297,18 @@ def _trace_mix(layer_id, *, hidden, alpha, beta, q_tilde, s, reading, core, gate
         return
     _STEP_SEEN[key] = 1
 
+    rows = hidden.shape[0]
+
     def one(t):
-        row = t[0].float().reshape(-1)
+        """Row 0, whatever axis layout the tensor happens to be in.
+
+        `core` is (rows, heads*dim) and `gated` is (rows*heads, dim) -- the z-gated norm reshapes
+        for its own kernel -- so `t[0]` is a whole row of one and a single HEAD of the other. The
+        first version of this line used `t[0]` for both and printed 0.0107 beside 1.4261 as though
+        they were comparable. Fourth time in this search. Reshaped to (rows, -1) first so the axis
+        cannot vary between the things on one line.
+        """
+        row = t.reshape(rows, -1)[0].float()
         return f"|{float(row.norm()):.5g}|"
 
     a, b = alpha[0].float(), beta[0].float()
@@ -306,7 +316,7 @@ def _trace_mix(layer_id, *, hidden, alpha, beta, q_tilde, s, reading, core, gate
         "afd mix: layer %s -- hidden %s | alpha mean %.5f min %.5f max %.5f | beta mean %.5f | "
         "q~ %s | reading %s | s %s | core %s | gated %s | out %s",
         layer_id, one(hidden), float(a.mean()), float(a.min()), float(a.max()), float(b.mean()),
-        one(q_tilde), one(reading), one(s.unsqueeze(-1)), one(core), one(gated), one(out),
+        one(q_tilde), one(reading), one(s), one(core), one(gated), one(out),
     )
 
 

@@ -8,6 +8,33 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, the stages of a linear layer, and where the divergence cannot be
+
+Layer 0's stages beside layer 1's and layer 2's, row 0 of a first prefill:
+
+    layer   hidden   alpha mean   beta mean   q~      reading   s        core     out
+    0       69.19    0.747        0.724       0.606   0         0.0672   0.375    28.75
+    1       29.72    0.655        0.641       0.607   0         0.0639   0.0326   16.75
+    2       30.59    0.693        0.676       0.603   0         0.0860   0.0221   16.60
+
+Nothing steps out of line. The gates, the query coefficient and the write strength are the same
+order across all three, and `reading` is exactly zero everywhere, which is what row 0 of a first
+prefill must read from an empty state.
+
+That last zero is the useful part. If row 0 reads nothing and its core is `s * v` alone, then
+whatever makes layer 1 differ from the model cannot be at row 0 -- it has to come from the LATER
+rows of the chunk, which is the sequential scan. And the scan is the one piece whose reference has
+never been the right one: `gdn_split.py` verifies the recurrence against
+`fused_recurrent_gated_delta_rule_packed_decode`, the DECODE kernel, while the model's prefill
+runs a CHUNKED delta rule. Two algorithms for one recurrence, verified against the wrong one.
+
+A fourth instance of comparing two correct measurements of different quantities happened writing
+this. `core` is (rows, heads*dim) and `gated` is (rows*heads, dim), because the z-gated norm
+reshapes for its own kernel, so `t[0]` was a whole row of one and a single head of the other --
+printed as 0.0107 beside 1.4261 on the same line. Everything is reshaped to (rows, -1) first now.
+The running count of this mistake in this search is four.
+
+
 ## 2026-08-21, the feed-forward is ruled out and layer 1's attention is what is left
 
 Layer 1's input is layer 0's residual plus layer 0's FEED-FORWARD output, and that output had
