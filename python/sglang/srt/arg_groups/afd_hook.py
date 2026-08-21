@@ -10,6 +10,9 @@ Every check here exists because the failure it prevents is silent or arrives lat
     measures the cost of the rewiring and reports it as the cost of the arrangement;
   * a pool that will not depart without a partner hangs the last request of a draining workload
     rather than failing, so `--afd-max-wait-ms 0` is refused rather than accepted as "no timeout".
+  * `--afd-coverage all` under `--afd-span-cut` asks for a conversion the group cut does not
+    perform, and the group cut ignored it in silence: every run of that arrangement passed it and
+    reported it, and the linear-attention queries never moved.
 """
 
 from __future__ import annotations
@@ -34,6 +37,8 @@ def handle_afd(server_args: ServerArgs) -> None:
         from sglang.srt.afd.compatibility import check as check_compatibility
 
         check_compatibility(server_args)
+
+    _check_coverage(server_args)
 
     if server_args.afd_mode not in ("null", "host", "pool"):
         raise ValueError(
@@ -75,6 +80,39 @@ def handle_afd(server_args: ServerArgs) -> None:
             "each feed-forward before its next attention. This is the synchronous baseline.",
             server_args.afd_mode,
         )
+
+
+def _check_coverage(server_args: ServerArgs) -> None:
+    """`--afd-coverage` under the group cut: softmax is what it does, all is refused.
+
+    The group cut moves ONE query, in `SpanRunner._finish`: the next group's softmax attention,
+    projected from the residual between the last linear attention and the last feed-forward. Its
+    linear layers take q, k and v from the current hidden and move nothing. That is coverage
+    "softmax", exactly, and it is not coverage "all".
+
+    The flag was read by nobody in the span path -- it appears in neither `span.py` nor
+    `span_routing.py` -- so every run of this arrangement passed `--afd-coverage all`, logged it,
+    and converted 16 layers' worth of read point while reporting 63. That is the same failure as
+    the shift flag not being wired, which was found and fixed here a few hours earlier: a run that
+    names a setting it never applied.
+
+    Refused only when it is set EXPLICITLY. Unset resolves to "all" downstream for the per-layer
+    cut, and refusing a default nobody chose would break every command line that never mentioned
+    coverage.
+    """
+    if not getattr(server_args, "afd_span_cut", False):
+        return
+    coverage = server_args.afd_coverage
+    if coverage is None or coverage == "softmax":
+        return
+    raise ValueError(
+        f"--afd-coverage={coverage!r} with --afd-span-cut. The group cut moves one query per "
+        f"group -- the next softmax attention's, projected from the read point inside the span -- "
+        f"and its linear-attention layers take their query, key and value from the current hidden. "
+        f"That is coverage 'softmax'. Accepting 'all' here would report 63 layers of converted "
+        f"read point for an arrangement that converts 16, which is the cost of a shallower "
+        f"conversion under a deeper one's name."
+    )
 
 
 def _check_pool_args(server_args) -> None:
