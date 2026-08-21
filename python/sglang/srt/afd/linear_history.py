@@ -181,8 +181,24 @@ class HistoryCache:
         self.value_heads = value_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        # float32 for the recurrence because it accumulates across every step of a generation and
-        # a bfloat16 accumulator drifts over thousands of updates in a way one step never shows
+        # float32 because bfloat16 cannot hold this state, MEASURED
+        # (`benchmark/afd/state_precision.py`, against a float64 reference):
+        #
+        #     decay   effective memory   fp32 error   bf16 error
+        #     0.90            10 steps    2.03e-07     1.39e-02
+        #     0.99           100 steps    5.71e-07     1.13e-01
+        #     0.999         1000 steps    2.54e-06     2.47e-01
+        #
+        # Note what the measurement CORRECTS. The reason written here before was that a bfloat16
+        # accumulator "drifts over thousands of updates", and that is the wrong axis: the recurrence
+        # decays, so old error decays with old signal and the error SATURATES at about 1/(1-alpha)
+        # steps -- 1.5e-2 at ten steps, 1.19e-1 at five hundred, and flat at 1.13e-1 out to four
+        # thousand. It does not grow with the length of a generation.
+        #
+        # The conclusion survives the reason being wrong, and by a wide margin: the saturated error
+        # is 11% to 25% of the state. bfloat16 has eight mantissa bits and this is a sum of roughly
+        # 1/(1-alpha) rank-one terms, so the rounding compounds to exactly that order. It is not a
+        # precision concession, it is a different model.
         self.state = torch.zeros(layers, slots, value_heads, head_v_dim, head_k_dim,
                                  device=device, dtype=dtype)
         self.conv = torch.zeros(layers, slots, conv_width, conv_taps,
