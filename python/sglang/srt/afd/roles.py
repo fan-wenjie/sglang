@@ -235,6 +235,18 @@ def watch_colocated_residual(model) -> None:
             )
         return hook
 
+    def watch_embedding(_module, _args, output):
+        if seen["n"] >= limit * 4:
+            return
+        seen["n"] += 1
+        row = output[0].float()
+        logger.info("afd colocated: EMBEDDING -- rows %s wide %s |%.5g| rms %.5g max %.5g",
+                    output.shape[0], row.numel(), float(row.norm()),
+                    float(row.pow(2).mean().sqrt()), float(row.abs().max()))
+
+    if hasattr(model.model, "embed_tokens"):
+        model.model.embed_tokens.register_forward_hook(watch_embedding)
+
     for index, layer in enumerate(model.model.layers):
         layer.register_forward_hook(watch(index))
         # o_proj's INPUT is the attention output after the output gate -- the one quantity the
