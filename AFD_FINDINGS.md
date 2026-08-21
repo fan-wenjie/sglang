@@ -783,5 +783,46 @@ is checking fails by passing.
 
 ### Result
 
-    (to be filled from the run; exact = 0.6232 bits per byte over 72,261 bytes of fineweb-edu,
-    12 documents, one token at a time)
+12 documents of fineweb-edu, 72,261 bytes, 15,457 tokens, scored one token at a time:
+
+    arm            bits per byte     delta     percent
+    exact                 0.6232    0.0000       0.00%
+    mixed                 0.6233    0.0001       0.01%
+    all_early             2.3684    1.7452     280.04%
+
+**The conjecture SURVIVES, and not marginally.** `mixed` is 0.013% from `exact`, which is
+thirty-eight times inside the 0.5% the rule allowed. `all_early` is 280%, which is twenty-one
+thousand times further from `exact` than `mixed` is, against the 4x the rule asked for.
+
+The third branch did not fire and could not have: `all_early` is not close to 0.5%, so the corpus
+was long enough to show a state error. 6,000-character documents run about 1,300 tokens, which is
+past the 1/(1-alpha) saturation `state_precision.py` measured.
+
+An honest reading of the small number: `mixed` is 4.2 nats worse over 31,214, in the direction
+expected of an approximation, on one sample. The claim is that it is far inside the threshold, not
+that it is exactly zero.
+
+### What it means
+
+The early key may be used in the query coefficient and must not be used anywhere the state is
+advanced. Concretely, in one linear layer:
+
+    q~ = P(k_early) q       formed on the pool, from h_(l-1), one feed-forward early
+    S_t = alpha S P(k) ...  the current key, always
+
+So the whole round trip fits inside the previous feed-forward's 361 us: the coefficient is ready
+before `x_l` exists, the host's single contraction runs while the pool spends that feed-forward,
+and the reading is back before it is needed. The convolution ring is protected the same way -- the
+early key is convolved against it WITHOUT writing, because three steps of reuse is still reuse.
+
+`all_early` at 2.37 bits per byte is worth stating plainly: the model is destroyed, not degraded.
+That is what feeding an approximate key into something that compounds does, and it is why the
+split is where it is rather than being a matter of taste.
+
+### What this does NOT license
+
+That `mixed` is free. It costs a second key projection on the pool -- about 12 us a layer, 0.56 ms
+a decode step -- and buys latency, not throughput: under a max-of-both-ends accounting the pool is
+the bottleneck below about 131k context, so hiding a round trip inside a feed-forward improves the
+per-request latency and leaves the step time where it was. Whether to take it is a separate
+question from whether it is correct, and only the second was measured here.
