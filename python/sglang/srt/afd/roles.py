@@ -222,8 +222,28 @@ def watch_colocated_residual(model) -> None:
             )
         return hook
 
+    def watch_gate(index):
+        def hook(_module, args):
+            if seen["n"] >= limit * 2:
+                return
+            seen["n"] += 1
+            row = args[0][0].float()
+            logger.info(
+                "afd colocated gate: layer %s -- what o_proj is given |%.5g| rms %.5g max %.5g",
+                index, float(row.norm()), float(row.pow(2).mean().sqrt()),
+                float(row.abs().max()),
+            )
+        return hook
+
     for index, layer in enumerate(model.model.layers):
         layer.register_forward_hook(watch(index))
+        # o_proj's INPUT is the attention output after the output gate -- the one quantity the
+        # span computes from a gate it saved on a previous call, and the one this side has no
+        # reference for. The span's gated output is 15x smaller than the attention output it
+        # came from, consistently, and whether that is what a trained gate does or a fault is not
+        # decidable without the model's own number for it.
+        if hasattr(layer, "o_proj"):
+            layer.o_proj.register_forward_pre_hook(watch_gate(index))
     logger.info("afd colocated: watching %s layer(s) for the residual reference",
                 len(model.model.layers))
 
