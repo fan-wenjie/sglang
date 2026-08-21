@@ -8,6 +8,31 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-21, the feed-forward is ruled out and layer 1's attention is what is left
+
+Layer 1's input is layer 0's residual plus layer 0's FEED-FORWARD output, and that output had
+never been compared to anything. An attention that is perfectly correct computes a wrong answer
+from a wrong input, so the feed-forward between the exact layer and the inexact one had to be
+ruled in or out before the attention was blamed -- and these are MoE layers, where "same module,
+same weights, therefore same output" is an assumption rather than an argument.
+
+    layer 0 feed-forward   10.588  against 10.654    -0.6%, bfloat16
+    layer 1 feed-forward    1.685  against  1.789    -5.8%
+
+Layer 0's is fine. Layer 1's is off by the same order as everything downstream of layer 1, which
+is what a correct function of a wrong input looks like.
+
+So layer 0 is right in all three of its parts -- x + attn to five figures, the feed-forward to
+0.6% -- and layer 1's attention is the first thing that is wrong. That is now agreed by three
+measurements that share no code: the per-layer residual bisect, the feed-forward comparison here,
+and `watch_linear_attention`, which feeds one hidden state into both implementations and gave
+0.0003 at layer 0 against 0.049 at layer 1.
+
+What layer 0 has that layer 1 does not, on this side, is still the question. Both enter the same
+loop with a zero state and an empty ring; the only visible difference is that layer 0 is entered
+with residual=None.
+
+
 ## 2026-08-21, the state starts clean, so layer 1's 6.3% is the arithmetic and not the start
 
 The layer-0-exact-layer-1-off pattern has two shapes of explanation: the recurrence computes the
