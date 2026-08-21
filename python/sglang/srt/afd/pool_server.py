@@ -104,6 +104,8 @@ class Departure(threading.Thread):
         self._first_seen: dict[int, float] = {}
         self._stop = False
         self.departures: list[dict] = []
+        # state readings filed by the connection thread, keyed by (socket, request, layer)
+        self._readings: dict = {}
         # where to write the riders histogram, or None to keep it in memory only
         self.riders_path: str | None = None
 
@@ -484,17 +486,8 @@ class Departure(threading.Thread):
                 piece = q_tilde[offset : offset + n].reshape(n, -1)
                 offset += n
                 send_frame(sock, Frame(frame.request_id, layer_id, (piece,), OP_STATE_READ))
-                pending.append((sock, frame, n))
-            out = []
-            for sock, frame, n in pending:
-                reply = decode(sock)
-                if reply is None or reply.op != OP_STATE_READ:
-                    raise RuntimeError(
-                        f"layer {layer_id}: expected a state reading back and got "
-                        f"{OP_NAMES.get(getattr(reply, 'op', None), reply)}. The far end is not "
-                        f"holding the history this span asked it for."
-                    )
-                out.append(reply.tensor.to(self.device))
+                pending.append((sock, frame.request_id, layer_id))
+            out = [self._await_reading(sock, rid, lid) for sock, rid, lid in pending]
             joined = torch.cat(out, dim=0) if len(out) > 1 else out[0]
             return joined.reshape(q_tilde.shape[0], q_tilde.shape[1], -1).float()
 
@@ -510,6 +503,37 @@ class Departure(threading.Thread):
 
         self.span._local.ask_host = ask_host
         self.span._local.defer_update = defer_update
+
+    def _await_reading(self, sock, request_id: int, layer_id: int):
+        """Wait for one caller's state reading, WITHOUT reading the socket here.
+
+        The connection thread owns the socket and is already inside `decode` on it. A second
+        reader is not a race that sometimes loses -- it is a deadlock that always happens as soon
+        as the departure is taken by the timer thread rather than by the connection thread: the
+        connection thread swallows the reading, files it as a new request, and this waits forever.
+        The symptom is a watchdog timeout with no traceback, which says nothing about any of this.
+
+        So the connection loop files readings here and this waits on them. It is the same shape as
+        `PoolClient`'s INBOUND_OPS, which was built carefully on that side and then rebuilt wrongly
+        on this one.
+        """
+        key = (id(sock), request_id, layer_id)
+        with self._cond:
+            deadline = time.perf_counter() + SPAN_HANDOVER_TIMEOUT_S
+            while key not in self._readings:
+                if not self._cond.wait(timeout=max(0.0, deadline - time.perf_counter())):
+                    raise RuntimeError(
+                        f"no state reading for request {request_id} layer {layer_id} within "
+                        f"{SPAN_HANDOVER_TIMEOUT_S}s. The far end holds the history this span "
+                        f"asked for and did not answer."
+                    )
+            return self._readings.pop(key).to(self.device)
+
+    def file_reading(self, sock, frame) -> None:
+        """A reading arriving on the connection thread, for whichever span is waiting on it."""
+        with self._cond:
+            self._readings[(id(sock), frame.request_id, frame.layer)] = frame.tensor
+            self._cond.notify_all()
 
     def _handover(self, riding, counts, group: int, sent: threading.Event):
         """Send the shifted read point without waiting for the feed-forward behind it.
@@ -696,6 +720,12 @@ def serve(
                 frame = decode(sock)
                 if frame is None:
                     return
+                if frame.op == OP_STATE_READ:
+                    # a REPLY, on the socket the connection thread owns. Filed rather than read
+                    # by the span that wants it, because two readers on one socket deadlock the
+                    # moment the departure is taken by the timer thread.
+                    departure.file_reading(sock, frame)
+                    continue
                 if departure.answer_directly(frame, sock):
                     continue
                 departure.offer(frame, sock)
