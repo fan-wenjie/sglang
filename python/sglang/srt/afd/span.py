@@ -294,7 +294,15 @@ class SpanRunner:
         sending a value back to the machine that produced it and then receiving it again.
         """
         gate = self._take_gate(request_ids, attn_output)
-        return attn_output * torch.sigmoid(gate)
+        flat = attn_output.reshape(attn_output.shape[0], -1)
+        if flat.shape != gate.shape:
+            raise RuntimeError(
+                f"an attention output of {tuple(attn_output.shape)} against a gate of "
+                f"{tuple(gate.shape)}. The caller's two attention paths -- fused for a prefill, "
+                f"split for a decode -- have to put ONE shape on the wire; they do not agree on "
+                f"their own, and the mismatch arrives here rather than where it is made."
+            )
+        return flat * torch.sigmoid(gate)
 
     def _keep_gate(self, request_ids, gate: torch.Tensor) -> None:
         with self._lock:

@@ -309,9 +309,16 @@ class SpanRouting:
         if state is None:
             # no prefix to sweep: the first token of a request has nothing behind it. The fused
             # path is the right one here and the window had nothing to hide anyway.
-            return attn(q, k, v, forward_batch)
-        return join(get_attn_backend(), attn, forward_batch, k=k, v=v, state=state,
-                    index=self._index)
+            out = attn(q, k, v, forward_batch)
+        else:
+            out = join(get_attn_backend(), attn, forward_batch, k=k, v=v, state=state,
+                       index=self._index)
+        # ONE shape on the wire. The two paths do not agree on their own: the fused call returns
+        # (rows, heads, head dim) and `join` returns (rows, heads x head dim), so a prefill and a
+        # decode would put different shapes on the same socket. The pool multiplies this by a gate
+        # of the flat shape, and the mismatch surfaced there rather than here -- two files away
+        # from the divergence.
+        return out.reshape(out.shape[0], -1)
 
     def _check_untouched(self, layer_id: int, hidden_states) -> None:
         if self._returned is None or hidden_states is not self._returned:
