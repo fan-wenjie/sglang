@@ -185,6 +185,49 @@ def _span_query_shift() -> int:
     return int(shift)
 
 
+def watch_colocated_residual(model) -> None:
+    """Log the residual leaving every layer of the model's OWN forward, under SGLANG_AFD_SELFCHECK.
+
+    The reference the span's residual trace has been missing. The pool holds the whole model and
+    also runs the spans, so both sequences come from ONE process and ONE set of weights: serve a
+    prompt on this server's own port and the model's per-layer residuals are logged; serve it
+    through the arrangement and `_trace_residual` logs the span boundaries. A span boundary IS a
+    layer boundary, so the two line up and the first index where they part is the answer.
+
+    Without this the span sequence says only that the residual does not grow -- rms 1.07 at the
+    first boundary falling to about 0.25 and staying there -- and "a residual stream should grow"
+    is an assumption about this model, not a measurement of it. Every earlier round of this search
+    that reasoned instead of measuring was wrong.
+    """
+    import os
+
+    if not os.environ.get("SGLANG_AFD_SELFCHECK"):
+        return
+    seen = {"n": 0}
+    limit = int(os.environ.get("SGLANG_AFD_SELFCHECK", "20"))
+
+    def watch(index):
+        def hook(_module, _args, output):
+            if seen["n"] >= limit or not isinstance(output, tuple) or len(output) != 2:
+                return
+            residual = output[1]
+            if residual is None:
+                return
+            seen["n"] += 1
+            row = residual[0].float()
+            logger.info(
+                "afd colocated: layer %s -- rows %s wide %s |%.5g| rms %.5g max %.5g",
+                index, residual.shape[0], row.numel(), float(row.norm()),
+                float(row.pow(2).mean().sqrt()), float(row.abs().max()),
+            )
+        return hook
+
+    for index, layer in enumerate(model.model.layers):
+        layer.register_forward_hook(watch(index))
+    logger.info("afd colocated: watching %s layer(s) for the residual reference",
+                len(model.model.layers))
+
+
 def make_span_runner(model, *, device):
     """The pool's span runner, if --afd-span-cut asked for one. None otherwise.
 
@@ -210,6 +253,7 @@ def make_span_runner(model, *, device):
         head_v_dim=config.linear_value_head_dim,
         device=device,
     )
+    watch_colocated_residual(model)
     runner = SpanRunner(
         model, states, layer_types=layer_types, query_shift=_span_query_shift())
     spans = group_layers(layer_types)
