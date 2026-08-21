@@ -574,9 +574,12 @@ class SpanRunner:
         """
         from sglang.srt.afd.linear_state import LinearStates  # noqa: F401 -- slot table only
 
+        # sglang holds this as (channels, 1, taps) -- the model's own code squeezes it the same
+        # way before handing it to the backend. Squeezed ONCE here so neither path below can
+        # broadcast against the extra axis, which is what it does rather than raising.
+        weight = attn.conv1d.weight.squeeze(1)
         ring = self.states.conv_buffer(
-            layer_id, width=qkv.shape[-1], taps=attn.conv1d.weight.shape[-1],
-            dtype=qkv.dtype)
+            layer_id, width=qkv.shape[-1], taps=weight.shape[-1], dtype=qkv.dtype)
         runs = _runs(request_ids)
         slots = [self.states.slot_of(r) for r, _, _ in runs]
         self.states.note_touched(slots, ("conv", layer_id))
@@ -587,7 +590,7 @@ class SpanRunner:
             held = ring.index_select(0, index)
             window = torch.cat([held[..., 1:], qkv.unsqueeze(-1)], dim=-1)
             ring.index_copy_(0, index, window)
-            out = (window * attn.conv1d.weight).sum(-1)
+            out = (window * weight).sum(-1)
             return torch.nn.functional.silu(out)
 
         # prefill, or a bus carrying both: a request's rows are its own tokens IN ORDER, and each
@@ -598,8 +601,7 @@ class SpanRunner:
 
         pieces = []
         for slot, (_, start, count) in zip(slots, runs):
-            got, tail = prefill_convolve(ring[slot], qkv[start : start + count],
-                                         attn.conv1d.weight)
+            got, tail = prefill_convolve(ring[slot], qkv[start : start + count], weight)
             ring[slot] = tail
             pieces.append(got)
         return torch.cat(pieces, dim=0)
