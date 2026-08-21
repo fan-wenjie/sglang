@@ -322,13 +322,36 @@ def install_span_routing(model, client: PoolClient, *, sweep_ahead,
     halves back to back. `SpanRouting.report()["sweep_window_open"]` says so, so a timing taken
     now cannot be quoted as this arrangement's without the report contradicting it.
     """
+    from sglang.srt.afd.history_service import HistoryService
+    from sglang.srt.afd.linear_history import HistoryCache
     from sglang.srt.afd.read_point import layer_types_of
     from sglang.srt.afd.span_routing import SpanClient, SpanRouting
 
+    types = layer_types_of(model)
     routing = SpanRouting(
-        model,
-        SpanClient(client, reply_timeout_s=reply_timeout_s),
-        layer_types_of(model),
+        model, SpanClient(client, reply_timeout_s=reply_timeout_s), types)
+
+    # the history the pool calls back for. It lives here because it is the request's, and
+    # because putting it here is what lets the pool stay out of a request's business between
+    # that request's calls -- see linear_history.HistoryCache for what the round trips cost.
+    config = model.config
+    cache = HistoryCache(
+        slots=_span_slots(),
+        layers=len(types),
+        value_heads=config.linear_num_value_heads,
+        head_k_dim=config.linear_key_head_dim,
+        head_v_dim=config.linear_value_head_dim,
+        conv_width=1, conv_taps=1,        # the ring stays on the pool; this holds no convolution
+        device=next(model.parameters()).device,
+    )
+    # the pool sends rows in the order this host sent them, so the ids are the ones the routing
+    # is holding for the span in flight. Read through the routing rather than captured, because a
+    # captured list would be the FIRST span's rows for every span after it.
+    routing.history = HistoryService(cache, rows_of=lambda frame: routing.current_rows())
+    client.serve = routing.history
+    logger.info(
+        "afd host: holding %s linear layer(s) of recurrent state for up to %s request(s), %s",
+        sum(1 for t in types if t != "full_attention"), cache.slots, cache.report(),
     )
     logger.info("afd host: the group cut is installed. %s", routing.report())
     if sweep_ahead is not None:

@@ -172,6 +172,12 @@ class SpanRouting:
         self._outstanding = None
         # what the previous head returned, so the next one can check nothing ran in between
         self._returned = None
+        # the row ids of the span in flight. The pool calls back for the history mid-span, on the
+        # reader thread, and it needs to know whose rows it is asking about -- and a list captured
+        # at install would be the first span's rows for every span after it.
+        self._rows = None
+        # the history this host holds and the pool calls back for; set by install_span_routing
+        self.history = None
         # the cache partition, built once a forward pass and shared by every sweep in it
         from sglang.srt.afd.split_attention import PerPassIndex
 
@@ -219,6 +225,7 @@ class SpanRouting:
             attn = layer.attn
             device = hidden_states.device
             rows = self._row_ids(forward_batch)
+            self._rows = [int(r) for r in rows]
             if opens:
                 handle = self.client.issue(
                     layer_id, hidden_states, rows, positions, OP_SPAN_ENTER)
@@ -293,6 +300,20 @@ class SpanRouting:
                 f"and their weights are on the meta device here; one of them running locally "
                 f"means the pass-through install missed it. The output would stay fluent."
             )
+
+    def current_rows(self):
+        """Whose rows the span in flight carries, for the pool's callback to key its reads by.
+
+        Raises rather than returning an empty list: a state read that could not say whose history
+        it wanted would either fail loudly here or read slot zero for everybody, and only one of
+        those is visible in the output.
+        """
+        if self._rows is None:
+            raise RuntimeError(
+                "the pool asked for a history reading with no span in flight on this host. The "
+                "two ends disagree about which call is outstanding."
+            )
+        return self._rows
 
     @staticmethod
     def _row_ids(forward_batch) -> torch.Tensor:
