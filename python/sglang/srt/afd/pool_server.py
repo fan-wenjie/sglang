@@ -61,6 +61,10 @@ logger = logging.getLogger(__name__)
 # that a stuck one fails instead of hanging every caller behind it.
 SPAN_HANDOVER_TIMEOUT_S = 30.0
 
+# Ops whose departure calls BACK to the caller. They are never departed on the thread that owns
+# the caller's socket, because that thread is the only reader of it.
+SPAN_OPS = frozenset({OP_SPAN, OP_SPAN_ENTER, OP_SPAN_EXIT})
+
 
 class Departure(threading.Thread):
     """Collects frames and hands whole batches to the feed-forward."""
@@ -326,15 +330,22 @@ class Departure(threading.Thread):
         riders, and the timer thread still owns the partial-batch case.
         """
         riding = None
+        # A SPAN is never departed on this thread. It calls back to the caller mid-run, and the
+        # caller's answer arrives on this socket -- which this thread is the only reader of. A
+        # connection thread that departs its own span becomes the thread waiting for a message
+        # only it can receive, and with min_batch=1, which is what the deployment runs, every
+        # offer completes a batch so it happens on the first token. It is a deadlock, not a race:
+        # no traceback, no wrong value, and a watchdog timeout that names none of this.
+        calls_back = frame.op in SPAN_OPS
         with self._cond:
             queue = self._waiting.setdefault(frame.layer, [])
             queue.append((frame, sock))
-            if len(queue) >= self.min_batch:
+            if not calls_back and len(queue) >= self.min_batch:
                 riding = self._waiting.pop(frame.layer)
                 self._first_seen.pop(frame.layer, None)
             else:
                 self._first_seen.setdefault(frame.layer, time.perf_counter())
-                self._cond.notify()
+                self._cond.notify()          # the departure thread takes it, and reads nothing
         if riding is not None:
             self._depart(frame.layer, riding)
 
@@ -374,7 +385,22 @@ class Departure(threading.Thread):
                     self._cond.wait(timeout=self.max_wait_s / 4 or 0.01)
                 riding = self._waiting.pop(layer)
                 self._first_seen.pop(layer, None)
-            self._depart(layer, riding)
+            try:
+                self._depart(layer, riding)
+            except BaseException as e:      # noqa: BLE001 -- reported, never swallowed
+                # A departure that raised used to kill this thread silently, and everything after
+                # it hung with no message anywhere. The riders are failed by name instead: their
+                # callers see a closed socket, which is a fact they can act on, and the reason is
+                # logged once where an operator will find it.
+                logger.exception(
+                    "afd pool: layer %s departure failed for %s rider(s); failing them rather "
+                    "than losing the departure thread", layer, len(riding),
+                )
+                for _, sock in riding:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
 
     def _depart(self, layer: int, riding: list[tuple[Frame, socket.socket]]) -> None:
         """Serve one batch. Which kind of batch is decided by the riders' opcode.
@@ -391,7 +417,7 @@ class Departure(threading.Thread):
                 f"departure serves one job; these callers asked for different ones and answering "
                 f"them from one batch would give each the other's arithmetic."
             )
-        if ops <= {OP_SPAN, OP_SPAN_ENTER, OP_SPAN_EXIT}:
+        if ops <= SPAN_OPS:
             return self._depart_span(layer, ops.pop(), riding)
         return self._depart_feed_forward(layer, riding)
 
