@@ -375,12 +375,17 @@ def install_early_q(model, shift_layers, layer_types: list[str] | None = None,
         # model exactly, while every other layer sat a few percent out in a direction that was not
         # a rescaling. The span was measured for days as though it were the only transformation on
         # the model it was running on.
+        # Shift ZERO, not None. The host's role wiring reads `afd_early_q.hooks.sweep_ahead`, so
+        # the hooks object still has to be built -- returning None took the host down with
+        # `'NoneType' object has no attribute 'hooks'`. Zero is the standard wiring and the only
+        # value that means off, so nothing is converted and everything downstream still has what
+        # it asks for.
         logger.info(
             "afd: --afd-span-cut implements its own read point, so the per-layer early-q wiring "
-            "stands down. --afd-query-shift-layers=%s is honoured by the span itself.",
+            "converts nothing. --afd-query-shift-layers=%s is honoured by the span itself.",
             shift_layers,
         )
-        return None
+        shift_layers = 0
 
     shift_layers, coverage = _resolve_settings(shift_layers, coverage, hf_config)
     if shift_layers == 0:
