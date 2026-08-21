@@ -65,7 +65,13 @@ import os
 
 import torch
 from sglang.srt.afd.pool_client import PoolClient, PoolClosed
-from sglang.srt.afd.protocol import OP_SPAN, OP_SPAN_ENTER, OP_SPAN_EXIT, OP_SPAN_Q
+from sglang.srt.afd.protocol import (
+    OP_SPAN,
+    OP_SPAN_ENTER,
+    OP_SPAN_EXIT,
+    OP_SPAN_Q,
+    pack_positions,
+)
 from sglang.srt.afd.span import group_layers
 
 logger = logging.getLogger(__name__)
@@ -98,10 +104,14 @@ class SpanClient:
                 f"{row_ids.shape[0]} row id(s) for {o.shape[0]} row(s). Every row has to say whose "
                 f"recurrent state it advances."
             )
+        # packed, not flattened. mrope carries a temporal, a height and a width row, so a
+        # multimodal stack's positions are (3, tokens) and reshaping them to a column would hand
+        # the rotation three times as many positions as there are tokens -- which is exactly how
+        # this failed, at 366 against 122.
         handle = self.client.issue_frame(
             next(self._ids), group,
             (o, row_ids.reshape(-1, 1).to(torch.int64),
-             positions.reshape(-1, 1).to(torch.int64)),
+             pack_positions(positions.to(torch.int64))),
             op,
         )
         self.calls += 1

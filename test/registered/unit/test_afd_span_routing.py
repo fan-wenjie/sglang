@@ -181,14 +181,26 @@ class TestTheRowIdsTravel(CustomTestCase):
             client.issue(3, torch.zeros(4, 8), torch.tensor([0, 1]), torch.tensor([5]))
         self.assertIn("row id", str(caught.exception))
 
-    def test_the_positions_ride_with_the_ids(self):
-        """The pool rotates the key and the query by them; a span without them attends nowhere."""
+    def test_the_positions_ride_packed_not_flattened(self):
+        """The pool rotates the query and key by them, and mrope's rows are AXES not riders.
+
+        A multimodal stack's positions are (3, tokens) -- temporal, height, width -- so flattening
+        them to a column hands the rotation three times as many positions as there are tokens.
+        That is exactly how this failed on the real model, at 366 against 122, and it is why the
+        shape rule is "the row count is the meaning" rather than "one column per row".
+        """
         client = a_client()
         client.issue(3, torch.zeros(2, 8), torch.tensor([5, 9]), torch.tensor([40, 41]))
         pos = client.client.issued[0]["tensors"][2]
-        self.assertEqual(tuple(pos.shape), (2, 1))
+        self.assertEqual(tuple(pos.shape), (1, 2))
         self.assertEqual(pos.dtype, torch.int64)
         self.assertEqual(pos.reshape(-1).tolist(), [40, 41])
+
+    def test_mrope_positions_keep_their_axes(self):
+        client = a_client()
+        client.issue(3, torch.zeros(2, 8), torch.tensor([5, 9]),
+                     torch.arange(6).reshape(3, 2))
+        self.assertEqual(tuple(client.client.issued[0]["tensors"][2].shape), (3, 2))
 
     def test_the_ids_ride_as_a_column_of_int64(self):
         client = a_client()

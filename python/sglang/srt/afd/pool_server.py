@@ -417,7 +417,11 @@ class Departure(threading.Thread):
         counts = [f.tensors[0].shape[0] for f, _ in riding]
         joined = torch.cat([f.tensors[0] for f, _ in riding], dim=0).to(self.device)
         ids = torch.cat([f.tensors[1] for f, _ in riding], dim=0).reshape(-1).tolist()
-        positions = torch.cat([f.tensors[2] for f, _ in riding], dim=0).reshape(-1).to(self.device)
+        # concatenated along the TOKEN axis, which is the last one -- mrope's rows are axes, not
+        # riders, so joining along the first would stack one rider's height row onto another's
+        # temporal row and rotate every token to somewhere nobody asked for
+        positions = unpack_positions(
+            torch.cat([f.tensors[2] for f, _ in riding], dim=-1)).to(self.device)
         if len(ids) != joined.shape[0]:
             raise RuntimeError(
                 f"{len(ids)} row id(s) for {joined.shape[0]} row(s) in group {group}'s span. Every "
