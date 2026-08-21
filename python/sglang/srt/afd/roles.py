@@ -247,8 +247,22 @@ def watch_colocated_residual(model) -> None:
     if hasattr(model.model, "embed_tokens"):
         model.model.embed_tokens.register_forward_hook(watch_embedding)
 
+    def watch_mlp(index):
+        def hook(_module, _args, output):
+            if seen["n"] >= limit * 8:
+                return
+            seen["n"] += 1
+            out = output[0] if isinstance(output, tuple) else output
+            row = out[0].float()
+            logger.info("afd colocated mlp: layer %s -- rows %s |%.5g| rms %.5g max %.5g",
+                        index, out.shape[0], float(row.norm()),
+                        float(row.pow(2).mean().sqrt()), float(row.abs().max()))
+        return hook
+
     for index, layer in enumerate(model.model.layers):
         layer.register_forward_hook(watch(index))
+        if hasattr(layer, "mlp"):
+            layer.mlp.register_forward_hook(watch_mlp(index))
         # o_proj's INPUT is the attention output after the output gate -- the one quantity the
         # span computes from a gate it saved on a previous call, and the one this side has no
         # reference for. The span's gated output is 15x smaller than the attention output it

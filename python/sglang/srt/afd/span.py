@@ -670,6 +670,11 @@ class SpanRunner:
             hidden, residual = _add_and_norm(layer.post_attention_layernorm, hidden, residual)
             _trace_step("pre-mlp", layer_id, residual)
             hidden = layer.mlp(hidden)
+            # the feed-forward's own output, never compared until now. Layer 0's x + attn is exact
+            # and layer 1's is 6.3% high, and layer 1's INPUT is layer 0's residual plus THIS. An
+            # attention that is perfectly right computes a wrong answer from a wrong input, so the
+            # feed-forward between them has to be ruled in or out before the attention is blamed.
+            _trace_step("mlp-out", layer_id, hidden)
             _trace_step("post-mlp", layer_id, residual + hidden)
         return hidden, residual
 
