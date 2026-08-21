@@ -248,6 +248,107 @@ def watch_colocated_residual(model) -> None:
                 len(model.model.layers))
 
 
+def watch_linear_attention(model, runner) -> None:
+    """Run the span's linear attention beside the model's own, under SGLANG_AFD_SELFCHECK.
+
+    Every PIECE of `SpanRunner._linear_attention` has been checked against something outside
+    itself -- the projection split bit-identical, the convolution against sglang's own kernels,
+    the scaling and gates and recurrence against the fused kernel in `gdn_split.py`, the head
+    expansion against that same reference, the tail against the model's. What none of that reaches
+    is the COMPOSITION: correct pieces in the wrong order, or with one of them missing, is still
+    wrong, and the arrangement is still wrong in a case where every piece is trivially exercised.
+
+    The comparison needs a real ForwardBatch and the pool never has one, because a span does not
+    run inside a model forward. It does have one HERE: the pool serves requests on its own port,
+    and during those `Qwen3_5GatedDeltaNet.forward(hidden, forward_batch)` is the real thing. So
+    the hook takes that call's input, runs the span's reimplementation on the same tensor with a
+    zeroed state and ring, and reports the difference -- one process, one set of weights, one
+    input.
+
+    The control is the same span call on a SHUFFLED input. Without it a small number means only
+    that two functions of the same tensor are close, which two wrong functions can also be.
+    """
+    import os
+    import threading
+
+    if not os.environ.get("SGLANG_AFD_SELFCHECK"):
+        return
+    import torch
+
+    seen = {}
+    limit = 1
+    scratch = 10_000_019          # far from any real request id
+
+    def compare(layer_id, attn):
+        def hook(_module, args, output):
+            if seen.get(layer_id, 0) >= limit:
+                return
+            hidden = args[0]
+            if hidden.dim() != 2 or hidden.shape[0] != 1:
+                return                       # one row only: the case the fault survives in
+            seen[layer_id] = seen.get(layer_id, 0) + 1
+
+            from sglang.srt.afd.split_read_kernel import read_one, update_only
+
+            local = runner._local
+            slot = runner.states.slot_of(scratch)
+            state = runner.states.state[layer_id]
+
+            def ask_host(lid, request_ids, q_tilde, step=None):
+                slots = torch.full((q_tilde.shape[0],), slot, device=q_tilde.device,
+                                   dtype=torch.long)
+                return read_one(runner.states.state[lid], slots, q_tilde).float()
+
+            def defer_update(lid, request_ids, k, v, alpha, beta):
+                slots = torch.full((k.shape[0],), slot, device=k.device, dtype=torch.long)
+                update_only(runner.states.state[lid], slots, k=k, v=v, alpha=alpha, beta=beta)
+
+            local.ask_host, local.defer_update = ask_host, defer_update
+
+            # the ring is (channels, taps) a slot, and the convolution's channel count IS the
+            # conv weight's first axis -- the packed query, key and value together
+            channels, taps = attn.conv1d.weight.shape[0], attn.conv1d.weight.shape[-1]
+
+            def span_of(x):
+                state[slot].zero_()
+                runner.states.conv_buffer(
+                    layer_id, width=channels, taps=taps, dtype=x.dtype)[slot].zero_()
+                return runner._linear_attention(attn, [scratch], layer_id, x).float()
+
+            try:
+                mine = span_of(hidden)
+                theirs = output.float()
+                shuffled = span_of(hidden[:, torch.randperm(hidden.shape[1], device=hidden.device)])
+            except Exception as e:                       # noqa: BLE001 -- diagnostic, reported
+                logger.info("afd linear: layer %s could not be compared: %r", layer_id, e)
+                return
+            finally:
+                runner.release(scratch)
+
+            def against(a, b):
+                a, b = a.reshape(-1), b.reshape(-1)
+                d = float((a - b).norm() / (b.norm() + 1e-9))
+                c = float(torch.nn.functional.cosine_similarity(a, b, dim=0))
+                return f"rel {d:.6g} cos {c:+.4f}"
+
+            logger.info(
+                "afd linear: layer %s -- span against the model %s | the control, a shuffled "
+                "input, gives %s",
+                layer_id, against(mine, theirs), against(shuffled, theirs),
+            )
+        return hook
+
+    installed = 0
+    for index, layer in enumerate(model.model.layers):
+        attn = getattr(layer, "linear_attn", None)
+        if attn is None:
+            continue
+        attn.register_forward_hook(compare(index, attn))
+        installed += 1
+    logger.info("afd linear: comparing the span against %s linear layer(s) of the model's own "
+                "forward", installed)
+
+
 def make_span_runner(model, *, device):
     """The pool's span runner, if --afd-span-cut asked for one. None otherwise.
 
@@ -276,6 +377,7 @@ def make_span_runner(model, *, device):
     watch_colocated_residual(model)
     runner = SpanRunner(
         model, states, layer_types=layer_types, query_shift=_span_query_shift())
+    watch_linear_attention(model, runner)
     spans = group_layers(layer_types)
     logger.info(
         "afd pool: the group cut. %s span(s) a decode step against %s per-layer calls, %s "
