@@ -2372,3 +2372,22 @@ written, both of which this project has already got wrong once: both sides must 
 SAME initial state, and the comparison must cover a multi-token prefill rather than row 0 alone --
 the reading that once said "layer 0 is exact" had looked only at the first row, which has no
 history and therefore cannot disagree.
+
+### The reference side is not as blocked as it looked
+
+`ForwardBatch` is constructible directly in a test -- `test/registered/unit/model_executor/
+test_mlp_sync_pad_unpad.py` builds one with plain keyword arguments, no `ScheduleBatch` and no
+scheduler. So the obstacle recorded above is smaller than stated: what remains unknown is only
+what the LINEAR-ATTENTION backend reads off it (an attention backend and a mamba state pool,
+probably), not how to make the batch itself.
+
+Also worth putting beside it, because it changes what the unit check would add: a span-level
+exactness result already exists at full scale, just not as a unit test. The deployed group cut at
+shift 0 is token-identical to colocated on the prompts checked, repeatedly, with hidden-state
+drift at bfloat16 rounding -- that IS the span against the model's own layers, through the real
+path, on the real checkpoint. What it lacks is the CONTROL: nothing shows what a wrong grouping
+would have looked like, and without that the agreement means less than it appears to.
+
+So the unit check's value is the control more than the agreement, which is the same lesson as the
+attention split's boundary cases. Worth writing for that reason rather than to confirm what the
+deployment already shows.
