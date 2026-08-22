@@ -2391,3 +2391,27 @@ would have looked like, and without that the agreement means less than it appear
 So the unit check's value is the control more than the agreement, which is the same lesson as the
 attention split's boundary cases. Worth writing for that reason rather than to confirm what the
 deployment already shows.
+
+### And the reference side needs more than a ForwardBatch after all
+
+`Qwen3_5GatedDeltaNet.forward` does its projections and then hands the batch straight to
+`self.attn(forward_batch, mixed_qkv=...)` -- the GDN attention backend. So running the model's own
+linear layer needs that backend and its mamba state pool, which is most of a ModelRunner. The
+ForwardBatch is constructible; what it must CARRY is not.
+
+That leaves two honest options and they check different things:
+
+    stand up the backend      the full reference. Expensive, and it is a GPU test that builds a
+                              state pool -- but it is the only one that compares the span against
+                              what the model actually runs
+    compose the model's own   run the group's layers in sequence using the model's own norms,
+    modules in sequence       mlp and o_proj, with `_linear_attention` for the recurrence. Every
+                              piece is the model's, in the model's order, so it is not a fake --
+                              but the recurrence is then COMMON MODE and the check covers the
+                              bookkeeping only: residual, gates, layer order
+
+The second is worth doing and worth labelling. The bookkeeping is where this cut's real bug lived
+-- a residual table keyed by request instead of by row, which a 122-token prefill exposed and a
+decode never could -- and a check that covers it is not less valuable for leaving the recurrence
+to the checks that already cover it. What it must not do is call itself a span exactness check
+without saying which half is common mode.
