@@ -2415,3 +2415,25 @@ The second is worth doing and worth labelling. The bookkeeping is where this cut
 decode never could -- and a check that covers it is not less valuable for leaving the recurrence
 to the checks that already cover it. What it must not do is call itself a span exactness check
 without saying which half is common mode.
+
+### The cheap path was already taken
+
+Before writing the bookkeeping check, I looked for what `test_afd_span.py` already asserts. It
+covers exactly the bug that motivated it: each row comes back as itself; the last row is NOT
+broadcast over the others, which is the control and names the failure keying by request produced;
+two requests in one batch keep their own rows; a row-count mismatch is refused rather than
+broadcast; and the gate table the same way. Five cases, with the control.
+
+So option (b) -- compose the model's modules and check the bookkeeping -- would have re-tested
+what is already tested, one level up and with the recurrence common mode. That is a test whose
+deletion changes nothing, which the repository's own admission criteria refuse.
+
+What that leaves for #56 is option (a) alone: stand up the GDN backend and its state pool, and
+compare the span against what the model actually runs, with the group boundary moved as the
+control. It is a real GPU test and it is the only thing that would add anything.
+
+Three turns on this task produced no test and three corrections: the obstacle is not the
+ForwardBatch, it is what the batch must carry; the cheap alternative is common-mode in the half
+that matters; and the bookkeeping it would have covered is covered. Recording that is the output.
+The next person to pick this up should either build the backend or leave the task closed as
+"covered by the deployment's token identity plus the table-level cases", and say which.
