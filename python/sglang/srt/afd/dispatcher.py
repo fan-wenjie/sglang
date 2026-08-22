@@ -30,9 +30,20 @@ component exists is the connection count, not the batching.
 
 ## What it is not
 
-Not a data-plane hop across the network. It belongs on the same node as the hosts it serves, where
-the extra hop is loopback or shared memory -- tens of microseconds against the 0.59 ms round trip
-it is inserted into. Put it on another machine and it costs more than it saves.
+Not a data-plane hop across the network. It belongs on the same node as the hosts it serves.
+
+## What the hop costs, measured rather than assumed
+
+From the host's own node, 4-token calls: 1.06 ms straight to the pool, 1.40 ms through a stop on
+loopback. **0.34 ms**, and the docstring here first guessed "tens of microseconds" -- wrong by an
+order of magnitude, because the hop is not a kernel copy but a full decode, queue, re-encode,
+decode and re-encode in Python.
+
+So it pays only when it saves more than 0.34 ms a call, and what it saves is the pool's
+degradation under connection count: 2224 calls/s at two connections against 1197 at eight, which
+is 0.45 ms against 0.84 ms per call at the pool. Sixteen hosts through one stop is roughly a wash
+at today's cost and clearly wrong below eight. Making the stop cheaper is what would change that,
+and the number to beat is 0.34 ms.
 """
 
 from __future__ import annotations
@@ -66,8 +77,9 @@ class Stop:
         self._waiting: dict[int, list] = {}
         self._first_seen: dict[int, float] = {}
         self.merged = 0          # upstream calls that carried more than one host
+        self.departures = 0      # upstream feed-forward calls, of any size
         self.relayed = 0         # frames passed through one for one
-        self.riders = 0          # hosts served across all merged calls
+        self.riders = 0          # hosts served across all departures
 
     def offer(self, frame: Frame, sock: socket.socket) -> None:
         """Take a frame from a host. Departs it here when that completes a bus."""
@@ -134,11 +146,21 @@ class Stop:
             offset += n
         if len(riding) > 1:
             self.merged += 1
+        self.departures += 1
         self.riders += len(riding)
 
     def report(self) -> dict:
-        return {"merged_calls": self.merged, "relayed": self.relayed, "riders": self.riders,
-                "riders_per_merged": self.riders / max(self.merged, 1)}
+        """Riders per DEPARTURE, not per merged call.
+
+        The first version divided by the merged count, so a stop that never merged reported
+        "riders_per_merged: 1536.0" from 1536 departures of one rider each -- a number that reads
+        as the merge working spectacularly when it had not fired once. With min_batch at 1 every
+        offer completes a bus on arrival and nothing ever merges, which is correct behaviour and
+        must not look like the opposite.
+        """
+        return {"departures": self.departures, "merged_calls": self.merged,
+                "relayed": self.relayed, "riders": self.riders,
+                "riders_per_departure": self.riders / max(self.departures, 1)}
 
 
 class PoolUpstream:

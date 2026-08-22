@@ -2154,3 +2154,32 @@ It now reconnects once, and if that fails it refuses with a message that says wh
 skip: the release is what stops the next request inheriting a stale recurrent state, so a host
 that cannot deliver it must fail loudly rather than serve fluent text conditioned on somebody
 else's prompt. A new call on an old path inherits none of that path's tolerance, and nothing warns.
+
+
+## 2026-08-22, #68: the stop, end to end, and what its hop costs
+
+A stop on the host's own node, upstream to the real pool, host pointed at it instead of at the
+pool. Per-layer cut, greedy, 12 tokens:
+
+    colocated              " Paris.\nThe capital of Germany is Berlin.\nThe"
+    host through the stop  identical
+
+So the merge, the split and the relay are right on real traffic. The cost, from the host's node,
+4-token calls:
+
+    straight to the pool     1.06 ms      878 calls/s
+    through the stop         1.40 ms      694 calls/s
+
+**0.34 ms a call.** The module docstring had guessed "tens of microseconds" for a loopback hop and
+that was wrong by an order of magnitude: the hop is not a kernel copy, it is a full decode, queue,
+re-encode, decode and re-encode in Python.
+
+Which changes what the component is worth. It saves the pool's degradation under connection count
+-- 0.45 ms a call at two connections against 0.84 ms at eight -- so sixteen hosts through one stop
+is roughly a WASH at today's cost, and it is clearly wrong below eight hosts. The idea survives;
+the implementation has to get cheaper, and the number to beat is 0.34 ms.
+
+A second thing the run corrected: the stop reported `riders_per_merged: 1536.0` from 1536
+departures of one rider each, because it divided by a merged count of zero. With min_batch at 1
+every offer completes a bus on arrival and nothing merges -- correct behaviour, reported as its
+spectacular opposite. It reports riders per DEPARTURE now.
