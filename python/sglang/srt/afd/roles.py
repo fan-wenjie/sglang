@@ -523,7 +523,7 @@ def watch_linear_attention(model, runner) -> None:
                     return
                 conv_before, ssm_before = held
 
-                def span_of(x):
+                def span_of(x, reverse_ring=False):
                     # SEEDED from the model's own state rather than zeroed. Two recurrences
                     # started from different states differ for that reason alone, and the size of
                     # the difference says nothing until they start from the same one.
@@ -534,7 +534,14 @@ def watch_linear_attention(model, runner) -> None:
                     # the call writes itself. The history lines up at the OLD end.
                     ring[slot].zero_()
                     history = conv_before.reshape(channels, -1).to(ring.dtype)
-                    ring[slot][..., 1:] = history[..., -(taps - 1):]
+                    kept = history[..., -(taps - 1):]
+                    # The control for this seeding. sglang's conv_state holds the last K-1 inputs
+                    # and this side's ring holds K with the newest LAST, so the K-1 go into
+                    # columns 1..K-1. That is an argument, not a measurement -- and it only
+                    # affects the COMPARISON: in deployment the pool builds its ring from its own
+                    # tokens and never seeds from the model. So a wrong seed here would produce
+                    # the 1-5% spread with nothing wrong in the arrangement at all.
+                    ring[slot][..., 1:] = kept.flip(-1) if reverse_ring else kept
                     return runner._linear_attention(
                         attn, [scratch] * x.shape[0], layer_id, x).float()
 
@@ -554,6 +561,7 @@ def watch_linear_attention(model, runner) -> None:
                 handle = attn.out_proj.register_forward_pre_hook(capture)
                 try:
                     mine = span_of(hidden)
+                    reversed_ring = span_of(hidden, reverse_ring=True)
                 finally:
                     handle.remove()
                 mine_pre = caught.get("pre")
@@ -723,6 +731,9 @@ def watch_linear_attention(model, runner) -> None:
                 logger.info("afd linear split: layer %s -- %s | %s", layer_id,
                             per_head(mine_pre, theirs_pre, heads),
                             elementwise(mine_pre, theirs_pre))
+            logger.info(
+                "afd ring control: layer %s -- as seeded %s | history REVERSED %s",
+                layer_id, against(mine, theirs), against(reversed_ring, theirs))
             logger.info("afd linear whole: layer %s -- %s",
                         layer_id, elementwise(mine, theirs))
             logger.info(

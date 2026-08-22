@@ -8,6 +8,33 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-22, the linear attention is clean on both paths, and the 1-5% was a misread of my own table
+
+    layer 0   whole-layer relative 0.00320    layer 1   0.00346    layer 2   0.00457
+    layer 4                        0.00447    layer 5   0.00475
+
+Cosine 1.0000 at every layer. That is bfloat16, and it is the same 0.4% the two prefill algorithms
+cost each other in isolation.
+
+So the "1 to 5 percent" that has driven the last several rounds was never the layer's error. It
+came from a PER-HEAD, PER-ROW breakdown, where a head whose own norm is small shows a large
+relative difference while contributing almost nothing to the layer. I read a diagnostic
+decomposition as if it were the quantity itself, chased the heads it happened to rank first, built
+a story about key head 10 out of it, and retracted that story only when the ranking moved with the
+row. The whole-tensor figure was in the same log line the entire time.
+
+`_linear_attention` is now exonerated on both paths -- decode and prefill, arithmetic and
+composition -- against the model's own forward, in the same process, on the same weights, seeded
+from the same state. What it does NOT exonerate is the deployed data flow: this comparison installs
+a LOCAL `ask_host` stub, so the wire, the deferred update's ordering, and the host's own state
+never enter it.
+
+The ring-seeding control that prompted this round did not discriminate -- reversing the history
+gives an identical number to five figures, which means the ring's content does not reach the
+result here at all, most likely because a fresh request's conv state is zero. It is recorded as a
+control that could not fail rather than as evidence the seeding is right.
+
+
 ## 2026-08-22, the two prefill algorithms agree at deployment size, so the 1-5% is not theirs
 
     8 tokens, zero initial state          relative 0.00416
