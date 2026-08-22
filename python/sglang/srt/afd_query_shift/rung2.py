@@ -53,18 +53,34 @@ class LinearOnPool:
         self._install()
 
     def _install(self) -> None:
+        """Move the linear layers, or the first `limit` of them.
+
+        The limit is the bisect. rung 2 with all 48 moved is not token-identical to colocated, and
+        that has two readings which no whole-arm measurement can separate: one layer's move is
+        wrong, or each is right and something accumulates across them -- a state indexed by the
+        wrong layer, a slot reused, a residual carried one call too far. Moving ONE answers it,
+        and the control is the same binary, the same wire and the same weights with the number
+        changed.
+        """
         kinds = layer_types_of(self.model)
+        limit = int(os.environ.get("SGLANG_AFD_RUNG2_LAYERS", "0")) or None
         moved = 0
         for index, kind in enumerate(kinds):
             if kind == "full_attention":
                 continue
+            if limit is not None and moved >= limit:
+                break
             layer = self.model.model.layers[index]
             self._replace(layer.linear_attn, index)
             moved += 1
         logger.info(
             "afd host: the per-layer linear cut is installed. %s linear layer(s) answer from the "
             "pool, one round trip each; the residual and both norms stay here, and so does the "
-            "recurrent state.", moved,
+            "recurrent state.%s", moved,
+            "" if limit is None else
+            f" LIMITED to the first {limit} by SGLANG_AFD_RUNG2_LAYERS: this is a bisect and not "
+            f"the arrangement -- the other {len([k for k in kinds if k != 'full_attention']) - moved}"
+            f" linear layer(s) ran here.",
         )
 
     def _replace(self, attn, layer_id: int) -> None:
