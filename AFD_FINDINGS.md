@@ -2183,3 +2183,44 @@ A second thing the run corrected: the stop reported `riders_per_merged: 1536.0` 
 departures of one rider each, because it divided by a merged count of zero. With min_batch at 1
 every offer completes a bus on arrival and nothing merges -- correct behaviour, reported as its
 spectacular opposite. It reports riders per DEPARTURE now.
+
+
+## 2026-08-22, #71: the stop's own cost, and the problem it inherits
+
+Measured against an ECHO upstream, which is what isolates the stop from the pool -- the phase
+accounting could not, because `wire_in` is a blocking read and on a caller that waits for each
+reply most of that phase is the stop waiting rather than working.
+
+    connections   calls/s   median
+        1          7061     0.15 ms
+        2          6541     0.28 ms
+        4          3521     1.05 ms
+
+Two things, and the second is the one that matters.
+
+**The stop's own serving costs 0.15 ms a call.** The hop measured 0.33 ms end to end, so roughly
+half is the stop's code and half is having a third process in the path at all -- an extra socket,
+extra context switches, and a slightly slower upstream call than the benchmark's own (0.656 ms
+against 0.59 ms direct). Making the Python cheaper can therefore recover at most a fraction of
+0.15 ms. The floor on a stop-shaped hop is not 0.
+
+**The stop degrades with connection count exactly as the pool does.** 7061 at one connection,
+3521 at four -- the same GIL shape, in the component built to spare the pool that shape. Sixteen
+hosts need ~4700 calls/s and a single Python stop is already below that at four connections. So
+the stop as written cannot serve the node it was designed for: it moves the contention rather than
+removing it.
+
+That is a real negative result for the design as built, and it narrows what can work:
+
+    a cheaper transport      shared memory rather than a socket, so the hop is a copy and not a
+                             round trip through two schedulers
+    a stop that is not       C or Rust, or several stop processes each serving a few hosts --
+    one Python process       which is the same sharding argument as the pools, one level down
+    no stop at all           give the pool a cheaper serving loop and let hosts connect directly.
+                             The pool's own floor is a weight read (0.394 ms), so its ceiling is
+                             ~2500 calls/s however it is reached -- and that is BELOW the 4700
+                             the sixteen-card node needs anyway
+
+The last line is the one to take seriously. The sixteen-card node needs more call rate than one
+pool can give whatever sits in front of it, so the answer is more pools (#64, #70), and the stop's
+value shrinks to what it does for CONNECTION COUNT at a scale where a pool could keep up.

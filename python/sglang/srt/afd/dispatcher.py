@@ -56,6 +56,7 @@ import time
 import torch
 
 from sglang.srt.afd.boarding import ready_to_depart
+from sglang.srt.afd.meter import Meter
 from sglang.srt.afd.protocol import OP_FFN, Frame, decode, send_frame
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,10 @@ class Stop:
         self._cond = threading.Condition()
         self._waiting: dict[int, list] = {}
         self._first_seen: dict[int, float] = {}
+        # the hop costs 0.34 ms measured end to end, and "the hop" is four things. Charged the
+        # same way the pool charges its own, so the next optimisation goes at the dominant one
+        # rather than at whichever is easiest to imagine.
+        self.meter = Meter(every=2000)
         self.merged = 0          # upstream calls that carried more than one host
         self.departures = 0      # upstream feed-forward calls, of any size
         self.relayed = 0         # frames passed through one for one
@@ -134,16 +139,18 @@ class Stop:
         counts = [f.tensor.shape[0] for f, _ in riding]
         joined = riding[0][0].tensor if len(riding) == 1 else torch.cat(
             [f.tensor for f, _ in riding], dim=0)
-        out = self.upstream.feed_forward(riding[0][0].request_id, layer, joined)
+        with self.meter.timed("work"):
+            out = self.upstream.feed_forward(riding[0][0].request_id, layer, joined)
         if out.shape[0] != sum(counts):
             raise RuntimeError(
                 f"the pool returned {out.shape[0]} row(s) for {sum(counts)} sent at layer {layer}; "
                 f"splitting that would give some host another host's rows"
             )
         offset = 0
-        for (frame, sock), n in zip(riding, counts):
-            send_frame(sock, Frame.one(frame.request_id, layer, out[offset : offset + n]))
-            offset += n
+        with self.meter.timed("wire_out"):
+            for (frame, sock), n in zip(riding, counts):
+                send_frame(sock, Frame.one(frame.request_id, layer, out[offset : offset + n]))
+                offset += n
         if len(riding) > 1:
             self.merged += 1
         self.departures += 1
@@ -187,12 +194,32 @@ class PoolUpstream:
                      tuple(self.client.collect_frame(handle, "cpu")), frame.op)
 
 
+class EchoUpstream:
+    """Answers rows for rows without a pool, so the stop's OWN cost can be measured.
+
+    The phase accounting cannot separate it: `wire_in` is a blocking read, so on a caller that
+    waits for each reply before sending the next frame, most of that phase is the stop waiting
+    rather than working. Throughput against an upstream that costs nothing is the number that
+    isolates it -- whatever the stop achieves here is what it costs, and the difference from a
+    real pool is the pool.
+    """
+
+    address = "echo://none"
+
+    def feed_forward(self, request_id: int, layer: int, joined: torch.Tensor) -> torch.Tensor:
+        return joined
+
+    def round_trip(self, frame: Frame) -> Frame:
+        return frame
+
+
 def main() -> int:
     """Run a stop. It belongs on the node with the hosts it serves -- see the module docstring."""
     import argparse
 
     p = argparse.ArgumentParser()
-    p.add_argument("--upstream", required=True, help="the pool, HOST:PORT")
+    p.add_argument("--upstream", required=True,
+                   help="the pool, HOST:PORT, or 'none' for an echo that isolates the stop's cost")
     p.add_argument("--port", type=int, default=9100, help="where the hosts reach this stop")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--min-batch", type=int, default=1)
@@ -200,8 +227,8 @@ def main() -> int:
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
-    stop = Stop(PoolUpstream(args.upstream), min_batch=args.min_batch,
-                max_wait_s=args.max_wait_ms / 1000.0)
+    upstream = EchoUpstream() if args.upstream == "none" else PoolUpstream(args.upstream)
+    stop = Stop(upstream, min_batch=args.min_batch, max_wait_s=args.max_wait_ms / 1000.0)
     logger.info("afd stop: upstream %s", args.upstream)
     threading.Thread(target=_report_forever, args=(stop,), daemon=True).start()
     serve(stop, args.host, args.port)
@@ -247,10 +274,12 @@ def _handle(stop: Stop, sock: socket.socket) -> None:
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         while True:
-            frame = decode(sock)
+            with stop.meter.timed("wire_in"):
+                frame = decode(sock)
             if frame is None:
                 return
             stop.offer(frame, sock)
+            stop.meter.call()
     finally:
         sock.close()
 
