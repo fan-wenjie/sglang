@@ -2029,3 +2029,35 @@ Two mechanisms, and which one a weight can use is a property of its CLASS, not a
 loader wraps classes rather than instances, so a class shared with anything the host still uses --
 QKVParallelLinear, RowParallelLinear, shared with the vision tower -- can only be released after
 routing. A class the arm owns entirely can be made absent before it exists.
+
+
+## 2026-08-22, where a pool call's time actually goes
+
+py-spy cannot attach to the scheduler process here (root refused), so the pool charges its own
+phases. Deployed pool, 4 tokens a call, 3000 rounds a connection count:
+
+    connections   calls/s    wire in     work     wire out
+        1          1759      0.098 ms   0.108 ms  0.321 ms
+        2          2320      0.122 ms   0.160 ms  0.303 ms
+        8          1264      1.380 ms   2.256 ms  1.605 ms
+
+Two things fall out, and neither was visible from the outside.
+
+**The reply costs three times the work.** At one connection the forward is 0.108 ms and writing
+the answer back is 0.321 ms -- serialising a tensor and putting it on a socket dominates a call
+whose whole point is a matmul. That is where the per-call ceiling lives, and it is a fixable
+number rather than a hardware one.
+
+**Under concurrency every phase inflates together, ~10x at eight connections.** Work goes 0.108 ->
+2.256 ms doing exactly the same matmul on an idle GPU. A phase that takes ten times longer while
+the work is unchanged is a thread waiting its turn, not a thread working: this is the GIL, and it
+is why throughput FALLS from 2320 to 1264 rather than plateauing.
+
+That settles the direction for #68. A per-node dispatcher is not about batching -- co-batching was
+measured to be a pessimisation -- it is about reaching the pool as ONE connection instead of
+sixteen, because the pool's own accounting says the sixteenth connection makes the first one
+slower.
+
+Note on absolute numbers: this pool instance peaks at 2320 calls/s where the #65 sweep on an older
+instance peaked at 1403. The absolutes move between instances; the SHAPE -- a peak at two
+connections and decline after -- is what has reproduced.
