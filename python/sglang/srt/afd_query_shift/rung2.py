@@ -72,12 +72,22 @@ class LinearOnPool:
 
         def forward(hidden_states, forward_batch=None, **kwargs):
             rows = self._row_ids(forward_batch)
+            self._rows = rows
             handle = self.client.issue_frame(
                 int(rows[0]), layer_id, (hidden_states,), OP_LAYER)
             return self.client.collect_frame(handle, hidden_states.device)[0]
 
         attn.forward = forward
         self._undo.append(lambda a=attn, o=original: setattr(a, "forward", o))
+
+    def current_rows(self):
+        """The row ids of the call in flight, for the state reading the pool asks back for.
+
+        Read through the routing rather than captured when the frame was sent: a captured list
+        would be the FIRST layer's rows for every layer after it, and on a decode batch where row,
+        request and token coincide that is invisible.
+        """
+        return list(self._rows)
 
     def _row_ids(self, forward_batch):
         """One id a ROW, expanded by the extend lengths.
@@ -116,11 +126,34 @@ class Rung2Arm:
         """
         from sglang.srt.afd.pool_client import PoolClient
         from sglang.srt.afd.roles import install_pool_routing, routable_layers
+        from sglang.srt.afd_query_shift.installer import _span_slots
 
         client.require(PoolClient.NEEDS_FEED_FORWARD)
         feed_forward = install_pool_routing(
             model, client, routable_layers(model), sweep_ahead=sweep_ahead)
-        return (feed_forward, LinearOnPool(model, client))
+        routing = LinearOnPool(model, client)
+
+        # The history the pool calls back for. Without it the pool asks for a state reading, this
+        # end has no handler, and the departure dies thirty seconds later with "no state reading
+        # for request 4 layer 0" -- which reads as a wire problem and is a missing service. Moving
+        # the linear attention means moving the CALLS to its state, and whoever moves them owes
+        # the answer.
+        from sglang.srt.afd.history_service import HistoryService
+        from sglang.srt.afd.linear_history import HistoryCache
+
+        config = model.config
+        cache = HistoryCache(
+            slots=_span_slots(),
+            layers=len(layer_types_of(model)),
+            value_heads=config.linear_num_value_heads,
+            head_k_dim=config.linear_key_head_dim,
+            head_v_dim=config.linear_value_head_dim,
+            conv_width=1, conv_taps=1,     # the ring stays on the pool; this holds no convolution
+            device=next(model.parameters()).device,
+        )
+        routing.history = HistoryService(cache, rows_of=lambda frame: routing.current_rows())
+        client.serve = routing.history
+        return (feed_forward, routing)
 
     def make_pool_runner(self, model, *, device):
         """The runner built directly, not through `make_span_runner`.
