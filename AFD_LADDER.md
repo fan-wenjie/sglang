@@ -101,8 +101,36 @@ a factory, and whoever wants the arm imports the derived package -- which is the
 puts it in the registry. Delete the derived directory and the registry is empty, `resolve` returns
 None, and the standard arrangement takes the only path there is.
 
+## Branches, and what belongs to which
+
+    origin/main
+      └── afd                    the arrangement itself, complete, on its own
+            └── afd-query-shift  the derived arm, in its own directory
+
+`afd` is forked from `origin/main` rather than continued from `afd/span-cut`, so what upstream
+sees is the arrangement and not the four days of instruments built to debug something else.
+
+**The batch re-forming belongs to AFD, not to the derived arm.** It is the travel-group model: a
+group fills a coach, tours the cities that are seen together, and disperses only where the visit
+takes an unpredictable time. The principle is the one this work established by measurement --
+re-form a batch only where LATENCY VARIES. A feed-forward and a linear attention are context-free:
+361 microseconds and 200, whoever is riding. A softmax attention is 19 microseconds at 1k and 2397
+at 128k, and a batch that waits for its slowest rider there wastes the difference.
+
+So the coach, the waiting room, the seating and the departure policy are AFD's own, and every
+`afd_query_shift` inherits rather than reimplements. The pieces already exist and already sit on
+the shared side: `seating`, and the departure machinery in `pool_server`.
+
+What the derived arm adds on top is only the read point -- the query projected from earlier in the
+stack -- and whatever the ladder proves it cannot do without. Every rung that turns out to be
+AFD's rather than the arm's moves down into `afd`, and the subclass shrinks by that much.
+
 ## Order of work
 
+0. **Find the fault.** The ladder is how, and it is the reason the branches are laid out this way:
+   each rung is a working server, and the rung that stops being token-identical to colocated is
+   the change that breaks it. Organising the code is not a detour from the debugging -- it IS the
+   instrument, and the only one in this search that cannot measure the wrong thing.
 1. **Anchor the original.** Tag it, so every later claim about "what it used to do" is checkable
    rather than remembered.
 2. **Carve the package in two** as a certified pure relocation -- `mechanical-refactor-verify`,
