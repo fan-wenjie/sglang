@@ -174,6 +174,10 @@ def install_span_routing(model, client: PoolClient, *, sweep_ahead,
         "afd host: holding %s linear layer(s) of recurrent state for up to %s request(s), %s",
         sum(1 for t in types if t != "full_attention"), cache.slots, cache.report(),
     )
+    # after the routing, because what is safe to release is exactly what it routed
+    from sglang.srt.afd_query_shift.absent_projections import strip_routed_weights
+
+    routing.released = strip_routed_weights(model, routing)
     logger.info("afd host: the group cut is installed. %s", routing.report())
     if sweep_ahead is not None:
         # it would otherwise fire from the per-layer prepare_mlp hook, on layers that no longer
