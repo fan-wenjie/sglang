@@ -18,6 +18,30 @@ Departures follow the rule the study's worked example uses: wait for `min_batch`
 carry EVERY caller at the stop rather than the first two. `max_wait_s` is not optional decoration
 -- with a strict minimum and no timeout the last caller of a draining workload waits for a partner
 that never arrives, and the request hangs rather than fails.
+
+## The batch is re-formed where latency VARIES, and nowhere else
+
+That is the whole cutting rule, and it decides both where a call boundary goes and how long a bus
+may be held. Measured on this model:
+
+    feed-forward             361 us      context-free
+    linear attention         200 us      context-free
+    softmax attention         19 us at 1k context -> 2397 us at 128k
+
+Only the last one moves, and it is the one stage that stays on the HOST. So the pool's side of
+every boundary is context-free, and the caller with the long context is simply LATE for the next
+departure rather than slow inside one. The bus leaves on its timeout with whoever is aboard and
+the late rider takes the next: riders disperse at the destination and re-form for the following
+call, which is what makes one pool able to serve a 1k request and a 128k one without the short one
+waiting out the long one's context.
+
+A departure that waited for a late rider would be correct, and every aggregate would look
+identical -- throughput, riders histogram, mean latency -- while every short-context caller paid
+the longest caller's context length. `test_afd_async_pool.py` asserts it by order for that reason.
+
+With ONE host the histogram is all ones and this rule buys nothing: a host sends one frame a layer
+for its whole batch, so there is a single rider by construction. It becomes live with several
+hosts against one pool, and with two batches staggered on one host -- see `staggered.py`.
 """
 
 from __future__ import annotations
@@ -29,6 +53,8 @@ import time
 from collections.abc import Callable
 
 import torch
+from sglang.srt.afd.boarding import ready_to_depart
+from sglang.srt.afd.meter import Meter
 from sglang.srt.afd.protocol import (
     OP_FFN,
     OP_APPEND,
@@ -106,6 +132,7 @@ class Departure(threading.Thread):
         # a pool that holds per-request state stops being stateless and can no longer be released
         # between one request's own calls, which is the property this whole arrangement rests on.
         # The states live on the caller and are read back across the wire.
+        self.meter = Meter()
         self.min_batch = min_batch
         self.max_wait_s = max_wait_s
         self.device = device
@@ -355,7 +382,12 @@ class Departure(threading.Thread):
         with self._cond:
             queue = self._waiting.setdefault(frame.layer, [])
             queue.append((frame, sock))
-            if not calls_back and len(queue) >= self.min_batch:
+            # the same question `_ready_layer` asks, with no wait behind it -- a frame that has
+            # just arrived cannot be overdue, and a second rule here would be a second thing to
+            # keep in step with the first
+            if not calls_back and ready_to_depart(
+                    waiting=len(queue), min_batch=self.min_batch,
+                    waited_s=0.0, max_wait_s=self.max_wait_s):
                 riding = self._waiting.pop(frame.layer)
                 self._first_seen.pop(frame.layer, None)
             else:
@@ -363,6 +395,39 @@ class Departure(threading.Thread):
                 self._cond.notify()          # the departure thread takes it, and reads nothing
         if riding is not None:
             self._depart(frame.layer, riding)
+            self._listen_again()
+
+    def _listen_again(self) -> None:
+        """Having sent, look at the queue again before going back to the socket.
+
+        The thread that just answered a call is the thread most likely to find another one ready:
+        the callers it answered are, at this instant, computing their own attentions, and whoever
+        finished theirs during this departure is already at the next stop. Going straight back to
+        `recv` leaves them to the timer thread, which is up to a quarter of `max_wait_s` away for
+        work that is ready NOW.
+
+        A departure that CALLS BACK is never taken here, for the reason `offer` gives: this thread
+        owns the caller's socket, and a callback made from it waits for a message only it can
+        receive.
+        """
+        while True:
+            riding = None
+            with self._cond:
+                now = time.perf_counter()
+                for layer, queue in self._waiting.items():
+                    if not queue or any(f.op in CALLS_BACK_OPS for f, _ in queue):
+                        continue
+                    if ready_to_depart(
+                        waiting=len(queue), min_batch=self.min_batch,
+                        waited_s=now - self._first_seen.get(layer, now),
+                        max_wait_s=self.max_wait_s,
+                    ):
+                        riding, ready = self._waiting.pop(layer), layer
+                        self._first_seen.pop(layer, None)
+                        break
+            if riding is None:
+                return
+            self._depart(ready, riding)
 
     def stop(self) -> None:
         with self._cond:
@@ -370,14 +435,14 @@ class Departure(threading.Thread):
             self._cond.notify_all()
 
     def _ready_layer(self, now: float) -> int | None:
+        """Ask the boarding question again, of every stop, on every pass. See `boarding.py`: the
+        answer is not computable in advance because the cadence belongs to the callers'
+        contexts and those are not uniform even inside one batch."""
         for layer, queue in self._waiting.items():
-            if not queue:
-                continue
-            if len(queue) >= self.min_batch:
-                return layer
-            if now - self._first_seen.get(layer, now) >= self.max_wait_s:
-                # the timeout the strict rule needs. Without it the last caller of a draining
-                # workload waits for a partner that never comes.
+            if ready_to_depart(
+                waiting=len(queue), min_batch=self.min_batch,
+                waited_s=now - self._first_seen.get(layer, now), max_wait_s=self.max_wait_s,
+            ):
                 return layer
         return None
 
@@ -697,7 +762,8 @@ class Departure(threading.Thread):
             [f.tensor for f, _ in riding], dim=0
         )
         batch = joined.to(self.device)
-        out = self.forward(batch, layer)
+        with self.meter.timed("work"):
+            out = self.forward(batch, layer)
         if out.shape != batch.shape:
             raise RuntimeError(
                 f"layer {layer} feed-forward returned {tuple(out.shape)} for {tuple(batch.shape)}; "
@@ -708,7 +774,8 @@ class Departure(threading.Thread):
             piece = out[offset : offset + n]
             offset += n
             try:
-                send_frame(sock, Frame.one(frame.request_id, layer, piece))
+                with self.meter.timed("wire_out"):
+                    send_frame(sock, Frame.one(frame.request_id, layer, piece))
             except OSError:
                 logger.warning(
                     "caller for request %s layer %s went away before its reply",
@@ -847,10 +914,12 @@ def serve(
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
             while True:
-                frame = decode(sock)
+                with departure.meter.timed("wire_in"):
+                    frame = decode(sock)
                 if frame is None:
                     return
                 route_frame(departure, frame, sock)
+                departure.meter.call()
         finally:
             sock.close()
 
