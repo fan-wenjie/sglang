@@ -31,7 +31,7 @@ import torch
 
 from sglang.srt.afd.arms import register
 from sglang.srt.afd.layer_kinds import layer_types_of
-from sglang.srt.afd.protocol import OP_LAYER
+from sglang.srt.afd.protocol import OP_LAYER, OP_RELEASE
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,10 @@ class LinearOnPool:
         # default: the reference call advances the host's own state and costs a second layer.
         self._check = int(os.environ.get("SGLANG_AFD_RUNG2_CHECK", "0"))
         self._checked: dict[int, int] = {}
+        # set by whoever builds the history this end holds; a routing with none has nothing to
+        # clear here and still has to tell the pool
+        self.history = None
+        self._first_moved = None
         self._install()
 
     def _install(self) -> None:
@@ -80,6 +84,8 @@ class LinearOnPool:
                 break
             layer = self.model.model.layers[index]
             self._replace(layer.linear_attn, index)
+            if self._first_moved is None:
+                self._first_moved = index
             moved += 1
         logger.info(
             "afd host: the per-layer linear cut is installed. %s linear layer(s) answer from the "
@@ -95,6 +101,10 @@ class LinearOnPool:
         original = attn.forward
 
         def forward(hidden_states, forward_batch=None, **kwargs):
+            if layer_id == self._first_moved:
+                # once a forward, at the FIRST moved layer. Per layer would clear the state layer
+                # 0 had just written, which is a different bug with the same name.
+                self._clear_starting(forward_batch)
             rows = self._row_ids(forward_batch)
             self._rows = rows
             reference = None
@@ -139,6 +149,31 @@ class LinearOnPool:
             )
         except Exception as e:                          # noqa: BLE001 -- a probe never kills a run
             logger.info("afd rung2 check: layer %s could not be compared: %r", layer_id, e)
+
+    def _clear_starting(self, forward_batch) -> None:
+        """Forget the history of every row id that is BEGINNING a request, on both ends.
+
+        sglang reuses `req_pool_indices`, and a slot table keyed by that id hands the next request
+        the previous one's memory. A KV cache survives the same reuse because a length of zero
+        excludes stale positions; a recurrent state has no length -- whatever is in the buffer IS
+        the history. The second request through a slot then answers, fluently, conditioned on the
+        first one's prompt, and the degeneration this ladder was built to find is exactly that.
+
+        The signal is a prefill chunk with no cached prefix. Taken at the START of a request
+        rather than at its end because an aborted request never reaches its end, and the slot it
+        leaves is indistinguishable from one in use.
+        """
+        prefix = forward_batch.extend_prefix_lens_cpu
+        if prefix is None:
+            return                                   # a decode step begins nothing
+        for rid, cached in zip(forward_batch.req_pool_indices, prefix):
+            if int(cached) != 0:
+                continue                             # a later chunk of a prefill already running
+            rid = int(rid)
+            if self.history is not None:
+                self.history.forget(rid)
+            handle = self.client.issue_frame(rid, 0, (torch.zeros(1, 1),), OP_RELEASE)
+            self.client.collect_frame(handle, "cpu")
 
     def current_rows(self):
         """The row ids of the call in flight, for the state reading the pool asks back for.

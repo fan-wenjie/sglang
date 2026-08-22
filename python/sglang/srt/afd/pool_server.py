@@ -174,6 +174,17 @@ class Departure(threading.Thread):
             return True
         if self.cache is not None and frame.op in (OP_SWEEP_Q, OP_APPEND, OP_RELEASE):
             return self._answer_cache(frame, sock)
+        if self.span is not None and frame.op == OP_RELEASE:
+            # The op existed, with the comment that says exactly why -- "sglang reuses slots and
+            # the next one is not this one" -- and it reached the KV cache and the attention holder
+            # and never the recurrent state. A KV cache survives that: a length of zero already
+            # excludes stale positions. A recurrent state has no length. Whatever is in the buffer
+            # IS the history, so the second request through a slot is conditioned on the first
+            # one's prompt, fluently, with nothing raising.
+            dropped = self.span.release(frame.request_id)
+            send_frame(sock, Frame(frame.request_id, frame.layer,
+                                   (torch.tensor([[float(dropped)]]),), OP_RELEASE))
+            return True
         if self.attention is None or frame.op not in (OP_SWEEP, OP_RELEASE, OP_KVPROJ):
             return False
 

@@ -91,6 +91,16 @@ class HistoryService:
             f"disagree about what lives here."
         )
 
+    def forget(self, request_id: int) -> bool:
+        """Drop a request's recurrent state. Returns whether a slot was held.
+
+        Called when a row id BEGINS a request rather than when one ends: an aborted or crashed
+        request never sends its ending, and the slot it leaves behind is indistinguishable from a
+        slot in use. What starts a request is knowable from the batch -- a prefill chunk with no
+        cached prefix -- and it is knowable every time.
+        """
+        return self.cache.release(int(request_id))
+
     def _read(self, frame) -> torch.Tensor:
         from sglang.srt.afd.split_read_kernel import read_one
 

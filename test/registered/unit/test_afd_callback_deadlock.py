@@ -27,6 +27,7 @@ from sglang.srt.afd.pool_client import PoolClient
 from sglang.srt.afd.pool_server import Departure, route_frame
 from sglang.srt.afd.protocol import (
     OP_LAYER,
+    OP_RELEASE,
     OP_SPAN,
     OP_SPAN_ENTER,
     OP_SPAN_Q,
@@ -46,11 +47,17 @@ class Runner:
     def __init__(self, asks=3):
         self.asks = asks
         self.seen = []
+        self.released = []
 
     def run_prologue(self, request_ids, embedded, positions, on_query=None):
         """The layers below the first attention. Same shape as `run`, one argument fewer -- and
         the arm that was never exercised, which is why the op mismatch survived every test."""
         return self.run(request_ids, -1, embedded, positions, on_query=on_query)
+
+    def release(self, request_id):
+        """Forget a request. The real one zeroes the recurrent state and the convolution ring."""
+        self.released.append(int(request_id))
+        return 1
 
     def _linear_attention(self, attn, request_ids, layer, hidden):
         """One layer on its own, which asks the caller for the state exactly as a span does.
@@ -216,6 +223,32 @@ class TestALayerCallsBackToo(CustomTestCase):
             pool.close()
 
 
+class TestAReleaseReachesTheRecurrentState(CustomTestCase):
+    """OP_RELEASE existed, and reached the KV cache and the attention holder and not the span.
+
+    Its own comment in the protocol says why it exists -- "sglang reuses slots and the next one is
+    not this one" -- and the recurrent state is the one holder for which that is fatal. A KV cache
+    survives a reused slot because a length of zero excludes stale positions. A recurrent state has
+    no length: whatever is in the buffer IS the history, so the second request through a slot
+    answers fluently, conditioned on the first one's prompt, and nothing raises.
+
+    Measured on the deployment before the fix: one moved linear layer agreed with the model's own
+    to 0.0026 on a fresh pool and to 0.31 on the second request through the same slot, and the
+    text went to "the same as the same as the same as".
+    """
+
+    def test_the_pool_forgets_the_request_it_is_told_to(self):
+        pool = Pool(asks=1, min_batch=1)
+        client = PoolClient(f"127.0.0.1:{pool.port}", 5.0, reconnect=False)
+        try:
+            handle = client.issue_frame(7, 0, (torch.zeros(1, 1),), OP_RELEASE)
+            reply = client.collect_frame(handle, "cpu")
+            self.assertEqual(pool.runner.released, [7])
+            self.assertEqual(float(reply[0][0, 0]), 1.0, "the reply says how many slots went")
+        finally:
+            pool.close()
+
+
 class TestTheReplyCarriesTheOpItWasAskedWith(CustomTestCase):
     """A prologue is asked as OP_SPAN_ENTER and must be answered as OP_SPAN_ENTER.
 
@@ -279,6 +312,11 @@ class ScanRunner(Runner):
     travel as OP_STATE_SCAN. So this fake exercises the scan opcode by carrying rows, not by
     naming it -- the same way the real runner does.
     """
+
+    def release(self, request_id):
+        """Forget a request. The real one zeroes the recurrent state and the convolution ring."""
+        self.released.append(int(request_id))
+        return 1
 
     def _linear_attention(self, attn, request_ids, layer, hidden):
         """One layer on its own, which asks the caller for the state exactly as a span does.

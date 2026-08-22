@@ -28,6 +28,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+from sglang.srt.afd.protocol import OP_LAYER, OP_RELEASE
 from sglang.srt.afd_query_shift.rung2 import LinearOnPool, Rung2Arm
 from sglang.test.test_utils import CustomTestCase
 
@@ -134,13 +135,69 @@ class TestTheHostAnswersWhatThePoolWillAsk(CustomTestCase):
         model = a_stack()
         _, routing = _install(model, StubClient())
 
-        first = types.SimpleNamespace(req_pool_indices=[7], extend_seq_lens_cpu=[3])
+        first = types.SimpleNamespace(req_pool_indices=[7], extend_seq_lens_cpu=[3],
+                                      extend_prefix_lens_cpu=[0])
         model.model.layers[0].linear_attn.forward(torch.zeros(3, 4), forward_batch=first)
         self.assertEqual(routing.current_rows(), [7, 7, 7])
 
-        second = types.SimpleNamespace(req_pool_indices=[9], extend_seq_lens_cpu=[2])
+        second = types.SimpleNamespace(req_pool_indices=[9], extend_seq_lens_cpu=[2],
+                                       extend_prefix_lens_cpu=[0])
         model.model.layers[1].linear_attn.forward(torch.zeros(2, 4), forward_batch=second)
         self.assertEqual(routing.current_rows(), [9, 9])
+
+
+class Forgetful:
+    """Stands in for the history this end holds, recording what it was told to forget."""
+
+    def __init__(self):
+        self.forgotten = []
+
+    def forget(self, request_id):
+        self.forgotten.append(int(request_id))
+        return True
+
+
+class TestAStartingRequestForgetsTheSlotItInherits(CustomTestCase):
+    """The fault the whole ladder was built to find, and it is one missing call.
+
+    Both slot tables have a `release` that zeroes the state, on the host and on the pool, and
+    nobody ever called either. sglang reuses `req_pool_indices`, the tables are keyed by it, and
+    the entry outlives the request -- so the second request through a slot reads the first one's
+    recurrent state and its convolution ring. It stays fluent, which is why every in-process check
+    passed: they all ran ONE request.
+    """
+
+    def _forward(self, model, routing, *, prefix, rows=3):
+        batch = types.SimpleNamespace(
+            req_pool_indices=[3], extend_seq_lens_cpu=[rows],
+            extend_prefix_lens_cpu=None if prefix is None else [prefix])
+        model.model.layers[0].linear_attn.forward(torch.zeros(rows, 4), forward_batch=batch)
+
+    def _routing(self):
+        model = a_stack()
+        client = StubClient()
+        _, routing = _install(model, client)
+        routing.history = Forgetful()
+        return model, client, routing
+
+    def test_a_first_chunk_forgets_on_both_ends(self):
+        model, client, routing = self._routing()
+        self._forward(model, routing, prefix=0)
+        self.assertEqual(routing.history.forgotten, [3], "this end kept the previous request")
+        self.assertIn((3, 0, OP_RELEASE), client.issued, "the pool was never told")
+        # and the release goes out BEFORE the layer it is clearing for
+        self.assertLess(client.issued.index((3, 0, OP_RELEASE)),
+                        client.issued.index((3, 0, OP_LAYER)))
+
+    def test_a_later_chunk_and_a_decode_forget_nothing(self):
+        """A chunked prefill's second chunk and every decode step continue a request. Clearing
+        there would throw away the history the request itself just built, which is the same bug
+        with the same name and the opposite sign."""
+        model, client, routing = self._routing()
+        self._forward(model, routing, prefix=8)
+        self._forward(model, routing, prefix=None, rows=1)
+        self.assertEqual(routing.history.forgotten, [])
+        self.assertNotIn((3, 0, OP_RELEASE), client.issued)
 
 
 if __name__ == "__main__":
