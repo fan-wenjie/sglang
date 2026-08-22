@@ -800,7 +800,15 @@ class SpanRunner:
         query, key, value, z, b, a = attn.fix_query_key_value_ordering(qkvz, ba)
         rows = hidden.shape[0]
         flat = [t.reshape(rows, -1) for t in (query, key, value)]
-        mixed = self._convolve(attn, torch.cat(flat, dim=-1), request_ids, layer_id)
+        packed = torch.cat(flat, dim=-1)
+        # BEFORE the convolution. The model's `mixed_qkv`, which is what reaches
+        # `self.attn(forward_batch, mixed_qkv=...)`, is pre-convolution too -- the convolution runs
+        # inside the backend. Publishing the post-convolution tensor here compared one side's
+        # filtered channels against the other's unfiltered ones and read 100% apart on every key
+        # head while the layer's output agreed to 2%, which is impossible and is how it was caught.
+        self._local.last_packed = packed.detach()
+        mixed = self._convolve(attn, packed, request_ids, layer_id)
+        self._local.last_mixed = mixed.detach()
 
         width = flat[0].shape[-1]
         q = mixed[:, :width].reshape(rows, attn.num_k_heads // attn.attn_tp_size,

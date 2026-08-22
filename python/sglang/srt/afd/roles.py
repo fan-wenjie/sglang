@@ -395,6 +395,19 @@ def watch_linear_attention(model, runner) -> None:
                 # control. So the model's value was overwritten by the control's, and the two
                 # "pre" tensors compared at 100% apart while the layer's outputs agreed to 0.5%.
                 # A linear projection cannot do that, and the contradiction is what gave it away.
+                inner = getattr(_module, "attn", None)
+                if inner is not None and ("mixed", layer_id) not in before:
+                    def grab_mixed(_m, args, kwargs, _lid=layer_id):
+                        if ("mixed", _lid) in before:
+                            return
+                        got = kwargs.get("mixed_qkv")
+                        if got is None:
+                            return
+                        before[("mixed", _lid)] = got.detach()
+                        grabbed[("mixed", _lid)].remove()
+                    grabbed[("mixed", layer_id)] = inner.register_forward_pre_hook(
+                        grab_mixed, with_kwargs=True)
+
                 attn_mod = getattr(_module, "out_proj", None)
                 if attn_mod is not None and ("pre", layer_id) not in before:
                     def grab(_m, args, _lid=layer_id):
@@ -517,6 +530,8 @@ def watch_linear_attention(model, runner) -> None:
                     handle.remove()
                 mine_pre = caught.get("pre")
                 caught["alpha"] = getattr(local, "last_alpha", None)
+                caught["mixed"] = getattr(local, "last_packed", None)
+                caught["after"] = getattr(local, "last_mixed", None)
                 theirs = output.float()
                 order = torch.randperm(hidden.shape[1], device=hidden.device)
                 shuffled = span_of(hidden[:, order])
@@ -604,6 +619,63 @@ def watch_linear_attention(model, runner) -> None:
                         f"spread {spread:.3f} over {int(keep.sum())} channels")
 
             heads = attn.num_v_heads // attn.attn_tp_size
+            mine_mixed, theirs_mixed = caught.get("mixed"), before.get(("mixed", layer_id))
+            if mine_mixed is not None and theirs_mixed is not None:
+                kh = attn.num_k_heads // attn.attn_tp_size
+                dk = attn.head_k_dim
+                width = kh * dk
+
+                def by_key_head(name, lo, hi):
+                    """The packed projection's q and k blocks, sliced the way the heads are.
+
+                    If key head 10's channels are already wrong HERE then the convolution put them
+                    wrong; if they are right here and the output is wrong, the scan downstream did.
+                    One boundary, and it separates the only two paths a prefill takes that a decode
+                    does not.
+                    """
+                    a = mine_mixed[:, lo:hi].reshape(-1, kh, dk).float()
+                    b = theirs_mixed.reshape(theirs_mixed.shape[0], -1)[:, lo:hi]
+                    b = b.reshape(-1, kh, dk).float()
+                    e = ((a - b).norm(dim=-1) / (b.norm(dim=-1) + 1e-9))[0]
+                    top = torch.topk(e, min(3, e.numel()))
+                    return (f"{name}: {int((e < 0.02).sum())}/{kh} key heads within 2%, worst "
+                            + " ".join(f"k{int(i)}={float(v):.3f}"
+                                       for v, i in zip(top.values, top.indices)))
+
+                logger.info("afd packed (pre-conv): layer %s -- %s | %s", layer_id,
+                            by_key_head("q", 0, width), by_key_head("k", width, 2 * width))
+
+                # The pre-convolution packing is identical on both sides, so the next boundary is
+                # the convolution's OUTPUT. The model's post-convolution tensor is a local inside
+                # the backend and cannot be hooked, but it does not need to be: run sglang's own
+                # `causal_conv1d_fn` on the packing both sides agree on, with an empty ring, and
+                # that IS the model's path. The span's is `last_mixed`.
+                after = caught.get("after")
+                if after is not None:
+                    try:
+                        from sglang.srt.layers.attention.mamba.causal_conv1d import (
+                            causal_conv1d_fn,
+                        )
+
+                        w = attn.conv1d.weight
+                        want = causal_conv1d_fn(
+                            theirs_mixed.reshape(theirs_mixed.shape[0], -1).t()
+                            .unsqueeze(0).contiguous(),
+                            w.view(w.shape[0], w.shape[2]), attn.conv1d.bias,
+                            activation=attn.activation)[0].t()
+                        mine_mixed2 = after.reshape(after.shape[0], -1)
+                        a = mine_mixed2[:, width:2 * width].reshape(-1, kh, dk).float()
+                        b = want[:, width:2 * width].reshape(-1, kh, dk).float()
+                        e = ((a - b).norm(dim=-1) / (b.norm(dim=-1) + 1e-9))[0]
+                        top = torch.topk(e, min(3, e.numel()))
+                        logger.info(
+                            "afd conv-out: layer %s -- k block %s/%s key heads within 2%%, worst %s",
+                            layer_id, int((e < 0.02).sum()), kh,
+                            " ".join(f"k{int(i)}={float(v):.3f}"
+                                     for v, i in zip(top.values, top.indices)))
+                    except Exception as e:                # noqa: BLE001 -- diagnostic, reported
+                        logger.info("afd conv-out: layer %s not comparable: %r", layer_id, e)
+
             theirs_pre = before.get(("pre", layer_id))
             if mine_pre is not None and theirs_pre is not None:
                 logger.info("afd linear split: layer %s -- %s | %s", layer_id,

@@ -8,6 +8,35 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-22, the error enters between the convolution's output and the layer's, on the wire
+
+Three boundaries measured on the deployed 122-row prefill, each against the model's own value:
+
+    the packed projection, BEFORE the convolution   16/16 key heads, error 0.000 -- identical
+    the convolution's output                        16/16 key heads, worst 0.004 -- bfloat16
+    the layer's output                              42/48 value heads, worst 0.057 on one
+                                                    key head's group
+
+So the projection, the packing and the convolution are exact, and everything between the
+convolution's output and the layer's output is where the per-key-head error is born. That段 is the
+scan and the mix -- and in the deployment the scan crosses the WIRE: the query coefficient is
+computed on the pool, sent to the host, walked token by token there through `read_one` and
+`update_only`, and the readings come back.
+
+`test_afd_prefill_scan.py` verifies the scan's ALGORITHM -- synthetic tensors, eight tokens, zero
+initial state, one process. The wire path has never been verified, and it is where the ordering of
+the two uses of `k` lives: the query coefficient's, computed locally and at once, and the state
+update's, deferred and sent separately.
+
+Getting the first two boundaries took catching the seventh instance of comparing two correct
+measurements of different quantities. The model's `mixed_qkv`, the tensor that reaches
+`self.attn(forward_batch, mixed_qkv=...)`, is PRE-convolution -- the convolution runs inside the
+backend -- and the span's `mixed` is post-convolution. Compared directly they read 100% apart on
+every key head while the layer's output agreed to 2%, which is impossible, and the impossibility
+is what exposed it. The reference for the convolution's output is built instead by running
+sglang's own `causal_conv1d_fn` on the packing both sides agree on.
+
+
 ## 2026-08-22, the worst heads are one key head's group, and it is not accumulation
 
 A prefill scan walks a chunk token by token, so a head whose decay is closest to 1 carries its
