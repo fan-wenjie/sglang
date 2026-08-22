@@ -34,6 +34,38 @@ from sglang.srt.afd.protocol import OP_STATE_READ, OP_STATE_SCAN, OP_STATE_UPDAT
 logger = logging.getLogger(__name__)
 
 
+_ORDER = {}
+
+
+def _trace_order(frame) -> None:
+    """The sequence of ops this side receives for one (request, layer), when SGLANG_AFD_ORDER is set.
+
+    The pool asks for a reading and then defers the update, and the correctness of every decode
+    step rests on those arriving in that order and being applied before the next read. Nothing has
+    ever checked it: the comparisons built so far install a LOCAL stub for `ask_host`, so the wire
+    and its ordering are outside all of them.
+
+    A decode must read then update, alternating. A prefill chunk is one scan and no separate
+    update, because a multi-row rider advances its own state inside the scan. Anything else --
+    two reads with no update between them, an update before its read, a scan followed by an update
+    for the same rows -- is a state one step out of place, and it stays fluent.
+    """
+    import os
+
+    from sglang.srt.afd.protocol import OP_NAMES
+
+    if not os.environ.get("SGLANG_AFD_ORDER"):
+        return
+    key = (frame.request_id, frame.layer)
+    seq = _ORDER.setdefault(key, [])
+    if len(seq) >= 6:
+        return
+    seq.append(OP_NAMES.get(frame.op, frame.op))
+    if len(seq) == 6:
+        logger.info("afd order: request %s layer %s -- %s",
+                    frame.request_id, frame.layer, " ".join(seq))
+
+
 class HistoryService:
     """Answers the two calls, against a `HistoryCache` this host owns."""
 
@@ -46,6 +78,7 @@ class HistoryService:
         self.updates = 0
 
     def __call__(self, frame):
+        _trace_order(frame)
         if frame.op == OP_STATE_SCAN:
             return (self._scan(frame),)
         if frame.op == OP_STATE_READ:
