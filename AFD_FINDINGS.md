@@ -1836,3 +1836,35 @@ The measurement is two CONNECTIONS, not two model hosts: a second host needs a s
 two hosts on one card contend for that card's bandwidth, so a flat aggregate could not tell a
 saturated pool from a saturated host. It measures the pool's side, which is the side the claim is
 about.
+
+
+## 2026-08-22, #62: co-batching across callers does not pay at any width measured
+
+The claim under test was that a second caller riding the first one's 267 MB weight read is what
+makes a shared pool worth having. Qwen3.8-27B, one dense layer, 20 rounds, tokens/s (calls/s x
+tokens a call), two independent connections against the real pool:
+
+    tokens a call     min_batch 1                 min_batch 2
+                      1 caller   2 callers        1 caller   2 callers
+         4              3096       7122 (2.30x)      518       4100
+       128             53490      27640 (0.52x)    14396      31180
+       512             85641      88212 (1.03x)    30930      37837
+
+Read the 512 row across: one caller alone at min_batch 1 does 85641 tokens/s; two callers FORCED
+into one departure do 37837. Co-batching more than halves it. At 128 it is 53490 against 31180.
+The min_batch 2 single-caller column is the same setting's other cost -- 4 ms of max_wait paid in
+full, every call, waiting for a partner that never comes.
+
+Why the read has nothing left to share: a 512-token frame already amortises the layer's weights
+across its own 512 rows, and at that width the pool is saturated -- a second caller adds 3%. The
+read is shared WITHIN a caller's frame long before two callers can share it between them.
+
+What the second caller does buy, at 4 tokens: 2.30x, with min_batch at 1 and no co-batching
+anywhere. That is PIPELINING -- one caller's wire transfer overlapping the other's compute -- and
+it needs nothing but a pool that takes whoever is ready.
+
+So the arrangement's answer is the stateless pool plus flexible re-forming, and NOT a minimum
+batch. min_batch above 1 would need a width where the weight read dominates AND the pool is idle;
+the range measured here does not contain one. The seating rules (`seating.py`, `boarding.py`) stay
+correct and stay useful -- they decide who rides when several are ready at once -- but the payoff
+they were assumed to deliver, a shared weight read, is not where the money is.

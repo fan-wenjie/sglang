@@ -84,24 +84,27 @@ def main() -> int:
     p.add_argument("--callers", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--width", type=int, default=5120)
-    p.add_argument("--tokens", type=int, default=4)
+    p.add_argument("--tokens", type=int, nargs="+", default=[4])
     p.add_argument("--rounds", type=int, default=40)
     args = p.parse_args()
 
-    print(f"  pool {args.pool}, layer {args.layer}, {args.tokens} token(s) x {args.width} a call")
-    print(f"  {'callers':>8} {'median ms':>10} {'worst ms':>9} {'calls/s':>9} {'per caller':>11}")
-    first = None
-    for callers in args.callers:
-        got = run(args.pool, callers, args.layer, args.width, args.tokens, args.rounds)
-        if first is None:
-            first = got["round_trip_ms"]
-        print(f"  {got['callers']:>8} {got['round_trip_ms']:>10.2f} {got['worst_ms']:>9.2f} "
-              f"{got['calls_per_s']:>9.1f} {got['round_trip_ms'] / first:>10.2f}x")
+    print(f"  pool {args.pool}, layer {args.layer}, width {args.width}")
+    print(f"  {'tokens':>7} {'callers':>8} {'median ms':>10} {'calls/s':>9} {'tokens/s':>10} "
+          f"{'vs 1 caller':>12}")
+    for tokens in args.tokens:
+        first = None
+        for callers in args.callers:
+            got = run(args.pool, callers, args.layer, args.width, tokens, args.rounds)
+            if first is None:
+                first = got["calls_per_s"]
+            print(f"  {tokens:>7} {got['callers']:>8} {got['round_trip_ms']:>10.2f} "
+                  f"{got['calls_per_s']:>9.1f} {got['calls_per_s'] * tokens:>10.0f} "
+                  f"{got['calls_per_s'] / first:>11.2f}x")
 
-    print("\n  A second caller that rides the first one's weight read costs almost nothing: the")
-    print("  median round trip stays flat and calls/s roughly doubles. A second caller that waits")
-    print("  its turn shows the median rising with the caller count and calls/s flat -- the pool")
-    print("  is serialising them, which is what min_batch=1 asks it to do.")
+    print("\n  The question is the last column at the WIDEST frame. A second caller that rides")
+    print("  the first one's weight read shows tokens/s near 2x; one that waits its turn shows it")
+    print("  flat. At 4 tokens a call the read is not what binds the pool, so the comparison only")
+    print("  means something where the read dominates -- which is what the widths are for.")
     return 0
 
 
