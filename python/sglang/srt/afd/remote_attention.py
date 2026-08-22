@@ -182,7 +182,7 @@ class RemoteAttention:
 
 def install_remote_attention(model, client, layer_types: list[str]) -> RemoteAttention:
     """Send every softmax layer's attention to the pool that holds its cache."""
-    from sglang.srt.afd.read_point import full_attention_layers
+    from sglang.srt.afd.layer_kinds import full_attention_layers
 
     layers = tuple(full_attention_layers(layer_types))
     if not layers:
@@ -253,7 +253,7 @@ class RemoteKVProjection:
 
 
 def install_kv_projection(model, client, layer_types: list[str]) -> RemoteKVProjection:
-    from sglang.srt.afd.read_point import full_attention_layers
+    from sglang.srt.afd.layer_kinds import full_attention_layers
 
     layers = tuple(full_attention_layers(layer_types))
     if not layers:

@@ -50,7 +50,7 @@ from sglang.srt.afd.protocol import OP_APPEND, OP_RELEASE, OP_SWEEP_Q
 
 # a release names no layer; the field is there and naming it keeps the frame readable
 RELEASE_LAYER = 0
-from sglang.srt.afd.read_point import is_full_attention
+from sglang.srt.afd.layer_kinds import is_full_attention
 from sglang.srt.afd.split_attention import PerPassIndex, join, split_refusal, sweep
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu

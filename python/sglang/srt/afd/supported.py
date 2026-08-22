@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 
-from sglang.srt.afd.read_point import is_full_attention
+from sglang.srt.afd.layer_kinds import is_full_attention
 
 logger = logging.getLogger(__name__)
 

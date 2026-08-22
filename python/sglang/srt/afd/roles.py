@@ -771,7 +771,7 @@ def make_span_runner(model, *, device):
     # to size and must not be refused for a limit it does not need
     max_requests = _span_slots()
     from sglang.srt.afd.linear_state import LinearStates
-    from sglang.srt.afd.read_point import layer_types_of
+    from sglang.srt.afd.layer_kinds import layer_types_of
     from sglang.srt.afd.span import SpanRunner, group_layers
 
     config = model.config
@@ -805,7 +805,7 @@ def make_sweep_service(model, *, enabled, max_context: int, device):
     if not enabled:
         return None
     from sglang.srt.afd.pool_attention import KVHolder, SweepService
-    from sglang.srt.afd.read_point import layer_types_of
+    from sglang.srt.afd.layer_kinds import layer_types_of
 
     logger.info(
         "afd pool: holding the KV cache and the key/value projections, up to %s positions a "
@@ -837,7 +837,7 @@ def install_kv_on_pool(model, *, client, mode):
         return None
     if not mode:
         return None
-    from sglang.srt.afd.read_point import layer_types_of
+    from sglang.srt.afd.layer_kinds import layer_types_of
     from sglang.srt.afd.remote_attention import (
         install_kv_projection,
         install_remote_attention,
@@ -927,7 +927,7 @@ def install_span_routing(model, client: PoolClient, *, sweep_ahead,
     """
     from sglang.srt.afd.history_service import HistoryService
     from sglang.srt.afd.linear_history import HistoryCache
-    from sglang.srt.afd.read_point import layer_types_of
+    from sglang.srt.afd.layer_kinds import layer_types_of
     from sglang.srt.afd.span_routing import SpanClient, SpanRouting
 
     types = layer_types_of(model)

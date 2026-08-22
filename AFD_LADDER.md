@@ -25,11 +25,31 @@ so.
 Rung 4 is today's arrangement. Rungs 1 to 3 do not exist as separate settings: `--afd-span-cut` is
 all of them at once, which is why the failure has no smaller box to be in.
 
-## What has to be built
+## What has to be built, and how the rungs are selected
 
-Each rung needs a setting that turns on exactly one change. They are not independent knobs on a
-finished system -- rung 3 presupposes rung 2 -- so one ordinal flag, `--afd-cut-level {0,1,2,3,4}`,
-says how far up the ladder to go, and the code branches once per rung rather than once per feature.
+NOT by a level flag in the shared code. An ordinal `--afd-cut-level {0..4}` was the first design
+here and it is the wrong one: it puts knowledge of the derived arm inside the standard path, so
+every rung's branch lives in the file that is supposed to be the arm-independent half. Standard
+AFD must not know that a query shift exists.
+
+Each rung is a CLASS instead, and each derives from the one below it:
+
+    StandardPool                          rung 0, in afd/
+      ProjectionsOnPool(StandardPool)     rung 1
+        LinearOnPool(ProjectionsOnPool)   rung 2
+          GroupedSpan(LinearOnPool)       rung 3
+            ShiftedReadPoint(GroupedSpan) rung 4
+
+all but the first in the derived package. The choice happens once, at the composition root, by
+which class is constructed -- nothing below it branches. A rung is then not a configuration to be
+read but a type to be instantiated, and "which rung is running" is answerable by asking the object
+what it is rather than by reading a flag through six call sites.
+
+The repository's own style rule prefers composition to inheritance and forbids mixins. This chain
+is neither a mixin nor a grab bag: it is a linear specialisation where each rung genuinely IS the
+one below it plus one change, which is the shape the ladder has by construction. Where a rung
+needs to vary a step rather than extend it, the step is a collaborator held by the class and
+swapped, not an overridden method.
 
 ## The split, by what a module actually says rather than by memory
 
