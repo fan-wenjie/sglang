@@ -164,6 +164,38 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _moved_boundary(full: list[int], depth: int) -> list[int]:
+    """The CONTROL, and nothing else: shift every group boundary by SGLANG_AFD_SPAN_OFFSET layers.
+
+    The group cut agrees with the colocated model token for token, and that agreement means less
+    than it looks like without an answer to "what would a WRONG grouping have looked like?" -- the
+    same argument the attention split's boundary cases make, where the honest partition sits at
+    6e-16 and either off-by-one at 2e-1 and the two cannot be confused.
+
+    A shifted boundary is a real arrangement in the sense that it runs: every layer is still in
+    exactly one span, the spans still tile the stack, and the pool still answers. What changes is
+    WHICH layer's output projection heads a span, so the host's attention is fed a residual stream
+    that has been through one layer too many or too few. Nothing raises, and the text stays
+    fluent -- which is exactly why the control is worth taking.
+
+    Unset is the arrangement. Any other value is a deliberately wrong cut and must never be quoted
+    as a measurement of this one; it is logged loudly for that reason.
+    """
+    import os
+
+    offset = int(os.environ.get("SGLANG_AFD_SPAN_OFFSET", "0"))
+    if not offset:
+        return full
+    moved = sorted({min(max(i + offset, 1), depth - 1) for i in full})
+    logger.warning(
+        "afd span: THE BOUNDARY IS DELIBERATELY WRONG. SGLANG_AFD_SPAN_OFFSET=%s moves every "
+        "group boundary by %s layer(s): %s -> %s. This is the control for the group cut's own "
+        "agreement and it is not the arrangement -- no number taken under it describes this cut.",
+        offset, offset, full[:4], moved[:4],
+    )
+    return moved
+
+
 def group_layers(layer_types: list[str]) -> list[tuple[int, ...]]:
     """The spans, as layer indices, read off the model's own layer list.
 
@@ -176,6 +208,7 @@ def group_layers(layer_types: list[str]) -> list[tuple[int, ...]]:
     caller can tell the headless one from the rest without re-deriving the layout.
     """
     full = [i for i, kind in enumerate(layer_types) if kind == "full_attention"]
+    full = _moved_boundary(full, len(layer_types))
     if not full:
         raise ValueError(
             "no full-attention layer in this stack, so there is no place to cut a span. The group "
