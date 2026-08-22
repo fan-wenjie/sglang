@@ -125,6 +125,27 @@ What the derived arm adds on top is only the read point -- the query projected f
 stack -- and whatever the ladder proves it cannot do without. Every rung that turns out to be
 AFD's rather than the arm's moves down into `afd`, and the subclass shrinks by that much.
 
+## Standard AFD has no overlap of its own, so it needs two batches staggered
+
+Within one request the two machines cannot work at once. The host's key and value are projected
+from `x_l`, and `x_l` is what the pool returns -- so the host waits for the pool, then the pool
+waits for the host, and each is idle for the other's turn. That is what the shifted read point
+buys back, and it is exactly what standard AFD must not depend on.
+
+The arrangement that fills both machines without touching the model is two batches, staggered:
+while the pool runs batch A's feed-forward, the host runs batch B's attention, and the next step
+they swap. Neither batch is overlapped with itself, so nothing about the model changes and no
+query moves -- it is a scheduling property, and it belongs to AFD.
+
+Note what it costs and what it does not. It doubles the requests in flight, so it doubles the KV
+cache the host must hold at a given depth, which is the resource the whole arrangement is short of
+-- that trade has to be measured, not assumed. It does NOT need the read point, and a measurement
+of it must not be reported beside a shifted-read measurement as though they were the same
+arrangement.
+
+Last of the work, after the ladder has said what breaks the derived arm. Recorded now so that when
+the pipeline turns out to be half idle, the reason is already written down.
+
 ## Order of work
 
 0. **Find the fault.** The ladder is how, and it is the reason the branches are laid out this way:
