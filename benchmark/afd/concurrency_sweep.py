@@ -14,10 +14,16 @@ the gap to colocated, two batch overlap is worth much less than the 1.81x the si
 arithmetic suggests.
 """
 import json
+import os
 import sys
 import time
 
-from sglang.srt.afd.under_test import model_path
+# `under_test` moved out of the runtime package and into this directory when the arrangement's
+# code was split for merging; five benchmarks kept importing it from where it used to be and none
+# of them had been run since. A benchmark that cannot import is at least loud -- the dangerous
+# version of this is the one that imports something ELSE of the same name.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from under_test import model_path
 
 # named once, in the environment, and checked for quantisation before the weights
 # load. It was written down separately in eight tools, which is eight chances to
