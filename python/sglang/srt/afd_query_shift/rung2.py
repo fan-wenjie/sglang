@@ -67,7 +67,11 @@ class LinearOnPool:
         changed.
         """
         kinds = layer_types_of(self.model)
-        limit = int(os.environ.get("SGLANG_AFD_RUNG2_LAYERS", "0")) or None
+        # unset means all of them, which is the arrangement. A NUMBER is a bisect, and 0 is a
+        # real value in it: zero linear layers moved is rung 0 reached through this installer, the
+        # control that says whether a difference belongs to the move or to everything around it.
+        asked = os.environ.get("SGLANG_AFD_RUNG2_LAYERS")
+        limit = None if asked in (None, "") else int(asked)
         moved = 0
         for index, kind in enumerate(kinds):
             if kind == "full_attention":
