@@ -29,6 +29,37 @@ import torch
 from sglang.srt.afd.protocol import OP_RELEASE
 
 
+def _tell_the_pool(client, rid: int) -> None:
+    """Send the release, and survive a pool that was restarted since the last call.
+
+    Every other call on this path degrades when the pool goes away -- the feed-forward falls back
+    to running locally and the router counts it -- and this one did not: a `PoolClosed` raised
+    inside a forward reaches sglang as an exception in the model, and the scheduler dies. A pool
+    restart then takes the host with it, which is exactly the failure `test_afd_pool_failure.py`
+    exists to say cannot happen, reached by a path that file does not cover.
+
+    One reconnect, then a refusal that says what it is. NOT a silent skip: the release is what
+    stops the next request inheriting a stale recurrent state, so a host that could not deliver it
+    must fail loudly rather than serve fluent text conditioned on somebody else's prompt.
+    """
+    from sglang.srt.afd.pool_client import PoolClosed
+
+    try:
+        handle = client.issue_frame(rid, 0, (torch.zeros(1, 1),), OP_RELEASE)
+        client.collect_frame(handle, "cpu")
+        return
+    except PoolClosed:
+        pass
+    if not client.reconnect():
+        raise RuntimeError(
+            f"could not tell the pool to release request {rid}: it is unreachable. Serving on "
+            f"without the release would hand this request whatever the last occupant of its slot "
+            f"left behind, which stays fluent and reports nothing."
+        )
+    handle = client.issue_frame(rid, 0, (torch.zeros(1, 1),), OP_RELEASE)
+    client.collect_frame(handle, "cpu")
+
+
 def forget_starting_requests(forward_batch, *, history, client) -> list[int]:
     """Release every row id that BEGINS a request. Returns the ids released.
 
@@ -49,7 +80,6 @@ def forget_starting_requests(forward_batch, *, history, client) -> list[int]:
         rid = int(rid)
         if history is not None:
             history.forget(rid)
-        handle = client.issue_frame(rid, 0, (torch.zeros(1, 1),), OP_RELEASE)
-        client.collect_frame(handle, "cpu")
+        _tell_the_pool(client, rid)
         released.append(rid)
     return released
