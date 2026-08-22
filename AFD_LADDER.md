@@ -146,6 +146,31 @@ arrangement.
 Last of the work, after the ladder has said what breaks the derived arm. Recorded now so that when
 the pipeline turns out to be half idle, the reason is already written down.
 
+## The verdict, and the gate it has to pass first
+
+`benchmark/afd/rung_verdict.py` reports both halves: whether the tokens are identical, and how far
+the final hidden state drifted, per token, as a relative difference and a cosine. It refuses to
+report anything until the logs show the arrangement INSTALLED -- the host's "the group cut is
+installed", the pool's "span(s) a decode step".
+
+That gate is not ceremony. The same script, run against an arrangement whose arm had registered
+but not installed, reported:
+
+    tokens identical, relative 0.005 to 0.0125, cosine 0.99999
+
+which reads as "the cut works". It was standard AFD. With the arm genuinely installed, the same
+prompt gives:
+
+    tokens part at token 0, relative 1.17, cosine 0.217
+
+Two orders of magnitude apart, and both runs logged "the 'query-shift' arm is available". A
+verdict that cannot say which arrangement produced it is worse than no verdict, so the script
+refuses rather than warns.
+
+rung 4's baseline is therefore: parts at the first token, cosine 0.22 to 0.67 across the
+generation. Every rung below it is measured the same way and the first one that stops matching is
+the answer.
+
 ## Order of work
 
 0. **Find the fault.** The ladder is how, and it is the reason the branches are laid out this way:

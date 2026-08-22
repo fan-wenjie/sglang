@@ -77,14 +77,55 @@ def compare(a: list[float], b: list[float]) -> tuple[float, float]:
     return diff / (nb + 1e-9), dot / (na * nb + 1e-9)
 
 
+INSTALLED = {
+    "host": "the group cut is installed",
+    "pool": "span(s) a decode step",
+}
+
+
+def confirm_installed(log: str, side: str, via: str | None) -> None:
+    """Refuse to report a verdict until the log says the arm was INSTALLED.
+
+    "The arm is available" is a REGISTRATION message and it is not the same thing. sglang spawns
+    the scheduler, so a package imported by the argument check registers in the parent and leaves
+    the child's registry empty: both ends logged the arm as available, neither installed it, the
+    standard arrangement served, and the verdict came back token-identical with a hidden-state
+    drift of one percent. That reads as "the cut works" and it means "the cut did not run".
+
+    So the number is gated on the install line rather than on the availability line, and a missing
+    log is a refusal rather than a warning. A verdict that cannot say which arrangement produced
+    it is worse than no verdict.
+    """
+    needle = INSTALLED[side]
+    cmd = ["grep", "-cF", needle, log]
+    argv = (via.split() + [" ".join(f"'{c}'" if " " in c else c for c in cmd)]) if via else cmd
+    got = subprocess.run(argv, capture_output=True, text=True).stdout.strip()
+    if got.isdigit() and int(got) > 0:
+        print(f"  {side} log confirms the arrangement is installed ({needle!r} x{got})")
+        return
+    raise SystemExit(
+        f"REFUSED: {log} does not contain {needle!r}, so the {side} is not running the "
+        f"arrangement this verdict would be attributed to. Check for 'arm is available' -- that "
+        f"is registration, not installation, and it is what fooled this once already."
+    )
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--colocated", required=True)
     p.add_argument("--rung", required=True)
+    p.add_argument("--host-log", default=None, help="the rung host's log; the verdict is refused "
+                                                    "unless it shows the arrangement installed")
+    p.add_argument("--pool-log", default=None)
     p.add_argument("--via", default=None, help="a command that runs curl where the rung lives")
     p.add_argument("--tokens", type=int, default=8)
     p.add_argument("--prompt", action="append", default=None)
     args = p.parse_args()
+
+    if args.host_log:
+        confirm_installed(args.host_log, "host", args.via)
+    if args.pool_log:
+        confirm_installed(args.pool_log, "pool", None)
 
     prompts = args.prompt or [
         "The capital of France is",
