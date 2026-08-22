@@ -8,6 +8,38 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-22, the pool's linear attention is arithmetically correct, and the axis that said otherwise
+
+Fed the model's own input and seeded from the model's own state, `_linear_attention` agrees with
+`Qwen3_5GatedDeltaNet.forward` head by head:
+
+    layer 0   48/48 heads within 2%, worst h40 = 0.007
+    layer 1   48/48 heads within 2%, worst h27 = 0.016
+    layer 2   48/48 heads within 2%, worst h2  = 0.019
+
+Including layer 1, the layer whose deployed output has been 6.3% high throughout. So the
+reimplementation is right and what feeds it in the arrangement is not.
+
+The first run of this comparison said 0/48 heads within 2% and an elementwise median of 1.06 --
+100% error on the input of a LINEAR projection whose output agreed to 0.5%. A linear map cannot do
+that, and the contradiction is what exposed the instrument rather than the code: the hook capturing
+the model's pre-projection value was registered permanently, and `compare` calls `span_of` twice --
+the second time on a shuffled input, for its control. The model's value was overwritten by the
+control's. Fixed by capturing once and removing the hook.
+
+That is the SIXTH time in this search that two correct measurements of different things were set
+side by side, and the second caught by an internal contradiction rather than by luck. The full
+list, kept because the pattern is the finding: a trace walking rows against a reference walking
+layers; a control reversing a filter on both sides at once; x+attn+mlp against x+attn; a whole row
+against a single head; a 1-row occasion against a 122-row one; and this.
+
+The two uses of `k` in the linear attention -- the query coefficient's `I - beta k k^T` and the
+state update's `k k^T` -- currently draw from ONE tensor, the current attention input after the
+convolution. Whether the intended arm reads them from two different points, the feed-forward's
+input vector and the attention's input vector, is a design question and not a defect: the standing
+constraint has been that only the query moves.
+
+
 ## 2026-08-22, the per-layer cut is token-identical to colocated, and the group cut is not
 
 The bisect that should have been run first. Same two processes, same weights, same prompts, the

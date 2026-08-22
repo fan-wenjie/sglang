@@ -362,6 +362,7 @@ def watch_linear_attention(model, runner) -> None:
     scratch = 10_000_019          # far from any real request id
 
     before = {}
+    grabbed = {}
 
     def snapshot(layer_id):
         """The model's own conv and recurrent state BEFORE it runs, one slot's worth.
@@ -389,6 +390,19 @@ def watch_linear_attention(model, runner) -> None:
                 index = int(backend.forward_metadata.mamba_cache_indices[0])
                 before[layer_id] = (cache.conv[0][index].clone(),
                                     cache.temporal[index].clone())
+                # ONCE, and then removed. Registered permanently, this hook kept firing -- and
+                # `compare` calls `span_of` twice, the second time on a SHUFFLED input for its
+                # control. So the model's value was overwritten by the control's, and the two
+                # "pre" tensors compared at 100% apart while the layer's outputs agreed to 0.5%.
+                # A linear projection cannot do that, and the contradiction is what gave it away.
+                attn_mod = getattr(_module, "out_proj", None)
+                if attn_mod is not None and ("pre", layer_id) not in before:
+                    def grab(_m, args, _lid=layer_id):
+                        if ("pre", _lid) in before:
+                            return
+                        before[("pre", _lid)] = args[0].detach()
+                        grabbed[_lid].remove()
+                    grabbed[layer_id] = attn_mod.register_forward_pre_hook(grab)
                 if layer_id < 2:
                     logger.info(
                         "afd colocated dtypes: layer %s -- ssm %s conv %s hidden %s",
@@ -476,7 +490,25 @@ def watch_linear_attention(model, runner) -> None:
                     ring[slot][..., 1:] = history[..., -(taps - 1):]
                     return runner._linear_attention(attn, [scratch], layer_id, x).float()
 
-                mine = span_of(hidden)
+                # `out_proj`'s INPUT is where the heads still exist: (rows, value heads x head
+                # dim). Its OUTPUT is hidden_size wide and has no head structure at all -- the
+                # first version of this decomposition reshaped the output to (-1, 48, 106) and the
+                # pool refused to start, which is the shape saying so.
+                # a temporary PRE-HOOK, not a reassignment: `attn.out_proj` is an nn.Module and
+                # binding a plain function to that name raises "cannot assign ... as child
+                # module". The model's own call has already returned by the time this runs -- this
+                # is a forward hook -- so the only `out_proj` call inside `span_of` is the span's.
+                caught = {}
+
+                def capture(_m, args):
+                    caught["pre"] = args[0].detach()
+
+                handle = attn.out_proj.register_forward_pre_hook(capture)
+                try:
+                    mine = span_of(hidden)
+                finally:
+                    handle.remove()
+                mine_pre = caught.get("pre")
                 theirs = output.float()
                 order = torch.randperm(hidden.shape[1], device=hidden.device)
                 shuffled = span_of(hidden[:, order])
@@ -485,6 +517,33 @@ def watch_linear_attention(model, runner) -> None:
                 return
             finally:
                 runner.release(scratch)
+
+            def per_head(a, b, heads):
+                """Where the difference lives, head by head.
+
+                The output is `heads` blocks of `head_v_dim` side by side. A reimplementation that
+                is merely imprecise is wrong a little everywhere; one that pairs a query with the
+                wrong key, or expands the key heads across the value heads in the wrong order, is
+                exactly right on some heads and exactly wrong on others. Norms cannot tell those
+                apart and this can.
+                """
+                a = a.reshape(-1, heads, a.shape[-1] // heads).float()
+                b = b.reshape(-1, heads, b.shape[-1] // heads).float()
+                err = (a - b).norm(dim=-1) / (b.norm(dim=-1) + 1e-9)
+                err = err[0]
+                good = int((err < 0.02).sum())
+                worst = torch.topk(err, min(4, err.numel()))
+                return (f"{good}/{heads} heads within 2%, worst "
+                        + " ".join(f"h{int(i)}={float(v):.3f}"
+                                   for v, i in zip(worst.values, worst.indices)))
+
+            def elementwise(a, b):
+                d = (a.reshape(-1) - b.reshape(-1)).abs()
+                scale = b.reshape(-1).abs() + 1e-6
+                r = d / scale
+                q = torch.quantile(r.float(), torch.tensor([0.5, 0.9, 0.99], device=r.device))
+                return (f"elementwise |d|/|b| median {float(q[0]):.4g} p90 {float(q[1]):.4g} "
+                        f"p99 {float(q[2]):.4g} max {float(r.max()):.4g}")
 
             def against(a, b):
                 a, b = a.reshape(-1), b.reshape(-1)
@@ -520,6 +579,14 @@ def watch_linear_attention(model, runner) -> None:
                 return (f"ratio median {mid:+.4f} iqr [{lo:+.4f}, {hi:+.4f}] "
                         f"spread {spread:.3f} over {int(keep.sum())} channels")
 
+            heads = attn.num_v_heads // attn.attn_tp_size
+            theirs_pre = before.get(("pre", layer_id))
+            if mine_pre is not None and theirs_pre is not None:
+                logger.info("afd linear split: layer %s -- %s | %s", layer_id,
+                            per_head(mine_pre, theirs_pre, heads),
+                            elementwise(mine_pre, theirs_pre))
+            logger.info("afd linear whole: layer %s -- %s",
+                        layer_id, elementwise(mine, theirs))
             logger.info(
                 "afd linear: layer %s call %s -- span against the model %s | control %s | state "
                 "|%.5g| conv |%.5g| | %s",
