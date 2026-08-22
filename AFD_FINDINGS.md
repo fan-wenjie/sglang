@@ -1966,3 +1966,40 @@ Two things this does NOT do, stated because both are easy to assume:
 A correction on the way: the first reading said 45.36 GiB released, on a host whose whole
 checkpoint is 19.18 GB. The counter moved every parameter and counted every parameter, and the
 feed-forward was already on meta from the loader -- counted twice. Numbers like that get quoted.
+
+
+## 2026-08-22, #65: the pool's ceiling is its own serving loop, and it FALLS under concurrency
+
+Connections against the deployed pool, 4 tokens a call, 25 rounds:
+
+    connections   median ms   calls/s
+        1            0.53       931
+        2            0.91      1403     <- the peak
+        4            2.00      1241
+        8            6.06       844
+       16           12.14       844
+
+GPU utilisation at the end of the sweep: 0%. The pool is nowhere near compute or bandwidth bound
+at this frame width -- it is bound by its own per-call path, and it does not merely plateau, it
+DEGRADES: sixteen connections get 60% of what two get, and the median goes 23x. That is the shape
+of lock and interpreter contention, not of saturation.
+
+Against what the sixteen-small-cards design needs: each 4090D-class host doing 512K context runs
+~74 decode steps/s (13.5 GB of KV at ~1 TB/s), and each step needs 64 feed-forward calls. Even
+with a node-level dispatcher merging all sixteen hosts' rows into one call per layer -- the best
+case, and the reason #68 exists -- that is ~4700 calls/s from one node against a measured ceiling
+of 1400. **3.4x short, and adding connections makes it worse rather than better.**
+
+So the critical path for that design is the pool's per-call cost, not its bandwidth and not the
+interconnect. Three candidates, in the order their evidence points:
+
+    the serving loop      Python, per-frame, one thread a connection. 0% GPU at 844 calls/s says
+                          the work is not where the cost is
+    CUDA graphs (#44)     7.3 ms of launch overhead was measured once; at 0.5 ms a call that is
+                          not the whole story, but it is on the same path
+    frame width           at 512 tokens the pool DOES saturate (85641 tokens/s). The narrow-frame
+                          regime is the one that is broken, and decode is exactly that regime
+
+What this settles for #68: a per-node dispatcher is not an optimisation, it is a requirement. Not
+because it batches -- co-batching was measured to be a pessimisation -- but because the pool gets
+SLOWER with connection count, so sixteen hosts must reach it as one connection, not sixteen.
