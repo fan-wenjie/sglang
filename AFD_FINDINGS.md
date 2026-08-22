@@ -8,6 +8,33 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-22, the worst heads are one key head's group, and it is not accumulation
+
+A prefill scan walks a chunk token by token, so a head whose decay is closest to 1 carries its
+rounding furthest -- "the worst heads are the slowest-decaying heads" would be a completely
+different finding from "one key head's channels are wrong". The per-head decay separates them:
+
+    layer 0   worst h30 h31 h32   their alpha 0.173, 0.129, 0.008   rank corr(err, alpha) -0.269
+    layer 1   worst h30 h31 h32               0.715, 0.775, 0.979                        +0.126
+    layer 2   worst h24 h39 h11               0.750, 0.606, 0.749                        +0.276
+    layer 4   worst h17 h16 h15               0.748, 0.935, 0.647                        +0.253
+
+The correlation is weak and changes sign, and layer 0's three worst heads are among the FASTEST
+decaying of the 48 -- alpha 0.008 accumulates nothing at all. Accumulation is out.
+
+What is left is a structure, and it is the same structure three times:
+
+    layer 0   h30, h31, h32   ->  30//3 = 31//3 = 32//3 = 10   key head 10
+    layer 1   h30, h31, h32   ->                               key head 10
+    layer 4   h15, h16, h17   ->  15//3 = 16//3 = 17//3 =  5   key head  5   (error 0.16)
+
+48 value heads over 16 key heads, three value heads to a key head, and the worst three are a
+CONTIGUOUS TRIPLE every time -- exactly one key head's group. Which key head varies by layer. So
+whatever is wrong is per-key-head: the q and k channel slicing out of the convolved packed
+projection, or the key-head-to-value-head expansion. And it is prefill-only: the same comparison
+on a decode row gives 48/48 heads within 2% at every layer.
+
+
 ## 2026-08-22, the prefill path compared at last, and one key head's group is the worst twice
 
 The comparison's gate was single-row, so everything it had ever said covered the DECODE path. The

@@ -516,6 +516,7 @@ def watch_linear_attention(model, runner) -> None:
                 finally:
                     handle.remove()
                 mine_pre = caught.get("pre")
+                caught["alpha"] = getattr(local, "last_alpha", None)
                 theirs = output.float()
                 order = torch.randperm(hidden.shape[1], device=hidden.device)
                 shuffled = span_of(hidden[:, order])
@@ -540,9 +541,25 @@ def watch_linear_attention(model, runner) -> None:
                 err = err[0]
                 good = int((err < 0.02).sum())
                 worst = torch.topk(err, min(4, err.numel()))
-                return (f"{good}/{heads} heads within 2%, worst "
+                line = (f"{good}/{heads} heads within 2%, worst "
                         + " ".join(f"h{int(i)}={float(v):.3f}"
                                    for v, i in zip(worst.values, worst.indices)))
+                # Is the ordering a STRUCTURE or an ACCUMULATION? A prefill scan walks the chunk
+                # token by token, so a head whose decay is closest to 1 carries its rounding
+                # furthest -- and "the worst heads are the slowest-decaying heads" is a completely
+                # different finding from "one key head's channels are mis-sliced". The per-head
+                # decay and its rank correlation with the error separate them, and neither can be
+                # read off the error alone.
+                decay = caught.get("alpha")
+                if decay is not None and decay.numel() == heads:
+                    a = decay.float()
+                    ranks = lambda t: t.argsort().argsort().float()
+                    rho = float(torch.corrcoef(torch.stack([ranks(err), ranks(a)]))[0, 1])
+                    line += (f" | alpha of those: "
+                             + " ".join(f"{float(a[int(i)]):.4f}" for i in worst.indices)
+                             + f" | alpha mean {float(a.mean()):.4f} max {float(a.max()):.4f}"
+                             + f" | rank corr(err, alpha) {rho:+.3f}")
+                return line
 
             def elementwise(a, b):
                 d = (a.reshape(-1) - b.reshape(-1)).abs()

@@ -810,6 +810,9 @@ class SpanRunner:
         v = mixed[:, 2 * width :].reshape(rows, attn.num_v_heads // attn.attn_tp_size,
                                           attn.head_v_dim)
         alpha, beta = gates(a, b, attn.A_log, attn.dt_bias)
+        # published for the comparison in roles.py, which needs the per-head decay to tell a
+        # mis-sliced key head from a head that simply accumulates its rounding furthest
+        self._local.last_alpha = alpha[0].detach()
         q, k = normalise(q, k, scale=attn.head_k_dim ** -0.5)
         heads = attn.num_v_heads // attn.attn_tp_size
         q, k = expand_to_value_heads(q, heads), expand_to_value_heads(k, heads)
