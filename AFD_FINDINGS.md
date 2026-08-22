@@ -8,6 +8,28 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-22, the prefill path compared at last, and one key head's group is the worst twice
+
+The comparison's gate was single-row, so everything it had ever said covered the DECODE path. The
+gate is lifted and the deployment's own case -- a 122-row prefill through `prefill_convolve` and
+OP_STATE_SCAN -- is inside it now:
+
+                        decode                 prefill
+    layer 0   48/48 within 2%          42/48, worst h30 .057 h31 .053 h32 .051
+    layer 1   48/48 within 2%          45/48, worst h30 .034 h32 .034 h31 .033
+    layer 2   48/48 within 2%          48/48, worst h24 .010
+
+Heads 30, 31 and 32 are the three worst at TWO different layers. This model has 48 value heads
+over 16 key heads, three value heads to a key head, and 30 // 3 = 31 // 3 = 32 // 3 = 10 -- they
+are exactly the three value heads of KEY HEAD 10. One key head's group being the worst at two
+independent layers is a structure, not scatter.
+
+Read the per-head norm ratio and not the elementwise median on this table. The elementwise figure
+is |d| / (|b| + 1e-6) and its median sits at 0.47 to 0.86 while every head's norm agrees to a few
+percent -- which happens when the differences live in elements whose reference is near zero, and
+says nothing about the ones that carry the signal.
+
+
 ## 2026-08-22, the pool's linear attention is arithmetically correct, and the axis that said otherwise
 
 Fed the model's own input and seeded from the model's own state, `_linear_attention` agrees with

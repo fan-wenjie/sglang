@@ -377,7 +377,7 @@ def watch_linear_attention(model, runner) -> None:
             if seen.get(layer_id, 0) >= limit:
                 return
             hidden = args[0]
-            if hidden.dim() != 2 or hidden.shape[0] != 1:
+            if hidden.dim() != 2:
                 return
             try:
                 # the LINEAR backend, not the hybrid wrapper around it. `get_attn_backend()`
