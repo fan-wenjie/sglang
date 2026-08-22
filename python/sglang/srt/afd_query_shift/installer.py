@@ -215,6 +215,32 @@ class QueryShiftArm:
         check_arm_args(server_args)
 
     @staticmethod
+    def absent_classes(server_args) -> tuple:
+        """The linear attention, built with no storage at all, under the group cut.
+
+        Every linear-attention layer is a PASSENGER of a span: the pool runs the whole layer and
+        the host's forward is a pass-through. So `Qwen3_5GatedDeltaNet` is a class this host never
+        multiplies by anything, all of it, which is exactly what the fifth entry point requires --
+        the loader wraps a class rather than its instances, so a class with even one instance the
+        host still uses cannot be named.
+
+        The attention projections cannot come this way and are released after routing instead:
+        they are QKVParallelLinear and RowParallelLinear, shared with the vision tower and with
+        every other projection in the model. This one is not shared with anything.
+
+        Naming it here rather than releasing it later is worth the separate mechanism because it
+        moves the memory from 'taken and given back' to 'never taken', and the construction peak
+        is what fails on a card smaller than the checkpoint.
+        """
+        if not server_args.afd_span_cut:
+            return ()
+        try:
+            from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+        except ImportError:                            # a build without this family
+            return ()
+        return (Qwen3_5GatedDeltaNet,)
+
+    @staticmethod
     def transform_model(*, model, model_config, server_args):
         """Move the read point on the loaded model. None when this arm was not asked for.
 

@@ -131,6 +131,37 @@ def install_transforms(*, model, model_config, server_args):
     return installed[0][1] if installed else None
 
 
+def absent_classes(server_args) -> tuple:
+    """Module classes an arm computes remotely, to be built with no storage at all.
+
+    The fifth entry point, and the one that reaches furthest into the shared half: it decides what
+    the LOADER allocates, before any model exists. `absent_ffn` already does this for the
+    feed-forward -- the parameters are constructed on the meta device, so the memory is never
+    taken rather than taken and released -- and that distinction is the whole point. Releasing
+    afterwards recovers steady-state memory and does nothing about the peak, and the peak is what
+    fails on a card smaller than the checkpoint.
+
+    An arm may only name a class whose EVERY instance it computes remotely. A class shared with
+    modules the host still uses cannot be named here: the loader wraps the class, not the
+    instances, so naming one would strip storage from things nobody routed and the symptom is a
+    meta tensor reaching a kernel -- a message about devices, from somewhere that names neither
+    the arm nor the module. What cannot be named this way is released after the routing instead,
+    which is a different mechanism with a different cost.
+
+    Returns an empty tuple when no arm is installed, which is the ordinary case.
+    """
+    found: list = []
+    for name, factory in sorted(_ARMS.items()):
+        declare = getattr(factory, "absent_classes", None)
+        if declare is None:
+            continue
+        classes = tuple(declare(server_args))
+        if classes:
+            logger.info("afd: the %r arm builds %s class(es) with no storage", name, len(classes))
+        found.extend(classes)
+    return tuple(found)
+
+
 def sweep_schedule(transform):
     """The sweep schedule an arm's transform produced, or None.
 

@@ -187,7 +187,7 @@ def feed_forward_build_context():
     logger.info("afd loader: feed-forward built with storage=%s (%s)", not wanted, why)
     if not wanted:
         return contextlib.nullcontext()
-    classes = _mlp_classes()
+    classes = _mlp_classes() + list(_arm_classes())
     if not classes:
         logger.warning(
             "afd host: --afd-mode=host asked to skip the feed-forward's weights and no MLP class "
@@ -197,6 +197,24 @@ def feed_forward_build_context():
         return contextlib.nullcontext()
     _LAST_CONTEXT = BuildFeedForwardOnMeta(classes)
     return _LAST_CONTEXT
+
+
+def _arm_classes():
+    """What the installed arms compute remotely. Empty when none is installed.
+
+    Asked here rather than listed here: this file must not know that any arm exists, and the
+    registry is what keeps that true. `load()` first, because the loader runs in a process sglang
+    spawned and a registry populated in the parent is empty in the child.
+    """
+    from sglang.srt.afd.arms import absent_classes, load
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        load()
+        return absent_classes(get_global_server_args())
+    except Exception as e:                             # noqa: BLE001 -- reported, never swallowed
+        logger.warning("afd loader: could not ask the arms what to skip: %r", e)
+        return ()
 
 
 def _mlp_classes():

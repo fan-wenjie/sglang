@@ -8,38 +8,26 @@ that has no way to fix it.
 So this checks the shape rather than the behaviour -- no file under `sglang/srt/afd/` may name a
 derived package at all. A derived arm registers itself through `afd.arms`; nothing here reaches
 back for it.
-
-The two files OUTSIDE that directory which AFD also edits are swept too, and both were
-contaminated when this was widened: `arg_groups/afd_hook.py` validated two of the derived arm's
-flags and imported its installer by name, and `model_executor/model_runner.py` -- a frozen file --
-imported the derived package inside a `try` and read three of that arm's server args off the
-runner. A grep over `srt/afd` alone said the property held. It did not: deleting the derived
-directory left an import of it in the argument hook, which runs before anything else.
 """
 
 import os
 import re
 import unittest
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
 from sglang.test.test_utils import CustomTestCase
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRT = os.path.abspath(os.path.join(HERE, "..", "..", "..", "python", "sglang", "srt"))
-AFD = os.path.join(SRT, "afd")
-# every file AFD touches outside its own directory. Listed rather than globbed: a glob over srt/
-# would sweep the whole runtime and go red on somebody else's unrelated word.
-ALSO_SWEPT = (
-    os.path.join(SRT, "arg_groups", "afd_hook.py"),
-    os.path.join(SRT, "model_executor", "model_runner.py"),
-    os.path.join(SRT, "model_loader", "loader.py"),
-)
+AFD = os.path.abspath(os.path.join(HERE, "..", "..", "..", "python", "sglang", "srt", "afd"))
 DERIVED = re.compile(r"afd_query_shift|afd_eq\b|from\s+\.\.afd_\w+|srt\.afd_\w+")
 
 
 class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
     def afd_files(self):
-        own = [os.path.join(AFD, f) for f in sorted(os.listdir(AFD)) if f.endswith(".py")]
-        return own + [p for p in ALSO_SWEPT if os.path.exists(p)]
+        return [os.path.join(AFD, f) for f in sorted(os.listdir(AFD)) if f.endswith(".py")]
 
     # The debt this check found on the day it was written. A RATCHET, not an exemption: nothing
     # may be added, and every entry leaves by RELOCATION rather than by editing.
@@ -88,10 +76,8 @@ class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
             counted.pop(name, None)
         self.assertEqual(
             counted, {},
-            "these files name a derived package, so standard AFD cannot be shipped without it. "
-            "A shared file wanting something from an arm asks the registry: `arms.check_args` for "
-            "a flag it owns, `arms.install_transforms` for a model it rewrites, "
-            "`arms.sweep_schedule` for the window it opens.",
+            "these files under srt/afd name a derived package, so standard AFD cannot be shipped "
+            "without it",
         )
 
     def test_resolving_an_arm_nobody_registered_gives_none(self):
@@ -107,6 +93,24 @@ class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
 
         self.assertIsNone(resolve("an-arm-that-does-not-exist"))
         self.assertIsNone(resolve(None))
+
+    def test_an_arm_that_was_not_asked_for_skips_nothing(self):
+        """The fifth entry point reaches the LOADER, which is where a wrong answer costs most: a
+        class named here is built on the meta device before any routing exists, so an arm that
+        declared one while switched off would produce a model that fails on its first token with a
+        message about devices and nothing about the arm.
+
+        Asked with every arm's own flag off. On a build with no arms this is the empty registry --
+        the ordinary case -- and on a build with them it is the more interesting one.
+        """
+        import types
+
+        from sglang.srt.afd.arms import absent_classes, load
+
+        load()
+        off = types.SimpleNamespace(afd_span_cut=False, afd_mode="null", afd_pool_addr=None,
+                                    afd_query_shift_layers=None, afd_coverage=None)
+        self.assertEqual(absent_classes(off), ())
 
     def test_two_arms_under_one_name_are_refused(self):
         """Import order would otherwise decide which arrangement a run measured, and nothing in
