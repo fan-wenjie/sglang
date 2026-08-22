@@ -39,6 +39,7 @@ from sglang.srt.afd.protocol import (
     OP_HELLO,
     OP_LINEAR,
     OP_SWEEP_Q,
+    OP_LAYER,
     OP_SPAN,
     OP_SPAN_ENTER,
     OP_SPAN_EXIT,
@@ -419,9 +420,42 @@ class Departure(threading.Thread):
                 f"departure serves one job; these callers asked for different ones and answering "
                 f"them from one batch would give each the other's arithmetic."
             )
+        if ops == {OP_LAYER}:
+            return self._depart_layer(layer, riding)
         if ops <= SPAN_OPS:
             return self._depart_span(layer, ops.pop(), riding)
         return self._depart_feed_forward(layer, riding)
+
+    def _depart_layer(self, layer: int, riding) -> None:
+        """One linear-attention layer for everybody who boarded, and nothing else.
+
+        The residual stays on the caller: this returns the layer's attention output alone, so both
+        norms and the feed-forward happen there. That is what makes it need no per-request state
+        here -- the recurrent state is read back across the wire, the same callback a span uses,
+        and this side keeps nothing between one request's calls.
+
+        The arithmetic is `SpanRunner._linear_attention`, unchanged and not reimplemented. A second
+        implementation of a recurrence that took days to verify once would be a second thing to
+        verify, and the only difference here is how many layers ride at a time.
+        """
+        if self.span is None:
+            raise ConnectionError(
+                "a LAYER frame reached a pool with no linear-attention runner. The caller moves "
+                "its linear layers here and this pool was not started to hold their weights."
+            )
+        rows = [f.tensor.shape[0] for f, _ in riding]
+        joined = riding[0][0].tensor if len(riding) == 1 else torch.cat(
+            [f.tensor for f, _ in riding], dim=0)
+        ids = []
+        for (frame, _), n in zip(riding, rows):
+            ids.extend([frame.request_id] * n)
+        attn = self.span.model.model.layers[layer].linear_attn
+        self._install_history_calls(riding, rows)
+        out = self.span._linear_attention(attn, ids, layer, joined.to(self.device))
+        offset = 0
+        for (frame, sock), n in zip(riding, rows):
+            send_frame(sock, Frame(frame.request_id, layer, (out[offset:offset + n],), OP_LAYER))
+            offset += n
 
     def _depart_span(self, group: int, op: int, riding) -> None:
         """One bus: a whole group of layers for everybody who boarded before it left.
