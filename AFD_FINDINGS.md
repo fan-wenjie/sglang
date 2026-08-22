@@ -1908,6 +1908,22 @@ weight memory and then spends part of the gain on a smaller working budget -- an
 comparison between the two sides is also a comparison between a 3-request host and an 8-request
 one, and must say so.
 
-What this does NOT measure: the PER-LAYER cut's host, which keeps its attention projections and is
-therefore larger than the row above. Same method, one run, and it belongs beside this table before
-the per-layer arrangement is quoted on memory at all.
+### The per-layer cut's host, measured the same way: 19.18 GB. IDENTICAL.
+
+    host, GROUP cut         19.18 GB      (attention projections computed on the pool)
+    host, PER-LAYER cut     19.18 GB      (attention projections computed here)
+
+The prediction above was wrong and the reason is worth more than the prediction. The group cut
+moves where the projections are COMPUTED; it does not change what the host ALLOCATES. The loader
+makes exactly one thing absent -- "afd loader: feed-forward built with storage=False" -- so under
+the group cut the host holds attention projection weights it never multiplies by anything.
+
+That is an unclaimed reduction sitting in plain sight, and it is the only remaining route to the
+small-card claim now that "move the projections too" turns out to change no memory at all: make
+them absent in the loader as well, on a host that has a pool to compute them. `absent_ffn.py`
+already does this for one weight class and nothing else uses it.
+
+(The cache rows differ between the two runs -- mamba 3.52 GB against 2.86 GB, KV 4.12 against 3.34,
+max_running_requests 4 against 3 -- because the group-cut host was launched with
+--enable-return-hidden-states and this one was not. Those rows are not comparable across the two
+runs; the weight row is, because it is decided by the loader alone.)
