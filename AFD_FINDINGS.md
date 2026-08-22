@@ -2265,3 +2265,41 @@ The arithmetic that "confirmed" the read was fitted to the number it was explain
 bandwidth nobody had measured on this card. The project's own note says the bandwidth ceiling here
 has been wrong three times, always low, and always in the direction that makes a reading look
 explained. Four.
+
+
+## 2026-08-22, #60: the shift's quality cost, re-measured -- and a regression the re-run caught
+
+Re-running `quality.py` at shift 1 was meant to confirm a number taken on 2026-08-18. The first
+attempt reported the shifted arm's bits per byte as EXACTLY the unshifted arm's:
+
+    stock     bpb 0.713010
+    shifted   bpb 0.713010     <- identical to six figures
+
+An arm that is not installed is indistinguishable from an arm that costs nothing, and this is what
+that looks like. The cause was my own refactor: `arms.install_transforms` iterates the registry
+without calling `load()` first, and the model runner lives in a scheduler process sglang SPAWNS --
+so an arm imported by the launcher registers in the parent and leaves the child's registry empty.
+That is the exact hazard `arms.load` was written for and documented against, in the one function
+added after it.
+
+The deployment was unaffected: its arm installs through `roles._arm_if_wanted`, which does call
+`load`, and at shift 0 the transform is a no-op anyway. What was affected is every colocated shift
+measurement taken since the refactor -- of which this was the first.
+
+With `load()` in place, the number reproduces exactly:
+
+    stock            shift 0             bpb 0.7130   ppl 8.701
+    shifted          shift 1             bpb 0.7321   ppl 9.221     +0.0191 bpb, +2.68%
+    shifted_split    shift 1, split on   bpb 0.7321   ppl 9.221     +0.0000
+
+Same to four decimals as the run four days earlier, which is what a re-measurement is for. Two
+readings worth keeping apart:
+
+    the read point costs 0.0191 bits per byte on this FP8 checkpoint, softmax coverage
+    the split costs nothing HERE, and that is not a claim about the split: bits per byte is a
+    prefill number and the partition is decode-only, so a zero says the wiring left prefill alone
+    rather than that the partition is free
+
+Still open for #60: MAUVE against a null, which is the generation-quality question and the one
+bits per byte cannot answer. A model can lose bits per byte and generate indistinguishably, or
+hold it and degenerate.

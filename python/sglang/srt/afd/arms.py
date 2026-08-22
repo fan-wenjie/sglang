@@ -114,6 +114,14 @@ def install_transforms(*, model, model_config, server_args):
     is refused: two rewritings of the same layers compose into an arrangement nobody described,
     and the run would be attributed to whichever was asked for.
     """
+    # HERE, in this process. The model runner lives in a scheduler sglang spawned, and an arm
+    # imported by the launcher registers in the parent and leaves this registry empty in the
+    # child -- which is what `load` exists for and what this function did not do. The symptom was
+    # a shift that quietly stopped installing: a quality re-run reported the shifted arm's bits
+    # per byte as exactly the unshifted arm's, 0.713010 against 0.713010, and an arm that is not
+    # installed is indistinguishable from an arm that costs nothing.
+    load()
+
     installed = []
     for name, factory in sorted(_ARMS.items()):
         transform = getattr(factory, "transform_model", None)
