@@ -13,7 +13,15 @@ different occasion, and every one of those was a per-layer probe. This one canno
 neither side is asked for anything but its answer.
 
     python benchmark/afd/rung_verdict.py --colocated 127.0.0.1:31000 --rung HOST:31001 \
-        [--via 'ssh ...'] [--prompt "..."]
+        [--via 'ssh ...'] [--prompt "..."] [--repeats 2]
+
+EVERY PROMPT IS ASKED TWICE, and that is not for averaging. A recurrent state has no length --
+whatever is in its buffer IS the history -- so a slot handed to a new request without being
+cleared gives it the previous request's memory, fluently. The FIRST request through a fresh pool
+is always right. This instrument reported "not identical, relative 1.28" for three arrangements in
+a row and none of those numbers was about the arrangement named; they were second requests through
+one uncleared slot. Each side is now compared against its own earlier answer, and a side that
+disagrees with itself voids the verdict rather than colouring it.
 
 Reported per prompt:
 
@@ -123,12 +131,18 @@ def main() -> int:
     p.add_argument("--via", default=None, help="a command that runs curl where the rung lives")
     p.add_argument("--tokens", type=int, default=8)
     p.add_argument("--prompt", action="append", default=None)
+    p.add_argument("--repeats", type=int, default=2, help="how many times each prompt is asked. "
+                                                          "TWO is the floor and the default; see "
+                                                          "below")
     args = p.parse_args()
 
     if args.host_log:
         confirm_installed(args.host_log, "host", args.via)
     if args.pool_log:
         confirm_installed(args.pool_log, "pool", None)
+    if args.repeats < 2:
+        print("  WARNING: one pass a prompt cannot see a slot handed on with the previous "
+              "request's state still in it, which is the fault this instrument missed for days")
 
     prompts = args.prompt or [
         "The capital of France is",
@@ -136,29 +150,61 @@ def main() -> int:
         "Explain why the sky is blue in one sentence.",
     ]
     worst = 0.0
+    unstable = []
     for prompt in prompts:
-        base = ask(args.colocated, prompt, args.tokens, None)
-        rung = ask(args.rung, prompt, args.tokens, args.via)
-        same = base["output_ids"] == rung["output_ids"]
-        where = "identical" if same else next(
-            (f"part at token {i}" for i, (x, y) in
-             enumerate(zip(base["output_ids"], rung["output_ids"])) if x != y),
-            "differ in length")
         print(f"\n  prompt {prompt!r}")
-        print(f"    tokens   {where}")
-        hb = base["meta_info"].get("hidden_states")
-        hr = rung["meta_info"].get("hidden_states")
-        if hb is None or hr is None:
-            print("    hidden   not returned -- both servers need --enable-return-hidden-states")
-            continue
-        rows_b, rows_r = flatten(hb), flatten(hr)
-        for i, (x, y) in enumerate(zip(rows_b, rows_r)):
-            rel, cos = compare(y, x)
-            worst = max(worst, rel)
-            print(f"    token {i:<3} relative {rel:.6g}   cosine {cos:+.6f}")
+        first = {}
+        for turn in range(args.repeats):
+            base = ask(args.colocated, prompt, args.tokens, None)
+            rung = ask(args.rung, prompt, args.tokens, args.via)
+            label = f"pass {turn}"
+            where = _where(base["output_ids"], rung["output_ids"])
+            print(f"    {label}  tokens {where}")
 
-    print(f"\n  worst relative difference over all prompts and tokens: {worst:.6g}")
+            # Each side against ITSELF on the earlier pass. This is the null the token comparison
+            # cannot provide: a server whose second answer differs from its first has handed a slot
+            # on with the previous request's history in it, and BOTH sides could do it -- the
+            # colocated one runs sglang's own state machinery and is the reference only for as long
+            # as it is stable.
+            for side, answer in (("colocated", base), ("rung", rung)):
+                previous = first.get(side)
+                if previous is None:
+                    first[side] = answer["output_ids"]
+                elif previous != answer["output_ids"]:
+                    unstable.append((prompt, side, turn))
+                    print(f"    {label}  {side} DIFFERS FROM ITS OWN PASS 0 -- "
+                          f"{_where(previous, answer['output_ids'])}. A slot was reused with "
+                          f"state still in it; every number below is about two arrangements only "
+                          f"if this line is absent")
+
+            hb = base["meta_info"].get("hidden_states")
+            hr = rung["meta_info"].get("hidden_states")
+            if hb is None or hr is None:
+                print("    hidden   not returned -- both need --enable-return-hidden-states")
+                continue
+            rows_b, rows_r = flatten(hb), flatten(hr)
+            for i, (x, y) in enumerate(zip(rows_b, rows_r)):
+                rel, cos = compare(y, x)
+                worst = max(worst, rel)
+                print(f"    {label}  token {i:<3} relative {rel:.6g}   cosine {cos:+.6f}")
+
+    print(f"\n  worst relative difference over all prompts, passes and tokens: {worst:.6g}")
+    if unstable:
+        print(f"  REFUSED as a verdict: {len(unstable)} pass(es) disagreed with the same server's "
+              f"own earlier answer to the same prompt: {unstable}. That is one arrangement "
+              f"disagreeing with itself, and no comparison between two of them means anything "
+              f"until it is gone.")
+        return 1
+    print(f"  every side answered the same on all {args.repeats} passes, so the slots were clean")
     return 0
+
+
+def _where(a: list, b: list) -> str:
+    if a == b:
+        return "identical"
+    return next((f"part at token {i}" for i, (x, y) in enumerate(zip(a, b)) if x != y),
+                "differ in length")
+
 
 
 if __name__ == "__main__":
