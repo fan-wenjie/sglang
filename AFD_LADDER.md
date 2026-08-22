@@ -234,6 +234,23 @@ The shape, so the next pass builds rather than re-decides:
                   table, because a rung whose installation cannot be confirmed produces the same
                   reading whether it ran or not -- three times now
 
+Half of it already exists, unused. `OP_LINEAR` is defined in the shared protocol and handled in
+`pool_server` -- the frame carries the convolved projection, the two gates and the layer's two
+learned constants, and the pool runs `self.linear.step(...)` and sends the output back. One round
+trip a linear layer, which is rung 2's shape exactly.
+
+Nothing sends it. Nothing constructs the pool-side `self.linear` either, and `--afd-pool-attention`
+offers only "cache" and "projection". It is a handler with no client, left from an earlier design,
+and it means rung 2 needs the HOST half and the slot wiring rather than a protocol.
+
+One difference from the specification above, and it has to be decided rather than absorbed: this
+path keeps the recurrent state on the POOL, where the specification puts it on the host. For the
+ladder's question -- does moving the linear attention break the arrangement -- either placement
+answers it, and the existing half is much cheaper. For the arrangement's own design the placement
+matters, because a pool holding per-request state stops being stateless and cannot be released
+between a request's calls. Use the existing half to get rung 2's verdict; do not let that choice
+migrate into the arrangement without measuring what it costs.
+
 Not built in the pass that specified it, deliberately. Half a protocol that has not been through
 the verdict is worth less than a specification that has not been guessed at.
 
