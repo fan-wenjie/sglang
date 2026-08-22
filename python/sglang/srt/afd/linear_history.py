@@ -269,7 +269,20 @@ class HistoryCache:
         return True
 
     def read_and_update(self, request_ids, layer: int, *, q, k, v, alpha, beta):
-        """The host's whole job in a linear layer: read the old state twice, then advance it.
+        """A REFERENCE form of one step, kept for the checks that pin the recurrence. Not the path.
+
+        It was the host's whole job under an earlier arrangement, where the host took BOTH
+        readings -- one for the query and one for the state's own copy of the key. The production
+        path does not: the pool forms the query coefficient itself, asks for one reading with
+        OP_STATE_READ, and defers the advance with OP_STATE_UPDATE. That split is the arrangement
+        rather than an omission -- the deferral is what lets the caller carry on without waiting
+        for its own state to be written, and it is the one contraction the query coefficient
+        bought.
+
+        So nothing in the runtime calls this, and wiring it in would UNDO the split. It stays
+        because the cases below use it to pin the recurrence against the reference step, and a
+        reference implementation exercised by tests is not dead code -- but it is only that, and
+        the docstring said "the host's whole job" long after it stopped being true.
 
         `q` and `k` arrive normalised and expanded to the value heads -- the pool does that,
         because the scale and the head expansion are the layer's own and the side holding the
