@@ -79,6 +79,28 @@ state emitting two readings).
 That leaves the derived arm at roughly 3,000 lines against 7,000 shared, rather than the even
 split the seed list produced. The shared half is what sglang keeps.
 
+## The property upstream needs: AFD ships without the derived arm
+
+AFD may land upstream before anything derived from it does, so standard AFD has to work with the
+derived code **absent** -- not merely disabled. Those are different properties. A flag defaulting
+to off still fails when a module imports the derived package inside an `if` and the directory is
+not there, and it fails at the first request rather than at startup, on a machine with no way to
+fix it.
+
+Machine-checkable, as one grep: no file under `sglang/srt/afd/` may name a derived package.
+`test_afd_stands_alone.py` is that grep, plus the registry's own contract.
+
+The check found two real debts on the day it was written, and they are held as a ratchet that may
+only shrink:
+
+    roles.py        reads `server_args.afd_query_shift_layers`
+    checkpoint.py   `RETIRED_KEYS` maps the derived arm's retired flag names
+
+A derived arm announces itself through `afd/arms.py` instead: it imports that module and registers
+a factory, and whoever wants the arm imports the derived package -- which is the only thing that
+puts it in the registry. Delete the derived directory and the registry is empty, `resolve` returns
+None, and the standard arrangement takes the only path there is.
+
 ## Order of work
 
 1. **Anchor the original.** Tag it, so every later claim about "what it used to do" is checkable
