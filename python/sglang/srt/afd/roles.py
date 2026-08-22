@@ -440,8 +440,14 @@ def watch_linear_attention(model, runner) -> None:
             if seen.get(layer_id, 0) >= limit:
                 return
             hidden = args[0]
-            if hidden.dim() != 2 or hidden.shape[0] != 1:
-                return                       # one row only: the case the fault survives in
+            if hidden.dim() != 2:
+                return
+            # MULTI-ROW too. This was gated to one row, which is a decode step -- and every
+            # comparison it has produced ran the decode path: `_convolve`'s scatter branch and
+            # OP_STATE_READ. The deployment fails on a 122-row PREFILL, which takes
+            # `prefill_convolve` and OP_STATE_SCAN instead, and those two have never been inside
+            # this comparison at all. "The linear attention is correct" was true of the half of it
+            # that was measured.
             seen[layer_id] = seen.get(layer_id, 0) + 1
 
             from sglang.srt.afd.split_read_kernel import read_one, update_only
@@ -488,7 +494,8 @@ def watch_linear_attention(model, runner) -> None:
                     ring[slot].zero_()
                     history = conv_before.reshape(channels, -1).to(ring.dtype)
                     ring[slot][..., 1:] = history[..., -(taps - 1):]
-                    return runner._linear_attention(attn, [scratch], layer_id, x).float()
+                    return runner._linear_attention(
+                        attn, [scratch] * x.shape[0], layer_id, x).float()
 
                 # `out_proj`'s INPUT is where the heads still exist: (rows, value heads x head
                 # dim). Its OUTPUT is hidden_size wide and has no head structure at all -- the
