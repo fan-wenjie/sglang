@@ -8,6 +8,34 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-22, the two prefill algorithms agree at deployment size, so the 1-5% is not theirs
+
+    8 tokens, zero initial state          relative 0.00416
+    122 tokens, onto a warmed state       relative 0.00416
+
+The same to three figures. The model's prefill runs `chunk_gated_delta_rule` and the pool walks
+the chunk token by token, and the difference between those two algorithms does not grow with the
+chunk or with the state -- so the 1 to 5 percent seen in the deployed arrangement is NOT what two
+implementations of one recurrence cost. It is an order of magnitude above that, and it belongs to
+something else.
+
+The comparison had to be built carefully in two places, and both would have produced a number
+rather than an error:
+
+    the state layout      the chunked kernel keeps (heads, key dim, value dim) and `read_one`
+                          keeps (heads, value dim, key dim) -- transposed. Handing one tensor to
+                          both would have measured the transpose. Each side builds its own initial
+                          state from the SAME warm-up tokens instead, which is also what the
+                          deployment does
+    the state handoff     the kernel returns three things, the second is None, and the final state
+                          is not usefully among them: it advances `initial_state` IN PLACE, which
+                          is how the backend chains chunks. Feeding `got[1]` forward made triton
+                          fail to compile on a null pointer
+
+Kept as a case at the deployed size, because "they agree" was previously known only for eight
+tokens from nothing.
+
+
 ## 2026-08-22, three rows instead of one, and the key-head reading is retracted
 
     layer 0   row 0   42/48 within 2%, worst h30 h31 h1     mid  44/48, worst h37 h36 h38
