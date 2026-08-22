@@ -2003,3 +2003,29 @@ interconnect. Three candidates, in the order their evidence points:
 What this settles for #68: a per-node dispatcher is not an optimisation, it is a requirement. Not
 because it batches -- co-batching was measured to be a pessimisation -- but because the pool gets
 SLOWER with connection count, so sixteen hosts must reach it as one connection, not sixteen.
+
+### The construction peak, closed by the fifth entry point
+
+`#67` left the peak untouched: the model was built whole and then released, so a card too small to
+build it once was still too small. The arms registry now has a fifth entry -- an arm names classes
+whose EVERY instance it computes remotely, and the loader builds those with no storage at all.
+The query-shift arm names `Qwen3_5GatedDeltaNet`: under the group cut every linear-attention layer
+is a span's passenger, so the host never multiplies that class by anything, and unlike the
+projections it is shared with nothing else in the model.
+
+    host, group cut          before      release only     + never allocated
+    peak at load             19.18 GB      19.18 GB           8.81 GB
+    steady state             19.18 GB       5.69 GB           5.68 GB
+    released after routing        -        13.49 GiB          3.13 GiB
+    KV cache                  3.34 GB      10.46 GB          10.38 GB
+    max_total_num_tokens        54688       171524            169943
+
+Same output, " Paris.\nThe capital of". The steady state is unchanged, as it should be -- the same
+weights end up absent either way. What moved is the peak, 19.18 -> 8.81 GB, and that is the number
+deciding whether a card can build this host at all: a 12 GB card now can, with about 3 GB left for
+cache; a 24 GB card has ~18 GB, which holds a 512K context's 13.5 GB with room.
+
+Two mechanisms, and which one a weight can use is a property of its CLASS, not a preference. The
+loader wraps classes rather than instances, so a class shared with anything the host still uses --
+QKVParallelLinear, RowParallelLinear, shared with the vision tower -- can only be released after
+routing. A class the arm owns entirely can be made absent before it exists.
