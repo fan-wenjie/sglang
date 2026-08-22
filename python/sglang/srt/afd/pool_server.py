@@ -64,9 +64,17 @@ logger = logging.getLogger(__name__)
 # that a stuck one fails instead of hanging every caller behind it.
 SPAN_HANDOVER_TIMEOUT_S = 30.0
 
+SPAN_OPS = frozenset({OP_SPAN, OP_SPAN_ENTER, OP_SPAN_EXIT})
+
 # Ops whose departure calls BACK to the caller. They are never departed on the thread that owns
 # the caller's socket, because that thread is the only reader of it.
-SPAN_OPS = frozenset({OP_SPAN, OP_SPAN_ENTER, OP_SPAN_EXIT})
+#
+# A LAYER is one of them and was left out when it was added: a linear layer run here reads a
+# recurrent state the caller holds, exactly as a span does, and asking for it from the connection
+# thread makes that thread wait for a message only it can receive. The reading is "no state
+# reading for request 3 layer 0 within 30.0s", which names the far end and blames it, and the far
+# end answered immediately.
+CALLS_BACK_OPS = SPAN_OPS | {OP_LAYER}
 
 
 class Departure(threading.Thread):
@@ -339,7 +347,7 @@ class Departure(threading.Thread):
         # only it can receive, and with min_batch=1, which is what the deployment runs, every
         # offer completes a batch so it happens on the first token. It is a deadlock, not a race:
         # no traceback, no wrong value, and a watchdog timeout that names none of this.
-        calls_back = frame.op in SPAN_OPS
+        calls_back = frame.op in CALLS_BACK_OPS
         with self._cond:
             queue = self._waiting.setdefault(frame.layer, [])
             queue.append((frame, sock))

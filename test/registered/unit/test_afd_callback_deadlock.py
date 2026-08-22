@@ -14,6 +14,7 @@ indistinguishable from a slow one and gets deleted.
 
 import socket
 import threading
+import types
 import unittest
 
 import torch
@@ -25,6 +26,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 from sglang.srt.afd.pool_client import PoolClient
 from sglang.srt.afd.pool_server import Departure, route_frame
 from sglang.srt.afd.protocol import (
+    OP_LAYER,
     OP_SPAN,
     OP_SPAN_ENTER,
     OP_SPAN_Q,
@@ -50,6 +52,17 @@ class Runner:
         the arm that was never exercised, which is why the op mismatch survived every test."""
         return self.run(request_ids, -1, embedded, positions, on_query=on_query)
 
+    def _linear_attention(self, attn, request_ids, layer, hidden):
+        """One layer on its own, which asks the caller for the state exactly as a span does.
+
+        Same shape as the real one and for the same reason: what makes a departure unsafe on the
+        connection thread is that it calls BACK, and that is true of a layer whether or not it is
+        part of a span.
+        """
+        self._local.ask_host(layer, request_ids, torch.zeros(hidden.shape[0], 2, 4))
+        self.seen.append(("layer", layer))
+        return hidden
+
     def run(self, request_ids, group, attn_output, positions, on_query=None):
         for layer in range(self.asks):
             reading = self._local.ask_host(layer, request_ids, torch.zeros(1, 2, 4))
@@ -69,6 +82,9 @@ class Pool:
         self.departure = Departure(lambda b, l: b, min_batch, 0.005, "cpu")
         self.runner = Runner(asks)
         self.runner._local = threading.local()
+        # `_depart_layer` reaches the layer's module off the runner's model, as the real pool does
+        self.runner.model = types.SimpleNamespace(model=types.SimpleNamespace(
+            layers=[types.SimpleNamespace(linear_attn=object()) for _ in range(4)]))
         self.departure.span = self.runner
         self.departure.start()
         self.sock = socket.socket()
@@ -162,6 +178,44 @@ class TestASpanThatCallsBackCompletes(CustomTestCase):
             pool.close()
 
 
+class TestALayerCallsBackToo(CustomTestCase):
+    """A LAYER was not on the list of ops that call back, and deployment hung on its first token.
+
+    The list existed, with the comment that says exactly why a departure that calls back must not
+    run on the connection thread, and the op added months later was not put on it. Everything else
+    was right: the host had the history service, answered at once, and the pool's own error blamed
+    it -- "no state reading for request 3 layer 0 within 30.0s. The far end ... did not answer."
+
+    min_batch=1 is what the deployment runs and it is what makes every offer complete a batch, so
+    the connection thread takes the departure every time.
+    """
+
+    def test_a_layer_departure_does_not_wait_on_its_own_socket(self):
+        pool = Pool(asks=1, min_batch=1)
+        client = PoolClient(f"127.0.0.1:{pool.port}", 5.0, reconnect=False)
+        client.serve = lambda frame: (torch.ones(1, 8),)
+        done, result = threading.Event(), {}
+
+        def call():
+            try:
+                handle = client.issue_frame(1, 0, (torch.zeros(1, 4),), OP_LAYER)
+                result["reply"] = client.collect_frame(handle, "cpu")
+            except BaseException as e:                   # noqa: BLE001
+                result["error"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=call, daemon=True).start()
+        try:
+            self.assertTrue(done.wait(DEADLINE),
+                            "the layer never answered: the callback and the reply are deadlocked "
+                            "on one socket, with min_batch=1 as deployed")
+            self.assertIsNone(result.get("error"), f"{result.get('error')}")
+            self.assertIn(("layer", 0), pool.runner.seen, "the callback was never made")
+        finally:
+            pool.close()
+
+
 class TestTheReplyCarriesTheOpItWasAskedWith(CustomTestCase):
     """A prologue is asked as OP_SPAN_ENTER and must be answered as OP_SPAN_ENTER.
 
@@ -225,6 +279,17 @@ class ScanRunner(Runner):
     travel as OP_STATE_SCAN. So this fake exercises the scan opcode by carrying rows, not by
     naming it -- the same way the real runner does.
     """
+
+    def _linear_attention(self, attn, request_ids, layer, hidden):
+        """One layer on its own, which asks the caller for the state exactly as a span does.
+
+        Same shape as the real one and for the same reason: what makes a departure unsafe on the
+        connection thread is that it calls BACK, and that is true of a layer whether or not it is
+        part of a span.
+        """
+        self._local.ask_host(layer, request_ids, torch.zeros(hidden.shape[0], 2, 4))
+        self.seen.append(("layer", layer))
+        return hidden
 
     def run(self, request_ids, group, attn_output, positions, on_query=None):
         rows = 3
