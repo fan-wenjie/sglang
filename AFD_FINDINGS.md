@@ -2342,3 +2342,33 @@ Recorded together, the two halves of #60:
 
     bits per byte    +0.0191 bpb, +2.68%, reproduced exactly four days apart. Real and small
     MAUVE            no difference this metric can resolve at this sample size
+
+
+## 2026-08-22, #56 as it actually stands
+
+The task conflated two checks. One is done and one is not, and saying so is worth more than
+starting the second badly.
+
+**Done: the attention split.** `test_afd_split_exactness.py`, seven cases at Qwen3.8-27B's own
+shapes -- 24 query heads, 4 key-value heads, head_dim 256. Sweep-then-join against one fused call
+in float64; bfloat16 against an fp32 reference at the precision bfloat16 has; the sweep's
+signature containing no current value, which is the protocol's whole point; any cut in any order;
+and the two boundary controls the skill asks for -- an off-by-one, and a position counted twice.
+
+Those last two ARE the index-space check, done by numerical consequence rather than by inspecting
+index sets, which is stronger: the merge is exact for any partition INCLUDING one that drops a
+position, so only the number can tell them apart. In float64 the honest split and either boundary
+error are orders apart and cannot be confused.
+
+**Not done: the span.** Running `SpanRunner` over a whole group of layers in one process, against
+the model's own layers run in sequence, with the group boundary moved as the control.
+`afd_tiny_stack.py` was built for exactly this and says so in its own docstring -- "the span cut
+has no split-exactness check, and the reason it has none is this file" -- and the check still is
+not written.
+
+The hard part is the reference side, not the span: running the model's own linear layer needs a
+`ForwardBatch` carrying a mamba state, not just a tensor. Two things to get right when it is
+written, both of which this project has already got wrong once: both sides must start from the
+SAME initial state, and the comparison must cover a multi-token prefill rather than row 0 alone --
+the reading that once said "layer 0 is exact" had looked only at the first row, which has no
+history and therefore cannot disagree.
