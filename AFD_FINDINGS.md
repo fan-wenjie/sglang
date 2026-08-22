@@ -1,3 +1,46 @@
+# AFD findings
+
+**Read this section first.** What follows it is a journal in the order things were learned, and
+several entries in it were WITHDRAWN by later ones. A reader going top to bottom meets a wrong
+claim before its correction. This section is what currently stands, as of 2026-08-22.
+
+## What holds
+
+    the arrangement       host runs every attention and owns the KV cache and the recurrent
+                          states; the pool holds static weights and answers statelessly. The
+                          split is by STATE, which is what makes the pool shareable
+    correctness           the per-layer cut and the group cut at shift 0 are token-identical to
+                          colocated, checked repeatedly, hidden-state drift at bfloat16 rounding
+    the fault that was    a slot handed to a new request with the previous request's recurrent
+    hunted for days       state still in it. Both slot tables had a `release` that zeroes them
+                          and nothing ever called it. Fixed; the release now goes at the START of
+                          a request, because an aborted one never reaches its end
+    host memory           weights 19.18 GB -> 5.69 GB by releasing what the pool computes, and
+                          the load peak 19.18 -> 8.81 GB by never allocating the class the arm
+                          owns entirely. KV cache 3.34 -> 10.46 GB on the same card
+    the pool's floor      0.394 ms a call, which is this model's 510 MiB feed-forward read at the
+                          card's measured 1345 GB/s. Hardware, not overhead: a CUDA graph buys 3%
+    batching              co-batching across callers is a PESSIMISATION at every width measured.
+                          min_batch stays 1. What several callers buy is pipelining
+    the shift's cost      +0.0191 bits per byte (+2.68%), reproduced exactly four days apart.
+                          MAUVE cannot resolve a difference at 500 samples, and the spread of its
+                          own null between two runs is the evidence
+
+## What was withdrawn, and by what
+
+    "the shifted read point costs relative 1.17"      -- contaminated slots; the ladder's rungs
+                                                         were measuring one uncleared slot twice
+    "the reply costs three times the work"            -- the meter timed the launch, not the work
+    "the floor is a weight read at 0.68 TB/s"         -- bandwidth assumed to fit; card does 1345
+    "half the floor is unaccounted for"               -- the layer is 510 MiB, not the 267 recalled
+    "sharding shrinks the per-call read"              -- 8 layers and 48 layers cost the same
+    "the span check is blocked on ForwardBatch"       -- blocked on what the batch must CARRY
+    "MAUVE says the shift is 0.84x the noise"         -- the same run says 1.72x four days later
+
+Every one of those was arithmetic that fitted, or an instrument that agreed with itself. The
+pattern is the finding: when a number comes out explained, check whether each constant in the
+explanation was measured or remembered.
+
 # AFD with an Early-Q read point: what was measured
 
 Everything here was run on Qwen3.8-27B-FP8. Host is an RTX PRO 6000 Blackwell (97 GB); the pool,
