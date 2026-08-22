@@ -107,7 +107,20 @@ class Rung2Arm:
         return wanted()
 
     def install_on_host(self, model, client, *, sweep_ahead):
-        return LinearOnPool(model, client)
+        """rung 0's feed-forward offload AND this rung's linear attention. Both, or it is not a rung.
+
+        A ladder's rung is the one below it plus one change. Installing only the linear-attention
+        move would leave the feed-forward on the host -- a third arrangement that is neither rung 1
+        nor rung 2, and whose verdict would answer a question nobody asked. The first version of
+        this did exactly that, and would have measured it as rung 2.
+        """
+        from sglang.srt.afd.pool_client import PoolClient
+        from sglang.srt.afd.roles import install_pool_routing, routable_layers
+
+        client.require(PoolClient.NEEDS_FEED_FORWARD)
+        feed_forward = install_pool_routing(
+            model, client, routable_layers(model), sweep_ahead=sweep_ahead)
+        return (feed_forward, LinearOnPool(model, client))
 
     def make_pool_runner(self, model, *, device):
         """The runner built directly, not through `make_span_runner`.
