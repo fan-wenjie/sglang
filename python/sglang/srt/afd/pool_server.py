@@ -764,6 +764,14 @@ class Departure(threading.Thread):
         batch = joined.to(self.device)
         with self.meter.timed("work"):
             out = self.forward(batch, layer)
+            # The kernels are launched asynchronously, so timing the call alone measures the
+            # LAUNCH. Without this the forward's real time was charged to the reply, because
+            # `_payload_of` does `.to("cpu")` and that synchronises -- and the first reading said
+            # "the reply costs three times the work" when the reply was mostly waiting for the
+            # work. The synchronise costs nothing that was not already going to be paid at the
+            # copy; it only decides which phase pays it.
+            if out.is_cuda:
+                torch.cuda.current_stream().synchronize()
         if out.shape != batch.shape:
             raise RuntimeError(
                 f"layer {layer} feed-forward returned {tuple(out.shape)} for {tuple(batch.shape)}; "
