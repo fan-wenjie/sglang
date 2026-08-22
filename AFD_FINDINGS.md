@@ -1795,3 +1795,44 @@ Still open on this line: the travel-group batch re-forming as a documented prope
 half (the pool's departure already re-forms per layer, which IS the coach model -- it has never
 been stated or measured as one), and the two-batch staggered time-division multiplexing, which
 doubles the in-flight requests and the host's KV cache and must be measured rather than assumed.
+
+
+## 2026-08-22, two callers on one pool: what re-forming across callers actually buys
+
+The pool holds no per-request state, so two callers' calls are the same kind of transaction and
+can leave on one bus -- which is what makes re-forming across CALLERS, and therefore across NODES,
+possible at all. `benchmark/afd/two_callers.py` measures it: N independent connections, which is
+what a second host is to this pool, issuing at one layer at once. Qwen3.8-27B, 4 tokens x 5120 a
+call, 30 rounds, median round trip:
+
+    callers     min_batch 1      min_batch 2
+       1          0.54 ms          5.33 ms      <- the lone caller waits out max_wait 4 ms
+       2          0.93 ms          0.76 ms
+       4          1.77 ms          1.67 ms
+
+    calls/s     min_batch 1      min_batch 2
+       1            882              166
+       2           1354             1250
+       4           1240             1061
+
+Three readings, and the third is the one worth having.
+
+At min_batch 1 the departure leaves the instant the first frame lands, so two callers are
+SERIALISED: the median rises 1.72x for two and 3.28x for four. That is the deployed configuration,
+chosen for latency, and it means the bus never fills -- the coach model buys nothing in the
+arrangement as it runs today, which is a fact about the setting rather than about the idea.
+
+At min_batch 2 two callers do ride together and each one's call is 18% cheaper than when they were
+serialised. The lone caller pays 5.33 ms for it -- max_wait, in full, waiting for a partner that
+never comes -- so the setting trades a single caller's latency for a pair's.
+
+And the throughput columns say the pool is NOT bound by the weight read at these widths: sharing
+the read across two callers did not raise calls/s at all (1354 -> 1250). Whatever binds the pool
+at 4 tokens a call is per-call cost, not bandwidth, so the case for batching across callers has to
+be made at widths where the read dominates -- `pool_amortisation.py` shows the per-token cost
+still falling at 512 tokens, and that is where two callers should be measured next.
+
+The measurement is two CONNECTIONS, not two model hosts: a second host needs a second card, and
+two hosts on one card contend for that card's bandwidth, so a flat aggregate could not tell a
+saturated pool from a saturated host. It measures the pool's side, which is the side the claim is
+about.
