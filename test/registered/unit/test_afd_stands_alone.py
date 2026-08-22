@@ -21,13 +21,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 from sglang.test.test_utils import CustomTestCase
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-AFD = os.path.abspath(os.path.join(HERE, "..", "..", "..", "python", "sglang", "srt", "afd"))
+AFD = os.path.abspath(
+    os.path.join(HERE, "..", "..", "..", "python", "sglang", "srt", "afd")
+)
 DERIVED = re.compile(r"afd_query_shift|afd_eq\b|from\s+\.\.afd_\w+|srt\.afd_\w+")
 
 
 class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
     def afd_files(self):
-        return [os.path.join(AFD, f) for f in sorted(os.listdir(AFD)) if f.endswith(".py")]
+        return [
+            os.path.join(AFD, f) for f in sorted(os.listdir(AFD)) if f.endswith(".py")
+        ]
 
     # The debt this check found on the day it was written. A RATCHET, not an exemption: nothing
     # may be added, and every entry leaves by RELOCATION rather than by editing.
@@ -69,13 +73,15 @@ class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
         counted = {f: len(h) for f, h in offenders.items()}
         for name, allowed in self.KNOWN.items():
             self.assertLessEqual(
-                counted.get(name, 0), allowed,
+                counted.get(name, 0),
+                allowed,
                 f"{name} names a derived package more often than the {allowed} known -- the "
                 f"allowlist ratchets down, never up",
             )
             counted.pop(name, None)
         self.assertEqual(
-            counted, {},
+            counted,
+            {},
             "these files under srt/afd name a derived package, so standard AFD cannot be shipped "
             "without it",
         )
@@ -108,8 +114,13 @@ class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
         from sglang.srt.afd.arms import absent_classes, load
 
         load()
-        off = types.SimpleNamespace(afd_span_cut=False, afd_mode="null", afd_pool_addr=None,
-                                    afd_query_shift_layers=None, afd_coverage=None)
+        off = types.SimpleNamespace(
+            afd_span_cut=False,
+            afd_mode="null",
+            afd_pool_addr=None,
+            afd_query_shift_layers=None,
+            afd_coverage=None,
+        )
         self.assertEqual(absent_classes(off), ())
 
     def test_two_arms_under_one_name_are_refused(self):
