@@ -26,11 +26,22 @@ class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
         return [os.path.join(AFD, f) for f in sorted(os.listdir(AFD)) if f.endswith(".py")]
 
     # The debt this check found on the day it was written. A RATCHET, not an exemption: nothing
-    # may be added, and each line here is a place where standard AFD currently knows the derived
-    # arm's configuration by name and would ship carrying it.
+    # may be added, and every entry leaves by RELOCATION rather than by editing.
+    #
+    # `checkpoint.py` is derived-arm code in its entirety -- its whole subject is the read point a
+    # checkpoint states, and its code names the shift eighteen times. This grep catches it on one
+    # literal flag name, but deleting that line would leave the file where it is and the property
+    # still broken. It goes to the derived package.
+    #
+    # `roles.py` holds `_span_query_shift`, which validates the group cut's shift. Same: it is the
+    # derived arm's rule living in the shared composition root, and it leaves when the arm's
+    # installation does.
+    #
+    # Recorded here because the obvious repair -- edit the offending line -- would make the grep
+    # pass while the architecture stayed wrong, which is worse than the debt.
     KNOWN = {
-        "roles.py": 1,        # reads server_args.afd_query_shift_layers
-        "checkpoint.py": 1,   # RETIRED_KEYS maps the derived arm's retired flag names
+        "roles.py": 1,        # _span_query_shift, leaves with the arm's installation
+        "checkpoint.py": 1,   # the whole file is the derived arm's; it relocates
     }
 
     def test_no_new_file_in_afd_names_a_derived_package(self):
