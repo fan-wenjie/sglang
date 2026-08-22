@@ -203,3 +203,9 @@ class QueryShiftArm:
 
 
 register(QueryShiftArm.name, QueryShiftArm)
+
+
+# The ladder's rungs live beside this one and register the same way. Imported here because
+# `arms.load()` looks for `<package>.installer` and nothing else -- a rung in its own module would
+# announce itself to nobody, which is the failure the registry was built to make impossible.
+from sglang.srt.afd_query_shift import rung2  # noqa: E402,F401 -- imported for its registration

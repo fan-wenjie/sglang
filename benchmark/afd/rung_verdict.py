@@ -77,9 +77,11 @@ def compare(a: list[float], b: list[float]) -> tuple[float, float]:
     return diff / (nb + 1e-9), dot / (na * nb + 1e-9)
 
 
+# One line a side a rung. A rung whose installation cannot be confirmed reads the same whether it
+# ran or not, and that has happened three times in two days.
 INSTALLED = {
-    "host": "the group cut is installed",
-    "pool": "span(s) a decode step",
+    "host": ("the group cut is installed", "the per-layer linear cut is installed"),
+    "pool": ("span(s) a decode step",),
 }
 
 
@@ -96,13 +98,14 @@ def confirm_installed(log: str, side: str, via: str | None) -> None:
     log is a refusal rather than a warning. A verdict that cannot say which arrangement produced
     it is worse than no verdict.
     """
-    needle = INSTALLED[side]
-    cmd = ["grep", "-cF", needle, log]
-    argv = (via.split() + [" ".join(f"'{c}'" if " " in c else c for c in cmd)]) if via else cmd
-    got = subprocess.run(argv, capture_output=True, text=True).stdout.strip()
-    if got.isdigit() and int(got) > 0:
-        print(f"  {side} log confirms the arrangement is installed ({needle!r} x{got})")
-        return
+    for needle in INSTALLED[side]:
+        cmd = ["grep", "-cF", needle, log]
+        argv = (via.split() + [" ".join(f"'{c}'" if " " in c else c for c in cmd)]) if via else cmd
+        got = subprocess.run(argv, capture_output=True, text=True).stdout.strip()
+        if got.isdigit() and int(got) > 0:
+            print(f"  {side} log confirms the arrangement is installed ({needle!r} x{got})")
+            return
+    needle = " or ".join(repr(n) for n in INSTALLED[side])
     raise SystemExit(
         f"REFUSED: {log} does not contain {needle!r}, so the {side} is not running the "
         f"arrangement this verdict would be attributed to. Check for 'arm is available' -- that "
