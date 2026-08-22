@@ -1877,18 +1877,26 @@ than from nvidia-smi (which cannot separate weights from caches):
 
                             weights     mamba state    KV cache     total resident
     pool (everything)       51.05 GB      10.47 GB     11.86 GB        73.4 GB
-    host (feed-forward
-    on the pool)            19.18 GB       2.86 GB      3.34 GB        25.4 GB
+    host, GROUP cut         19.18 GB       2.86 GB      3.34 GB        25.4 GB
+
+CORRECTION, same day: the host row was first written as "feed-forward on the pool", the per-layer
+cut. It is not -- that host was launched with --afd-span-cut, and its own log says "the group cut
+is installed". So 19.18 GB is the GROUP cut's host, which also has its attention projections on
+the pool. The per-layer cut's host keeps those and is therefore LARGER, and it has not been
+measured. Attributing a number to the wrong arrangement is the error this tree has spent days on
+from the other direction; it is corrected here rather than quietly re-run.
 
 The cut removes 31.87 GB of weights, 62% of them. That is the arrangement working exactly as
 described -- and it is NOT enough for the claim this line has been carrying.
 
-**An 8 or 12 GB card cannot serve this model under the per-layer cut.** The weights alone are
-19.18 GB: attention and linear-attention projections, embeddings, the vision tower and the norms
+**An 8 or 12 GB card cannot serve this model under either cut.** Under the group cut -- the
+smaller of the two -- the weights alone are 19.18 GB: attention and linear-attention projections, embeddings, the vision tower and the norms
 all stay on the host, and only the feed-forward leaves. The claim needs one of
 
-    move the attention projections too   W_q/W_kv/W_o to the pool, which is what the group cut
-                                         already does -- that number has to be taken the same way
+    move more than the projections       W_q/W_kv/W_o are ALREADY on the pool in this number.
+                                         What is left on the host is the embeddings, the vision
+                                         tower, the norms and the linear-attention projections,
+                                         and that is what 19.18 GB is
     a smaller model                      the 62% is a property of this stack's shape, not of AFD
     quantised weights                    FP8 would put the host's weights near 9.6 GB, which is a
                                          12 GB card with very little left for KV
@@ -1900,6 +1908,6 @@ weight memory and then spends part of the gain on a smaller working budget -- an
 comparison between the two sides is also a comparison between a 3-request host and an 8-request
 one, and must say so.
 
-What this does NOT measure: the group cut's host, which should be smaller again because the
-attention projections move too. Same method, one run, and it belongs beside this table before
-either number is quoted.
+What this does NOT measure: the PER-LAYER cut's host, which keeps its attention projections and is
+therefore larger than the row above. Same method, one run, and it belongs beside this table before
+the per-layer arrangement is quoted on memory at all.
