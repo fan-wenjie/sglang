@@ -172,14 +172,22 @@ def _moved_boundary(full: list[int], depth: int) -> list[int]:
     same argument the attention split's boundary cases make, where the honest partition sits at
     6e-16 and either off-by-one at 2e-1 and the two cannot be confused.
 
-    A shifted boundary is a real arrangement in the sense that it runs: every layer is still in
-    exactly one span, the spans still tile the stack, and the pool still answers. What changes is
-    WHICH layer's output projection heads a span, so the host's attention is fed a residual stream
-    that has been through one layer too many or too few. Nothing raises, and the text stays
-    fluent -- which is exactly why the control is worth taking.
+    THE CONTROL DOES NOT EXIST, and finding that out is the result. A shifted boundary was
+    expected to run and be quietly wrong, the way an off-by-one partition of a softmax is. It is
+    not: a span is headed by the layer whose attention the HOST keeps, so its head must be a
+    full-attention layer -- it needs `attn` for the sweep and `o_proj` for the epilogue. Move the
+    boundary and a linear layer heads a span, which dies at startup with
 
-    Unset is the arrangement. Any other value is a deliberately wrong cut and must never be quoted
-    as a measurement of this one; it is logged loudly for that reason.
+        'Qwen3_5LinearDecoderLayer' object has no attribute 'attn'
+
+    So the group cut's boundary is not a free parameter with a wrong setting nearby. It is
+    structural: the spans are defined by where the KV cache is, and a stack cut anywhere else is
+    not a worse arrangement but a refused one. That is why the cut's agreement with colocated
+    stands without the control the attention split needed -- there is no nearby wrong arrangement
+    to confuse it with.
+
+    The knob stays to make that checkable rather than remembered, and it now refuses in terms of
+    the constraint instead of dying three layers deep in a message about an attribute.
     """
     import os
 
@@ -187,6 +195,14 @@ def _moved_boundary(full: list[int], depth: int) -> list[int]:
     if not offset:
         return full
     moved = sorted({min(max(i + offset, 1), depth - 1) for i in full})
+    raise ValueError(
+        f"SGLANG_AFD_SPAN_OFFSET={offset} moves the group boundaries from {full[:4]} to "
+        f"{moved[:4]}, and a span must be headed by a FULL-ATTENTION layer: the host keeps that "
+        f"layer's attention, so the head needs `attn` for the sweep and `o_proj` for the epilogue. "
+        f"A linear layer cannot head one. The boundary is structural rather than a setting with a "
+        f"wrong value nearby -- which is the answer this knob exists to give, and it is why the "
+        f"group cut's agreement with the colocated model needs no boundary control."
+    )
     logger.warning(
         "afd span: THE BOUNDARY IS DELIBERATELY WRONG. SGLANG_AFD_SPAN_OFFSET=%s moves every "
         "group boundary by %s layer(s): %s -> %s. This is the control for the group cut's own "

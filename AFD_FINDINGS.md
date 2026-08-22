@@ -2504,3 +2504,30 @@ mechanism is parallelism across devices rather than a smaller read), one host ad
 pools (#64), and several hosts against one pool (#47). Each of those is a measurement that cannot
 be taken on one GPU, because two pools on one card contend for the same bandwidth and a flat
 result would say nothing.
+
+
+## 2026-08-22, #56: the boundary control the group cut cannot have
+
+The attention split's agreement is readable because a WRONG partition was measured beside it: the
+honest one sits at 6e-16 and either off-by-one at 2e-1. The group cut's agreement with colocated
+had no such control, so a knob was added to move every group boundary by one layer and the
+deployment was started with it.
+
+It does not start:
+
+    'Qwen3_5LinearDecoderLayer' object has no attribute 'attn'
+
+A span is headed by the layer whose attention the HOST keeps, so its head must be a full-attention
+layer -- it needs `attn` for the sweep and `o_proj` for the epilogue. Move the boundary and a
+linear layer heads a span, and there is nothing there to run.
+
+**So the control does not exist, and that is the answer rather than a failure to get one.** The
+group cut's boundary is not a free parameter with a wrong setting nearby; it is structural. The
+spans are defined by where the KV cache is, and a stack cut anywhere else is not a worse
+arrangement but an impossible one. The agreement therefore stands without a boundary control,
+because there is no nearby wrong arrangement it could be confused with -- which is a stronger
+position than the attention split's, not a weaker one.
+
+The knob stays so this is checkable rather than remembered, and it now refuses in terms of the
+constraint instead of dying three layers deep in a message about a missing attribute. An
+arrangement that cannot be got wrong in a particular way should say so where someone would look.
