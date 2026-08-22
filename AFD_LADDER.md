@@ -270,3 +270,37 @@ the verdict is worth less than a specification that has not been guessed at.
 
 Rung by rung, the verdict is the same sentence: identical to colocated, or not. The first "not" is
 the answer this search has been unable to reach by any other means.
+
+
+## Outcome, 2026-08-22
+
+The ladder found it on rung 2, and then the bisect inside rung 2 found it exactly.
+
+    rung 2, 48 layers moved      not identical      relative 1.28
+    rung 2, 1 layer moved        not identical      relative 1.27   -> not accumulation
+    rung 2, 0 layers moved       IDENTICAL          relative 0.005  -> not the installer or wire
+    that layer vs the model's    0.0026 on a FRESH pool, 0.31 on the SECOND request through the
+    own, same input, same call   same slot, and the text degenerated
+
+The fault is a slot handed to a new request with the previous request's recurrent state and
+convolution ring still in it. `OP_RELEASE` and both `release` methods already existed; nothing
+called them for the span. See AFD_FINDINGS.md for the measurements and `slot_reset.py` for the
+fix.
+
+With it in place, both ends confirming their own installation from their logs, six tokens greedy:
+
+    arrangement                  "The capital of France is"     "Explain why the sky is blue..."
+    rung 2, 48 layers moved      IDENTICAL, drift 0.0062        IDENTICAL, drift 0.0198
+    group cut, shift 0           IDENTICAL, drift 0.0062        IDENTICAL, drift 0.0092
+    group cut, shift 1           IDENTICAL, drift 0.1375        IDENTICAL, drift 0.0807
+
+Shift 1 is a different model and is not supposed to be identical: its drift is twenty times the
+bfloat16 floor the shift-0 rows sit at, and that separation is the first honest reading of what
+moving the read point costs. The earlier 1.17 was a contaminated slot, not a read point.
+
+The bare "The" parts under all three, into fluent unrelated text. A one-token prompt is a near-tie
+and the skill's warning covers it: batch composition alone parts the same model's greedy output on
+3 of 4 prompts.
+
+Rungs 1 and 3 were never needed. They stay described here because the next fault of this shape
+should be cornered the same way.
