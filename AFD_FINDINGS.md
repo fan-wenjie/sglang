@@ -1667,3 +1667,68 @@ a decode step -- and buys latency, not throughput: under a max-of-both-ends acco
 the bottleneck below about 131k context, so hiding a round trip inside a feed-forward improves the
 per-request latency and leaves the step time where it was. Whether to take it is a separate
 question from whether it is correct, and only the second was measured here.
+
+
+## 2026-08-22, the group cut's fault: a slot handed on with the previous request still in it
+
+Found by the ladder, on the rung it was built for, and it is one call that nobody makes.
+
+Both slot tables have a `release` that zeroes the recurrent state and the convolution ring --
+`LinearStates.release` on the pool, `HistoryCache.release` on the host -- and `OP_RELEASE` has
+existed in the protocol since the beginning, carrying the comment that says exactly why: "sglang
+reuses slots and the next one is not this one". It reached the KV cache and the attention holder.
+It never reached the span, and no host ever sent it.
+
+A KV cache survives a reused slot, which is why this went unnoticed: a length of zero already
+excludes stale positions. A recurrent state has no length. Whatever is in the buffer IS the
+history, so the second request through a slot is conditioned on the first one's prompt.
+
+### How it was cornered
+
+Each step is a control the step before it made possible.
+
+    rung 2, all 48 linear layers on the pool     not identical, relative 1.28, cosine 0.03
+    rung 2, ONE linear layer on the pool         not identical, relative 1.27 -- so not
+                                                 accumulation across layers
+    rung 2, ZERO linear layers (same installer)  IDENTICAL, drift 0.005 -- so not the installer,
+                                                 the wire, the feed-forward offload or the harness
+    the moved layer against the model's own,     fresh pool, first request: relative 0.0026 mean,
+    same input, same call, same occasion         0.012 worst, cosine 1.0000
+                                                 second request, same slot: 0.31, and the text
+                                                 became " the same as the same as the same as"
+
+The last line is the whole finding. The first request through a fresh pool was always right, and
+every in-process check ever run was a first request.
+
+That is also why the fault looked like it moved: rung 3 and rung 4 measured 1.23 and 1.17 with
+cosines of 0.13 and 0.22, and those numbers are not a shifted read point being slightly worse than
+a grouped one. They are two runs of the same contaminated slot.
+
+### The fix
+
+`slot_reset.forget_starting_requests`, called once a forward pass by both cuts, at the first
+routed layer. It releases every row id that BEGINS a request -- a prefill chunk with no cached
+prefix -- on this end and, with OP_RELEASE, on the pool.
+
+At the start of a request rather than at its end: an aborted or crashed request never reaches its
+end, and the slot it leaves behind is indistinguishable from one in use.
+
+### After the fix, both ends confirmed installed from their own logs
+
+    arrangement                       "The capital of France is"   "Explain why the sky..."
+    rung 2, 48 layers on the pool     IDENTICAL, drift 0.0062      IDENTICAL, drift 0.0198
+    group cut, shift 0                IDENTICAL, drift 0.0062      IDENTICAL, drift 0.0092
+
+The third prompt, a bare "The", parts at token 1 under both -- and its continuation is fluent and
+unrelated ("the following excerpt is taken from a philosophical text" against "the following table
+lists the average annual salaries"), which is the near-tie a one-token prompt is, not the
+repetition loop. The drift at token 0 is 0.008, at bfloat16 rounding, before the argmax parts.
+The skill's own warning applies to it: batch composition alone parts the same model's greedy
+output on 3 of 4 prompts, so a single parted prompt is not yet a finding either way.
+
+### What this says about the instruments
+
+Every in-process check that passed while the deployment degenerated was correct AND blind, by one
+shared property: it ran one request. A recurrent state's whole failure mode is what the SECOND
+request sees. Any check of a stateful cut has to run at least two requests through one slot, and
+the second one is the test.
