@@ -49,10 +49,24 @@ def ask(endpoint: str, prompt: str, tokens: int, via: str | None) -> dict:
 
 
 def flatten(hidden) -> list[list[float]]:
-    """One row a token, whatever nesting the server used."""
-    if hidden and isinstance(hidden[0], (int, float)):
-        return [list(map(float, hidden))]
-    return [list(map(float, row)) for row in hidden]
+    """One row a token, whatever nesting the server used.
+
+    The server returns a token's state nested more deeply than one level -- the first version of
+    this assumed two and raised `float() argument must be ... not 'list'`. Descend until the
+    leaves are numbers, then take the last axis as the state and everything above it as tokens.
+    """
+    def depth(x):
+        return 1 + depth(x[0]) if isinstance(x, list) and x and isinstance(x[0], list) else 1
+
+    def rows(x):
+        if depth(x) == 1:
+            return [[float(v) for v in x]]
+        out = []
+        for part in x:
+            out.extend(rows(part))
+        return out
+
+    return rows(hidden)
 
 
 def compare(a: list[float], b: list[float]) -> tuple[float, float]:

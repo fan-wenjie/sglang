@@ -211,8 +211,15 @@ def _arm_if_wanted():
     what arms exist -- it holds the object or it does not, and every branch below reads
     `if arm is not None` rather than naming an arrangement.
     """
-    from sglang.srt.afd.arms import available, resolve
+    from sglang.srt.afd.arms import available, load, resolve
 
+    # IN THIS PROCESS. The registry is a module-level dict, and the pool and host roles are set up
+    # inside the scheduler process, which sglang SPAWNS -- so an import done by the argument check
+    # in the parent registers nothing here. That is the exact boundary `span_cut_wanted` was
+    # written to warn about, in this file, and the registry walked into it anyway: the arm
+    # reported itself available at startup, was never installed, and the arrangement served the
+    # standard path while every log line said the arm was there.
+    load()
     for name in available():
         factory = resolve(name)
         arm = factory()
