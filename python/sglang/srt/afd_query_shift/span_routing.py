@@ -211,6 +211,8 @@ class SpanRouting:
         self.client = client
         self.spans = group_layers(layer_types)
         self.heads = {s[0] for s in self.spans if s[0] >= 0}
+        # the earliest head, which is where a forward pass first reaches this routing
+        self._first_head = min(self.heads) if self.heads else None
         self.passengers = {i for s in self.spans for i in s[1:]}
         self._undo: list = []
         # the span issued by the previous head and not yet collected. One at a time per pass:
@@ -274,6 +276,13 @@ class SpanRouting:
         def head(positions, hidden_states, residual=None, forward_batch=None, **kwargs):
             attn = layer.attn
             device = hidden_states.device
+            if opens and layer_id == self._first_head:
+                # once a forward pass, before any span of it runs. See `slot_reset`: both slot
+                # tables are keyed by a row id sglang reuses, and neither was ever cleared.
+                from sglang.srt.afd_query_shift.slot_reset import forget_starting_requests
+
+                forget_starting_requests(
+                    forward_batch, history=self.history, client=self.client.client)
             rows = self._row_ids(forward_batch)
             self._rows = [int(r) for r in rows]
             if opens:

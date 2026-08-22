@@ -31,7 +31,7 @@ import torch
 
 from sglang.srt.afd.arms import register
 from sglang.srt.afd.layer_kinds import layer_types_of
-from sglang.srt.afd.protocol import OP_LAYER, OP_RELEASE
+from sglang.srt.afd.protocol import OP_LAYER
 
 logger = logging.getLogger(__name__)
 
@@ -151,29 +151,10 @@ class LinearOnPool:
             logger.info("afd rung2 check: layer %s could not be compared: %r", layer_id, e)
 
     def _clear_starting(self, forward_batch) -> None:
-        """Forget the history of every row id that is BEGINNING a request, on both ends.
+        """Forget the history of every row id that is beginning a request. See `slot_reset`."""
+        from sglang.srt.afd_query_shift.slot_reset import forget_starting_requests
 
-        sglang reuses `req_pool_indices`, and a slot table keyed by that id hands the next request
-        the previous one's memory. A KV cache survives the same reuse because a length of zero
-        excludes stale positions; a recurrent state has no length -- whatever is in the buffer IS
-        the history. The second request through a slot then answers, fluently, conditioned on the
-        first one's prompt, and the degeneration this ladder was built to find is exactly that.
-
-        The signal is a prefill chunk with no cached prefix. Taken at the START of a request
-        rather than at its end because an aborted request never reaches its end, and the slot it
-        leaves is indistinguishable from one in use.
-        """
-        prefix = forward_batch.extend_prefix_lens_cpu
-        if prefix is None:
-            return                                   # a decode step begins nothing
-        for rid, cached in zip(forward_batch.req_pool_indices, prefix):
-            if int(cached) != 0:
-                continue                             # a later chunk of a prefill already running
-            rid = int(rid)
-            if self.history is not None:
-                self.history.forget(rid)
-            handle = self.client.issue_frame(rid, 0, (torch.zeros(1, 1),), OP_RELEASE)
-            self.client.collect_frame(handle, "cpu")
+        forget_starting_requests(forward_batch, history=self.history, client=self.client)
 
     def current_rows(self):
         """The row ids of the call in flight, for the state reading the pool asks back for.
