@@ -1927,3 +1927,42 @@ already does this for one weight class and nothing else uses it.
 max_running_requests 4 against 3 -- because the group-cut host was launched with
 --enable-return-hidden-states and this one was not. Those rows are not comparable across the two
 runs; the weight row is, because it is decided by the loader alone.)
+
+
+## 2026-08-22, #67: the host stops holding what the pool computes
+
+The loader made one thing absent, the feed-forward. Everything else the pool computes was still
+allocated on the host: a full set of attention projections nobody multiplied by anything. Released
+after the routing is installed, from the modules the routing itself names -- passenger layers
+whole, and a head layer's qkv_proj, o_proj and mlp; the head keeps its norms and its weight-free
+attention core.
+
+    host, group cut          before        after
+    weights                  19.18 GB      5.69 GB       (13.49 GiB released)
+    mamba state               2.86 GB      9.18 GB
+    KV cache                  3.34 GB     10.46 GB
+    max_running_requests            3            8
+    max_total_num_tokens        54688       171524       3.1x
+
+Same card, same everything else: the freed weights become cache, which is the only form the gain
+can take. The deployment answers " Paris.\nThe capital of Germany is" as before, so nothing was
+released that was being used.
+
+This is what the small-card claim needed. A 24 GB card carrying 5.69 GB of weights has ~18 GB for
+cache, and a 512K context of standard attention in bf16 is 13.5 GB -- so one request of that size
+fits with room, on a card that cannot hold a twentieth of the checkpoint. The claim was refused
+this morning on 19.18 GB and it is the release, not the cut, that was missing.
+
+Two things this does NOT do, stated because both are easy to assume:
+
+    the construction peak      unchanged. The projections are QKVParallelLinear and
+                               RowParallelLinear, classes shared with modules this host still uses
+                               and with the vision tower, so they cannot be built on meta by class
+                               the way Qwen2MoeMLP is. The model is still materialised whole and
+                               then released, which needs the card to survive one full
+                               construction. On a card too small for THAT, this does not help yet.
+    the per-layer cut          untouched. Its host computes its own projections and needs them.
+
+A correction on the way: the first reading said 45.36 GiB released, on a host whose whole
+checkpoint is 19.18 GB. The counter moved every parameter and counted every parameter, and the
+feed-forward was already on meta from the loader -- counted twice. Numbers like that get quoted.
