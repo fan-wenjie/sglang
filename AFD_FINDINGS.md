@@ -1758,3 +1758,40 @@ have reported it: it asked once.
 What is NOT yet covered: a request that is aborted or retracted mid-generation. Its slot is
 released by the next request that lands on it, which is the design, but nothing has exercised the
 path.
+
+
+## 2026-08-22, the two lines get two branches
+
+`afd/main`, forked from origin/main, carries standard AFD alone: the host runs every attention and
+owns the KV cache and the recurrent states, the pool holds the static weights and answers
+feed-forward frames. 60 files, 248 unit cases, and no derived package anywhere in the tree. It is
+named `afd/main` rather than `afd` because `afd/span-cut` already occupies that namespace and git
+cannot hold both.
+
+`afd/span-cut` keeps the derived line and is what the deployment runs.
+
+Forking is what found the contamination. The property "standard AFD runs with the derived code
+ABSENT" had a ratchet, the ratchet was green, and it was grepping `srt/afd` alone -- while two
+files outside that directory imported the derived package by name, one of them the argument hook,
+which runs before anything else in the process. A test that cannot see the offender reports the
+property it was written for.
+
+    arg_groups/afd_hook.py   validated two of the arm's flags, imported its installer by name
+    model_runner.py          FROZEN, imported the derived package in a `try`, read three of the
+                             arm's server args off the runner, and reached two levels into the
+                             arm's own object for the sweep schedule
+    server_args.py           still holds the arm's three flags on the derived branch; absent on
+                             afd/main. The remaining gap, recorded rather than closed
+
+The repair is three named entry points on the shared registry -- `check_args`, `install_transforms`,
+`sweep_schedule` -- each answering a question a shared file legitimately has, none of them naming
+an arm. The checks themselves moved unchanged into `afd_query_shift/arg_checks.py`.
+
+Re-deployed on the rewired installation, group cut at shift 0, two passes: every per-token
+relative difference is bit-identical to the run before the refactor (0.00615874, 0.00787484,
+0.00920967, and the same cosines). A relocation that changes a number is not a relocation.
+
+Still open on this line: the travel-group batch re-forming as a documented property of the shared
+half (the pool's departure already re-forms per layer, which IS the coach model -- it has never
+been stated or measured as one), and the two-batch staggered time-division multiplexing, which
+doubles the in-flight requests and the host's KV cache and must be measured rather than assumed.
