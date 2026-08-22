@@ -113,6 +113,7 @@ class LinearOnPool:
             return answer
 
         attn.forward = forward
+        self._undo.append(lambda a=attn, o=original: setattr(a, "forward", o))
 
     def _report(self, layer_id, rows, reference, answer) -> None:
         """One line a call, for the first few. Raising here would kill the scheduler."""
@@ -134,7 +135,6 @@ class LinearOnPool:
             )
         except Exception as e:                          # noqa: BLE001 -- a probe never kills a run
             logger.info("afd rung2 check: layer %s could not be compared: %r", layer_id, e)
-        self._undo.append(lambda a=attn, o=original: setattr(a, "forward", o))
 
     def current_rows(self):
         """The row ids of the call in flight, for the state reading the pool asks back for.
