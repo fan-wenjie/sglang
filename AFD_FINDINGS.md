@@ -2480,3 +2480,27 @@ ForwardBatch, it is what the batch must carry; the cheap alternative is common-m
 that matters; and the bookkeeping it would have covered is covered. Recording that is the output.
 The next person to pick this up should either build the backend or leave the task closed as
 "covered by the deployment's token identity plus the table-level cases", and say which.
+
+
+## 2026-08-22, the review pass
+
+Everything green, on all three branches and on the deployment:
+
+    afd/main            266 unit cases, no derived package present in the tree at all
+    afd-query-shift     370 unit cases + 60 in the recovered Early-Q suite
+    afd/span-cut        367 unit cases, and the deployment answers
+                        " Paris.\nThe capital of Germany is" as colocated does
+
+The ratchet and the import smoke check pass on all three -- so standard AFD still names no derived
+arm anywhere it touches, and every module still imports from its own tree.
+
+One thing the pass caught that nothing else would have: `afd/main` had drifted back out of black.
+The benchmarks moved in and two docstrings were rewritten after the formatting sweep, and there is
+no pre-commit hook running in this environment -- so "formatted" is only ever true as of the last
+time somebody ran it. Re-run and clean.
+
+What remains needs a second card and nothing else: sharding layers across pools (#70, whose
+mechanism is parallelism across devices rather than a smaller read), one host addressing several
+pools (#64), and several hosts against one pool (#47). Each of those is a measurement that cannot
+be taken on one GPU, because two pools on one card contend for the same bandwidth and a flat
+result would say nothing.
