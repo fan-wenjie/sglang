@@ -43,7 +43,19 @@ from __future__ import annotations
 
 import logging
 
-from sglang.srt.afd.absent_ffn import to_meta
+import torch
+
+
+def release(module) -> int:
+    """Move a module's parameters to meta and return the bytes THAT WERE ACTUALLY THERE.
+
+    Not `absent_ffn.to_meta`, which counts every parameter it moves. Here the feed-forward has
+    already been built on meta by the loader, so counting it again reported 45.36 GiB released on
+    a host whose whole checkpoint was 19.18 GB -- a number that would have been quoted.
+    """
+    freed = sum(p.numel() * p.element_size() for p in module.parameters() if not p.is_meta)
+    module.to("meta")
+    return freed
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +73,7 @@ def strip_routed_weights(model, routing) -> dict:
     freed, touched = 0, {"passenger_layers": 0, "head_layers": 0}
 
     for index in sorted(routing.passengers):
-        freed += to_meta(layers[index])
+        freed += release(layers[index])
         touched["passenger_layers"] += 1
 
     for index in sorted(routing.heads):
@@ -70,10 +82,10 @@ def strip_routed_weights(model, routing) -> dict:
             module = getattr(layer, name, None)
             if module is None:
                 continue
-            freed += to_meta(module)
+            freed += release(module)
         # the feed-forward of a head layer runs on the pool too, in `run_epilogue`
         if getattr(layer, "mlp", None) is not None:
-            freed += to_meta(layer.mlp)
+            freed += release(layer.mlp)
         touched["head_layers"] += 1
 
     report = {"gib_freed": freed / 1024 ** 3, **touched}
