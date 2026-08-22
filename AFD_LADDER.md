@@ -171,6 +171,22 @@ rung 4's baseline is therefore: parts at the first token, cosine 0.22 to 0.67 ac
 generation. Every rung below it is measured the same way and the first one that stops matching is
 the answer.
 
+## What the ladder has said so far
+
+    rung 0   standard AFD                token-identical to colocated, three prompts
+    rung 4   group cut + shifted read     parts at token 0, relative 1.17, cosine 0.217
+    rung 3   group cut, read point at 0   parts at token 0, relative 1.23, cosine 0.128
+
+Both rungs with installation confirmed on both ends, which is the part that makes them worth
+anything. rung 3 and rung 4 are the same to within their own scatter, so the shifted read point is
+not the cause -- and this is the first time that has been said about a run where the arrangement
+was known to be running. Every earlier shift-0 control was taken before "registered" and
+"installed" were known to be different questions, and none of them can be relied on.
+
+The fault is at rung 3 or below: the group cut without the shift. That is the linear attention on
+the pool, the residual and gate held there between layers, and one round trip a group instead of
+one a layer. rungs 1 and 2 do not exist yet as separate settings and have to be built.
+
 ## Order of work
 
 0. **Find the fault.** The ladder is how, and it is the reason the branches are laid out this way:
