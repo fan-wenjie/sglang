@@ -76,11 +76,18 @@ class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
             "without it",
         )
 
-    def test_the_registry_is_empty_without_a_derived_package(self):
-        """`resolve` returning None is the ordinary state, not an error state."""
+    def test_resolving_an_arm_nobody_registered_gives_none(self):
+        """`resolve` returning None is the ordinary state, not an error state.
+
+        Asked about a name nothing will ever register, rather than about "query-shift". The first
+        version asserted the registry was empty, which is a property of the TEST SESSION and not
+        of the source: an argument check that imports the arm's package to see whether the build
+        carries it registers it globally, and this went red the moment that check existed. The
+        property worth pinning is that an unknown name resolves to nothing.
+        """
         from sglang.srt.afd.arms import resolve
 
-        self.assertIsNone(resolve("query-shift"))
+        self.assertIsNone(resolve("an-arm-that-does-not-exist"))
         self.assertIsNone(resolve(None))
 
     def test_two_arms_under_one_name_are_refused(self):

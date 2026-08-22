@@ -39,6 +39,7 @@ def handle_afd(server_args: ServerArgs) -> None:
         check_compatibility(server_args)
 
     _check_coverage(server_args)
+    _check_arm_is_present(server_args)
 
     if server_args.afd_mode not in ("null", "host", "pool"):
         raise ValueError(
@@ -79,6 +80,40 @@ def handle_afd(server_args: ServerArgs) -> None:
             "afd %s with --afd-query-shift-layers=0: the standard read point, so the host waits for "
             "each feed-forward before its next attention. This is the synchronous baseline.",
             server_args.afd_mode,
+        )
+
+
+def _check_arm_is_present(server_args: ServerArgs) -> None:
+    """An arm asked for by flag but not installed is refused at startup, not ignored.
+
+    The derived arms live outside `sglang.srt.afd` and announce themselves by being imported. That
+    is what lets AFD ship without them. It also means a server can be launched with the arm's flag
+    set, find nothing registered, and serve the STANDARD arrangement in silence -- which is
+    exactly what happened the first time this indirection ran: both ends took `--afd-span-cut`,
+    neither installed anything, and the output became correct because the arrangement under test
+    had stopped running. A quiet fallback that produces right answers is the worst kind: it reads
+    as a fix.
+
+    So the flag is honoured or the server does not start. Importing the arm's package here is what
+    registers it, and the ImportError is reported with the flag that asked for it.
+    """
+    if not getattr(server_args, "afd_span_cut", False):
+        return
+    from sglang.srt.afd.arms import available
+
+    try:
+        import sglang.srt.afd_query_shift.installer  # noqa: F401 -- imported for its registration
+    except ImportError as e:
+        raise ValueError(
+            f"--afd-span-cut asks for an arm this build does not carry: {e}. AFD itself is "
+            f"installed and would serve the standard arrangement, which is why this is refused "
+            f"rather than ignored -- a run that names a cut it never took would report the "
+            f"standard arrangement's numbers under the cut's name."
+        ) from e
+    if not available():
+        raise ValueError(
+            "--afd-span-cut was given, the arm's package imported, and nothing registered. The "
+            "arrangement that would run is the standard one."
         )
 
 
