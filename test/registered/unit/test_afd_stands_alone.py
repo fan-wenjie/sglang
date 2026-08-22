@@ -39,9 +39,11 @@ class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
     #
     # Recorded here because the obvious repair -- edit the offending line -- would make the grep
     # pass while the architecture stayed wrong, which is worse than the debt.
-    KNOWN = {
-        "roles.py": 1,        # _span_query_shift, leaves with the arm's installation
-    }
+    # EMPTY, and it must stay empty. Both entries it opened with left by relocation rather than
+    # by editing the line the grep found -- checkpoint.py and wiring.py to the derived package,
+    # and roles.py's five installer functions with them. Nothing under srt/afd names a derived
+    # arm now, which is the property upstream needs and the reason this file exists.
+    KNOWN = {}
 
     def test_no_new_file_in_afd_names_a_derived_package(self):
         """The whole property, as one grep. If this fails, deleting the derived directory breaks
