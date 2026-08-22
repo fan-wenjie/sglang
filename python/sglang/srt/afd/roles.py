@@ -569,7 +569,7 @@ def watch_linear_attention(model, runner) -> None:
             finally:
                 runner.release(scratch)
 
-            def per_head(a, b, heads):
+            def per_head(a, b, heads, layer_id=layer_id):
                 """Where the difference lives, head by head.
 
                 The output is `heads` blocks of `head_v_dim` side by side. A reimplementation that
@@ -581,6 +581,20 @@ def watch_linear_attention(model, runner) -> None:
                 a = a.reshape(-1, heads, a.shape[-1] // heads).float()
                 b = b.reshape(-1, heads, b.shape[-1] // heads).float()
                 err = (a - b).norm(dim=-1) / (b.norm(dim=-1) + 1e-9)
+                # ROWS 0, middle and last, not row 0 alone. Row 0 reads the initial state and
+                # nothing else, so every prefill reading this comparison produced until now
+                # described the chunk's FIRST TOKEN -- and the recurrence had not run yet. A stub
+                # rewritten to scan token by token changed not one digit, which is what exposed it.
+                rows = err.shape[0]
+                for tag, r in (("row0", 0), ("mid", rows // 2), ("last", rows - 1)):
+                    e = err[r]
+                    top = torch.topk(e, min(3, e.numel()))
+                    logger.info(
+                        "afd rows: layer %s %s (of %s) -- %s/%s heads within 2%%, worst %s",
+                        layer_id, tag, rows, int((e < 0.02).sum()), heads,
+                        " ".join(f"h{int(i)}={float(v):.3f}"
+                                 for v, i in zip(top.values, top.indices)),
+                    )
                 err = err[0]
                 good = int((err < 0.02).sum())
                 worst = torch.topk(err, min(4, err.numel()))

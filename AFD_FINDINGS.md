@@ -8,6 +8,34 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-22, three rows instead of one, and the key-head reading is retracted
+
+    layer 0   row 0   42/48 within 2%, worst h30 h31 h1     mid  44/48, worst h37 h36 h38
+              last    48/48, worst 0.014
+    layer 1   row 0   45/48, worst h30 h32 h31              mid  48/48
+              last    46/48, worst h3 h5 h17
+    layer 2   row 0   48/48                                 mid  46/48, worst h18 h20 h32
+              last    48/48
+
+Two things fall out, and both cut against what was written here yesterday.
+
+The error does NOT grow along the chunk. Layer 0 goes 42/48, 44/48, 48/48 -- it improves. So the
+scan is not accumulating anything, which is the second independent way accumulation has now been
+ruled out.
+
+And the worst key head CHANGES WITH THE ROW: key head 10 at row 0, key head 12 at the middle, no
+grouping at all at the end. "Key head 10 is mis-sliced" is dead. The contiguous triples are not
+evidence of a slicing bug -- three value heads share one key head on this model, so they share q
+and k, so their errors are correlated by construction. That is a property of the model's shape
+and it would appear for ANY error in the (k.q) term, rounding included. The previous entry read
+it as structure. It was not.
+
+What the three rows leave is a scatter of 1 to 5 percent that does not grow, does not favour a
+head, and sits above the 0.4% the decode path gives. The model's prefill runs
+`chunk_gated_delta_rule` while this side walks the chunk token by token; those agree to 0.0042 on
+eight tokens from a zero state, and 122 tokens from a live state is not that test.
+
+
 ## 2026-08-22, the stub was fixed, nothing moved, and the reason is that the comparison sees one row
 
 The comparison's local `ask_host` did a BATCHED read over every row of a chunk -- right for a
