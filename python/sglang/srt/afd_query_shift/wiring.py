@@ -41,7 +41,7 @@ import torch
 from sglang.srt.afd_query_shift.checkpoint import resolve_coverage, resolve_shift
 from sglang.srt.afd.supported import check_supported
 from sglang.srt.afd.sweep_ahead import install_sweep_ahead, resolve_split
-from sglang.srt.afd.read_point import (
+from sglang.srt.afd_query_shift.read_point import (
     ReadPlan,
     convertible_layers,
     full_attention_layers,

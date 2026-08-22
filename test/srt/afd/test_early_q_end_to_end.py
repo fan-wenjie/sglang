@@ -62,12 +62,12 @@ class TestEarlyQOnTheRealStack(unittest.TestCase):
         if not os.path.isdir(MODEL):
             raise unittest.SkipTest(f"no checkpoint at {MODEL}")
         cls.runner, cls.model_config = _build_runner(shift=1)
-        from sglang.srt.afd.read_point import layer_types_of
+        from sglang.srt.afd_query_shift.read_point import layer_types_of
 
         cls.layer_types = layer_types_of(cls.runner.model)
 
     def test_the_plan_covers_the_softmax_layers_and_records_the_clamp(self):
-        from sglang.srt.afd.read_point import full_attention_layers
+        from sglang.srt.afd_query_shift.read_point import full_attention_layers
         from sglang.srt.afd_query_shift.wiring import install_early_q
 
         full = full_attention_layers(self.layer_types)
@@ -84,7 +84,7 @@ class TestEarlyQOnTheRealStack(unittest.TestCase):
             wiring.remove()
 
     def test_a_group_shift_clamps_the_first_softmax_layer(self):
-        from sglang.srt.afd.read_point import full_attention_layers
+        from sglang.srt.afd_query_shift.read_point import full_attention_layers
         from sglang.srt.afd_query_shift.wiring import install_early_q
 
         full = full_attention_layers(self.layer_types)
@@ -106,7 +106,7 @@ class TestEarlyQOnTheRealStack(unittest.TestCase):
         logits delta would show only that SOMETHING changed, which a hook on the wrong tensor
         also produces.
         """
-        from sglang.srt.afd.read_point import full_attention_layers
+        from sglang.srt.afd_query_shift.read_point import full_attention_layers
         from sglang.srt.afd_query_shift.wiring import install_early_q
 
         target = full_attention_layers(self.layer_types)[4]     # a converted layer, mid-stack

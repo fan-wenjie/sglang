@@ -100,7 +100,7 @@ def make_span_runner(model, *, device):
     max_requests = _span_slots()
     from sglang.srt.afd.linear_state import LinearStates
     from sglang.srt.afd.layer_kinds import layer_types_of
-    from sglang.srt.afd.span import SpanRunner, group_layers
+    from sglang.srt.afd_query_shift.span import SpanRunner, group_layers
 
     config = model.config
     layer_types = layer_types_of(model)
@@ -111,12 +111,12 @@ def make_span_runner(model, *, device):
         head_v_dim=config.linear_value_head_dim,
         device=device,
     )
-    from sglang.srt.afd.selfcheck import watch_colocated_residual
+    from sglang.srt.afd_query_shift.selfcheck import watch_colocated_residual
 
     watch_colocated_residual(model)
     runner = SpanRunner(
         model, states, layer_types=layer_types, query_shift=_span_query_shift())
-    from sglang.srt.afd.selfcheck import watch_linear_attention
+    from sglang.srt.afd_query_shift.selfcheck import watch_linear_attention
 
     watch_linear_attention(model, runner)
     spans = group_layers(layer_types)
@@ -146,7 +146,7 @@ def install_span_routing(model, client: PoolClient, *, sweep_ahead,
     from sglang.srt.afd.history_service import HistoryService
     from sglang.srt.afd.linear_history import HistoryCache
     from sglang.srt.afd.layer_kinds import layer_types_of
-    from sglang.srt.afd.span_routing import SpanClient, SpanRouting
+    from sglang.srt.afd_query_shift.span_routing import SpanClient, SpanRouting
 
     types = layer_types_of(model)
     routing = SpanRouting(

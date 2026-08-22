@@ -25,7 +25,7 @@ CUDA = torch.cuda.is_available()
 class TestTheSpansConvolutionIsTheModels(CustomTestCase):
     def setUp(self):
         from sglang.srt.afd.linear_state import LinearStates
-        from sglang.srt.afd.span import SpanRunner
+        from sglang.srt.afd_query_shift.span import SpanRunner
 
         self.stack, self.config, kinds = build_tiny_stack(device="cuda")
         self.attn = self.stack.layers[0].linear_attn

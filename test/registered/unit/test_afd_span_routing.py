@@ -28,7 +28,7 @@ from sglang.srt.afd.protocol import (
     decode,
     send_frame,
 )
-from sglang.srt.afd.span_routing import SpanClient, SpanRouting
+from sglang.srt.afd_query_shift.span_routing import SpanClient, SpanRouting
 from sglang.test.test_utils import CustomTestCase
 
 TYPES = ["linear_attention"] * 3 + ["full_attention"] + \
@@ -102,7 +102,7 @@ class TestThePassThroughs(CustomTestCase):
         self.routing = SpanRouting.__new__(SpanRouting)
         self.routing.model = self.stack
         self.routing._undo = []
-        from sglang.srt.afd.span import group_layers
+        from sglang.srt.afd_query_shift.span import group_layers
 
         self.routing.spans = group_layers(TYPES)
         for span in self.routing.spans:

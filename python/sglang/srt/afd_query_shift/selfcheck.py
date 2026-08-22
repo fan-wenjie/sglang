@@ -55,7 +55,7 @@ def watch_colocated_residual(model) -> None:
             if residual is None:
                 return
             seen["n"] += 1
-            from sglang.srt.afd.span import _dump
+            from sglang.srt.afd_query_shift.span import _dump
 
             _dump("model", f"pre-mlp {index}", residual)
             row = residual[0].float()
@@ -112,7 +112,7 @@ def watch_colocated_residual(model) -> None:
                 return
             entering_seen[key] = 1
             stream = hidden if residual is None else hidden + residual
-            from sglang.srt.afd.span import _dump
+            from sglang.srt.afd_query_shift.span import _dump
 
             _dump("model", f"entering {index} rows {stream.shape[0]}", stream)
             row = stream[0].float()

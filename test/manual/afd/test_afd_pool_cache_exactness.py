@@ -51,7 +51,7 @@ class TestPoolCacheOnRealWeights(unittest.TestCase):
 
     def test_a_decode_stream_sweeps_the_history_it_actually_wrote(self):
         from sglang.srt.afd.pool_attention import KVHolder, SweepService, sweep_cache
-        from sglang.srt.afd.read_point import full_attention_layers, layer_types_of
+        from sglang.srt.afd_query_shift.read_point import full_attention_layers, layer_types_of
         from sglang.srt.afd.remote_attention import join
 
         model = self.runner.model
@@ -134,7 +134,7 @@ class TestPoolCacheOnRealWeights(unittest.TestCase):
         """The other one, on the real weights: the pool applies the rotation, so it needs the
         host's positions. Sending the wrong ones is the bug that makes order matter."""
         from sglang.srt.afd.pool_attention import KVHolder, SweepService, sweep_cache
-        from sglang.srt.afd.read_point import full_attention_layers, layer_types_of
+        from sglang.srt.afd_query_shift.read_point import full_attention_layers, layer_types_of
 
         model = self.runner.model
         types = layer_types_of(model)

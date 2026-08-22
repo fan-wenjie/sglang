@@ -72,7 +72,7 @@ from sglang.srt.afd.protocol import (
     OP_SPAN_Q,
     pack_positions,
 )
-from sglang.srt.afd.span import group_layers
+from sglang.srt.afd_query_shift.span import group_layers
 
 logger = logging.getLogger(__name__)
 

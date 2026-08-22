@@ -7,8 +7,8 @@ reads as tolerance rather than as a hook that never installed.
 
 import unittest
 
-from sglang.srt.afd.early_q import EarlyQStash, EarlyQWiring, install
-from sglang.srt.afd.read_point import full_attention_layers, plan_read_points
+from sglang.srt.afd_query_shift.early_q import EarlyQStash, EarlyQWiring, install
+from sglang.srt.afd_query_shift.read_point import full_attention_layers, plan_read_points
 
 # Qwen3.8-27B: 64 layers, full_attention_interval 4, so the softmax layers are the last of each
 # group of four. Written out rather than imported so the test states what it assumes.
@@ -153,7 +153,7 @@ class TestCoverage(unittest.TestCase):
     """
 
     def test_the_three_questions_have_three_answers(self):
-        from sglang.srt.afd.read_point import (
+        from sglang.srt.afd_query_shift.read_point import (
             convertible_layers,
             full_attention_layers,
             stateful_layers,
@@ -169,7 +169,7 @@ class TestCoverage(unittest.TestCase):
         self.assertNotEqual(len(sweeps), len(moves))
 
     def test_full_coverage_is_63_of_64_at_one_layer_back(self):
-        from sglang.srt.afd.read_point import convertible_layers
+        from sglang.srt.afd_query_shift.read_point import convertible_layers
 
         plan = plan_read_points(1, 64, convertible=convertible_layers(QWEN38_27B_LAYER_TYPES))
         # layer 0 is exempt, everything else moves
@@ -177,7 +177,7 @@ class TestCoverage(unittest.TestCase):
         self.assertEqual(plan.clamped, ())
 
     def test_softmax_only_coverage_is_16_of_64(self):
-        from sglang.srt.afd.read_point import full_attention_layers
+        from sglang.srt.afd_query_shift.read_point import full_attention_layers
 
         plan = plan_read_points(1, 64, convertible=full_attention_layers(QWEN38_27B_LAYER_TYPES))
         self.assertEqual(len(plan.moved), 16)

@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 
 import torch
-from sglang.srt.afd.read_point import ReadPlan, plan_read_points
+from sglang.srt.afd_query_shift.read_point import ReadPlan, plan_read_points
 
 logger = logging.getLogger(__name__)
 
