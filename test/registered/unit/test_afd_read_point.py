@@ -210,7 +210,7 @@ class TestTheEarlyProjectionReadsOnlyItsOwnRows(CustomTestCase):
             in_proj_qkvz=SimpleNamespace(weight=weight), key_dim=key_dim, attn_tp_size=1)
 
     def test_the_slice_is_a_view_of_the_original(self):
-        from sglang.srt.afd.wiring import _query_rows
+        from sglang.srt.afd_query_shift.wiring import _query_rows
 
         attn = self.a_fake_attn()
         rows = _query_rows(attn)
@@ -221,7 +221,7 @@ class TestTheEarlyProjectionReadsOnlyItsOwnRows(CustomTestCase):
     def test_it_projects_what_the_full_projection_would_have(self):
         import torch
 
-        from sglang.srt.afd.wiring import _query_rows
+        from sglang.srt.afd_query_shift.wiring import _query_rows
 
         attn = self.a_fake_attn()
         x = torch.randn(3, 8)
@@ -235,11 +235,11 @@ class TestTheEarlyProjectionReadsOnlyItsOwnRows(CustomTestCase):
         Refusing would turn a speed optimisation into a load failure on checkpoints this has
         never been run against, which is a worse trade than reading some bytes twice.
         """
-        from sglang.srt.afd.wiring import _query_rows
+        from sglang.srt.afd_query_shift.wiring import _query_rows
 
         self.assertIsNone(_query_rows(self.a_fake_attn(contiguous=False)))
 
     def test_a_query_wider_than_the_projection_is_refused(self):
-        from sglang.srt.afd.wiring import _query_rows
+        from sglang.srt.afd_query_shift.wiring import _query_rows
 
         self.assertIsNone(_query_rows(self.a_fake_attn(out=2, key_dim=4)))

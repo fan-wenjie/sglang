@@ -41,7 +41,6 @@ class TestStandardAfdNamesNoDerivedArm(CustomTestCase):
     # pass while the architecture stayed wrong, which is worse than the debt.
     KNOWN = {
         "roles.py": 1,        # _span_query_shift, leaves with the arm's installation
-        "checkpoint.py": 1,   # the whole file is the derived arm's; it relocates
     }
 
     def test_no_new_file_in_afd_names_a_derived_package(self):

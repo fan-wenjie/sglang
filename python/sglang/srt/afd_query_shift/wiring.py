@@ -38,7 +38,7 @@ import logging
 from collections.abc import Callable
 
 import torch
-from sglang.srt.afd.checkpoint import resolve_coverage, resolve_shift
+from sglang.srt.afd_query_shift.checkpoint import resolve_coverage, resolve_shift
 from sglang.srt.afd.supported import check_supported
 from sglang.srt.afd.sweep_ahead import install_sweep_ahead, resolve_split
 from sglang.srt.afd.read_point import (

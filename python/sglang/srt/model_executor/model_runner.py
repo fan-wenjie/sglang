@@ -758,7 +758,13 @@ class ModelRunner:
         Wired here because this is where a loaded model may be transformed, and because the model
         lives in the scheduler process: a caller holding an Engine cannot reach it.
         """
-        from sglang.srt.afd.wiring import install_early_q
+        # Imported here and tolerantly: AFD may ship without this arm, and a missing directory
+        # must leave the standard arrangement running rather than fail at startup.
+        try:
+            from sglang.srt.afd_query_shift.wiring import install_early_q
+        except ImportError:
+            self.afd_early_q = None
+            return
 
         self.afd_early_q = install_early_q(
             model=self.model,

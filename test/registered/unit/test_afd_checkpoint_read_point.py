@@ -42,28 +42,28 @@ def _config(shift=None, coverage=None, nested=True):
 
 class TestResolveShift(CustomTestCase):
     def test_unset_takes_the_checkpoints_own(self):
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
         self.assertEqual(resolve_shift(None, _config(shift=1)), 1)
 
     def test_unset_on_an_unconverted_checkpoint_is_standard(self):
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
         self.assertEqual(resolve_shift(None, _config()), 0)
 
     def test_explicit_zero_is_not_the_same_as_unset(self):
         """The whole reason the default is None. A repaired checkpoint served at the standard
         wiring must warn, and it cannot if unset and 0 are one value."""
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
-        with self.assertLogs("sglang.srt.afd.checkpoint", level=logging.WARNING) as caught:
+        with self.assertLogs("sglang.srt.afd_query_shift.checkpoint", level=logging.WARNING) as caught:
             self.assertEqual(resolve_shift(0, _config(shift=1)), 0)
         self.assertIn("OVERRIDES", "".join(caught.output))
 
     def test_agreeing_with_the_checkpoint_is_silent(self):
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
-        logger = logging.getLogger("sglang.srt.afd.checkpoint")
+        logger = logging.getLogger("sglang.srt.afd_query_shift.checkpoint")
         with self.assertNoLogs(logger, level=logging.WARNING):
             self.assertEqual(resolve_shift(1, _config(shift=1)), 1)
 
@@ -71,9 +71,9 @@ class TestResolveShift(CustomTestCase):
         """Legitimate -- it is how the study's forward-only numbers were taken -- and still a
         warning, because the weights were never repaired for this read point. Only a specific
         intent wants it, and a deployment that arrives here arrived by accident."""
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
-        with self.assertLogs("sglang.srt.afd.checkpoint", level=logging.WARNING) as caught:
+        with self.assertLogs("sglang.srt.afd_query_shift.checkpoint", level=logging.WARNING) as caught:
             self.assertEqual(resolve_shift(1, _config()), 1)
         self.assertIn("nothing has repaired", "".join(caught.output))
 
@@ -81,19 +81,19 @@ class TestResolveShift(CustomTestCase):
         """The one arrangement nothing is wrong with, however it was spelled. Serving stock
         weights at the stock read point must stay quiet whether the flag was omitted or written
         out, or every ordinary launch carries an afd warning and the real ones stop being read."""
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
-        logger = logging.getLogger("sglang.srt.afd.checkpoint")
+        logger = logging.getLogger("sglang.srt.afd_query_shift.checkpoint")
         with self.assertNoLogs(logger, level=logging.WARNING):
             self.assertEqual(resolve_shift(0, _config()), 0)
 
     def test_the_top_level_is_read_when_there_is_no_text_config(self):
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
         self.assertEqual(resolve_shift(None, _config(shift=2, nested=False)), 2)
 
     def test_a_checkpoint_stating_nonsense_raises(self):
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
         with self.assertRaises(TypeError):
             resolve_shift(None, _config(shift="half"))
@@ -101,24 +101,24 @@ class TestResolveShift(CustomTestCase):
 
 class TestResolveCoverage(CustomTestCase):
     def test_unset_takes_the_checkpoints_own(self):
-        from sglang.srt.afd.checkpoint import resolve_coverage
+        from sglang.srt.afd_query_shift.checkpoint import resolve_coverage
 
         self.assertEqual(resolve_coverage(None, _config(coverage="softmax")), "softmax")
 
     def test_unset_with_nothing_stated_is_all(self):
-        from sglang.srt.afd.checkpoint import resolve_coverage
+        from sglang.srt.afd_query_shift.checkpoint import resolve_coverage
 
         self.assertEqual(resolve_coverage(None, _config()), "all")
 
     def test_contradicting_the_checkpoint_warns(self):
-        from sglang.srt.afd.checkpoint import resolve_coverage
+        from sglang.srt.afd_query_shift.checkpoint import resolve_coverage
 
-        with self.assertLogs("sglang.srt.afd.checkpoint", level=logging.WARNING) as caught:
+        with self.assertLogs("sglang.srt.afd_query_shift.checkpoint", level=logging.WARNING) as caught:
             self.assertEqual(resolve_coverage("all", _config(coverage="softmax")), "all")
         self.assertIn("overrides", "".join(caught.output))
 
     def test_a_checkpoint_stating_an_unknown_coverage_raises(self):
-        from sglang.srt.afd.checkpoint import resolve_coverage
+        from sglang.srt.afd_query_shift.checkpoint import resolve_coverage
 
         with self.assertRaises(ValueError):
             resolve_coverage(None, _config(coverage="every-other"))
@@ -127,7 +127,7 @@ class TestResolveCoverage(CustomTestCase):
 class TestStamp(CustomTestCase):
     def test_a_conversion_can_write_the_read_point_into_the_config(self):
         """So the shift travels with the weights and nobody has to remember it."""
-        from sglang.srt.afd.checkpoint import stamp
+        from sglang.srt.afd_query_shift.checkpoint import stamp
 
         out = stamp({"text_config": {"num_hidden_layers": 64}}, shift=1, coverage="all")
         self.assertEqual(out["text_config"]["query_shift_layers"], 1)
@@ -135,7 +135,7 @@ class TestStamp(CustomTestCase):
         self.assertEqual(out["text_config"]["num_hidden_layers"], 64, "the rest is untouched")
 
     def test_stamping_does_not_mutate_the_input(self):
-        from sglang.srt.afd.checkpoint import stamp
+        from sglang.srt.afd_query_shift.checkpoint import stamp
 
         original = {"text_config": {"a": 1}}
         stamp(original, shift=1, coverage="all")
@@ -153,7 +153,7 @@ class TestRetiredKeys(CustomTestCase):
     """
 
     def test_the_old_shift_spelling_is_refused(self):
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
         cfg = FakeConfig()
         cfg.afd_query_shift_layers = 1
@@ -162,7 +162,7 @@ class TestRetiredKeys(CustomTestCase):
         self.assertIn("query_shift_layers", str(caught.exception))
 
     def test_the_old_coverage_spelling_is_refused(self):
-        from sglang.srt.afd.checkpoint import resolve_coverage
+        from sglang.srt.afd_query_shift.checkpoint import resolve_coverage
 
         cfg = FakeConfig()
         cfg.afd_coverage = "softmax"
@@ -171,7 +171,7 @@ class TestRetiredKeys(CustomTestCase):
 
     def test_a_checkpoint_carrying_both_takes_the_new_one(self):
         """A conversion tool that writes both spellings during a transition is not an error."""
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
         cfg = FakeConfig()
         cfg.afd_query_shift_layers = 1
@@ -180,7 +180,7 @@ class TestRetiredKeys(CustomTestCase):
 
     def test_an_unconverted_checkpoint_still_says_nothing(self):
         """The guard must not fire on the ordinary case, which states neither spelling."""
-        from sglang.srt.afd.checkpoint import resolve_shift
+        from sglang.srt.afd_query_shift.checkpoint import resolve_shift
 
         self.assertEqual(resolve_shift(None, FakeConfig()), 0)
 

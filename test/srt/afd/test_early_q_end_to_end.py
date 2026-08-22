@@ -68,7 +68,7 @@ class TestEarlyQOnTheRealStack(unittest.TestCase):
 
     def test_the_plan_covers_the_softmax_layers_and_records_the_clamp(self):
         from sglang.srt.afd.read_point import full_attention_layers
-        from sglang.srt.afd.wiring import install_early_q
+        from sglang.srt.afd_query_shift.wiring import install_early_q
 
         full = full_attention_layers(self.layer_types)
         wiring = install_early_q(self.runner.model, 1, self.layer_types)
@@ -85,7 +85,7 @@ class TestEarlyQOnTheRealStack(unittest.TestCase):
 
     def test_a_group_shift_clamps_the_first_softmax_layer(self):
         from sglang.srt.afd.read_point import full_attention_layers
-        from sglang.srt.afd.wiring import install_early_q
+        from sglang.srt.afd_query_shift.wiring import install_early_q
 
         full = full_attention_layers(self.layer_types)
         wiring = install_early_q(self.runner.model, 4, self.layer_types)
@@ -107,7 +107,7 @@ class TestEarlyQOnTheRealStack(unittest.TestCase):
         also produces.
         """
         from sglang.srt.afd.read_point import full_attention_layers
-        from sglang.srt.afd.wiring import install_early_q
+        from sglang.srt.afd_query_shift.wiring import install_early_q
 
         target = full_attention_layers(self.layer_types)[4]     # a converted layer, mid-stack
         layer = self.runner.model.model.layers[target]
