@@ -477,11 +477,39 @@ def watch_linear_attention(model, runner) -> None:
                 taps = attn.conv1d.weight.shape[-1]
 
                 def ask_host(lid, request_ids, q_tilde, step=None):
-                    slots = torch.full((q_tilde.shape[0],), slot, device=q_tilde.device,
-                                       dtype=torch.long)
-                    return read_one(runner.states.buffer(lid), slots, q_tilde).float()
+                    """What the HOST does, including the part that makes a chunk a chunk.
+
+                    A batched `read_one` over every row contracts them all against one unchanging
+                    state -- right for a decode batch, where no two rows share a slot, and wrong
+                    for a prefill chunk, whose rows are one request's consecutive tokens and each
+                    reads what its predecessor wrote. That is `HistoryService._scan`, and this stub
+                    did not have it.
+
+                    Without it this comparison reported 42 of 48 value heads within 2% on a prefill
+                    against 48 of 48 on a decode, and the shortfall landed on one key head's group
+                    at a time -- a structure, chased for a round, produced entirely by the
+                    instrument. The eighth time in this search that a measurement measured itself.
+                    """
+                    state_buf = runner.states.buffer(lid)
+                    rows = q_tilde.shape[0]
+                    slots = torch.full((rows,), slot, device=q_tilde.device, dtype=torch.long)
+                    if rows == 1 or step is None:
+                        logger.info("afd stub: layer %s batched read of %s row(s), step=%s",
+                                    lid, rows, step is not None)
+                        return read_one(state_buf, slots, q_tilde).float()
+                    logger.info("afd stub: layer %s scanning %s rows sequentially", lid, rows)
+                    k_s, v_s, alpha_s, beta_s = step
+                    out = []
+                    for t in range(rows):
+                        one = slots[t : t + 1]
+                        out.append(read_one(state_buf, one, q_tilde[t : t + 1]))
+                        update_only(state_buf, one, k=k_s[t : t + 1], v=v_s[t : t + 1],
+                                    alpha=alpha_s[t : t + 1], beta=beta_s[t : t + 1])
+                    return torch.cat(out, dim=0).float()
 
                 def defer_update(lid, request_ids, k, v, alpha, beta):
+                    if k.shape[0] != 1:
+                        return          # a multi-row rider advanced inside the scan already
                     slots = torch.full((k.shape[0],), slot, device=k.device, dtype=torch.long)
                     update_only(runner.states.buffer(lid), slots,
                                 k=k, v=v, alpha=alpha, beta=beta)

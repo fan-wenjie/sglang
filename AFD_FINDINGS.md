@@ -8,6 +8,28 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-22, the stub was fixed, nothing moved, and the reason is that the comparison sees one row
+
+The comparison's local `ask_host` did a BATCHED read over every row of a chunk -- right for a
+decode batch and wrong for a prefill, whose rows are one request's consecutive tokens. That is the
+first bug of this whole search, reappearing inside the instrument built to hunt it, and it looked
+like the explanation for "42 of 48 heads on a prefill against 48 of 48 on a decode".
+
+It was not. With the stub walking the chunk token by token -- proven, not assumed, by a marker
+that logs "scanning 122 rows sequentially" -- every figure is bit-identical: 42/48, h30 = 0.057,
+h31 = 0.053, h32 = 0.051.
+
+The reason is in `per_head`: it computes the error over the chunk and then takes `err[0]`. ROW
+ZERO. Row 0 reads the initial state and nothing else, so batched and sequential give it the same
+answer, and every prefill reading this comparison has produced describes the FIRST TOKEN of the
+chunk. The per-key-head structure at row 0 is real -- it reproduces across layers and across runs
+-- and it has nothing to do with the scan, because at row 0 there is no scan yet.
+
+So two things are now known that were not: the batched-stub hypothesis is dead, disproved rather
+than abandoned, and the prefill comparison has never looked at a row where the recurrence has run.
+Comparing a late row is the next measurement, and it is one line.
+
+
 ## 2026-08-22, the error enters between the convolution's output and the layer's, on the wire
 
 Three boundaries measured on the deployed 122-row prefill, each against the model's own value:
