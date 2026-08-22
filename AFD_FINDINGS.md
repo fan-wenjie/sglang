@@ -2241,15 +2241,25 @@ already amortised across five big kernels, and capturing them removes almost not
 of startup overhead that opened that task was a different thing -- capture cost, paid once -- and
 it is not worth paying for 3%.
 
-**And the correction it forced.** This card reads at 1345 GB/s, not the 0.68 TB/s I assumed when
-calling the pool's 0.394 ms floor "a weight read". At the measured rate a 267 MB layer is 0.19 ms.
-So the read is HALF the pool's per-call floor, and the other half -- about 0.2 ms -- is not the
-read, not the launches, and not the reply path (0.064 ms). It is unaccounted for, and unlike a
-hardware read it is the kind of thing that can be found and removed.
+**And the correction it forced -- which then corrected itself.** This card reads at 1345 GB/s, not
+the 0.68 TB/s I assumed. At that rate a "267 MB" layer is 0.19 ms, which appeared to leave half the
+pool's floor unaccounted for. The 267 MB was the wrong number too, remembered rather than read:
+this model's dense feed-forward is gate, up and down at 5120 x 17408 in bfloat16, which is
 
-That matters for the sixteen-card arithmetic. A pool at the read floor would do ~5000 calls/s for
-one layer rather than the ~2500 measured, which is about what a sixteen-host node needs. The
-ceiling that made more pools look mandatory is half software.
+    3 x 5120 x 17408 x 2 bytes = 510 MiB a layer
+    510 MiB at the measured 1345 GB/s = 0.398 ms
+
+against a measured floor of 0.394 ms. **The pool is running at the card's read bandwidth**, and
+there is nothing unaccounted for. `make_pool_forward` binds each layer's method at construction
+and does nothing per call but the matmul, which is what that leaves room for.
+
+The byte count has an independent check, taken days earlier for another purpose: making the
+feed-forward absent removed 31.87 GB from the host, and 510 MiB x 64 layers is 31.9 GiB.
+
+So the ceiling stands at ~2500 calls/s for one layer, a sixteen-host node needs ~4700, and more
+pools (#64, #70) is the answer after all -- reached this time by measuring both numbers instead of
+assuming one to explain the other. Two wrong constants in one paragraph, in opposite directions,
+nearly cancelled into a conclusion that felt explanatory.
 
 The arithmetic that "confirmed" the read was fitted to the number it was explaining, using a
 bandwidth nobody had measured on this card. The project's own note says the bandwidth ceiling here
