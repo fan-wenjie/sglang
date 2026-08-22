@@ -8,6 +8,42 @@ Findings are grouped by what they decide. Several of them refuted the hypothesis
 them, and those are marked, because a refuted hypothesis that stays in the record is the only
 protection against re-adopting it.
 
+## 2026-08-22, the per-layer cut is token-identical to colocated, and the group cut is not
+
+The bisect that should have been run first. Same two processes, same weights, same prompts, the
+only change being `--afd-span-cut` dropped and the shift at 0:
+
+    prompt                          colocated                        per-layer AFD
+    "The capital of France is"      " Paris.\nThe capital of         IDENTICAL
+                                     Germany is Berlin.\nThe"
+    "The"                           " following table lists the      IDENTICAL
+                                     average annual salaries..."
+    "Explain why the sky is blue"   "\n\nThe sky appears blue        IDENTICAL
+                                     because shorter wavelengths..."
+
+Token for token, on three prompts. The conventional arrangement -- feed-forward on the pool,
+attention on the host -- is exact.
+
+So everything both cuts share is clear, and it is most of the machinery: the protocol, the
+transport, the socket and its reply routing, the pool server and its departure batching, the
+host's attention and KV cache, the per-layer feed-forward offload, the host's model wiring. Every
+hang and every misrouted frame fixed over the past days was real and none of them is what is
+wrong now.
+
+What is left is what only the GROUP cut has: `SpanRunner`'s prologue, run and epilogue, the
+residual and gate tables on the pool, the convolution ring on the pool, the state callbacks, the
+head-and-pass-through install in `SpanRouting` -- and, above all, the fact that under the per-layer
+cut the linear attention is THE MODEL'S OWN CODE running on the host, while under the group cut it
+is the pool's reimplementation of it.
+
+That reimplementation has been verified piece by piece against external references -- projection
+split bit-identical, convolution to 0.003, gates identical, scan against the chunked kernel to
+0.004, head expansion, the z-gated tail -- and it is still the thing that differs. Which means the
+next measurement is not another piece. It is the whole of `_linear_attention` against
+`Qwen3_5GatedDeltaNet.forward` on identical inputs, elementwise, which the dump added in 7e9ad914
+exists to do.
+
+
 ## 2026-08-21, every early read turned off, and the arrangement is still wrong
 
     colocated              " Paris.\nThe capital of Germany is Berlin.\nThe"
