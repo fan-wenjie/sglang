@@ -174,6 +174,8 @@ the answer.
 ## What the ladder has said so far
 
     rung 0   standard AFD                token-identical to colocated, three prompts
+                                         and it really was routing: "routing 64 layer(s) to the
+                                         pool", all of them, not a subset
     rung 4   group cut + shifted read     parts at token 0, relative 1.17, cosine 0.217
     rung 3   group cut, read point at 0   parts at token 0, relative 1.23, cosine 0.128
 
@@ -186,6 +188,23 @@ was known to be running. Every earlier shift-0 control was taken before "registe
 The fault is at rung 3 or below: the group cut without the shift. That is the linear attention on
 the pool, the residual and gate held there between layers, and one round trip a group instead of
 one a layer. rungs 1 and 2 do not exist yet as separate settings and have to be built.
+
+## A trap rung 0 could have fallen into and did not
+
+`routable_layers` excludes any layer whose feed-forward is a `Qwen2MoeSparseMoeBlock`, because a
+sparse block takes a forward batch the wire does not carry. If this model's layers were sparse,
+standard AFD would have routed NOTHING, run the whole stack on the host, and reported
+token-identical to colocated for the same reason the uninstalled arm did -- because the
+arrangement under test was not running.
+
+Checked rather than assumed. The config has no `num_experts`, and the host logged "routing 64
+layer(s) to the pool" -- all of them. rung 0's verdict stands.
+
+Worth writing down because it is the third instance of one shape in two days: an arrangement that
+looks like it is running, agrees with the baseline, and agrees because it is not running. The
+others were the arm that registered without installing, and `--afd-coverage` accepted and ignored.
+Every rung's verdict now has to carry evidence that the rung was in effect, not merely that the
+server started.
 
 ## Order of work
 
