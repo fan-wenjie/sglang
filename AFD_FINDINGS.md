@@ -2100,3 +2100,26 @@ Two ways out, and neither is the reply path:
 not where the ceiling is. The wide-frame reading confirms the shape from the other end -- 512-token
 frames give 107571 tokens/s against 6651 at four tokens, because the same read is amortised over
 128 times as many rows.
+
+### #70's premise was wrong: sharding does not shrink the read
+
+The floor could have been two things -- a true HBM read of the layer's weights on every call, or a
+cache effect that hammering one layer hides. Measured by cycling the calls across different layers
+on the deployed pool, 4 tokens a call, 2000 rounds:
+
+    layers touched     round trip     work
+          8              0.58 ms     0.380 ms
+         48              0.59 ms     0.383 ms
+
+Identical. The read is real and it happens every call, so a pool holding a QUARTER of the layers
+still reads a whole layer per call and its per-call time is unchanged. "Shard the layers so each
+call reads less" was my own reasoning and it does not survive its first measurement.
+
+What sharding actually buys is different and still worth having: four pools each holding a quarter
+of the layers are four DEVICES serving four different layers at once, for the same total memory as
+one full pool -- 4x the aggregate call rate with no weight duplicated. The gain is parallelism
+across devices, not a smaller read, and that distinction decides the experiment: it cannot be
+tested on one GPU, where two pools contend for the same HBM. It needs two cards, like #47.
+
+So the sixteen-card arithmetic stands as it was: ~4700 calls/s needed, ~2500 per pool, one pool per
+about eight hosts -- and the way to more is more pools, sharded to keep the memory bill flat.

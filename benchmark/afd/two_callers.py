@@ -39,27 +39,37 @@ import torch
 from sglang.srt.afd.pool_client import PoolClient
 
 
-def one_caller(pool: str, layer: int, width: int, tokens: int, rounds: int, out: list) -> None:
-    """A caller's own connection, its own frames, its own timings."""
+def one_caller(pool: str, layer: int, width: int, tokens: int, rounds: int, out: list,
+               spread: int = 1) -> None:
+    """A caller's own connection, its own frames, its own timings.
+
+    `spread` is how many DIFFERENT layers the calls cycle through. It exists to separate two
+    explanations of the same per-call floor: a true HBM read of the layer's weights every time,
+    which cannot be helped, or a cache effect that hammering one layer hides -- if 64 layers cost
+    what 1 layer costs, the read is real; if cycling is slower, a pool holding fewer layers keeps
+    more of them warm and sharding buys something the arithmetic did not predict.
+    """
     client = PoolClient(pool, connect_timeout_s=10)
     hidden = torch.zeros(tokens, width, dtype=torch.bfloat16)
     try:
         for _ in range(3):                       # warm the connection and any JIT behind it
             client.collect(client.issue(1, layer, hidden), "cpu")
-        for _ in range(rounds):
+        for i in range(rounds):
+            at = layer + (i % spread)
             start = time.perf_counter()
-            client.collect(client.issue(1, layer, hidden), "cpu")
+            client.collect(client.issue(1, at, hidden), "cpu")
             out.append((time.perf_counter() - start) * 1e3)
     finally:
         client.close()
 
 
-def run(pool: str, callers: int, layer: int, width: int, tokens: int, rounds: int) -> dict:
+def run(pool: str, callers: int, layer: int, width: int, tokens: int, rounds: int,
+        spread: int = 1) -> dict:
     """All callers issue at once, which is the case the departure has to batch."""
     timings: list[list] = [[] for _ in range(callers)]
     threads = [
         threading.Thread(target=one_caller,
-                         args=(pool, layer, width, tokens, rounds, timings[i]))
+                         args=(pool, layer, width, tokens, rounds, timings[i], spread))
         for i in range(callers)
     ]
     start = time.perf_counter()
@@ -86,6 +96,8 @@ def main() -> int:
     p.add_argument("--width", type=int, default=5120)
     p.add_argument("--tokens", type=int, nargs="+", default=[4])
     p.add_argument("--rounds", type=int, default=40)
+    p.add_argument("--spread", type=int, default=1,
+                   help="how many different layers the calls cycle through")
     args = p.parse_args()
 
     print(f"  pool {args.pool}, layer {args.layer}, width {args.width}")
@@ -94,7 +106,8 @@ def main() -> int:
     for tokens in args.tokens:
         first = None
         for callers in args.callers:
-            got = run(args.pool, callers, args.layer, args.width, tokens, args.rounds)
+            got = run(args.pool, callers, args.layer, args.width, tokens, args.rounds,
+                      args.spread)
             if first is None:
                 first = got["calls_per_s"]
             print(f"  {tokens:>7} {got['callers']:>8} {got['round_trip_ms']:>10.2f} "
