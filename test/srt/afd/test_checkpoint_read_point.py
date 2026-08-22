@@ -26,9 +26,9 @@ def _config(shift=None, coverage=None, nested=True):
     cfg = FakeConfig()
     target = FakeText() if nested else cfg
     if shift is not None:
-        target.afd_q_shift_layers = shift
+        target.query_shift_layers = shift
     if coverage is not None:
-        target.afd_coverage = coverage
+        target.query_shift_coverage = coverage
     if nested:
         cfg.text_config = target
     return cfg
@@ -124,8 +124,8 @@ class TestStamp(unittest.TestCase):
         from sglang.srt.afd_query_shift.checkpoint import stamp
 
         out = stamp({"text_config": {"num_hidden_layers": 64}}, shift=1, coverage="all")
-        self.assertEqual(out["text_config"]["afd_q_shift_layers"], 1)
-        self.assertEqual(out["text_config"]["afd_coverage"], "all")
+        self.assertEqual(out["text_config"]["query_shift_layers"], 1)
+        self.assertEqual(out["text_config"]["query_shift_coverage"], "all")
         self.assertEqual(out["text_config"]["num_hidden_layers"], 64, "the rest is untouched")
 
     def test_stamping_does_not_mutate_the_input(self):
@@ -133,7 +133,7 @@ class TestStamp(unittest.TestCase):
 
         original = {"text_config": {"a": 1}}
         stamp(original, shift=1, coverage="all")
-        self.assertNotIn("afd_q_shift_layers", original["text_config"])
+        self.assertNotIn("query_shift_layers", original["text_config"])
 
 
 if __name__ == "__main__":

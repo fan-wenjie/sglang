@@ -55,7 +55,7 @@ class TestProtocol(unittest.TestCase):
 
         a, b = socket.socketpair()
         t = torch.randn(3, WIDTH).to(torch.bfloat16)
-        a.sendall(encode(Frame(7, 11, t)))
+        a.sendall(encode(Frame.one(7, 11, t)))
         got = decode(b)
         self.assertEqual(got.request_id, 7)
         self.assertEqual(got.layer, 11)
@@ -65,7 +65,7 @@ class TestProtocol(unittest.TestCase):
         import socket
 
         a, b = socket.socketpair()
-        payload = encode(Frame(1, 1, _hidden()))
+        payload = encode(Frame.one(1, 1, _hidden()))
         a.sendall(payload[: len(payload) - 4])
         a.close()
         with self.assertRaises(ConnectionError):

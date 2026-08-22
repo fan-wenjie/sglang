@@ -181,7 +181,10 @@ class TestSplitIsTheSameAttention(unittest.TestCase):
 
         a, b = socket.socketpair()
         hidden = torch.randn(7, 5120).to(torch.bfloat16)      # Qwen3.8-27B hidden_size
-        a.sendall(encode(Frame(42, 7, hidden)))
+        # `Frame.one`, because a frame carries a TUPLE of tensors now -- it grew a second and a
+        # fifth when spans and scans arrived. Passing the bare tensor made the constructor iterate
+        # its ROWS, and the refusal named a shape of (5120,) that appears nowhere in this test.
+        a.sendall(encode(Frame.one(42, 7, hidden)))
         got = decode(b)
         self.assertTrue(torch.equal(got.tensor, hidden))
         self.assertEqual(got.key, (42, 7))
