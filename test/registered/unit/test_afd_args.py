@@ -15,6 +15,9 @@ from sglang.test.test_utils import CustomTestCase
 class TestCoverageUnderTheGroupCut(CustomTestCase):
     """`--afd-coverage all` with `--afd-span-cut` asks for a conversion the group cut never does.
 
+    The check lives in the ARM now, not in the shared argument hook: a flag belongs to whoever
+    honours it, and the hook naming this package by name is what stopped AFD shipping without it.
+
     The group cut moves ONE query per group -- the next softmax attention's, projected from the
     read point inside the span -- and its linear-attention layers take q, k and v from the current
     hidden. That is coverage "softmax".
@@ -35,7 +38,7 @@ class TestCoverageUnderTheGroupCut(CustomTestCase):
         return a
 
     def check(self, a):
-        from sglang.srt.arg_groups.afd_hook import _check_coverage
+        from sglang.srt.afd_query_shift.arg_checks import _check_coverage
 
         _check_coverage(a)
 

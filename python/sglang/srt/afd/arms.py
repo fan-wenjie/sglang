@@ -83,6 +83,69 @@ def resolve(name: str | None) -> Callable | None:
     return _ARMS.get(name)
 
 
+def check_args(server_args) -> None:
+    """Let every registered arm refuse a configuration of its own flags.
+
+    An arm that adds a flag owns the refusal that flag needs, and the refusal has to run before a
+    model loads rather than at the first token. Putting those checks in the shared argument hook
+    made that file name a derived package by hand, which is the one dependency direction that must
+    not exist -- AFD ships without the arms, and a module that imports one inside an `if` still
+    fails when the directory is not there.
+
+    An arm with nothing to check simply has no `check_args`. With no arms installed this iterates
+    an empty dict, which is the ordinary case and not a degraded one.
+    """
+    for name, factory in sorted(_ARMS.items()):
+        check = getattr(factory, "check_args", None)
+        if check is None:
+            continue
+        check(server_args)
+
+
+def install_transforms(*, model, model_config, server_args):
+    """Let whatever arm this build carries transform the LOADED model. None when there is none.
+
+    The one hook a derived arm needs inside the model runner, and it names no arm. Before this
+    existed, the runner -- a frozen file -- imported a derived package by name inside a `try`, read
+    three of that arm's own flags off `server_args`, and handed them over. Every one of those is a
+    dependency from the half that ships to the half that may not.
+
+    Returns what the arm returns, for the runner to hold. More than one arm transforming one model
+    is refused: two rewritings of the same layers compose into an arrangement nobody described,
+    and the run would be attributed to whichever was asked for.
+    """
+    installed = []
+    for name, factory in sorted(_ARMS.items()):
+        transform = getattr(factory, "transform_model", None)
+        if transform is None:
+            continue
+        result = transform(model=model, model_config=model_config, server_args=server_args)
+        if result is not None:
+            installed.append((name, result))
+    if len(installed) > 1:
+        raise ValueError(
+            f"{len(installed)} arms transformed this model: {[n for n, _ in installed]}. Each "
+            f"rewrites the same layers, so what ran is neither of them and the run would be "
+            f"reported under whichever name was asked for."
+        )
+    return installed[0][1] if installed else None
+
+
+def sweep_schedule(transform):
+    """The sweep schedule an arm's transform produced, or None.
+
+    The host router opens its window between issuing a feed-forward and collecting it, and the
+    schedule that fires in that gap belongs to whichever arm moved a read point early enough to
+    have one. `SweepAhead` is shared -- the schedule is AFD's own idea -- so this asks for a
+    named attribute rather than reaching through the arm's own structure, which is what the
+    frozen file used to do (`self.afd_early_q.hooks.sweep_ahead`, two levels into a package that
+    may not be installed).
+
+    An arm that moves nothing early sets it to None. With no arm at all there is nothing to ask.
+    """
+    return None if transform is None else transform.sweep_ahead
+
+
 def available() -> tuple[str, ...]:
     """The arms that have registered, for an error message that can name the alternatives."""
     return tuple(sorted(_ARMS))

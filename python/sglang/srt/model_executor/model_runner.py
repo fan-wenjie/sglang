@@ -749,32 +749,19 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
-        self.maybe_init_afd_early_q()
+        self.maybe_init_afd_transforms()
         self.maybe_init_afd_roles()
 
-    def maybe_init_afd_early_q(self):
-        """Move each softmax layer's query read point, if --afd-query-shift-layers asks for it.
+    def maybe_init_afd_transforms(self):
+        """Let whatever AFD arm this build carries transform the loaded model. None if there is none.
 
         Wired here because this is where a loaded model may be transformed, and because the model
         lives in the scheduler process: a caller holding an Engine cannot reach it.
         """
-        # Imported here and tolerantly: AFD may ship without this arm, and a missing directory
-        # must leave the standard arrangement running rather than fail at startup.
-        try:
-            from sglang.srt.afd_query_shift.wiring import install_early_q
-        except ImportError:
-            self.afd_early_q = None
-            return
+        from sglang.srt.afd.arms import install_transforms
 
-        self.afd_early_q = install_early_q(
-            model=self.model,
-            shift_layers=self.server_args.afd_query_shift_layers,
-            coverage=self.server_args.afd_coverage,
-            span_cut=self.server_args.afd_span_cut,
-            hf_config=self.model_config.hf_config,
-            split_attention=self.server_args.afd_split_attention,
-            verify_split=self.server_args.afd_verify_split,
-        )
+        self.afd_transform = install_transforms(
+            model=self.model, model_config=self.model_config, server_args=self.server_args)
 
     def maybe_init_afd_roles(self):
         """Take the host or the pool side of the arrangement, if --afd-mode names one.
@@ -783,6 +770,7 @@ class ModelRunner:
         window has to open between the issue and the collect, and the router is what owns that
         gap.
         """
+        from sglang.srt.afd.arms import sweep_schedule
         from sglang.srt.afd.roles import (
             attach_cache_pool,
             install_host_routing,
@@ -810,10 +798,10 @@ class ModelRunner:
             self.afd_pool_client, self.afd_routing = install_host_routing(
                 model=self.model,
                 pool_addr=self.server_args.afd_pool_addr,
-                sweep_ahead=self.afd_early_q.hooks.sweep_ahead,
+                sweep_ahead=sweep_schedule(self.afd_transform),
             )
             self.afd_cache_client = attach_cache_pool(
-                self.afd_early_q.hooks.sweep_ahead,
+                sweep_schedule(self.afd_transform),
                 addr=self.server_args.afd_cache_addr,
             )
             self.afd_remote_attention = install_kv_on_pool(

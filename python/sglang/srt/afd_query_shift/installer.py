@@ -185,14 +185,54 @@ def install_span_routing(model, client: PoolClient, *, sweep_ahead,
 class QueryShiftArm:
     """What the composition root needs from an arm, and nothing else.
 
-    Two entry points, because there are two ends. The root holds one of these or None; it never
-    asks which arm it is, and it never imports the module that answers.
+    Four entry points now, two a side. The root holds one of these or None; it never asks which
+    arm it is, and it never imports the module that answers.
+
+        check_args       this arm's own flags, refused before a model loads. They used to be
+                         checked in `arg_groups/afd_hook.py`, which had to import this package by
+                         name to do it -- the one dependency direction that stops AFD shipping
+                         without this arm
+        transform_model  what the model runner, a FROZEN file, used to do by importing
+                         `afd_query_shift.wiring` inside a try and reading three of this arm's
+                         server args off the runner
+        install_on_host / make_pool_runner    the two ends of the cut itself
     """
 
     name = "query-shift"
 
     def wanted(self) -> bool:
         return span_cut_wanted()
+
+    @staticmethod
+    def check_args(server_args) -> None:
+        """This arm's flags, refused at startup rather than ignored at the first token."""
+        from sglang.srt.afd_query_shift.arg_checks import check as check_arm_args
+
+        check_arm_args(server_args)
+
+    @staticmethod
+    def transform_model(*, model, model_config, server_args):
+        """Move the read point on the loaded model. None when this arm was not asked for.
+
+        Returns the wiring, which carries `sweep_ahead` for the host router: the window opens
+        between issuing a feed-forward and collecting it, and the schedule that fires in that gap
+        is this arm's, so this arm is what hands it over.
+        """
+        from sglang.srt.afd_query_shift.wiring import install_early_q
+
+        wiring = install_early_q(
+            model=model,
+            shift_layers=server_args.afd_query_shift_layers,
+            coverage=server_args.afd_coverage,
+            span_cut=server_args.afd_span_cut,
+            hf_config=model_config.hf_config,
+            split_attention=server_args.afd_split_attention,
+            verify_split=server_args.afd_verify_split,
+        )
+        # the shared side asks for one named attribute rather than reaching through this arm's own
+        # structure, so nothing outside knows the wiring holds a `hooks`
+        wiring.sweep_ahead = wiring.hooks.sweep_ahead
+        return wiring
 
     def install_on_host(self, model, client, *, sweep_ahead):
         client.require(PoolClient.NEEDS_SPANS)
