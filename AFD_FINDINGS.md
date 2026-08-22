@@ -1732,3 +1732,29 @@ Every in-process check that passed while the deployment degenerated was correct 
 shared property: it ran one request. A recurrent state's whole failure mode is what the SECOND
 request sees. Any check of a stateful cut has to run at least two requests through one slot, and
 the second one is the test.
+
+### The fix, checked the way the fault would have been caught
+
+Group cut at shift 0, both ends confirming their own installation, each prompt asked THREE times
+through the same slots, and each side compared against its own earlier answer:
+
+    prompt                              pass 0      pass 1      pass 2
+    "The capital of France is"          identical   identical   identical
+    "The"                               part @1     part @1     part @1
+    "Explain why the sky is blue..."    identical   identical   identical
+
+Every per-token relative difference is repeated to the digit across passes (0.0092, 0.0096, 0.0108
+...), and neither side ever disagreed with its own pass 0. Before the fix the second pass was a
+different arrangement.
+
+Two requests in flight together through one pool answer exactly as they do one at a time, on both
+prompts -- so the slot table holds up when two of them are live at once, which is the case a
+single-request check cannot reach either.
+
+`rung_verdict.py` now asks every prompt twice by default and VOIDS the verdict, non-zero, when a
+side disagrees with its own earlier answer. The instrument that missed this for days could not
+have reported it: it asked once.
+
+What is NOT yet covered: a request that is aborted or retracted mid-generation. Its slot is
+released by the next request that lands on it, which is the design, but nothing has exercised the
+path.
