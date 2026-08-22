@@ -81,7 +81,7 @@ def compare(a: list[float], b: list[float]) -> tuple[float, float]:
 # ran or not, and that has happened three times in two days.
 INSTALLED = {
     "host": ("the group cut is installed", "the per-layer linear cut is installed"),
-    "pool": ("span(s) a decode step",),
+    "pool": ("span(s) a decode step", "the per-layer linear cut is served here"),
 }
 
 

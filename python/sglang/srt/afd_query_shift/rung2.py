@@ -175,7 +175,14 @@ class Rung2Arm:
             head_v_dim=config.linear_value_head_dim,
             device=device,
         )
-        return SpanRunner(model, states, layer_types=layer_types_of(model), query_shift=0)
+        types = layer_types_of(model)
+        logger.info(
+            "afd pool: the per-layer linear cut is served here. %s linear layer(s) answer one at "
+            "a time, each holding no state between calls -- the caller is asked for the recurrent "
+            "state and keeps it. %s slot(s) are sized for the callback's cache alone.",
+            len([t for t in types if t != "full_attention"]), _span_slots(),
+        )
+        return SpanRunner(model, states, layer_types=types, query_shift=0)
 
 
 register(Rung2Arm.name, Rung2Arm)
