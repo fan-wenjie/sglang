@@ -1868,3 +1868,38 @@ batch. min_batch above 1 would need a width where the weight read dominates AND 
 the range measured here does not contain one. The seating rules (`seating.py`, `boarding.py`) stay
 correct and stay useful -- they decide who rides when several are ready at once -- but the payoff
 they were assumed to deliver, a shared weight read, is not where the money is.
+
+
+## 2026-08-22, #46: what the host actually needs on its card
+
+Both sides of the running deployment, Qwen3.8-27B, read from their own startup accounting rather
+than from nvidia-smi (which cannot separate weights from caches):
+
+                            weights     mamba state    KV cache     total resident
+    pool (everything)       51.05 GB      10.47 GB     11.86 GB        73.4 GB
+    host (feed-forward
+    on the pool)            19.18 GB       2.86 GB      3.34 GB        25.4 GB
+
+The cut removes 31.87 GB of weights, 62% of them. That is the arrangement working exactly as
+described -- and it is NOT enough for the claim this line has been carrying.
+
+**An 8 or 12 GB card cannot serve this model under the per-layer cut.** The weights alone are
+19.18 GB: attention and linear-attention projections, embeddings, the vision tower and the norms
+all stay on the host, and only the feed-forward leaves. The claim needs one of
+
+    move the attention projections too   W_q/W_kv/W_o to the pool, which is what the group cut
+                                         already does -- that number has to be taken the same way
+    a smaller model                      the 62% is a property of this stack's shape, not of AFD
+    quantised weights                    FP8 would put the host's weights near 9.6 GB, which is a
+                                         12 GB card with very little left for KV
+
+There is a second-order cost visible in the same logs and it is easy to miss: with less memory
+left over, the host's own limits shrink. `max_running_requests` was capped to 3 by the mamba state
+cache against the pool's 8, and `max_total_num_tokens` is 54688 against 194276. So the cut buys
+weight memory and then spends part of the gain on a smaller working budget -- any throughput
+comparison between the two sides is also a comparison between a 3-request host and an 8-request
+one, and must say so.
+
+What this does NOT measure: the group cut's host, which should be smaller again because the
+attention projections move too. Same method, one run, and it belongs beside this table before
+either number is quoted.
