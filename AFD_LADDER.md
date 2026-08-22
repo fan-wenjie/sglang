@@ -206,6 +206,37 @@ others were the arm that registered without installing, and `--afd-coverage` acc
 Every rung's verdict now has to carry evidence that the rung was in effect, not merely that the
 server started.
 
+## rung 2, in enough detail to build without deciding anything again
+
+rung 2 is "the linear attention runs on the pool, one round trip a layer". It separates two things
+the group cut does together, and which of them breaks the arrangement is the open question:
+
+    is it that the linear attention moved?        rung 2 answers this
+    is it the grouping and the residual held      rung 3 minus rung 2 answers this
+      on the pool between layers?
+
+It cannot be reached by configuration. `group_layers` is structural -- a span is named by the
+softmax layer that heads it and runs to the next one -- so a singleton group is not a setting, it
+is a different meaning. rung 2 needs its own protocol op and its own handler on both ends.
+
+The shape, so the next pass builds rather than re-decides:
+
+    on the wire   OP_LAYER: (hidden, residual) out, (hidden, residual) back, one linear layer's
+                  worth. The residual TRAVELS -- that is the whole point of the rung, and it is
+                  what makes it cost one round trip a layer instead of one a group
+    on the pool   input_layernorm -> linear_attn -> post_attention_layernorm -> mlp for that one
+                  layer, reusing `SpanRunner._linear_attention` unchanged. The recurrent state
+                  stays on the host and is read across the wire exactly as it is now
+    on the host   a router that replaces each LINEAR layer's forward with the round trip, and
+                  leaves the softmax layers alone. The per-layer feed-forward router already has
+                  this shape; this one carries a residual and covers a different set of layers
+    its log line  "the per-layer linear cut is installed", added to rung_verdict.py's INSTALLED
+                  table, because a rung whose installation cannot be confirmed produces the same
+                  reading whether it ran or not -- three times now
+
+Not built in the pass that specified it, deliberately. Half a protocol that has not been through
+the verdict is worth less than a specification that has not been guessed at.
+
 ## Order of work
 
 0. **Find the fault.** The ladder is how, and it is the reason the branches are laid out this way:
