@@ -2224,3 +2224,34 @@ That is a real negative result for the design as built, and it narrows what can 
 The last line is the one to take seriously. The sixteen-card node needs more call rate than one
 pool can give whatever sits in front of it, so the answer is more pools (#64, #70), and the stop's
 value shrinks to what it does for CONNECTION COUNT at a scale where a pool could keep up.
+
+
+## 2026-08-22, #44: graphs buy 3%, and the floor is NOT a weight read after all
+
+Measured on this card rather than argued: chains of dense matmuls of known size, four rows --
+the decode shape, where the weights dominate and the arithmetic is nothing -- run plainly and
+through a captured CUDA graph.
+
+    weights   kernels   per call   achieved      graph   graph GB/s   launches
+       50M          1   0.023 ms   2263 GB/s   0.021 ms   2531 GB/s        11%
+      250M          5   0.195 ms   1345 GB/s   0.189 ms   1386 GB/s         3%
+
+**#44 is answered: a CUDA graph on the pool buys 3%.** At the size that matters the launches are
+already amortised across five big kernels, and capturing them removes almost nothing. The 7.3 ms
+of startup overhead that opened that task was a different thing -- capture cost, paid once -- and
+it is not worth paying for 3%.
+
+**And the correction it forced.** This card reads at 1345 GB/s, not the 0.68 TB/s I assumed when
+calling the pool's 0.394 ms floor "a weight read". At the measured rate a 267 MB layer is 0.19 ms.
+So the read is HALF the pool's per-call floor, and the other half -- about 0.2 ms -- is not the
+read, not the launches, and not the reply path (0.064 ms). It is unaccounted for, and unlike a
+hardware read it is the kind of thing that can be found and removed.
+
+That matters for the sixteen-card arithmetic. A pool at the read floor would do ~5000 calls/s for
+one layer rather than the ~2500 measured, which is about what a sixteen-host node needs. The
+ceiling that made more pools look mandatory is half software.
+
+The arithmetic that "confirmed" the read was fitted to the number it was explaining, using a
+bandwidth nobody had measured on this card. The project's own note says the bandwidth ceiling here
+has been wrong three times, always low, and always in the direction that makes a reading look
+explained. Four.
