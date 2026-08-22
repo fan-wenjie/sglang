@@ -2043,10 +2043,23 @@ phases. Deployed pool, 4 tokens a call, 3000 rounds a connection count:
 
 Two things fall out, and neither was visible from the outside.
 
-**The reply costs three times the work.** At one connection the forward is 0.108 ms and writing
-the answer back is 0.321 ms -- serialising a tensor and putting it on a socket dominates a call
-whose whole point is a matmul. That is where the per-call ceiling lives, and it is a fixable
-number rather than a hardware one.
+**WITHDRAWN, same day: the reply does not cost three times the work.** The instrument was wrong.
+Kernels launch asynchronously, so timing `self.forward(...)` measured the LAUNCH, and the reply
+path paid for the compute because `_payload_of` copies to the CPU and that synchronises. With a
+stream synchronise closing the work phase, the same pool reads:
+
+    connections   calls/s    wire in     work     wire out
+        1          1663      0.102 ms   0.394 ms  0.064 ms
+        2          2224      0.121 ms   0.413 ms  0.141 ms
+        8          1197      1.357 ms   2.667 ms  1.620 ms
+
+The reply is 0.064 ms of a 0.59 ms round trip. The forward is 0.394 ms -- and for a FOUR-token
+frame that is not arithmetic, it is the layer's 267 MB of weights being read: 267 MB at ~0.68 TB/s
+is 0.39 ms. The pool's per-call floor is a weight read, which is a hardware fact and not an
+overhead to optimise away.
+
+That also explains the 0% GPU utilisation without contradicting it: a memory-bound read occupying
+0.39 ms of a 0.59 ms window is not what an occupancy sampler counts as busy.
 
 **Under concurrency every phase inflates together, ~10x at eight connections.** Work goes 0.108 ->
 2.256 ms doing exactly the same matmul on an idle GPU. A phase that takes ten times longer while
@@ -2061,3 +2074,29 @@ slower.
 Note on absolute numbers: this pool instance peaks at 2320 calls/s where the #65 sweep on an older
 instance peaked at 1403. The absolutes move between instances; the SHAPE -- a peak at two
 connections and decline after -- is what has reproduced.
+
+### What the corrected numbers say about the sixteen-card design
+
+The per-call floor is one layer's weight read, ~0.4 ms, however few rows ride. So a pool serving
+one layer tops out near 2500 calls/s, and the measured peak of 2224-2320 at two connections is
+that floor rather than a software ceiling.
+
+A node of sixteen 4090D-class hosts at 512K context needs 64 layers x ~74 decode steps/s = ~4700
+calls/s. A per-node dispatcher merges the sixteen hosts' ROWS into one call, which is worth doing
+for the GIL reason already measured -- but it does NOT reduce the call RATE, because every layer
+still needs its own call every step. ~4700 calls/s against a ~2500 ceiling is **one pool per about
+eight hosts at this operating point**, and that is now a number rather than a guess.
+
+Two ways out, and neither is the reply path:
+
+    more pools (#64)     the obvious one, and the ceiling says how many: one per ~8 hosts here
+    shard layers         a pool holding a QUARTER of the layers reads a quarter of the weights per
+                         call, so its floor falls with its share. Four such pools serve the same
+                         node with the same total memory and four times the call rate. Untested,
+                         and it changes what a host addresses per layer -- which is exactly the
+                         multi-pool routing #64 has to build anyway
+
+`#69` is closed by this measurement rather than by work: at 0.064 ms of 0.59 ms, the reply path is
+not where the ceiling is. The wide-frame reading confirms the shape from the other end -- 512-token
+frames give 107571 tokens/s against 6651 at four tokens, because the same read is amortised over
+128 times as many rows.
