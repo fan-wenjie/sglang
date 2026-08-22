@@ -2303,3 +2303,42 @@ readings worth keeping apart:
 Still open for #60: MAUVE against a null, which is the generation-quality question and the one
 bits per byte cannot answer. A model can lose bits per byte and generate indistinguishably, or
 hold it and degenerate.
+
+
+## 2026-08-22, #60: MAUVE re-run -- the sign holds, the verdict flips, and that IS the answer
+
+Same script, same model, same 500 prompts, four days apart:
+
+                              2026-08-18   2026-08-22
+    stock vs human               0.7230       0.7765
+    shifted vs human             0.7619       0.8348
+    stock vs stock (the null)    0.9539       0.9661
+    stock vs shifted             0.9406       0.9476
+
+    the gap                     -0.0389      -0.0583
+    the noise floor              0.0461       0.0339
+    gap / floor                    0.84x        1.72x
+
+The sign agrees: the shifted model scores HIGHER against human text than the stock model does,
+both times, which is the opposite direction from its 2.7% bits-per-byte cost. But the ratio the
+script reports as its verdict went from 0.84x -- below the noise -- to 1.72x, above it. **The
+conclusion flipped without anything changing.**
+
+The reason is in the third row. The null is estimated from ONE pair of samples of the same model,
+and it moved 26% between runs. A gap compared against a single noisy estimate of the noise is not
+a test; it is two random numbers divided by each other. The script did the right thing by
+measuring a null at all -- without one, "0.0389" reads as a finding -- and then treated that null
+as a constant.
+
+So the honest reading of #60's generation half is: **at 500 samples MAUVE cannot tell these two
+models apart, and the run-to-run spread of its own null is the evidence.** What both runs support
+is only the sign, weakly: the read point's likelihood cost does not show up as worse-looking text.
+
+What would settle it: estimate the null from several independent pairs and compare the gap to that
+distribution rather than to one draw of it, at the ~5000 samples the MAUVE paper uses. That is a
+bigger run than this line needs today, and the finding stands as a null result either way.
+
+Recorded together, the two halves of #60:
+
+    bits per byte    +0.0191 bpb, +2.68%, reproduced exactly four days apart. Real and small
+    MAUVE            no difference this metric can resolve at this sample size
