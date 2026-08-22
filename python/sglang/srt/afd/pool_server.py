@@ -102,10 +102,10 @@ class Departure(threading.Thread):
         # one feed-forward a call. None means it serves the per-layer cut, and a span frame is
         # refused by name rather than half-served.
         self.span = None
-        # set when this pool also holds recurrent states, which is the linear-attention half of
-        # the same idea: a per-request read belongs with the data. None means it answers sweeps
-        # and appends only, and a LINEAR frame is refused rather than half-served.
-        self.linear = None
+        # There is no field here for recurrent states, deliberately. See OP_LINEAR in the protocol:
+        # a pool that holds per-request state stops being stateless and can no longer be released
+        # between one request's own calls, which is the property this whole arrangement rests on.
+        # The states live on the caller and are read back across the wire.
         self.min_batch = min_batch
         self.max_wait_s = max_wait_s
         self.device = device
@@ -172,6 +172,19 @@ class Departure(threading.Thread):
             send_frame(sock, Frame(frame.request_id, 0,
                                    (torch.tensor([[float(self.capabilities())]]),), OP_HELLO))
             return True
+        if frame.op == OP_LINEAR:
+            # FIRST, above every other branch, because the alternative is not "unserved" -- an op
+            # this function returns False for falls through to `offer` and is queued as a
+            # feed-forward, then answered with something nobody asked for. A reserved op has to be
+            # refused where nothing can reach past it.
+            raise ConnectionError(
+                "a LINEAR frame reached this pool. That op is RESERVED and not served: it runs a "
+                "linear layer here with the request's recurrent state HELD here, and a pool "
+                "holding per-request state can no longer be released between one request's own "
+                "calls -- which is the property this arrangement is built on. A host that wants "
+                "its linear layers run here sends LAYER or SPAN, which leave the state on the "
+                "caller and read it back across the wire."
+            )
         if self.cache is not None and frame.op in (OP_SWEEP_Q, OP_APPEND, OP_RELEASE):
             return self._answer_cache(frame, sock)
         if self.span is not None and frame.op == OP_RELEASE:
@@ -230,21 +243,6 @@ class Departure(threading.Thread):
             q, ids = frame.tensors[0], frame.tensors[1].view(-1)
             expect = frame.tensors[2].view(-1) if len(frame.tensors) > 2 else None
             return self._sweep_or_park(frame, sock, q.to(device), ids, expect)
-        if frame.op == OP_LINEAR:
-            self._expect_tensors(
-                frame, (6,), "LINEAR: mixed_qkv, a, b, A_log, dt_bias, row ids")
-            if self.linear is None:
-                raise ConnectionError(
-                    "a LINEAR frame reached a pool that holds no recurrent states. Start it with "
-                    "--linear-slots, or the host is configured to move its linear layers here and "
-                    "this pool was not."
-                )
-            qkv, a, b, a_log, dt, ids = frame.tensors
-            out = self.linear.step(
-                [int(r) for r in ids.view(-1)], frame.layer, qkv.to(device), a.to(device),
-                b.to(device), a_log.view(-1).to(device), dt.view(-1).to(device))
-            send_frame(sock, Frame(frame.request_id, frame.layer, (out,), OP_LINEAR))
-            return True
         if frame.op == OP_APPEND:
             self._expect_tensors(frame, (3,), "APPEND: k, v, row ids")
             k, v, ids = frame.tensors[0], frame.tensors[1], frame.tensors[2].view(-1)
@@ -262,11 +260,6 @@ class Departure(threading.Thread):
                             held=self.cache.holder.positions(request_id, layer)):
                         entry.resume()
             return True
-        if self.linear is not None:
-            # a recurrent state has no length to reset, so the slot's buffers are zeroed on
-            # release; handing one over uncleared gives the next request the previous one's
-            # memory and the output stays fluent
-            self.linear.states.release(frame.request_id)
         if self.parked is not None:
             # a released request's parked sweeps can never be satisfied: the history they name is
             # exactly what is being dropped. Left behind they would sit until the timeout and

@@ -67,10 +67,21 @@ OP_HELLO = 7      # what each side does, exchanged before the first token. A hos
                   # cache pool and reaches a weights pool otherwise finds out from a frame the
                   # far end cannot parse, which arrives as "closed mid-call" -- a message about
                   # the socket that says nothing about the configuration that caused it
-OP_LINEAR = 8     # a linear-attention layer's decode step, run where its recurrent state lives.
-                  # Carries the convolved projection, the two gates and the layer's two learned
-                  # constants: the pool holds no checkpoint, and 384 bytes of constants a call is
-                  # cheaper than teaching it about a model and keeping it in sync with one
+OP_LINEAR = 8     # RESERVED, not served, and the number is kept so nothing reuses it.
+                  #
+                  # It ran a linear-attention layer's decode step ON THE POOL, with that request's
+                  # recurrent state held there. The pool server had a complete handler for it and
+                  # nothing ever sent one -- no host built the frame, and no path constructed the
+                  # state table it needed. It was a cheap half-road to moving the linear attention
+                  # and it was not taken, on purpose: a pool holding per-request state stops being
+                  # stateless, so it can no longer be released between one request's own calls,
+                  # and that release is the property the whole arrangement is built on.
+                  #
+                  # OP_LAYER and OP_SPAN do the same work the other way round -- the weights are
+                  # here, the state stays on the caller, and the pool reads it back. A frame with
+                  # this op is refused BY NAME rather than falling through to the feed-forward
+                  # queue, where it would be half-served and answered with something nobody asked
+                  # for.
 OP_SPAN = 9       # a whole group of layers: the host's attention output at a full-attention layer
                   # -> the hidden state the NEXT full attention reads. Four feed-forwards and
                   # three linear attentions, uninterrupted, with the batch fixed for all of it.
