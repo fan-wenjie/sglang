@@ -2123,3 +2123,34 @@ tested on one GPU, where two pools contend for the same HBM. It needs two cards,
 
 So the sixteen-card arithmetic stands as it was: ~4700 calls/s needed, ~2500 per pool, one pool per
 about eight hosts -- and the way to more is more pools, sharded to keep the memory bill flat.
+
+
+## 2026-08-22, #59: an aborted request's slot, and a crash found on the way
+
+The design clears a slot when a request BEGINS rather than when it ends, precisely because a
+request that is aborted or crashes never reaches its ending. That was reasoning, and the abort
+side had never been walked. `benchmark/afd/abort_then_reuse.py` walks it: start a 400-token
+generation, abort it 1.5 s in with `/abort_request`, then ask the same short prompt again and
+compare against colocated.
+
+    colocated          " Paris.\nThe capital of Germany is Berlin.\nThe"
+    host, no abort     identical
+    after abort 0-2    identical, all three
+
+So the slot an aborted request leaves is cleared before the next request uses it, and the design
+holds on the path that motivated it.
+
+### The crash the run exposed, which was not the abort
+
+The first attempt found the host dead. Not from the abort -- from a pool restart earlier in the
+session. Every other call on the host's path degrades when the pool goes away: the feed-forward
+falls back to running locally and the router counts the degradation. The RELEASE did not. A
+`PoolClosed` raised inside a forward reaches sglang as an exception in the model and the scheduler
+dies, so restarting the pool killed the host on its next token -- the exact failure
+`test_afd_pool_failure.py` exists to rule out, reached by a path added after it and not covered by
+it.
+
+It now reconnects once, and if that fails it refuses with a message that says why. NOT a silent
+skip: the release is what stops the next request inheriting a stale recurrent state, so a host
+that cannot deliver it must fail loudly rather than serve fluent text conditioned on somebody
+else's prompt. A new call on an old path inherits none of that path's tolerance, and nothing warns.
