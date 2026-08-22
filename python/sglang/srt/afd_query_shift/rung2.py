@@ -50,6 +50,10 @@ class LinearOnPool:
         self.client = client
         self._undo: list = []
         self._rows: list[int] = []
+        # how many calls a layer to compare against the model's own. Zero is off, and off is the
+        # default: the reference call advances the host's own state and costs a second layer.
+        self._check = int(os.environ.get("SGLANG_AFD_RUNG2_CHECK", "0"))
+        self._checked: dict[int, int] = {}
         self._install()
 
     def _install(self) -> None:
@@ -89,11 +93,47 @@ class LinearOnPool:
         def forward(hidden_states, forward_batch=None, **kwargs):
             rows = self._row_ids(forward_batch)
             self._rows = rows
+            reference = None
+            if self._check:
+                # The model's own layer, on the SAME input, BEFORE the pool's answer is asked for.
+                # Both implementations then advance their own state from identical inputs at every
+                # step, so this stays a fair comparison for the whole generation rather than for
+                # the first token -- what the layer is fed does not depend on which answer is
+                # returned, because the returned one is always the pool's.
+                #
+                # It is a per-layer probe, which is the shape of instrument that has misled this
+                # search ten times. What makes this one safe is that there is no convention to get
+                # wrong: one call, one input tensor, one occasion, two implementations.
+                reference = original(hidden_states, forward_batch=forward_batch, **kwargs)
             handle = self.client.issue_frame(
                 int(rows[0]), layer_id, (hidden_states,), OP_LAYER)
-            return self.client.collect_frame(handle, hidden_states.device)[0]
+            answer = self.client.collect_frame(handle, hidden_states.device)[0]
+            if reference is not None:
+                self._report(layer_id, rows, reference, answer)
+            return answer
 
         attn.forward = forward
+
+    def _report(self, layer_id, rows, reference, answer) -> None:
+        """One line a call, for the first few. Raising here would kill the scheduler."""
+        try:
+            seen = self._checked.get(layer_id, 0)
+            if seen >= self._check:
+                return
+            self._checked[layer_id] = seen + 1
+            a, b = reference.float(), answer.float()
+            diff = (b - a).norm(dim=-1)
+            scale = a.norm(dim=-1).clamp_min(1e-9)
+            rel = (diff / scale)
+            cos = torch.nn.functional.cosine_similarity(a, b, dim=-1)
+            logger.info(
+                "afd rung2 check: layer %s call %s -- %s row(s) | relative worst %.5g mean %.5g "
+                "| cosine worst %.5f | row 0 relative %.5g | first row ids %s",
+                layer_id, seen, a.shape[0], float(rel.max()), float(rel.mean()),
+                float(cos.min()), float(rel[0]), rows[:4],
+            )
+        except Exception as e:                          # noqa: BLE001 -- a probe never kills a run
+            logger.info("afd rung2 check: layer %s could not be compared: %r", layer_id, e)
         self._undo.append(lambda a=attn, o=original: setattr(a, "forward", o))
 
     def current_rows(self):
