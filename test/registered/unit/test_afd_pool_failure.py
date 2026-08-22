@@ -39,16 +39,30 @@ class Echo:
         self.port = self.sock.getsockname()[1]
         self.served = 0
         self._stop = threading.Event()
+        self._lock = threading.Lock()
         self._conns = []
         threading.Thread(target=self._accept, daemon=True).start()
 
     def _accept(self):
+        """Accept, and hand the connection over UNDER THE LOCK.
+
+        Without it there is a window that made `test_the_degradation_is_counted` fail about two
+        runs in three of the full suite and pass every time alone: `accept()` returns, `close()`
+        runs `drop_connections()` and clears the list, and only then does this thread append -- so
+        that connection is never dropped, its serving thread lives on, and a client that was
+        supposed to find a dead pool gets its calls answered. The count then reads 0 fallbacks
+        where 3 were expected, and the message says nothing about a race.
+        """
         while not self._stop.is_set():
             try:
                 conn, _ = self.sock.accept()
             except OSError:
                 return
-            self._conns.append(conn)
+            with self._lock:
+                if self._stop.is_set():
+                    conn.close()
+                    return
+                self._conns.append(conn)
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
     def _serve(self, conn):
@@ -63,12 +77,13 @@ class Echo:
             return
 
     def drop_connections(self):
-        for conn in self._conns:
+        with self._lock:
+            conns, self._conns = self._conns, []
+        for conn in conns:
             try:
                 conn.close()
             except OSError:
                 pass
-        self._conns.clear()
 
     def close(self):
         self._stop.set()
@@ -197,6 +212,13 @@ class TestTheRouterRecoversAndNotJustTheClient(CustomTestCase):
         client = PoolClient(f"127.0.0.1:{pool.port}", 5.0, reconnect=False)
         model = self._model()
         routing = install_pool_routing(model, client, (0,))
+        # one call THROUGH the pool first, so the connection is established and served before it
+        # is taken away. Closing a pool whose connection was still in the listen backlog tests
+        # whichever side won a race, and this test is about what happens after a pool that WAS
+        # working goes away.
+        model.model.layers[0].mlp.forward(torch.ones(1, 4))
+        self.assertEqual(pool.served, 1, "the pool never answered, so nothing was taken away")
+        self.assertEqual(routing._local_fallbacks, 0)
         pool.close()
         for _ in range(3):
             model.model.layers[0].mlp.forward(torch.ones(1, 4))
