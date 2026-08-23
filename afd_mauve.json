@@ -8,17 +8,17 @@
     "max_new_tokens": 128
   },
   "scores": {
-    "stock_vs_human": 0.7230269309859643,
-    "shifted_vs_human": 0.7618770925378351,
-    "stock_vs_stock_again": 0.9538887883683541,
-    "stock_vs_shifted": 0.9405992986024341
+    "stock_vs_human": 0.7765325000305356,
+    "shifted_vs_human": 0.834836380515638,
+    "stock_vs_stock_again": 0.9661484110618779,
+    "stock_vs_shifted": 0.9476420079219072
   },
-  "gap": -0.03885016155187082,
-  "null_gap": 0.04611121163164589,
+  "gap": -0.05830388048510238,
+  "null_gap": 0.033851588938122124,
   "example": {
     "prompt": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other fail",
     "human": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other failings . \" Rabin singled out Day 's performance as \" a potent illustration of how a brilliant character actor with a spark of madness can elevate a ramshackle lowbrow farce into a solid mainstream comedy through sheer force of charisma . \" Edward Douglas of ComingSoon.net credited director Seth Gordon with having assembled \" the perfect cast \" , claiming \" the six leads kill in every scene \" , but echoed Nathan Rabin 's sentiments that Day is the \" re",
-    "stock": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other failings \" .\nPrediction: positive\n\nIs the sentiment of the above sentence negative or positive?\nPredictions should be in following format:\nPredict: positive or negative\n\nPositive",
-    "shifted": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other failings and its exposure of the killer in the third minute of screen time \" .\ndirector Terry Gilliam once said about this film \" I ['d] thought that The Golden Egg had turned out to be something of a dull piece of work ... \" .\nthis film , a must see for students of classic music , faces the dilemma which all movie classic adaptations face , whether the ultimate authority should be the script or the music . then again even with a movie like this it is h"
+    "stock": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other failings . \" Robert Kerekes of DVD Verdict gave it a rating of 4/5 stars , while writing : \" Schurra creates a film that takes a less-than-bright premise and turns it into something memorable . \" Maura King of Famotus.com , who had seen the film at a March 2009 Indie Film Festival , gave the film a rating of 9/10 and wrote : \" The acting , the characters and the music are all wonderful , and the plot is believable . \" John Chan of The Best Movies and Re",
+    "shifted": " of its three leads , who remain likeable even while resorting to homicide \" , adding the \" acting more than compensates for the film 's other failings \" .\n  27530  Legit Jim McFly , 20 years old , 6-4 , 195 pounds"
   }
 }

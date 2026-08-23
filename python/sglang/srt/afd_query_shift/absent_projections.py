@@ -32,8 +32,19 @@ decides whether the model can be built at all. Both matter and they are differen
                         its own KV cache. The query, key and value arrive already projected in the
                         span's reply, and `run_epilogue` applies `o_proj` ON THE POOL. So the
                         head's own qkv_proj and o_proj are unused too
-    norms               kept. They are vectors, they cost nothing, and `post_attention_layernorm`
-                        is called by the span's own bookkeeping on this side
+    norms               kept, and the reason first written here was WRONG. It said
+                        `post_attention_layernorm` is called on this side; `span_routing.py`
+                        contains no norm call at all -- every per-layer norm is applied on the
+                        pool, inside `_add_and_norm`, `_finish` and `run_epilogue`. A head
+                        layer's norms are therefore held and never used, and they are kept only
+                        because releasing 1.2 MiB is not worth a line of code.
+
+                        The norm the host DOES apply is a different one: `model.norm`, the final
+                        RMSNorm after the layer loop. `run_epilogue` deliberately returns the
+                        un-normalised residual stream so sglang's own forward applies it here --
+                        normalising on the pool as well applied it twice, which with this
+                        checkpoint's weights running -0.285 to 1.711 squares every channel and
+                        flips the sign of the negative ones
 
 What is NOT stripped: anything on a layer the routing does not speak for. The list comes from the
 routing's own `heads` and `passengers`, so a half-installed cut strips exactly the half it routed.
@@ -53,9 +64,12 @@ def release(module) -> int:
     already been built on meta by the loader, so counting it again reported 45.36 GiB released on
     a host whose whole checkpoint was 19.18 GB -- a number that would have been quoted.
     """
-    freed = sum(p.numel() * p.element_size() for p in module.parameters() if not p.is_meta)
+    freed = sum(
+        p.numel() * p.element_size() for p in module.parameters() if not p.is_meta
+    )
     module.to("meta")
     return freed
+
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +102,13 @@ def strip_routed_weights(model, routing) -> dict:
             freed += release(layer.mlp)
         touched["head_layers"] += 1
 
-    report = {"gib_freed": freed / 1024 ** 3, **touched}
+    report = {"gib_freed": freed / 1024**3, **touched}
     logger.info(
         "afd host: released %.2f GiB of weights the pool computes -- %s passenger layer(s) whole "
         "and the projections of %s head layer(s). The construction peak is unchanged; this is "
         "steady-state memory, which is what decides how much KV cache fits.",
-        report["gib_freed"], touched["passenger_layers"], touched["head_layers"],
+        report["gib_freed"],
+        touched["passenger_layers"],
+        touched["head_layers"],
     )
     return report
