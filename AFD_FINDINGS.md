@@ -2531,3 +2531,35 @@ position than the attention split's, not a weaker one.
 The knob stays so this is checkable rather than remembered, and it now refuses in terms of the
 constraint instead of dying three layers deep in a message about a missing attribute. An
 arrangement that cannot be got wrong in a particular way should say so where someone would look.
+
+
+## 2026-08-23, #47: two hosts on one card, and the accounting that stops them
+
+The two-card topology has existed all along and was not recognised as one: the pool runs on a Pro
+6000 Blackwell (97 GB) and the host has always been an RTX 5090 (32 GB). So "several hosts, one
+pool" needed no new hardware, only a second host process on the 5090.
+
+It does not fit, and the reason is worth recording because it is not the obvious one.
+
+    host 1, mem_fraction_static 0.34    starts, 12.2 GB resident, 38203 tokens of KV
+    host 2, same fraction               "Not enough GPU memory for hybrid state cache.
+                                         Computed max_mamba_cache_size=-3"
+
+`mem_fraction_static` is a fraction of TOTAL memory, not of free memory, so both hosts ask for the
+same absolute budget and the second one's budget is already spent. Lowering the fraction does not
+help past a point, because the LOAD PEAK is fixed: a host materialises 8.81 GB of weights before
+releasing the ones the pool computes, so two hosts need 17.6 GB of peak between them however small
+their caches are.
+
+So #47 on this hardware is bounded by a memory-accounting detail rather than by the arrangement.
+Three ways out, in the order they are worth trying:
+
+    release before sizing    the host releases the pool's weights AFTER the KV cache is sized, so
+                             the sizing sees 8.81 GB it is about to give back. Sizing after the
+                             release would hand both hosts the 3 GB each that is currently lost
+    stagger the fraction     host 2 asked for what host 1 already holds. A fraction of FREE memory
+                             would let two hosts share a card without either being told the total
+    one host a card          which is what the arrangement is actually for, and needs a third card
+
+The measurement #47 exists for -- does KV capacity scale with host count -- is unaffected by which
+of those is chosen; it just cannot be taken on two cards, because the second card is the pool.
