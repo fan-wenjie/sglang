@@ -300,6 +300,13 @@ class SpanRouting:
             k, v = self.client.collect_kv(handle, device)
             attn_output = self._join(attn, forward_batch, k, v, state, q)
 
+            self.sweeps_since_report = getattr(self, "sweeps_since_report", 0) + 1
+            if self.sweeps_since_report >= 500:
+                # The report was logged ONCE, at install, when `sweeps` is necessarily zero and
+                # `sweep_window_open` therefore necessarily False. A field that can only ever be
+                # read at the one moment it cannot be true is not a report.
+                self.sweeps_since_report = 0
+                logger.info("afd host: the group cut is running. %s", self.report())
             if closes:
                 last = self.client.issue(layer_id, attn_output, rows, positions, OP_SPAN_EXIT)
                 out = self.client.collect_output(last, device)[0]
