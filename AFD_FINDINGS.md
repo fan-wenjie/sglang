@@ -2591,3 +2591,32 @@ Which is what the arrangement says it should: the host's weights are per-host an
 per-request, so hosts scale by CARD, not by process. #47's real question -- does KV capacity scale
 with host count -- therefore needs one host per card and a third card to ask, since the second one
 here is the pool.
+
+
+## 2026-08-23, #74: the sweep window, from a code fact to a runtime fact
+
+    afd host: the group cut is running. {'spans': 17, 'layers_on_the_pool': 48,
+    'attentions_here': 16, 'calls': 531, 'sweep_window_open': True, 'sweeps': 452,
+    'fused_prefills': 48}
+
+452 of 500 head calls swept in the gap between the two halves of a span's reply; 48 fell back to
+the fused path, which is three prefills times sixteen head layers and is the known, counted
+fallback. `sweep_window_open` is now `self.sweeps > 0` -- computed from what happened.
+
+Two errors were corrected to get here, both mine and both the same kind:
+
+    a hardcoded True         the field asserted the window was open, directly under a comment
+                             saying it must be counted rather than asserted
+    a hardcoded False        I read a stale docstring in `installer.py` saying the window was
+                             shut, believed it over the code, and "corrected" a truthful field
+                             into a false one. `SpanRouting.head` sweeps between
+                             `collect_read_point` and `collect_kv`, and always has
+
+And the report was emitted ONCE, at install, when `sweeps` is necessarily zero -- so the only
+moment it could ever be read was the one moment it could not be true. It is emitted every 500 head
+calls now.
+
+The remaining half of #74 is a case that asserts the ORDER -- issue, collect the read point,
+sweep, collect the key and value, join. All arrangements of those compute the same tokens, so
+only order separates them; a benchmark can only see a smaller number, and a smaller number has
+other explanations.
