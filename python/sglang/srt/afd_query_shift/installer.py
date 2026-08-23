@@ -136,12 +136,18 @@ def install_span_routing(model, client: PoolClient, *, sweep_ahead,
                          reply_timeout_s: float = 60.0):
     """Give whole groups of layers to the pool, keeping only the attentions here.
 
-    `sweep_ahead` is accepted and NOT yet used, and that is deliberate rather than forgotten. The
-    window under this cut sits between the two halves of a span's reply -- the pool hands over the
-    query's source one feed-forward before the span's output, and the host should spend that
-    feed-forward projecting the query and sweeping the cache. It does not yet; it collects both
-    halves back to back. `SpanRouting.report()["sweep_window_open"]` says so, so a timing taken
-    now cannot be quoted as this arrangement's without the report contradicting it.
+    `sweep_ahead` is accepted and not used, and that is deliberate rather than forgotten -- but
+    NOT for the reason this docstring gave until now. It said the window was shut and the host
+    collected both halves back to back. Read `SpanRouting.head`: the sweep sits between
+    `collect_read_point` and `collect_kv`, and always has. The window is open.
+
+    What `sweep_ahead` is, is the PER-LAYER cut's schedule -- a hook that fires between issuing a
+    feed-forward and collecting it. The group cut has its own gap, between the two halves of a
+    span's reply, and does not need that hook. Two mechanisms for one idea, and only one of them
+    belongs here.
+
+    The stale claim cost a round trip of its own: it was believed over the code, and a truthful
+    report field was "corrected" into a false one on the strength of it.
     """
     from sglang.srt.afd.history_service import HistoryService
     from sglang.srt.afd.linear_history import HistoryCache

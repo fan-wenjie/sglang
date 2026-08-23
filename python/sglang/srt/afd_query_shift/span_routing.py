@@ -450,7 +450,15 @@ class SpanRouting:
                 # asserted: a window that stopped opening -- a backend that started refusing the
                 # split, a request with no prefix -- looks exactly like one that never shut, and
                 # the difference is the whole schedule.
-                "sweep_window_open": True, "sweeps": self.sweeps, "fused_prefills": self.fused}
+                # COUNTED, not asserted -- which is what the comment above asks for and what
+                # neither of this field's two previous values did. It was a hardcoded True; then
+                # it was "corrected" to a hardcoded False on the strength of a docstring in
+                # `installer.py` saying the window was not open, without reading `head`, where
+                # the sweep sits between `collect_read_point` and `collect_kv` and always has.
+                # A literal cannot tell a window that stopped opening from one that never shut,
+                # in either direction.
+                "sweep_window_open": self.sweeps > 0,
+                "sweeps": self.sweeps, "fused_prefills": self.fused}
 
 
 def bus_size_note(riders: int) -> str:
