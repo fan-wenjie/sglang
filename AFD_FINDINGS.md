@@ -2563,3 +2563,31 @@ Three ways out, in the order they are worth trying:
 
 The measurement #47 exists for -- does KV capacity scale with host count -- is unaffected by which
 of those is chosen; it just cannot be taken on two cards, because the second card is the pool.
+
+### And what two hosts on one card actually showed
+
+A correction first: the proposal above -- move the release before the KV sizing -- was wrong. The
+host log shows the release at line 667 and the caches at 670-671, so it ALREADY precedes the
+sizing, and the sizing already sees the freed memory (which is why the KV cache grew from 3.34 GB
+to 10.46 GB when the release was added). The reading that produced that proposal was of the code's
+call order rather than of the log.
+
+Asymmetric fractions do let both hosts allocate -- the fraction is of TOTAL memory, so the second
+host can simply be given a larger one:
+
+    host 1, fraction 0.40     max_total_num_tokens 54367
+    host 2, fraction 0.88     max_total_num_tokens 76997
+    both resident             30.9 GB of the 5090's 32.6
+
+Host 1 served correctly through the shared pool. Host 2 died during warmup: with 30.9 of 32.6 GB
+allocated there is no headroom for a second set of activations.
+
+But the number that matters is the comparison, and it is negative: **two hosts on one card hold
+131364 tokens between them where ONE host using the whole card holds 169943.** Co-locating hosts
+duplicates the resident weights -- 5.69 GB each, 11.4 GB of a 32 GB card spent twice on the same
+weights -- so adding hosts to a card costs more than it adds.
+
+Which is what the arrangement says it should: the host's weights are per-host and its cache is
+per-request, so hosts scale by CARD, not by process. #47's real question -- does KV capacity scale
+with host count -- therefore needs one host per card and a third card to ask, since the second one
+here is the pool.
