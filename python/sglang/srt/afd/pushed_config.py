@@ -72,7 +72,7 @@ def code_version() -> str:
     return _code_version
 
 
-def pool_config(server_args) -> dict:
+def pool_config(server_args, model=None) -> dict:
     """Everything a host must agree with this pool about, stamped."""
     from sglang.srt.afd import arms
     from sglang.srt.afd.checkpoint import effective_model_path
@@ -84,7 +84,17 @@ def pool_config(server_args) -> dict:
         # None is "unset": the pool resolves it to the default here, so the host adopts a
         # decided value and never re-derives the default on its own
         "transfer": getattr(server_args, "afd_transfer_backend", None) or "nccl",
+        # what the host BUILDS: the family's class, or the attention-service
+        # skeleton that knows only the layer kinds and their widths
+        "host_model": (
+            "skeleton" if getattr(server_args, "afd_host_skeleton", False) else "family"
+        ),
     }
+    if model is not None:
+        # what a host must know to BUILD, named without any model's words
+        from sglang.srt.afd.manifest import MANIFEST_KEY, manifest_of
+
+        cfg[MANIFEST_KEY] = manifest_of(model)
     for _name, factory in sorted(arms._ARMS.items()):
         describe = getattr(factory, "pushed_config", None)
         if describe is not None:
@@ -103,6 +113,13 @@ def decode_config(tensor: torch.Tensor) -> dict:
 
 _ADOPTED = [False]
 _ADOPTED_TRANSFER = ["tcp"]
+_ADOPTED_CFG: list = [None]
+
+
+def adopted_value(key: str, default=None):
+    """One setting from the adopted configuration, or the default before adoption."""
+    cfg = _ADOPTED_CFG[0]
+    return default if cfg is None else cfg.get(key, default)
 
 
 def adopted_transfer() -> str:
@@ -215,6 +232,7 @@ def adopt(cfg: dict, server_args) -> None:
             f"with {mine_transfer}. The pool owns the configuration; drop the host's flag."
         )
     _ADOPTED_TRANSFER[0] = transfer
+    _ADOPTED_CFG[0] = dict(cfg)
     for _name, factory in sorted(arms._ARMS.items()):
         take = getattr(factory, "adopt_config", None)
         if take is not None:

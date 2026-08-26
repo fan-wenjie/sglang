@@ -108,3 +108,34 @@ reason it is refused rather than the flag it saw.
 
 The tests under `test/registered/unit/afd/` are written to be read: each case's docstring
 says which failure it guards and, usually, when that failure actually happened.
+
+## Serving another model family
+
+The host is an attention service: it builds from the pool's ATTENTION
+MANIFEST (`manifest.py`) and speaks two state algebras -- `softmax_kv` and
+`gated_delta`. What a new family costs depends only on what it is made of:
+
+1. **Its layers speak the known algebras** (any mix of standard attention and
+   gated-delta linear attention): the HOST needs nothing. The POOL needs the
+   family's span adaptation -- `layer_kinds` must recognise the decoder layer
+   classes (the kind is read off the class NAME: "Linear" / "Attention"), and
+   the span runner must find the modules it cuts around (`linear_attn.conv1d`,
+   `layer.attn`, the mlp). A family that follows those names serves as-is.
+2. **A new state algebra** (Mamba-2, GLA, ...): teach both ends the kind --
+   its manifest spec (widths), its host state kernel (what `HistoryService`
+   does for gated_delta), and its pushed-weight slots. The manifest's `kind`
+   field is where it announces itself; a host that meets an unknown kind
+   refuses by name rather than serving a guess.
+3. **The early read (query shift)** is per-operator: a new linear operator
+   that wants shift 1 also needs its cook (`afd_query_shift/pool_cook.py` is
+   the reference shape). Shift 0 -- standard AFD -- needs none of it.
+
+The verification ladder, in order, all of which exist as reusable pieces:
+unit suite against the model-less FAKE POOL (`test_afd_fake_pool.py` speaks
+the real wire); then a live pair with 32-token greedy probes; then top-5
+logprob capture against the family host on ONE pool, compared bitwise --
+capture on a FRESH server right after warmup, because request history
+(radix cache) shifts logprobs at the 0.1 level and reads as a regression;
+and when logits disagree, the wire-level ENTER dump on the pool is what
+locates the divergence (the M-RoPE position scheme was found exactly there:
+v, which carries no rope, matched to the bit while k drifted).

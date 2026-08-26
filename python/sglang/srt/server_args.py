@@ -3175,6 +3175,11 @@ class ServerArgs:
         "DANGEROUS. This flag changes what the model computes, and a wrong value fails silently: the server starts, generation is fluent, and the text is from a model nobody trained. Nothing downstream can detect it. Where each layer's query is read from, as a layer count N -- the offset is N-0.5 layers, the source is h_(l-N), the span is N layers, and the study's unit is 2N-1 half-layers. LEAVE IT UNSET unless you are running a measurement: unset reads the checkpoint's own query_shift_layers, which is the value its weights were repaired for, or 0 if it states none. Setting it is only correct for measuring what the rewiring costs BEFORE repair; every other use serves a query projection an input it was not trained on, so every such path warns. 0 is a real value meaning the standard wiring, which is why the default is unset rather than 0.",
         NS("disagg"),
     ] = None
+    afd_host_skeleton: A[
+        bool,
+        "Have every host build the attention-service skeleton instead of the model family's class: the host learns which layers exist, which are linear and which are standard, and the widths of q, k and v from the pushed configuration, and never resolves an architecture. Set it on the POOL; hosts adopt it with the rest of the pushed configuration.",
+        NS("disagg"),
+    ] = False
     afd_min_batch: A[
         int,
         "How many callers the pool waits for before a departure. A departure carries every caller at the stop, not the first N.",

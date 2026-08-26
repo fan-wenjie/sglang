@@ -90,19 +90,20 @@ def span_cut_wanted_for(server_args) -> bool:
     return serves_linear_layers(path)
 
 
-def _conv_width(config) -> int:
-    """The convolution's channel count: two key blocks and one value block, as the model lays it
-    out. Derived from the config rather than from a tensor, because it has to be right before any
-    weight is looked at -- the ring is allocated first.
+def _gated_delta_dims(model) -> dict:
+    """The linear layers' dimensions: the adopted manifest's word when the pool
+    pushed one, the checkpoint's own field names when it did not (an older pool,
+    a unit test's family fixture). One source per process, decided once."""
+    from sglang.srt.afd.manifest import KIND_GATED_DELTA, adopted_manifest
 
-    The widths come through `linear_widths` rather than off the config directly, because not
-    every family spells them the same way and a ring built to the wrong width is a host that
-    reads garbage rather than a host that refuses.
-    """
+    manifest = adopted_manifest()
+    if manifest:
+        for spec in manifest["layers"]:
+            if spec["kind"] == KIND_GATED_DELTA:
+                return spec
     from sglang.srt.afd.layer_kinds import linear_widths
 
-    w = linear_widths(config)
-    return 2 * w["k_heads"] * w["dk"] + (w["v_heads"] * w["dv"])
+    return linear_widths(model.config)
 
 
 def _span_slots() -> int:
@@ -229,24 +230,23 @@ def install_span_routing(model, client: PoolClient, *, reply_timeout_s: float = 
     # the history the pool calls back for. It lives here because it is the request's, and
     # because putting it here is what lets the pool stay out of a request's business between
     # that request's calls -- see linear_history.HistoryCache for what the round trips cost.
-    from sglang.srt.afd.layer_kinds import linear_widths
-
-    config = model.config
-    widths = linear_widths(config)
+    gdn = _gated_delta_dims(model)
     cache = HistoryCache(
         slots=_span_slots(),
         layers=len(types),
-        value_heads=widths["v_heads"],
-        head_k_dim=widths["dk"],
-        head_v_dim=widths["dv"],
+        value_heads=gdn["v_heads"],
+        head_k_dim=gdn["dk"],
+        head_v_dim=gdn["dv"],
         # The ring is sized for real when this host runs the convolution. It is the last
         # per-request thing the pool held, and while it was there a request was STICKY to the pool
         # that served its previous call -- another pool would convolve against four steps of
         # someone else's history and answer fluently. 80 KiB a layer a request here, against the
         # recurrent state's 3.00 MiB.
-        conv_width=_conv_width(config),
-        conv_taps=widths["conv_taps"],
-        device=next(model.parameters()).device,
+        conv_width=2 * gdn["k_heads"] * gdn["dk"] + gdn["v_heads"] * gdn["dv"],
+        conv_taps=gdn["conv_taps"],
+        # not `next(model.parameters())`: a skeleton host's first parameter is
+        # the embedding stub's meta placeholder
+        device=_host_device(model),
     )
     # the pool sends rows in the order this host sent them, so the ids are the ones the routing
     # is holding for the span in flight. Read through the routing rather than captured, because a
@@ -260,12 +260,7 @@ def install_span_routing(model, client: PoolClient, *, reply_timeout_s: float = 
         conv_weight=lambda layer: model.model.layers[
             layer
         ].linear_attn.conv1d.weight.squeeze(1),
-        dims=(
-            widths["k_heads"],
-            widths["v_heads"],
-            widths["dk"],
-            widths["dv"],
-        ),
+        dims=(gdn["k_heads"], gdn["v_heads"], gdn["dk"], gdn["dv"]),
     )
     client.serve = routing.history
     from sglang.srt.afd.lane import the_lane
@@ -510,7 +505,7 @@ class SpanArm:
         """The convolution, kept out of the class this arm otherwise declares absent.
 
         Under the group cut UNCONDITIONALLY, because on this branch the ring is unconditionally
-        here: `install_span_routing` sizes it with `_conv_width(config)` with no flag in front of
+        here: `install_span_routing` sizes it from `_gated_delta_dims(model)` with no flag in front of
         it, and `mix_host` is always installed. The pool holds nothing per request, full stop --
         that is what this branch settled, and a weight that only survived when a flag was set
         would be absent in the configuration everything actually runs in.

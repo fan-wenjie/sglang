@@ -197,6 +197,15 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
 def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
     from sglang.srt.models.registry import ModelRegistry
 
+    from sglang.srt.afd.skeleton import skeleton_wanted
+
+    if skeleton_wanted():
+        # an AFD host whose pool said `host_model: skeleton` serves attention
+        # from the adopted numbers and never resolves a family class
+        from sglang.srt.afd.skeleton import AttentionServiceForCausalLM
+
+        return AttentionServiceForCausalLM, "AfdAttentionService"
+
     architectures = getattr(model_config.hf_config, "architectures", [])
     # EmbeddingGemma is serialized as Gemma3TextModel, which is also the name
     # of the HF backbone.  Route the bidirectional variant to SGLang's pooled

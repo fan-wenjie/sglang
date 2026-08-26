@@ -97,6 +97,16 @@ class TestAFamilyThatNamesItsKinds(CustomTestCase):
             layer_types_of(stack), ["linear_attention", "full_attention"]
         )
 
+    def test_the_skeleton_hosts_own_names_are_read(self):
+        # `afd/skeleton.py` builds these and its docstring says the name is load-bearing.
+        from sglang.srt.afd.skeleton import (
+            AttentionServiceLayer,
+            AttentionServiceLinearLayer,
+        )
+
+        self.assertIn("Linear", AttentionServiceLinearLayer.__name__)
+        self.assertIn("Attention", AttentionServiceLayer.__name__)
+
 
 class TestAFamilyThatDoesNot(CustomTestCase):
     def test_one_decoder_class_is_sorted_by_what_it_holds(self):

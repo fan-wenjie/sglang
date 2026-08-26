@@ -166,12 +166,16 @@ def install_host_routing(model, pool_addr: str, connect_timeout_s: float = 30.0)
     if adopted_transfer() == "nccl":
         from sglang.srt.afd.lane import LANE_PORT_OFFSET, lane_up
 
+        from sglang.srt.afd.installer import _host_device
+
         ip, _, pool_port = pool_addr.rpartition(":")
+        # not `next(model.parameters())`: a skeleton host's first parameter is
+        # the embedding stub's meta placeholder, and a lane on meta never pairs
         lane_up(
             "host",
             ip,
             int(pool_port) + LANE_PORT_OFFSET,
-            next(model.parameters()).device,
+            _host_device(model),
         )
     arm = _arm_if_wanted()
     if arm is None:
@@ -252,7 +256,7 @@ def run_pool(
         arrangement=arrangement_word(get_server_args()),
         # and what it will PUSH: the settings a host adopts instead of configuring itself,
         # stamped with the schema and code versions. See pushed_config.
-        pushed=encode_config(pool_config(get_server_args())),
+        pushed=encode_config(pool_config(get_server_args(), model=model)),
         after_built=after_built,
     )
     # An operator asks for the riders histogram by naming a path. Without one the pool keeps the

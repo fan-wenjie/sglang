@@ -168,6 +168,7 @@ def _check_pool_args(server_args) -> None:
 # exact thing the push exists to remove), so it is refused outright rather than
 # adopted when it happens to match.
 _POOL_ONLY = (
+    ("afd_host_skeleton", False),
     ("afd_min_batch", 2),
     ("afd_max_wait_ms", 5),
     ("afd_transfer_backend", None),
