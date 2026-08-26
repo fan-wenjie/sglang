@@ -876,6 +876,29 @@ class SpanRunner:
         self.served += 1
         return residual + hidden
 
+    def run_epilogue_with_logits(self, request_ids, group: int, o: torch.Tensor):
+        """The epilogue, plus the language-model head for each request's LAST row.
+
+        A chunk's rows are one request's own tokens in order, so the row a sampler
+        needs is the last of each id-run -- computed from the ids the frame already
+        carries, batched into one [requests, vocab] GEMM. PRE-softmax on purpose:
+        softmax and every sampling knob stay on the host with the sampler. What this
+        buys the host is its whole 2.37 GiB head: never allocated, its weight read
+        never on its critical path, its gibibytes gone to KV.
+        """
+        from sglang.srt.afd.slots import _runs
+
+        hidden = self.run_epilogue(request_ids, group, o)
+        last = [first + n - 1 for _, first, n in _runs(request_ids)]
+        root = self.model
+        normed = root.model.norm(hidden[last])
+        if isinstance(normed, tuple):
+            normed = normed[0]
+        logits = torch.nn.functional.linear(
+            normed.to(root.lm_head.weight.dtype), root.lm_head.weight
+        )
+        return hidden, logits
+
     def _send_early(
         self, layer, attn, request_ids, layer_id, prev_attn_normed, raw_residual=None
     ):

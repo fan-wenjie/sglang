@@ -157,8 +157,16 @@ def _depart_span(departure, group: int, op: int, riding) -> None:
         )
 
     if op == OP_SPAN_EXIT:
-        out = departure.runner.run_epilogue(ids, group, joined)
-        _reply_pieces(departure, riding, counts, group, (out,), OP_SPAN_EXIT)
+        want_logits = any(len(f.tensors) > 3 for f, _ in riding)
+        if want_logits:
+            # the head lives with the weights: the reply carries each request's
+            # last-row logits beside the hidden stream, one batched GEMM for the
+            # whole departure where each host used to read 2.37 GiB alone
+            out, logits = departure.runner.run_epilogue_with_logits(ids, group, joined)
+            _reply_exit(departure, riding, counts, ids, group, out, logits)
+        else:
+            out = departure.runner.run_epilogue(ids, group, joined)
+            _reply_pieces(departure, riding, counts, group, (out,), OP_SPAN_EXIT)
     else:
         # both halves of the reply go down the SAME socket, and the early one is sent from
         # another thread. Two threads inside `send_frame` on one socket interleave a header
@@ -289,6 +297,28 @@ def _handover(departure, riding, counts, group: int, sent: threading.Event):
         threading.Thread(target=when_copied, daemon=True, name="afd-span-q").start()
 
     return hand_over
+
+
+def _reply_exit(departure, riding, counts, ids, group: int, hidden, logits) -> None:
+    """The exit's two tensors, cut on their OWN axes: hidden by rows, logits by requests."""
+    from sglang.srt.afd.slots import _runs
+
+    runs = _runs(ids)
+    row_offset = 0
+    req_offset = 0
+    for (frame, sock), n in zip(riding, counts):
+        nreq = sum(1 for _, first, cnt in runs if row_offset <= first < row_offset + n)
+        pieces = (
+            hidden[row_offset : row_offset + n],
+            logits[req_offset : req_offset + nreq],
+        )
+        row_offset += n
+        req_offset += nreq
+        try:
+            with departure._wire_lock:
+                send_frame(sock, Frame(frame.request_id, group, pieces, OP_SPAN_EXIT))
+        except OSError:
+            departure.host_departed(sock)
 
 
 def _reply_pieces(departure, riding, counts, group: int, out: tuple, op: int) -> None:

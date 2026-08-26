@@ -279,6 +279,7 @@ def install_span_routing(model, client: PoolClient, *, reply_timeout_s: float = 
         from sglang.srt.afd_query_shift.nccl_lane import serve_triangle
 
         serve_triangle(lane, routing.history)
+    _install_head_shim(model, routing)
     logger.info(
         "afd host: holding %s linear layer(s) of recurrent state for up to %s request(s), %s",
         sum(1 for t in types if t != "full_attention"),
@@ -430,7 +431,12 @@ class SpanArm:
             from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
         except ImportError:  # a build without this family
             return ()
-        return (Qwen3_5GatedDeltaNet,)
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        # the language-model head too: the pool computes every request's last-row
+        # logits at the exit span, so this host never multiplies by it -- 2.37 GiB
+        # never allocated, which on a small card is tens of thousands of KV tokens
+        return (Qwen3_5GatedDeltaNet, ParallelLMHead)
 
     @staticmethod
     def arrangement_word(server_args) -> float:
@@ -557,6 +563,48 @@ class SpanArm:
 
     def make_pool_runner(self, model, *, device):
         return make_span_runner(model, device=device)
+
+
+def _install_head_shim(model, routing) -> None:
+    """The head lives with the weights: the pool's logits replace the host's GEMM.
+
+    The routing stashes the pool-delivered PRE-softmax last-row logits for the step
+    in flight, and this wraps the logits processor's one GEMM so the stashed rows
+    are returned instead of multiplying a head this host does not hold. Softmax and
+    every sampling knob run downstream exactly as before, on exactly the tensor they
+    always ran on. The vocabulary width comes from the CONFIG, because the weight it
+    used to be read from is on the meta device; a path that reaches the GEMM with
+    nothing stashed and a meta head is refused by name rather than left to die
+    inside a matmul about devices.
+    """
+    lp = getattr(model, "logits_processor", None)
+    config = getattr(model, "config", None)
+    text = getattr(config, "text_config", None) or config
+    vocab = getattr(text, "vocab_size", None)
+    if lp is None or vocab is None:
+        routing._vocab = None
+        return
+    routing._vocab = int(vocab)
+    routing._head_on_pool = True
+    original = lp._compute_lm_head
+
+    def compute(hidden_states, lm_head, embedding_bias=None):
+        got = routing.take_pool_logits()
+        if got is not None and got.shape[0] == hidden_states.shape[0]:
+            return got
+        weight = getattr(lm_head, "weight", None)
+        if weight is not None and getattr(weight, "is_meta", False):
+            raise RuntimeError(
+                f"a logits read of {hidden_states.shape[0]} row(s) reached the head "
+                f"and this host holds none -- the pool computes each request's "
+                f"last-row logits, and "
+                f"{'a mismatched batch arrived' if got is not None else 'nothing was stashed'}. "
+                f"Paths that need logits at other positions (prompt logprobs) are "
+                f"not served by a weightless host."
+            )
+        return original(hidden_states, lm_head, embedding_bias)
+
+    lp._compute_lm_head = compute
 
 
 register(SpanArm.name, SpanArm)

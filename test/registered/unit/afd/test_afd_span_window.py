@@ -103,6 +103,9 @@ def a_routing(order):
     routing.client = Recorder(order)
     routing._undo = []
     routing._outstanding = None
+    routing._pool_logits = None
+    routing._head_on_pool = False
+    routing._vocab = None
     routing._returned = None
     routing._rows = None
     routing.history = None

@@ -102,6 +102,7 @@ class SpanClient:
         positions,
         op: int = OP_SPAN,
         windows=None,
+        want_logits: bool = False,
     ):
         """Put a span on the wire and return without waiting for either half of its answer.
 
@@ -127,6 +128,10 @@ class SpanClient:
             # the span's convolution windows, one per linear layer, because the ring lives here
             # and the convolution is about to run over there. See `SpanRouting._windows_for`.
             tensors = tensors + (windows,)
+        if want_logits:
+            # a tiny marker: the exit's reply should carry each request's last-row
+            # logits beside the hidden stream, because this host holds no head
+            tensors = tensors + (torch.ones(1, 1, dtype=torch.int64),)
         handle = self.client.issue_frame(next(self._ids), group, tensors, op)
         self.calls += 1
         return handle
@@ -251,6 +256,10 @@ class SpanRouting:
         # the host has nothing to do between issuing at layer l and collecting at layer l+4, so
         # depth here would buy nothing until several requests are in flight at once
         self._outstanding = None
+        # the pool-computed last-row logits for the step in flight, or None; and
+        # whether the language-model head lives on the pool at all (set at install)
+        self._pool_logits = None
+        self._head_on_pool = False
         # what the previous head returned, so the next one can check nothing ran in between
         self._returned = None
         # the row ids of the span in flight. The pool calls back for the history mid-span, on the
@@ -400,9 +409,22 @@ class SpanRouting:
 
             if closes:
                 last = self.client.issue(
-                    layer_id, attn_output, rows, positions, OP_SPAN_EXIT
+                    layer_id,
+                    attn_output,
+                    rows,
+                    positions,
+                    OP_SPAN_EXIT,
+                    want_logits=self._head_on_pool,
                 )
-                out = self.client.collect_output(last, device)[0]
+                got = self.client.collect_output(last, device)
+                if self._head_on_pool:
+                    if len(got) != 2:
+                        raise RuntimeError(
+                            "this host holds no head and the exit reply carried no "
+                            "logits: the two ends disagree about where the head lives."
+                        )
+                    self._pool_logits = got[1]
+                out = got[0]
                 _trace(
                     layer_id, hidden_states, q=q, k=k, v=v, attn=attn_output, out=out
                 )
@@ -464,6 +486,12 @@ class SpanRouting:
     def _dims_for_lane(self):
         svc = self.history
         return svc.dims
+
+    def take_pool_logits(self):
+        """The stashed logits, once. None when nothing is stashed."""
+        got = self._pool_logits
+        self._pool_logits = None
+        return got
 
     def _decode_windows(self, head: int, rows, forward_batch):
         """`_windows_for`, at decode only. A prefill chunk's rows are one request's own tokens;
