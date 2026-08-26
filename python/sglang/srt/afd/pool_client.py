@@ -42,6 +42,21 @@ from sglang.srt.afd.protocol import (
 
 logger = logging.getLogger(__name__)
 
+
+def _claimed_lane() -> int:
+    """Which lane slot this host claims, for every HELLO it sends. 0 when it cannot tell.
+
+    Answers 0 rather than raising because a process with no published runtime -- a tool, a test
+    -- is not a host claiming anything, and 0 is exactly what such a caller sent before the claim
+    existed.
+    """
+    try:
+        from sglang.srt.runtime_context import get_disagg
+
+        return int(get_disagg().afd_host_lane or 0)
+    except Exception:  # noqa: BLE001 -- no runtime, no claim
+        return 0
+
 # how many call records to keep. Enough for several report windows, bounded so a long run does
 # not accumulate one dict per pool call forever.
 WAIT_HISTORY = 8192
@@ -478,8 +493,12 @@ class PoolClient:
         Separate from `require` because it runs EARLIER: which capabilities a host needs can
         depend on settings it is about to adopt, so the word has to arrive before the asking.
         """
+        # The payload states which lane slot this host claims. It was a 1x1 of zeros that
+        # nothing read, so a pool that predates the claim sees the same shape and a host that
+        # claims nothing sends the same value it always did.
         self.collect_frame(
-            self.issue_frame(0, 0, (torch.zeros(1, 1),), OP_HELLO), "cpu"
+            self.issue_frame(0, 0, (torch.tensor([[float(_claimed_lane())]]),), OP_HELLO),
+            "cpu",
         )
         return self.pool_config
 
@@ -493,8 +512,14 @@ class PoolClient:
         reports "closed mid-call" -- a message about a socket that names neither side's
         configuration.
         """
+        # Every HELLO this host sends carries the same claim: the pool records it per
+        # connection, and a host whose two HELLOs disagreed would have its lane slot decided by
+        # whichever arrived last. There are two of them because there are two questions -- what
+        # the pool serves, and what it pushes -- and the claim belongs to the host, not to either
+        # question.
         self.collect_frame(
-            self.issue_frame(0, 0, (torch.zeros(1, 1),), OP_HELLO), "cpu"
+            self.issue_frame(0, 0, (torch.tensor([[float(_claimed_lane())]]),), OP_HELLO),
+            "cpu",
         )
         served = int(self._hello or 0)
         if arrangement is not None:

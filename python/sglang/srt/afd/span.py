@@ -313,27 +313,55 @@ def _runs_of(request_ids) -> list[tuple[int, int, int]]:
     return [(rid, start, count) for rid, start, count in runs]
 
 
-def _project_prefix(linear, x: torch.Tensor, width: int, what: str) -> torch.Tensor:
-    """The first `width` outputs of a fused projection, without computing the rest.
+# the early view's projections, by the linear METHOD serving the layer. Two
+# entries and a refusal: the unquantised method's outputs are its weight's
+# rows, so a leading group is a smaller matmul; a quantised method is not
+# `weight @ x`, so its entry computes the WHOLE projection through the
+# method's own `apply` -- the same kernel the pool's forward runs, so the
+# shared columns match it to the bit -- and slices the OUTPUT, which is
+# always legitimate. A method neither entry names is refused, not guessed.
+_EARLY_PROJECTIONS = {
+    "UnquantizedLinearMethod": lambda linear, x, width: (
+        torch.nn.functional.linear(x, linear.weight[:width])
+    ),
+    "Fp8LinearMethod": lambda linear, x, width: (
+        linear.quant_method.apply(linear, x)[..., :width]
+    ),
+}
 
-    A fused weight's outputs are its ROWS, so a leading group of them is a prefix of the weight
-    and taking it is a smaller matmul rather than a different one. A view, not a copy:
-    `weight[:n]` and `weight[:n].contiguous()` measured the same, so the copy would be a byte
-    cost for nothing.
+_LATE_PROJECTIONS = {
+    "UnquantizedLinearMethod": lambda linear, x, skip: (
+        torch.nn.functional.linear(x, linear.weight[skip:])
+    ),
+    "Fp8LinearMethod": lambda linear, x, skip: (
+        linear.quant_method.apply(linear, x)[..., skip:]
+    ),
+}
 
-    Refused rather than approximated when the layer is quantised. A quantised linear is not
-    `weight @ x`, and slicing its rows would silently compute something else -- which on this path
-    means a query coefficient that is subtly wrong and a model that still produces text.
-    """
+
+def _method_name(linear) -> str:
     method = getattr(linear, "quant_method", None)
-    if method is not None and type(method).__name__ != "UnquantizedLinearMethod":
+    return "UnquantizedLinearMethod" if method is None else type(method).__name__
+
+
+def _project_prefix(linear, x: torch.Tensor, width: int, what: str) -> torch.Tensor:
+    """The first `width` outputs of a fused projection, by the serving method's own means.
+
+    Dispatched on the linear METHOD (see `_EARLY_PROJECTIONS`): unquantised
+    slices the weight -- a smaller matmul, not a different one -- and a
+    quantised entry runs the method's whole `apply` and slices the output.
+    A method the table does not name is refused, not approximated: a wrong
+    slice here is a query coefficient that is subtly off and a model that
+    still produces text.
+    """
+    projector = _EARLY_PROJECTIONS.get(_method_name(linear))
+    if projector is None:
         raise NotImplementedError(
-            f"the early view slices this projection's weight to skip {what}, and the layer is "
-            f"served by {type(method).__name__}. A quantised projection is not a matrix multiply "
-            f"against `.weight`, so the slice would compute something else and say nothing. Run "
-            f"the arrangement unquantised, or teach this function the method's own slicing."
+            f"the early view needs the first {width} outputs of a projection served by "
+            f"{_method_name(linear)} (to skip {what}), and no entry in _EARLY_PROJECTIONS "
+            f"speaks that method. Teach it the method's own slicing rather than guessing."
         )
-    return torch.nn.functional.linear(x, linear.weight[:width])
+    return projector(linear, x, width)
 
 
 def _project_suffix(linear, x: torch.Tensor, skip: int, what: str) -> torch.Tensor:
@@ -342,14 +370,14 @@ def _project_suffix(linear, x: torch.Tensor, skip: int, what: str) -> torch.Tens
     The mirror of `_project_prefix`, with the same quantisation refusal for the same reason:
     a quantised linear is not `weight @ x`, and slicing its rows would compute something else.
     """
-    method = getattr(linear, "quant_method", None)
-    if method is not None and type(method).__name__ != "UnquantizedLinearMethod":
+    projector = _LATE_PROJECTIONS.get(_method_name(linear))
+    if projector is None:
         raise NotImplementedError(
-            f"the mix slices this projection's weight to skip {what}, and the layer is "
-            f"served by {type(method).__name__}. Run the arrangement unquantised, or teach "
-            f"this function the method's own slicing."
+            f"the mix needs everything past the first {skip} outputs of a projection served "
+            f"by {_method_name(linear)} (to skip {what}), and no entry in _LATE_PROJECTIONS "
+            f"speaks that method. Teach it the method's own slicing rather than guessing."
         )
-    return torch.nn.functional.linear(x, linear.weight[skip:])
+    return projector(linear, x, skip)
 
 
 def _project_qk(attn, normed: torch.Tensor, key_width: int) -> torch.Tensor:
@@ -934,7 +962,7 @@ class SpanRunner:
         if getattr(self._local, "use_lane", False):
             from sglang.srt.afd.lane import the_lane
 
-            lane = the_lane()
+            lane = the_lane(getattr(self._local, "lane_slot", 0))
         issue = getattr(self._local, "issue_host", None)
         if issue is None and lane is None:
             # Not a fallback. At shift 1 the early read is the arrangement, so a departure that
@@ -1268,7 +1296,7 @@ class SpanRunner:
             if getattr(self._local, "use_lane", False):
                 from sglang.srt.afd.lane import the_lane
 
-                lane = the_lane()
+                lane = the_lane(getattr(self._local, "lane_slot", 0))
             collect = getattr(self._local, "collect_early", None)
             apply_step = getattr(self._local, "apply_host", None)
             window = None if windows is None else windows.get(int(layer_id))

@@ -140,6 +140,16 @@ class HostDeparted(RuntimeError):
 
 
 _NAMESPACES: dict = {}
+# Which lane slot each connection's host claimed, by the same `id(sock)` key the namespace uses
+# and for the same reason: a lane is one pairing, and a rider served on another host's lane would
+# read a frame nobody sent it. Absent means slot 0, which is what a single-host deployment
+# announces and what an older host cannot announce at all.
+_LANE_SLOTS: dict = {}
+
+
+def lane_slot_of(sock) -> int:
+    """The lane slot this connection's host claimed at the HELLO. 0 when it claimed none."""
+    return _LANE_SLOTS.get(id(sock), 0)
 
 
 def namespace_of(sock) -> int:
@@ -284,6 +294,27 @@ class Departure(threading.Thread):
             RELEASE   anything                     ->  layers dropped
         """
         if frame.op == OP_HELLO:
+            # The HELLO's payload was a 1x1 of zeros that nothing read. A host states its lane
+            # slot there, so an older host claiming nothing lands on slot 0 and the two ends need
+            # no version negotiation for it. Arming is on demand: a pool that pre-armed a fixed
+            # number of slots would be configuring how many hosts may come.
+            claimed = 0
+            try:
+                claimed = int(frame.tensor.reshape(-1)[0].item())
+            except Exception:  # noqa: BLE001 -- an empty or odd payload is a claim of 0
+                claimed = 0
+            # Every slot is armed on its claim, slot 0 as much as any other: it is not a
+            # default that needs no announcing, it is one host's pairing like the rest.
+            _LANE_SLOTS[id(sock)] = claimed
+            if True:  # noqa: SIM108 -- every claim arms, none is skipped
+                from sglang.srt.afd.roles import arm_lane_slot
+
+                armed = arm_lane_slot(claimed)
+                logger.info(
+                    "afd pool: a host claimed lane slot %s; %s",
+                    claimed,
+                    "armed" if armed is not None else "this pool serves no lane, ignoring",
+                )
             send_frame(
                 sock,
                 Frame(
@@ -702,6 +733,24 @@ class Departure(threading.Thread):
             dismissed,
             released,
         )
+        # the departed host's lane pairing died with it, and a NEW host against the old
+        # pairing's rendezvous keys hangs forever; re-arm for the next. Two conditions, both
+        # learned from the log rather than reasoned out:
+        #
+        # ONLY that host's slot -- relighting every armed slot would abort the communicators of
+        # the hosts that are still here, for somebody else's restart.
+        #
+        # And only a connection that HELD one. A host opens several short-lived sockets before
+        # it serves anything -- the pushed configuration, the papers, the residual weights --
+        # and each close arrives here as a departure. Treating those as a host leaving relit
+        # slot 0 ten times in twelve seconds, each relight re-binding a port this process
+        # already held: five `EADDRINUSE` lines and a pairing that only settled at epoch 5.
+        # A socket that never claimed a slot never had a pairing to retire.
+        from sglang.srt.afd.lane import relight_lane
+
+        held = _LANE_SLOTS.pop(sid, None)
+        if held is not None:
+            relight_lane(held)
 
     def _without_the_departed(self, riding):
         """The riders whose hosts are still here; the dead are dismissed with a line."""

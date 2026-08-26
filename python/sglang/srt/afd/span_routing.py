@@ -464,7 +464,12 @@ class SpanRouting:
         from sglang.srt.afd.lane import the_lane
         from sglang.srt.afd_query_shift.nccl_lane import the_triangle
 
-        lane = the_lane()
+        # The host holds one lane -- the slot it claimed -- so this reads its own, not a
+        # dispatch. Named rather than defaulted so a host running at slot 3 does not silently
+        # reach for slot 0's pairing and park on a rendezvous nobody answers.
+        from sglang.srt.runtime_context import get_disagg
+
+        lane = the_lane(int(get_disagg().afd_host_lane or 0))
         triangle = the_triangle()
         if lane is None or not lane.ready or triangle is None:
             return OP_SPAN

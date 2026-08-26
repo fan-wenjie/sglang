@@ -3190,6 +3190,18 @@ class ServerArgs:
         "How long the pool waits for --afd-min-batch before departing anyway. Without it the last caller of a draining workload waits for a partner that never arrives.",
         NS("disagg"),
     ] = 5
+    afd_host_lane: A[
+        int,
+        'Which lane slot this HOST claims, when the transport is nccl. A lane is one pairing and '
+        'its exchange order IS its frame format, so two hosts on one communicator would interleave '
+        'into each other\'s frames with nothing to say so; they take separate slots instead, and '
+        'the rendezvous port derives from the slot. Stated rather than assigned, for the reason '
+        'every other two-ended setting here is: an operator running several hosts against one pool '
+        'numbers them, and two hosts given the same number fail at the rendezvous rather than '
+        'quietly serving each other\'s rows. Set on the HOST; the pool arms a slot when a host '
+        'claims it, so it needs no matching flag.',
+        NS("disagg"),
+    ] = 0
     afd_transfer_backend: A[
         Optional[Literal["tcp", "nccl"]],
         'The transport for AFD frames whose exchange order is fixed. Default is "nccl": a standalone NCCL pair beside the frame wire -- receives land directly in device buffers with no Python on the data path -- while everything whose order is not fixed stays on the wire; a pair that cannot come up degrades to the wire cleanly. "tcp" turns the pair off entirely. Set it on the POOL; the host adopts it with the rest of the pushed configuration, and the rendezvous derives from the bootstrap port, so nothing else needs configuring. On plain Ethernet NCCL runs its socket transport; on links with RoCE or InfiniBand and GPUDirect the same code goes RDMA, which is the reason the transport is a backend and not an implementation detail.',

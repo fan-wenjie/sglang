@@ -238,19 +238,29 @@ def _depart_span(departure, group: int, op: int, riding) -> None:
             )
         else:
             use_lane = op == OP_SPAN_LANE
+            slot = 0
             if use_lane:
                 from sglang.srt.afd.lane import the_lane
+                from sglang.srt.afd.pool_server import lane_slot_of
 
-                lane = the_lane()
+                # Whose lane, not THE lane. A lane-riding span is one row from one host
+                # (`afd_query_shift/nccl_lane`: "one row a rider"), so the rider's own socket
+                # names the pairing; picking a lane by process would answer one host's
+                # coefficient into another host's expectation queue, and NCCL has no tag to
+                # notice it with.
+                slot = lane_slot_of(riding[0][1])
+                lane = the_lane(slot)
                 if lane is None or not lane.ready:
                     raise RuntimeError(
-                        f"group {group} was asked as span_lane and this pool's lane is "
+                        f"group {group} was asked as span_lane on slot {slot} and this "
+                        f"pool's lane there is "
                         f"{'not up yet' if lane else 'not configured'}. The host decides "
                         f"the op from the adopted configuration, so the two ends disagree "
                         f"about --afd-transfer-backend or the lane died; check the pool "
                         f"log for the lane's own line."
                     )
             departure.runner._local.use_lane = use_lane
+            departure.runner._local.lane_slot = slot
             try:
                 _, k, v = departure.runner.run(
                     ids, group, joined, positions, on_query=handover, windows=windows

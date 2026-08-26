@@ -36,7 +36,16 @@ LANE_PORT_OFFSET = 3
 
 TRANSFER_BACKENDS = ("tcp", "nccl")
 
-_LANE = None
+# One lane per SLOT, not one per process. A slot is one host's pairing: the arrangement's
+# protocol on the lane is a fixed exchange ORDER with no metadata (`afd_query_shift/nccl_lane`),
+# so two hosts sharing a communicator would interleave into each other's frames with nothing to
+# say so. Separate pairs, separate ports, separate expectation queues -- and the pool's departure
+# still batches riders from every host, because that is the FRAME wire's business and not this
+# one's.
+#
+# Keyed by slot rather than by address because the slot is what the two ends agree on: the host
+# states it, the pool hears it at the HELLO, and both derive the same port from it.
+_LANES: dict = {}
 _LOCK = threading.Lock()
 
 
@@ -50,10 +59,53 @@ class Lane:
         self.failed = False
         self._pg = None
         self._loop_fn = None
+        self._store = None  # the pool's rendezvous listener; outlives every pairing
+        self._epoch = 0
+        self._pool_ip, self._port = pool_ip, port
         self._init = threading.Thread(
             target=self._bring_up, args=(pool_ip, port), daemon=True
         )
         self._init.start()
+
+    def relight(self) -> None:
+        """The pool's half of a host restart: retire the dead pairing, arm the next.
+
+        A pairing is one host's lifetime. When that host departs its communicator is
+        dead on this side too, and a NEW host's rendezvous against the old epoch's
+        keys would hang forever -- which read, from the outside, as "the lane never
+        came up and the flight got 45% slower", with the text still correct. So the
+        departure handler calls this: the old group is aborted (unparking anything
+        that still waited on the dead peer), the epoch advances, and a fresh
+        bring-up parks on the store until the next host arrives. Between the two,
+        `ready` is False and every span stays on the TCP wire -- later, not wrong.
+        """
+        if self.role != "pool":
+            return
+        if not self.ready and self._pg is None:
+            # Nothing paired here, so there is no dead pairing to retire and no stale
+            # rendezvous to step past. Returning is not an optimisation: a relight of a lane
+            # that never came up re-enters the bring-up, which re-binds a port this process
+            # already holds, and the log fills with `EADDRINUSE` from a lane whose only problem
+            # was being asked to restart something that had not started.
+            return
+        self.ready = False
+        old = self._pg
+        self._pg = None
+        if old is not None:
+            try:
+                abort = getattr(old, "abort", None) or getattr(old, "_shutdown", None)
+                if abort is not None:
+                    abort()
+            except Exception as e:  # noqa: BLE001 -- the group was already dead
+                logger.info("afd lane: retiring the dead pairing raised %r", e)
+        self._epoch += 1
+        self.failed = False
+        threading.Thread(
+            target=self._bring_up,
+            args=(self._pool_ip, self._port),
+            daemon=True,
+            name="afd-lane-relight",
+        ).start()
 
     def _bring_up(self, pool_ip: str, port: int) -> None:
         try:
@@ -61,20 +113,44 @@ class Lane:
 
             import torch.distributed as dist
 
+            # Several ranks on one device. A pool serving N hosts holds N communicators on
+            # ONE card in ONE process -- rank 0 of each -- and the hosts sharing a card hold
+            # one rank each of different ones. NCCL's own guidance is that assigning more than
+            # one rank to a GPU needs this said out loud; without it the pairs come up and the
+            # failure, when it comes, is a deadlock inside a collective rather than a refusal at
+            # the door. `setdefault`, so an operator who has decided otherwise still wins.
+            os.environ.setdefault("NCCL_MULTI_RANK_GPU_ENABLE", "1")
             os.environ.setdefault("NCCL_IB_DISABLE", "1")
             os.environ.setdefault("NCCL_P2P_DISABLE", "1")
             os.environ.setdefault("NCCL_SHM_DISABLE", "1")
             rank = 0 if self.role == "pool" else 1
             # a STANDALONE group, never the default one: the server already initialised
             # torch.distributed for its own parallelism, and the lane is a pair between
-            # two PROCESSES that share no world with it
-            store = dist.TCPStore(
-                pool_ip,
-                port,
-                2,
-                is_master=(rank == 0),
-                timeout=datetime.timedelta(minutes=30),
-            )
+            # two PROCESSES that share no world with it. The pool's listener is created
+            # once and kept across pairings; each pairing lives under an EPOCH prefix,
+            # because c10d's rendezvous keys are one host's lifetime and a second host
+            # against the first's keys hangs forever (see `relight`).
+            if self.role == "pool":
+                if self._store is None:
+                    self._store = dist.TCPStore(
+                        pool_ip,
+                        port,
+                        2,
+                        is_master=True,
+                        timeout=datetime.timedelta(minutes=30),
+                    )
+                self._store.set("afd_lane_epoch", str(self._epoch))
+                store = dist.PrefixStore(f"epoch{self._epoch}", self._store)
+            else:
+                self._store = dist.TCPStore(
+                    pool_ip,
+                    port,
+                    2,
+                    is_master=False,
+                    timeout=datetime.timedelta(minutes=30),
+                )
+                self._epoch = int(self._store.get("afd_lane_epoch").decode())
+                store = dist.PrefixStore(f"epoch{self._epoch}", self._store)
             # The pair's ops PARK by design -- the pool's serving loop sits in a receive
             # until a pass rides the lane, which can be never. c10d's watchdog treats a
             # parked op as a hung collective and ABORTS the process at the group timeout
@@ -101,7 +177,11 @@ class Lane:
                     target=self._guarded_loop, name="afd-lane", daemon=True
                 ).start()
             self.ready = True
-            logger.info("afd lane: up (%s); the fixed order leaves the wire", self.role)
+            logger.info(
+                "afd lane: up (%s, pairing %s); the fixed order leaves the wire",
+                self.role,
+                self._epoch,
+            )
         except Exception as e:  # noqa: BLE001 -- a lane that cannot come up is declined
             self.failed = True
             logger.warning("afd lane: not up (%r); everything stays on the wire", e)
@@ -149,14 +229,50 @@ class Lane:
             logger.error("afd lane: the serving loop failed: %r", e)
 
 
-def lane_up(role: str, pool_ip: str, port: int, device) -> Lane:
-    """The process's lane, brought up once. Returns it immediately; check `.ready`."""
-    global _LANE
+def lane_port(base: int, slot: int) -> int:
+    """The rendezvous port for one slot. Derived, so neither end configures a port list."""
+    return base + slot
+
+
+def lane_up(role: str, pool_ip: str, port: int, device, slot: int = 0) -> Lane:
+    """This slot's lane, brought up once. Returns it immediately; check `.ready`.
+
+    `slot` defaults to 0, which is the whole configuration for a single-host deployment and is
+    what an older host announces by sending nothing. A pool arms a slot when a host claims it,
+    so no flag names how many there will be.
+    """
     with _LOCK:
-        if _LANE is None:
-            _LANE = Lane(role, pool_ip, port, device)
-        return _LANE
+        lane = _LANES.get(slot)
+        if lane is None:
+            lane = _LANES[slot] = Lane(role, pool_ip, port, device)
+        elif lane.failed and not lane.ready:
+            # A claim on a slot whose bring-up failed is a retry, and the only one there is:
+            # `relight` declines to restart a pairing that never happened, so without this a
+            # slot that lost its first bind stays down for the pool's whole life while the host
+            # waits on a rendezvous nobody will answer. Building a fresh Lane rather than
+            # re-entering the old one's thread, because the old one's store may be half-made.
+            logger.info("afd lane: slot %s is being re-armed after a failed bring-up", slot)
+            lane = _LANES[slot] = Lane(role, pool_ip, port, device)
+        return lane
 
 
-def the_lane():
-    return _LANE
+def the_lane(slot: int = 0):
+    return _LANES.get(slot)
+
+
+def lane_slots() -> tuple:
+    """Which slots this process has armed. For the log line and for tests."""
+    with _LOCK:
+        return tuple(sorted(_LANES))
+
+
+def relight_lane(slot: int | None = None) -> None:
+    """Re-arm the pool's lane(s) for the next host. A no-op everywhere else.
+
+    `None` relights every armed slot, which is what a departure handler with no slot in hand
+    means by it. A departure that knows whose host left relights only that one, so the other
+    hosts' pairings are not torn down for somebody else's restart.
+    """
+    for key, lane in list(_LANES.items()):
+        if slot is None or key == slot:
+            lane.relight()

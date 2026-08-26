@@ -163,20 +163,6 @@ def install_host_routing(model, pool_addr: str, connect_timeout_s: float = 30.0)
     adopt_from_the_pool()
     from sglang.srt.afd.pushed_config import adopted_transfer
 
-    if adopted_transfer() == "nccl":
-        from sglang.srt.afd.lane import LANE_PORT_OFFSET, lane_up
-
-        from sglang.srt.afd.installer import _host_device
-
-        ip, _, pool_port = pool_addr.rpartition(":")
-        # not `next(model.parameters())`: a skeleton host's first parameter is
-        # the embedding stub's meta placeholder, and a lane on meta never pairs
-        lane_up(
-            "host",
-            ip,
-            int(pool_port) + LANE_PORT_OFFSET,
-            _host_device(model),
-        )
     arm = _arm_if_wanted()
     if arm is None:
         # ONE arrangement. The submission serves the span cut -- a stateless big card, a
@@ -193,7 +179,61 @@ def install_host_routing(model, pool_addr: str, connect_timeout_s: float = 30.0)
     # holds, not only in what they say to each other: a host built for one of them, run
     # against a pool built for the other, would not fail -- it would run out of layers to ask
     # for. The capability bit is what turns that into a startup error.
-    return client, arm.install_on_host(model, client)
+    installed = arm.install_on_host(model, client)
+    # AFTER the HELLO, never before. The HELLO is where this host CLAIMS its lane slot, and the
+    # pool arms a slot when it hears the claim -- so a bring-up started first parks on a
+    # rendezvous nobody has bound yet, `ready` never flips, and the arrangement stays on the TCP
+    # wire with no line to say why. Slot 0 hid this: the pool pre-arms that one, so the single-host
+    # deployment paired anyway and the ordering looked correct for as long as there was one host.
+    _bring_up_the_lane(model, pool_addr)
+    return client, installed
+
+
+def _bring_up_the_lane(model, pool_addr: str) -> None:
+    """This host's half of its own slot's pairing. A no-op unless the transport is the lane."""
+    from sglang.srt.afd.pushed_config import adopted_transfer
+
+    if adopted_transfer() != "nccl":
+        return
+    from sglang.srt.afd.installer import _host_device
+    from sglang.srt.afd.lane import LANE_PORT_OFFSET, lane_port, lane_up
+    from sglang.srt.runtime_context import get_disagg
+
+    ip, _, pool_port = pool_addr.rpartition(":")
+    slot = int(get_disagg().afd_host_lane or 0)
+    port = lane_port(int(pool_port) + LANE_PORT_OFFSET, slot)
+    logger.info("afd host: claiming lane slot %s, rendezvous at %s:%s", slot, ip, port)
+    # not `next(model.parameters())`: a skeleton host's first parameter is the embedding
+    # stub's meta placeholder, and a lane on meta never pairs
+    lane_up("host", ip, port, _host_device(model), slot=slot)
+
+
+_LANE_BASE = None
+
+
+def _remember_lane_base(base: int, device) -> None:
+    """What a later slot needs to arm itself, kept where the HELLO can reach it.
+
+    The HELLO handler is inside the frame server and has neither the bootstrap port nor the
+    device in hand; both are settled here, once, at pool start.
+    """
+    global _LANE_BASE
+    _LANE_BASE = (base, device)
+
+
+def arm_lane_slot(slot: int):
+    """Bring up the pool's half of one slot, on demand. Returns the lane, or None.
+
+    Called from the HELLO when a host claims a slot this pool has not armed. None whenever the
+    lane is not this pool's transport at all, which is how a tcp pool ignores a claim rather
+    than refusing a host that would have worked without it.
+    """
+    if _LANE_BASE is None:
+        return None
+    base, device = _LANE_BASE
+    from sglang.srt.afd.lane import lane_port, lane_up
+
+    return lane_up("pool", "0.0.0.0", lane_port(base, int(slot)), device, slot=int(slot))
 
 
 def _pool_runner(model, *, device):
@@ -231,9 +271,15 @@ def run_pool(
     if (get_disagg().afd_transfer_backend or "nccl") == "nccl":
         # rank 0 of the lane's pair; the rendezvous listens beside the bootstrap port and
         # the choice reaches the host with the rest of the pushed configuration
-        from sglang.srt.afd.lane import LANE_PORT_OFFSET, lane_up
+        from sglang.srt.afd.lane import LANE_PORT_OFFSET
 
-        lane_up("pool", "0.0.0.0", port + LANE_PORT_OFFSET, device)
+        # NOT armed here. Every slot, slot 0 included, is armed when a host CLAIMS it at the
+        # HELLO. Arming slot 0 at pool start was the obvious thing and it is the one that did
+        # not work: the eagerly-armed slot reported `EADDRINUSE` on port 9002 six times over
+        # while the lazily-armed slot 1 paired first try, on the same process and the same
+        # card. Whatever else startup is doing with that port, a slot armed after the frame
+        # server is serving does not race it.
+        _remember_lane_base(port + LANE_PORT_OFFSET, device)
 
     def after_built(departure):
         # `serve` never returns -- its accept loop is the pool's life -- so everything
