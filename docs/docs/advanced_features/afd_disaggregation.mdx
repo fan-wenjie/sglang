@@ -19,10 +19,16 @@ The consequence a deployment cares about: **the host never allocates the feed-fo
 | | |
 |---|---|
 | whole model, resident on the pool | 51.05 GiB |
-| AFD host, resident weights | 19.18 GiB |
-| the host therefore does not hold | 31.87 GiB, 62% of the checkpoint |
+| AFD host, resident weights | **3.75 MiB** — the convolution filters and the final norm, pushed by the pool at install |
+| model files on the host machine | **none** — `--model-path` may name a path that does not exist; the host provisions itself from `pool://IP:PORT` (config, tokenizer and templates arrive as raw bytes and become objects in memory; `load_weight=0.01 s`) |
 | the same model colocated on the host card | fails to construct, inside `create_weights`, before any token |
-| host KV cache at `--mem-fraction-static 0.88` | 4.12 GiB, `max_total_num_tokens=67519` |
+| host KV cache at `--mem-fraction-static 0.88` | `max_total_num_tokens=217357` |
+
+The host's model class is optional too: with `--afd-host-skeleton` on the pool, every host
+builds an **attention service** from the pushed manifest — which layers exist, which of the
+two state algebras each speaks, and how wide its pieces are — and never resolves the family's
+architecture. Verified against the family-built host on one pool: 16 decode steps of top-5
+logprobs, bitwise identical.
 
 The last row of the comparison is the point. It is not that AFD is cheaper on the host card; it is that there is no colocated run on that card to be cheaper than.
 
@@ -46,7 +52,14 @@ python -m sglang.launch_server --model-path MODEL \
 
 The host serves the OpenAI-compatible API as usual. The pool serves one too, and answering requests itself is a legitimate way to use it as a colocated reference.
 
-**Restart the host whenever you restart the pool.** The host reconnects for feed-forward calls, but a pool that disappears mid-generation fails the requests in flight.
+**Run the host under a supervisor that restarts it.** A host whose pool disappears exits by
+itself, by name — instantly when a call is in flight, within a couple of minutes idle, once
+reconnection is exhausted — because serving on without the pool's state would hand a request
+whatever the last occupant of its slot left behind. A restarting host waits for the pool at
+adoption, so a supervisor loop self-synchronises with the pool's return; measured, the whole
+cycle (pool reload from page cache + host reboot) is about two minutes. A host restart alone
+needs nothing: the pool notices the departure, retires the dead lane pairing, and re-arms for
+the next host under a fresh epoch — the new host pairs on arrival.
 
 ### The pool owns the configuration
 

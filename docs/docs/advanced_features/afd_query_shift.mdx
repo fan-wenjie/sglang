@@ -23,6 +23,85 @@ is fluent and wrong. So the arrangement is selected by the checkpoint's own conf
 either at the top level of `config.json` or inside `text_config`; the text config wins, because on
 a vision-language wrapper the text stack is what was converted.
 
+## The two attentions' rewiring, precisely
+
+Write `x_l` for the residual entering layer `l`, `norm_l` for its input RMSNorm with weight
+`w_l`, and let shift `N` read from `x_(l-N)`; everything below is `N = 1`.
+
+**The softmax heads.** The standard wiring projects everything from the same place; the shift
+moves only the query's source:
+
+```
+standard   q_l = W_q · norm_l(x_l)        k_l = W_k · norm_l(x_l)     v_l = W_v · norm_l(x_l)
+shift 1    q_l = W_q · norm_l(x_(l-1))    k_l, v_l unchanged
+```
+
+The attention itself — `softmax(q k^T / √d) v`, rope, the KV cache — is untouched. What the
+early source buys is TIME: `x_(l-1)` exists one feed-forward before `x_l` does, so the host's
+sweep over its own cache starts while the pool is still computing the feed-forward that
+produces `k` and `v`. The sweep is the variable-latency stage (up to ~2.4 ms at 128k context)
+and the feed-forward window is the only place to hide it.
+
+**The own norm.** `norm_l(x_(l-1))` looks like a second normalisation of a residual the model
+already normalised as `norm_(l-1)(x_(l-1))` — but both read the SAME residual, so they share
+one rms and differ only in the learned per-channel weight:
+
+```
+norm_l(x) = x / rms(x) ⊙ w_l   =   norm_(l-1)(x) ⊙ (w_l ⊘ w_(l-1))
+```
+
+one multiply by an install-time ratio, held to the identity by test. Reusing the neighbour's
+norm outright instead prices at +1.46% bits per byte — the two approximations were poisonous
+together while each alone is nearly free (see the table below).
+
+**The linear (gated-delta) layers.** One operator appears twice per step, and the rule is
+which copy the early tensors may enter:
+
+```
+P(k)   = I − β k k^T                              the delta rule's projector
+
+state  S_t = α S_(t−1) P(k_t) + β_t v_t k_t^T     ALWAYS the current k, v, β
+output o_t = α S_(t−1) q̃_t + s_t v_t
+
+  q̃_t = q_e − β_e (k_e·q_e) k_e    the coefficient, wholly from the EARLY
+                                   projection (convolved read-only against the
+                                   host's ring; the ring's q channels then
+                                   advance with the early raw column)
+  s_t = β_t (k_t · q_e)            the state's key and β, the early query
+```
+
+Early tensors enter the OUTPUT's copy of `P(k)`, where the error is spent in one step, and
+never the STATE's, where it compounds: the all-shifted control prices at +280% bits per byte
+against the served arm's +0.37%. The pool cooks `q̃` and sends it one feed-forward before `k`
+and `v`; the host contracts it against the state it alone holds and pushes the reading back
+inside the window; the advance lands unanswered.
+
+**What the schedule looks like.** One span, decode, both shifts:
+
+```
+shift 0 — serial: nothing can start before everything arrives
+  pool   ──[ffn][ffn][ffn][project q,k,v]─────────────────
+  wire   ─────────────────────────→ q,k,v ──── ← attn ────
+  host   ··························[sweep·····][join]·····
+
+shift 1 — the early read: the sweep rides inside the last feed-forward
+  pool   ──[ffn][ffn][project q̃]──[last ffn][project k,v]──
+  wire   ────────────→ q̃ ····················→ k,v ← attn─
+  host   ··············[sweep·················][join]······
+         and the linear triangle rides the NCCL lane beside it:
+         q̃ ↓ lane · reading ↑ lane · advance ↓ lane, order as the protocol
+```
+
+The window's width is the pool's last feed-forward; what shift 1 hides is constant in context
+length while the sweep it hides grows with it, so the margin widens with context.
+
+**Quantised pools.** The early view wants a prefix of a fused projection's outputs, and
+"slice the weight" is only a smaller matmul when the weight is the matrix. The projections
+are therefore dispatched by the serving method: unquantised slices the weight as always; an
+FP8 layer runs the method's own `apply` on the whole projection and slices the output — the
+same kernel the pool's forward runs, so the shared columns match it to the bit; a method the
+table does not name is refused by name.
+
 ## How to judge its output: two axes, not one
 
 The arrangement is validated against two different references, and conflating them is the
@@ -119,6 +198,7 @@ part of the result:
 | attention shift alone | 6 | 39.1 – 45.8 s | ≈ baseline at this context length |
 | **the push arrangement (what shift 1 serves)** | 12 | **29.4 – 33.9 s** | **−21% vs the baseline's distribution; the tail is gone** |
 | **the push arrangement + the NCCL lane** | 3 pairs | **22.6 – 27.1 s** | **−22% again on top, disjoint ranges; the reading finally lands inside the window** |
+| the same stack, later revisions (head on the pool, no-files host, attention-service host) | many | **20.1 – 22.6 s** | the band the branch head serves at today |
 
 What shift 1 serves by default is the full push arrangement: the linear layers' early read
 with the coefficient cooked on the pool, the reading pushed back inside the feed-forward
@@ -209,8 +289,8 @@ Everything [standard AFD refuses](/docs/advanced_features/afd_disaggregation), p
 
 - a shift other than 0 or 1. The cut reads the query from between the last linear attention and
   the last feed-forward of a group, or from the group's output; a deeper shift is a different cut
-- a quantised `in_proj_qkvz` or `in_proj_ba`. The early view slices their weights to skip what it
-  does not need, and a quantised linear is not a matrix multiply against `.weight` — refused by
+- a quantised projection whose linear method the projection tables do not name. Unquantised
+  and FP8 layers are served (see the rewiring section above); anything else is refused by
   name rather than computed wrong
 - a prefill chunk's own read. Its tokens read each other's advance, so its read cannot be
   separated from its update; those layers take the standard path and say so in the counters
