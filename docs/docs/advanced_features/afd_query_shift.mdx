@@ -1,0 +1,224 @@
+---
+title: "AFD Query Shift"
+metatags:
+    description: "Reading a linear layer's query one layer early, so the host contracts its recurrent state while the pool spends a feed-forward. For checkpoints repaired for it; measured, and currently a loss on near-parity hardware."
+---
+## What it is
+
+Under [AFD disaggregation](/docs/advanced_features/afd_disaggregation) the pool calls the host for
+a linear layer's recurrent state and waits. Query shift breaks that wait: the query and key that
+decide WHICH state to read are projected from the previous layer's residual instead of this
+layer's input, so the read can be sent one feed-forward earlier and the host contracts while the
+pool computes.
+
+The read point belongs to the **checkpoint**. A model whose `W_q` was repaired to read `h_(l-1)`
+must be served that way, and one that was not must not be: serving a repaired checkpoint at the
+standard read point feeds its query projection an input it was never trained on, and the output
+is fluent and wrong. So the arrangement is selected by the checkpoint's own config, not by a flag:
+
+```json
+{ "query_shift_layers": 1 }
+```
+
+either at the top level of `config.json` or inside `text_config`; the text config wins, because on
+a vision-language wrapper the text stack is what was converted.
+
+## How to judge its output: two axes, not one
+
+The arrangement is validated against two different references, and conflating them is the
+easiest way to misread a comparison.
+
+**Consistency, against a serial single-machine run of the SAME shifted semantics.** The
+distributed arrangement relocates arithmetic -- the pool cooks, the host contracts, kernels
+fuse, history travels as a partial sum -- and every relocation is held to the serial reference
+within a declared reassociation regime (fused kernels and split sums reorder floating-point
+additions; nothing else may change). Failures on this axis are bugs.
+`test_afd_cooked_is_the_same_arithmetic` and the in-process round trip are this axis's
+instruments.
+
+**Approximation, against the standard model.** A checkpoint that was not trained for the
+shift pays for it: the mechanism's +5.01% bits per byte and the linear operator's +0.38% below
+are properties of the SEMANTICS on a non-native checkpoint, not of the implementation. A
+native query-shift checkpoint absorbs them at training time; until one exists, these numbers
+are the price list the flag's warning points at. Output text differing from a shift-0 run --
+including near-tie token flips -- is this axis, and is expected.
+
+## What it costs the model
+
+Two approximations make up shift 1, and they are priced separately because they were measured
+separately.
+
+**The attention query, read one feed-forward early** — the design's own mechanism. Measured on
+the deployment itself: bits per byte of the served model over a fixed passage, from its own
+prefill logprobs, shift 1 against shift 0 on the same machines. The quantity is deterministic —
+replicates agree to the last printed digit.
+
+| passage | shift 0 | shift 1 | cost |
+|---|---|---|---|
+| natural prose | 1.559006 | 1.637043 | **+5.01%** |
+| shuffled words | 1.393054 | 1.477491 | +6.06% |
+
+Five percent of bits per byte, on a checkpoint that was not trained for the shift. This is the
+number behind the flag's warning: the mechanism itself is speed-neutral (see the next section),
+so what `--afd-query-shift-layers` does to an ordinary checkpoint is spend model quality on
+nothing. A checkpoint trained with the shifted read point pays its shift at training time; this
+override exists for those, and for experiments that know what they are giving up.
+
+**The linear layers' early read** — the derived arm on top of the mechanism. Measured offline,
+teacher-forced a position at a time through the recurrence, over twelve fineweb-edu documents
+(48168 bytes, 9927 tokens). `benchmark/afd/early_k_bpb.py`:
+
+| arm | bits per byte | vs exact |
+|---|---|---|
+| exact — the model | 0.6252 | — |
+| **serving — what shift 1 actually runs (own norm)** | **0.6275** | **+0.37%** |
+| serving with the previous layer's norm reused | 0.6366 | +1.83% |
+| all-shifted — the control | 4.0575 | +546.89% |
+
+The served semantics: this layer's own input norm applied to the shifted residual — at the
+price of one multiply, because both norms read the same residual and therefore share the same
+rms, so the own reading is the neighbour's reading times an install-time per-channel ratio
+(`pool_cook.norm_ratio`, held to the identity by test) — and the ring's q channels advanced
+with the early query's raw column, the one-query view carried into the history.
+
+The second row is the retraction of an attribution, not just a price: an earlier revision
+booked 0.94 points to the early-q ring history by comparing reused-norm variants. The cross
+says otherwise — under the own norm the ring costs nothing (0.37 against the old own-norm
+arm's 0.38), and the reuse alone costs +1.46 — because a mis-normed raw q column compounds
+through the convolution history. The two changes were poisonous together while each alone is
+nearly free. The pre-registered kill condition for this family is +2.68%.
+
+The rule the control establishes: the shifted tensors may enter the OUTPUT's copy of `P(k)`, where
+the error is spent in one step, and may **not** enter the STATE's, where it compounds through
+every step after. The control arm is what breaking that looks like — not a degraded model, a
+different one.
+
+The third row is a variant that reuses the previous layer's post-attention normalisation instead
+of running this layer's, which saves one RMSNorm a layer. It costs 0.52 points on top of the
+0.38 — a third of the budget for a twelfth of a millisecond.
+
+    An earlier version of this page reported -0.016% for the arrangement. That figure came from
+    an arm that left the query current while the key inside `P(k)` was early, and the served
+    arrangement forms the whole coefficient from the early projection. It described something
+    else. The arm computes what the code computes now, and `test_afd_arm_matches_the_code.py`
+    compares the two at the three places the operator's terms are decided, so they cannot drift
+    apart again without a test saying so.
+
+This was measured on a checkpoint that declares no read point, which is the case the command-line
+override exists for and warns about. A checkpoint repaired for the shift should do better.
+
+## What it costs in latency — it pays
+
+Two machines, pool on a 97 GiB card and host on a 31 GiB card across a LAN, five prompts of 32
+tokens, every comparison replicated and order-rotated because these arrangements' spreads are
+part of the result:
+
+| | flights | range | verdict |
+|---|---|---|---|
+| blocking baseline (standard read point) | 6 | 32.8 – 45.5 s | bimodal — its own tail |
+| attention shift alone | 6 | 39.1 – 45.8 s | ≈ baseline at this context length |
+| **the push arrangement (what shift 1 serves)** | 12 | **29.4 – 33.9 s** | **−21% vs the baseline's distribution; the tail is gone** |
+| **the push arrangement + the NCCL lane** | 3 pairs | **22.6 – 27.1 s** | **−22% again on top, disjoint ranges; the reading finally lands inside the window** |
+
+What shift 1 serves by default is the full push arrangement: the linear layers' early read
+with the coefficient cooked on the pool, the reading pushed back inside the feed-forward
+window, assembly on the pool, and the advance applied unanswered. Three earlier
+implementations of the same idea lost (+18.6%, +23.3%) and their post-mortems are in the
+design record; what changed the sign was removing the blocking round trip itself rather than
+cheapening its halves. The −21% headline is against the baseline's real distribution; against
+the baseline's fastest mode alone it is −3 to −6%, and the larger prize is the tail: the
+blocking arrangement's 13-second bimodal spread — a property of forty-eight synchronous round
+trips a token, not of the machines, as order rotation showed — collapses to a ±1 s band.
+
+The second step is the lane. The host's inbound Python was measured at 0.88 ms per advance
+and would not move: not for reordering (three arrangements flown, all lost), not for packing
+(no change on the direct clock), not for pinned staging (worse) — twenty small interpreter
+operations stretched under a contended GIL. What moves it is not running Python on the data
+path at all: the read triangle (coefficient down, reading up, advance down) rides a
+standalone NCCL pair whose receives land directly in device buffers, order as the protocol
+because NCCL has no tags, the host announcing every triple's (layer, row) to its own lane
+loop at issue time. Alternated pairs: 22.6–27.1 s against 30.0–32.8 s for the same stack
+without the lane — and the clock that matters most: the reading's lateness at assembly fell
+from 0.81 ms to 0.06 ms per layer, so the push arrangement's schedule finally holds as
+designed. The pool's span wall fell from 8.8 to 5.5 ms against a computed floor of about
+5.7. NCCL is the vehicle because the transport is its decision: today these sends run its
+socket transport; on links with RoCE or InfiniBand and GPUDirect the same code goes RDMA,
+where the pre-registered ceiling is another 20 points. The lane is `--afd-transfer-backend
+nccl` on the pool — one flag, adopted by the host with the rest of the configuration.
+
+The attention shift's own saving grows with context (the sweep is the one stage whose cost
+does) and prices at zero at this context length, as predicted.
+
+A four-configuration attribution — both mechanisms, each alone, neither — was flown twice: a
+fixed-order block and a Latin square that rotates which configuration flies in which slot of
+the start-stop cycle. Twenty-four flights, and the two families' ranges do not overlap:
+
+| | flights | range | mean |
+|---|---|---|---|
+| push configurations (linear early read, with or without the attention shift) | 12 | 29.4 – 33.9 s | 32.1 |
+| blocking configurations (per-layer request-reply, with or without the shift) | 12 | 32.8 – 45.8 s | 41.8 |
+
+Three verdicts fall out. The linear push is worth about **−21%** against the blocking
+baseline's real distribution. The attention shift alone measures ≈ 0 at this context length,
+as predicted. And the baseline's wide range is not the machines' weather — position rotation
+did not move it — but the **blocking arrangement's own tail behaviour**: forty-eight
+synchronous round trips a token are phase-sensitive in a way the pipelined push is not, which
+collapses a 13-second bimodal spread into a ±1 s band. For serving, the tail elimination is
+worth more than the mean.
+
+The early read for the LINEAR layers is a separate mechanism layered above it, and it lost in
+both of its implementations: raw materials finished on the host (+18.6% — the preparation
+overflowed the feed-forward window and the schedule's max moved to the host), and finished
+materials cooked on the pool (+23.3% — the host's half then performed exactly as designed, mix
+serve 1.848 → 0.566 ms, but each early send cost 0.95 ms of the pool's serial interpreter path
+against 0.16 ms for the same work in isolation). The loss is structural on this stack: the work
+the early read can move is about 0.38 ms a layer, constant in context length, and smaller than
+any implementation's own constants at batch one over TCP under a shared interpreter lock. The
+third implementation is the one that ships: assembly moved to the pool so nothing waits on the
+uplink, the advance returns unanswered, and the read triangle rides the lane with no Python on
+the data path — the push arrangement whose verdicts open this section. The measurement ladder
+that once selected these mechanisms one at a time (`SGLANG_AFD_QS_RUNG`) is gone with its
+verdicts recorded here; the shift resolved through the checkpoint is the one switch.
+
+## The one setting, and why you should not use it
+
+```
+--afd-query-shift-layers N
+```
+
+**DANGEROUS, and unset by default.** It overrides what the checkpoint says about its own weights,
+and a wrong value fails silently: the server starts, generation is fluent, and the text is from a
+model nobody trained.
+
+On a HOST, leave it unset always: the pool pushes its own value at startup and the host adopts
+it, so the flag belongs on the pool's command line alone. A host given a contradicting value is
+refused at load by name rather than served past.
+
+Leave it unset unless you are running a measurement. Unset reads the checkpoint's own
+`query_shift_layers`, which is the value its weights were repaired for, or 0 if it states none.
+Setting it is only correct for measuring what the rewiring costs BEFORE repair — every other use
+serves a query projection an input it was not trained on, and every path that honours it warns.
+
+`0` is a real value meaning the standard wiring, which is why the default is unset rather than 0:
+`--afd-query-shift-layers 0` and giving nothing at all mean different things, and the first is how
+the two arms are compared on one checkpoint.
+
+## What it does not work with
+
+Everything [standard AFD refuses](/docs/advanced_features/afd_disaggregation), plus:
+
+- a shift other than 0 or 1. The cut reads the query from between the last linear attention and
+  the last feed-forward of a group, or from the group's output; a deeper shift is a different cut
+- a quantised `in_proj_qkvz` or `in_proj_ba`. The early view slices their weights to skip what it
+  does not need, and a quantised linear is not a matrix multiply against `.weight` — refused by
+  name rather than computed wrong
+- a prefill chunk's own read. Its tokens read each other's advance, so its read cannot be
+  separated from its update; those layers take the standard path and say so in the counters
+
+## Reading the source
+
+`python/sglang/srt/afd_query_shift/` is the whole of it. `checkpoint.py` decides the read point
+and is the only thing that does; `span.py` sends the early projection; `early_contraction.py` is
+the host's half, registered rather than written into the shared package, so deleting this
+directory removes the behaviour rather than leaving a handler nothing reaches. `PIPELINE.md`
+carries the measurements, including the ones that were taken wrong and what replaced them.
