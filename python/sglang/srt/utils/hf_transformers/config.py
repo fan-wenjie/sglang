@@ -83,14 +83,24 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
-        if config is None:
-            config = AutoConfig.from_pretrained(
-                model,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
+        from sglang.srt.afd.model_files import is_pool_path
+
+        if is_pool_path(model):
+            # an AFD host provisioned from nothing but a pool address: the raw
+            # dict comes from the pool's pushed papers instead of a filesystem
+            # or a hub, and every family fixup below runs on it unchanged
+            from sglang.srt.afd.model_files import pool_config
+
+            config = pool_config(model)
+        else:
+            config = _try_load_longcat_config(model, revision, **kwargs)
+            if config is None:
+                config = AutoConfig.from_pretrained(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
 
         if (
             config.architectures is not None
@@ -140,9 +150,14 @@ class HfModelConfigParser(ModelConfigParserBase):
             model_type = config.model_type
             if model_type == "deepseek_vl_v2" and is_ocr:
                 model_type = "deepseek-ocr"
-            config = _CONFIG_REGISTRY[model_type].from_pretrained(
-                model, revision=revision
-            )
+            if is_pool_path(model):
+                from sglang.srt.afd.model_files import pool_config_dict
+
+                config = _CONFIG_REGISTRY[model_type].from_dict(pool_config_dict(model))
+            else:
+                config = _CONFIG_REGISTRY[model_type].from_pretrained(
+                    model, revision=revision
+                )
 
             # Re-check after reloading config from registry
             if _is_deepseek_ocr_model(config) or _is_deepseek_ocr2_model(config):
@@ -249,7 +264,9 @@ def get_config(
 
     model = resolve_runai_obj_uri(model)
 
-    if is_remote_url(model):
+    from sglang.srt.afd.model_files import is_pool_path
+
+    if is_remote_url(model) and not is_pool_path(model):
         client = create_remote_connector(model)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()

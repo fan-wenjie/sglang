@@ -8358,10 +8358,15 @@ class ServerArgs:
                 load_format="runai_streamer",
             )
         elif is_remote_url(cfg.model_path):
-            self._declare(
-                "_handle_load_format",
-                load_format="remote",
-            )
+            from sglang.srt.afd.model_files import is_pool_path
+
+            if not is_pool_path(cfg.model_path):
+                # `pool://` is the AFD host's scheme, not a storage connector,
+                # and its load format (dummy) is already declared by the hook
+                self._declare(
+                    "_handle_load_format",
+                    load_format="remote",
+                )
 
         if (
             cfg.speculative_draft_model_path is not None

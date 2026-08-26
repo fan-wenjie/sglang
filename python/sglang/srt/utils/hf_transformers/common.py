@@ -591,6 +591,13 @@ def get_generation_config(
     revision: Optional[str] = None,
     **kwargs,
 ):
+    from sglang.srt.afd.model_files import is_pool_path
+
+    if is_pool_path(model):
+        # an AFD host provisioned from nothing but a pool address; see model_files
+        from sglang.srt.afd.model_files import pool_generation_config
+
+        return pool_generation_config(model)
     if check_gguf_file(model):
         sidecar = gguf_sidecar_dir(model, "generation_config.json")
         if sidecar is not None:

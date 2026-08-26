@@ -26,10 +26,13 @@ import torch
 
 from sglang.srt.afd.pool_linear import _install_history_calls
 from sglang.srt.afd.pool_server import namespace_of, register_departure
+from sglang.srt.afd.layer_kinds import layer_types_of
 from sglang.srt.afd.protocol import (
     OP_NAMES,
     OP_SPAN,
     OP_SPAN_LANE,
+    OP_FILES,
+    OP_WEIGHTS,
     OP_SPAN_ENTER,
     OP_SPAN_EXIT,
     OP_SPAN_Q,
@@ -47,6 +50,34 @@ logger = logging.getLogger(__name__)
 SPAN_HANDOVER_TIMEOUT_S = 30.0
 
 SPAN_OPS = frozenset({OP_SPAN, OP_SPAN_LANE, OP_SPAN_ENTER, OP_SPAN_EXIT})
+
+
+def _depart_weights(departure, group: int, op: int, riding) -> None:
+    """The residual weights a weightless host computes with, in layer order.
+
+    Fixed order IS the schema: for each linear layer in index order, the convolution
+    filter and its bias; then the final norm's weight. Both ends derive the same
+    list from the same config, so nothing about it needs naming on the wire.
+    """
+    model = departure.runner.model
+    types = layer_types_of(model)
+    out = []
+    for index, kind in enumerate(types):
+        if kind == "full_attention":
+            continue
+        conv = model.model.layers[index].linear_attn.conv1d
+        # a frame carries (rows, columns); the host rebuilds each tensor to the
+        # shape it constructed itself, so one row of numbers is the whole story
+        out.append(conv.weight.detach().reshape(1, -1))
+        out.append(
+            conv.bias.detach().reshape(1, -1)
+            if conv.bias is not None
+            else torch.zeros(1, 0, device=conv.weight.device)
+        )
+    out.append(model.model.norm.weight.detach().reshape(1, -1))
+    for frame, sock in riding:
+        with departure._wire_lock:
+            send_frame(sock, Frame(frame.request_id, group, tuple(out), OP_WEIGHTS))
 
 
 _SPANS = [
@@ -349,3 +380,19 @@ def _reply_pieces(departure, riding, counts, group: int, out: tuple, op: int) ->
 # because the two facts living apart is what hung this pool once.
 for _span_op in SPAN_OPS:
     register_departure(_span_op, _depart_span, calls_back=True)
+# the residual-weights push calls nothing back: it reads the pool's own parameters
+register_departure(OP_WEIGHTS, _depart_weights)
+
+
+def _depart_files(departure, group: int, op: int, riding) -> None:
+    """The model's papers, for a host bootstrapping from nothing but an address."""
+    from sglang.srt.afd.model_files import files_reply
+    from sglang.srt.runtime_context import get_model
+
+    out = files_reply(get_model().model_path)
+    for frame, sock in riding:
+        with departure._wire_lock:
+            send_frame(sock, Frame(frame.request_id, group, out, OP_FILES))
+
+
+register_departure(OP_FILES, _depart_files)

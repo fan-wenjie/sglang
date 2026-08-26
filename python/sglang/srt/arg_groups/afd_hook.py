@@ -43,6 +43,50 @@ def handle_afd(server_args: ServerArgs) -> None:
 
     _refuse_pool_only_on_host(server_args)
 
+    if server_args.afd_mode == "host":
+        import os
+
+        from sglang.srt.afd.model_files import POOL_SCHEME, is_pool_path
+
+        if not is_pool_path(server_args.model_path) and not os.path.exists(
+            server_args.model_path
+        ):
+            # a host with no checkpoint provisions itself from the pool: the papers
+            # are fetched into MEMORY through the loader seams -- no tmpfs, no
+            # cache directory, no write permission needed anywhere. See
+            # afd/model_files.py.
+            from sglang.srt.arg_groups.overrides import declare_resolution
+
+            # declared, not assigned: the config-bag projection reads the
+            # declaration stash, and a bare write would leave every
+            # get_model()/get_serving() reader seeing the path that isn't there
+            old = server_args.model_path
+            pool_path = POOL_SCHEME + server_args.afd_pool_addr
+            fields = {"model_path": pool_path}
+            if getattr(server_args, "tokenizer_path", None) in (None, old):
+                fields["tokenizer_path"] = pool_path
+            declare_resolution(server_args, "handle_afd", **fields)
+            logger.info(
+                "afd host: %r does not exist here; the model's papers come from "
+                "the pool (%s) and stay in memory",
+                old,
+                server_args.model_path,
+            )
+
+    if server_args.afd_mode == "host" and server_args.load_format != "dummy":
+        # A host reads NO weight file: everything it holds is either built on meta
+        # (routed to the pool) or pushed by the pool at install (the convolution
+        # filters, the final norm). Dummy is not a degradation here -- it is the
+        # statement that the pool is the one source of every weight byte, so two
+        # ends built from different checkpoint files cannot silently disagree.
+        logger.info(
+            "afd host: --load-format forced to 'dummy' -- a host reads no weight "
+            "file; the few tensors it computes with are pushed by the pool"
+        )
+        from sglang.srt.arg_groups.overrides import declare_resolution
+
+        declare_resolution(server_args, "handle_afd", load_format="dummy")
+
     _check_pool_args(server_args)
 
     # Whatever arms this build carries check their own flags here. Nothing in this file knows

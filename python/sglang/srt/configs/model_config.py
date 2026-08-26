@@ -1263,7 +1263,11 @@ class ModelConfig:
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
-            is_local = os.path.exists(self.model_path)
+            from sglang.srt.afd.model_files import is_pool_path
+
+            # a `pool://` model is as local as it gets: everything a host can
+            # know already travelled from the pool, so never ask the hub
+            is_local = os.path.exists(self.model_path) or is_pool_path(self.model_path)
             if not is_local:
                 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
                 if envs.SGLANG_USE_MODELSCOPE.get():
@@ -1432,8 +1436,11 @@ class ModelConfig:
         # Check for HuggingFace quantization config
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is None:
+            from sglang.srt.afd.model_files import is_pool_path
             from sglang.srt.utils import has_hf_quant_config
 
+            if is_pool_path(self.model_path):
+                return False
             return has_hf_quant_config(self.model_path)
         return True
 
@@ -1750,9 +1757,14 @@ class ModelConfig:
             model: The model name or path.
 
         """
+        from sglang.srt.afd.model_files import is_pool_path
         from sglang.srt.connector import create_remote_connector
         from sglang.srt.utils import is_remote_url
 
+        if is_pool_path(self.model_path):
+            # `pool://` is the AFD host's scheme, not a storage connector; the
+            # papers come through the loader seams and nothing lands on disk
+            return
         if is_remote_url(self.model_path):
             logger.info("Pulling model configs from remote...")
             # BaseConnector implements __del__() to clean up the local dir.

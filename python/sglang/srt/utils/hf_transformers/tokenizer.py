@@ -477,6 +477,21 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    from sglang.srt.afd.model_files import is_pool_path
+
+    if is_pool_path(tokenizer_name):
+        # an AFD host provisioned from nothing but a pool address; see model_files.
+        # Built straight from the raw tokenizer.json, so the v5 class-rebuild
+        # fixes have nothing to fix -- but the serving-side patches (stop ids,
+        # special-token pattern) are the SERVER's contract and still apply.
+        from sglang.srt.afd.model_files import pool_tokenizer
+
+        tokenizer = pool_tokenizer(tokenizer_name)
+        _install_tokenizer_warnings_filter(tokenizer)
+        _fix_special_tokens_pattern(tokenizer)
+        attach_additional_stop_token_ids(tokenizer)
+        return patch_tokenizer(tokenizer)
+
     # Tiktoken format has its own backend — no fastokens patching needed.
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer

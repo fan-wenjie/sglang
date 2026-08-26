@@ -177,6 +177,30 @@ def effective_model_path(server_args=None) -> str:
         return server_args.model_path
 
 
+def effective_model_path(server_args=None) -> str:
+    """The checkpoint path this process actually serves.
+
+    `ServerArgs` carries the user's RAW input; what resolution decided lives in
+    the config bag, and on an AFD host the two differ BY DESIGN -- a host whose
+    path does not exist is given `pool://IP:PORT` so its config and tokenizer
+    come from the pool rather than a filesystem. Reading the record in a
+    published process therefore answers with a path that was never loaded, which
+    is how the identity guard came to refuse a host for serving the checkpoint it
+    was actually serving.
+
+    So: the bag where one exists (every published process), and the record where
+    one does not -- the resolution pipeline itself, and the tests that hand one in.
+    """
+    from sglang.srt.runtime_context import get_model
+
+    try:
+        return get_model().model_path
+    except ValueError:  # this process has not published; resolution is still running
+        if server_args is None:
+            raise
+        return server_args.model_path
+
+
 def stated_shift(model_path: str):
     """The read point the checkpoint at `model_path` declares, or None.
 

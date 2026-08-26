@@ -49,7 +49,7 @@ CLOSE = HEADER.pack(0, 0, 0, 0, 0)
 
 # int64 is on the list because RoPE travels with the frame: the pool projects the key, so it
 # needs the positions, and sending them as floats would round past 2^24.
-DTYPES = (torch.bfloat16, torch.float16, torch.float32, torch.int64)
+DTYPES = (torch.bfloat16, torch.float16, torch.float32, torch.int64, torch.uint8)
 DTYPE_CODE = {d: i for i, d in enumerate(DTYPES)}
 
 # What the pool is being asked for. The opcode travels because the reply's SHAPE depends on it and
@@ -189,6 +189,17 @@ OP_STATE_APPLY = 21  # POOL TO HOST, unanswered: this step's state and ring adva
 # layer behind it, and the host serves in order, so the state is advanced before anything can
 # read it.
 
+OP_WEIGHTS = 23  # HOST TO POOL, once at install: give me the residual weights I compute
+# with. A weightless host loads NO weight file (its loader runs dummy); the few
+# tensors its own arithmetic touches -- the convolution filters the rings are
+# swept with, and the final norm -- come from the pool, in layer order, so every
+# weight byte either end multiplies by has ONE source and cannot disagree.
+OP_FILES = 24  # HOST TO POOL, before anything loads: give me the model's small files.
+# config.json, the tokenizer, the templates -- everything a host needs to build
+# its skeleton, as raw bytes with a JSON manifest in front. The host writes them
+# to tmpfs and points its own loading at that; the checkpoint's weights are NOT
+# in this list (a host reads no weight file), so a host machine needs no model
+# download at all: a pool address is the whole of its provisioning.
 OP_SPAN_LANE = 22  # a middle span whose read triangle -- coefficient down,
 # reading up, advance down -- rides the NCCL lane instead of this wire. The HOST decides,
 # at issue, one frame at a time: the lane is up, the rows are one decode row, the windows
@@ -218,6 +229,8 @@ OP_NAMES = {
     OP_SPAN_Q: "span_q",
     OP_SPAN_ENTER: "span_enter",
     OP_SPAN_EXIT: "span_exit",
+    OP_WEIGHTS: "weights",
+    OP_FILES: "files",
     OP_STATE_READ: "state_read",
     OP_STATE_UPDATE: "state_update",
     OP_STATE_SCAN: "state_scan",
@@ -280,6 +293,9 @@ def _payload_of(t: torch.Tensor) -> tuple[memoryview, int, int, int]:
     if t.dim() != 2:
         raise ValueError(f"a frame carries (rows, columns); got {tuple(t.shape)}")
     host = t.detach().to("cpu").contiguous()
+    if host.numel() == 0:
+        # a deliberately empty tensor (an absent bias) still names its shape
+        return memoryview(b""), t.shape[0], t.shape[1], DTYPE_CODE[t.dtype]
     view = memoryview(host.view(torch.uint8).numpy()).cast("B")
     return view, t.shape[0], t.shape[1], DTYPE_CODE[t.dtype]
 
@@ -430,6 +446,9 @@ def decode(sock) -> Frame | None:
         )
     tensors, offset = [], 0
     for rows, cols, code, length in shapes:
+        if length == 0:
+            tensors.append(torch.empty(rows, cols, dtype=DTYPES[code]))
+            continue
         flat = torch.frombuffer(payload, dtype=torch.uint8, count=length, offset=offset)
         tensors.append(flat.view(DTYPES[code]).view(rows, cols))
         offset += length

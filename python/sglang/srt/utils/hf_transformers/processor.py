@@ -225,6 +225,16 @@ def get_processor(
 
         _ensure_fastokens_patched()
 
+    from sglang.srt.afd.model_files import is_pool_path
+
+    _afd_name = model_name if model_name is not None else tokenizer_name
+    if is_pool_path(_afd_name):
+        # an AFD host provisioned from nothing but a pool address; the processor
+        # is assembled in memory from the pushed papers. See afd/model_files.py.
+        from sglang.srt.afd.model_files import pool_processor
+
+        return pool_processor(_afd_name)
+
     revision = kwargs.pop("revision", tokenizer_revision)
     image_processor_backend = _normalize_image_processor_backend(
         image_processor_backend, use_fast

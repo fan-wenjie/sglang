@@ -189,9 +189,19 @@ def adopt(cfg: dict, server_args) -> None:
             f"configuration nobody had asked for. Check out the same commit on both ends."
         )
     from sglang.srt.afd.checkpoint import effective_model_path
+    from sglang.srt.afd.model_files import is_pool_path
 
-    my_model = pathlib.Path(str(effective_model_path(server_args))).name
-    if cfg.get("model") != my_model:
+    mine = effective_model_path(server_args)
+    my_model = pathlib.Path(str(mine)).name
+    if is_pool_path(mine):
+        # a pool-provisioned host has no checkpoint of its own to disagree with:
+        # its papers, its weights, and now its name are all the pool's
+        logger.info(
+            "afd host: serving %r -- the pool's checkpoint, adopted along with "
+            "everything else",
+            cfg.get("model"),
+        )
+    elif cfg.get("model") != my_model:
         raise RuntimeError(
             f"the pool serves {cfg.get('model')!r} and this host loaded {my_model!r}. "
             f"The host's attention would run one checkpoint's layers against another's "

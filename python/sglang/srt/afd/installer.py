@@ -280,6 +280,7 @@ def install_span_routing(model, client: PoolClient, *, reply_timeout_s: float = 
 
         serve_triangle(lane, routing.history)
     _install_head_shim(model, routing)
+    _pull_residual_weights(model, client)
     logger.info(
         "afd host: holding %s linear layer(s) of recurrent state for up to %s request(s), %s",
         sum(1 for t in types if t != "full_attention"),
@@ -563,6 +564,76 @@ class SpanArm:
 
     def make_pool_runner(self, model, *, device):
         return make_span_runner(model, device=device)
+
+
+def _host_device(model):
+    """The device this host computes on: any parameter that has real storage."""
+    for p in model.parameters():
+        if not p.is_meta:
+            return p.device
+    import torch
+
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _pull_residual_weights(model, client) -> None:
+    """Every weight byte this host multiplies by, fetched from the pool once.
+
+    The host's loader runs dummy -- it reads no weight file -- and the few tensors
+    its own arithmetic touches (the convolution filters, the final norm) arrive
+    here, in the fixed layer order both ends derive from the same config. Shapes
+    are checked by name; a mismatch is two ends built from different checkpoints,
+    refused before the first frame rather than served as fluent noise.
+    """
+    from sglang.srt.afd.layer_kinds import layer_types_of
+    from sglang.srt.afd.protocol import OP_WEIGHTS
+
+    import torch
+
+    handle = client.issue_frame(0, 0, (torch.zeros(1, 1),), OP_WEIGHTS)
+    got = client.collect_frame(handle, "cpu")
+    types = layer_types_of(model)
+    linear = [i for i, k in enumerate(types) if k != "full_attention"]
+    expected = 2 * len(linear) + 1
+    if len(got) != expected:
+        raise RuntimeError(
+            f"the pool pushed {len(got)} residual weight tensor(s) where "
+            f"{expected} were expected ({len(linear)} conv filters with biases and "
+            f"the final norm). The two ends were built from different checkpoints."
+        )
+    device = _host_device(model)
+
+    def _land(module, name, value, index):
+        target = getattr(module, name)
+        if value.numel() != target.numel():
+            raise RuntimeError(
+                f"{index}: the pool pushed {value.numel()} value(s) and this "
+                f"host built {tuple(target.shape)}. The two ends were built "
+                f"from different checkpoints."
+            )
+        value = value.reshape(target.shape)
+        if target.is_meta:
+            # the module was deliberately built with no storage; the pushed
+            # tensor IS its storage now
+            module._parameters[name] = torch.nn.Parameter(
+                value.to(device, target.dtype), requires_grad=False
+            )
+        else:
+            with torch.no_grad():
+                target.copy_(value.to(target.device, target.dtype))
+
+    for j, index in enumerate(linear):
+        conv = model.model.layers[index].linear_attn.conv1d
+        w, b = got[2 * j], got[2 * j + 1]
+        _land(conv, "weight", w, f"layer {index} convolution filter")
+        if conv.bias is not None and b.numel():
+            _land(conv, "bias", b, f"layer {index} convolution bias")
+    _land(model.model.norm, "weight", got[-1], "the final norm")
+    logger.info(
+        "afd host: %d residual weight tensor(s) adopted from the pool -- this host "
+        "read no weight file",
+        expected,
+    )
 
 
 def _install_head_shim(model, routing) -> None:

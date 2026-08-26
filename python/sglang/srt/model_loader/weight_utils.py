@@ -1665,6 +1665,10 @@ def initialize_dummy_weights(
     the parameter's number of elements and its data type.
     """
     for param in model.state_dict().values():
+        if param.device.type == "meta":
+            # a parameter deliberately left on meta (e.g. a module whose compute
+            # lives on another machine) has no storage to randomize
+            continue
         if torch.is_floating_point(param):
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
