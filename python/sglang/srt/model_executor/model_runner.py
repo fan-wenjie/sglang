@@ -770,6 +770,44 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+        self.maybe_init_afd_transforms()
+        self.maybe_init_afd_pool()
+        self.maybe_init_afd_host()
+
+    def maybe_init_afd_transforms(self):
+        """Let whatever AFD arm this build carries transform the loaded model. None if there is none.
+
+        Wired here because this is where a loaded model may be transformed, and because the model
+        lives in the scheduler process: a caller holding an Engine cannot reach it.
+        """
+        from sglang.srt.afd.arms import install_transforms
+
+        self.afd_transform = install_transforms(
+            model=self.model,
+            model_config=self.model_config,
+            server_args=self.server_args,
+        )
+
+    def maybe_init_afd_pool(self):
+        """Take the pool side of the arrangement, if --afd-mode names one. None otherwise."""
+        from sglang.srt.afd.roles import install_pool_side
+
+        self.afd_pool = install_pool_side(
+            self.model,
+            max_context=self.model_config.context_len,
+            device=self.device,
+        )
+
+    def maybe_init_afd_host(self):
+        """Take the host side of the arrangement, if --afd-mode names one. None otherwise.
+
+        After the transforms, because the host side hands its sweep schedule to the router: the
+        window has to open between the issue and the collect, and the schedule belongs to the arm
+        the previous helper installed.
+        """
+        from sglang.srt.afd.roles import install_host_side
+
+        self.afd_host = install_host_side(self.model, transform=self.afd_transform)
 
     def maybe_init_lora_manager(self):
         # Adapters apply to the target model only; the draft runs unadapted.
