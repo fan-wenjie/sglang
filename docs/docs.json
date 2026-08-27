@@ -98,6 +98,10 @@
       "destination": "/docs/advanced_features/dp_for_multi_modal_encoder"
     },
     {
+      "source": "/advanced_features/afd_disaggregation.html",
+      "destination": "/docs/advanced_features/afd_disaggregation"
+    },
+    {
       "source": "/advanced_features/epd_disaggregation.html",
       "destination": "/docs/advanced_features/epd_disaggregation"
     },
@@ -943,6 +947,7 @@
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",
               "docs/advanced_features/epd_disaggregation",
+              "docs/advanced_features/afd_disaggregation",
               "docs/advanced_features/pipeline_parallelism",
               {
                 "group": "Hierarchical KV Caching (HiCache)",

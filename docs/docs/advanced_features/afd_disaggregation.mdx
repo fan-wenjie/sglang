@@ -1,0 +1,192 @@
+---
+title: "AFD Disaggregation"
+metatags:
+    description: "SGLang AFD disaggregation: attention on a host that owns the KV cache, feed-forward on a stateless pool that holds the weights, so a model runs on a card that cannot hold it."
+---
+## Why and What is AFD Disaggregation?
+
+PD disaggregation splits a request in **time**: prefill on one engine, decode on another. AFD splits a model in **state**.
+
+The whole arrangement in one sentence: **the big card holds no state, and the small card holds
+no weights.**
+
+The **host** runs every attention — softmax and linear alike — and owns everything that belongs to a request: the KV cache and the linear layers' recurrent states. The **pool** holds the static weights and answers feed-forward calls for whoever asks, holding nothing between calls.
+
+The split is by state rather than by cost, and that is what makes the pool shareable. A stateless pool need not be reserved for a request between that request's own calls, so a request can give it up while it sweeps a long context and take it back afterwards. A pool holding any per-request state loses that property.
+
+The consequence a deployment cares about: **the host never allocates the feed-forward weights at all**, so a model can be served from a card that cannot construct it. Measured on Qwen3.8-27B in bfloat16, with the pool on a 97 GiB card and the host on a 31.36 GiB card across a LAN:
+
+| | |
+|---|---|
+| whole model, resident on the pool | 51.05 GiB |
+| AFD host, resident weights | 19.18 GiB |
+| the host therefore does not hold | 31.87 GiB, 62% of the checkpoint |
+| the same model colocated on the host card | fails to construct, inside `create_weights`, before any token |
+| host KV cache at `--mem-fraction-static 0.88` | 4.12 GiB, `max_total_num_tokens=67519` |
+
+The last row of the comparison is the point. It is not that AFD is cheaper on the host card; it is that there is no colocated run on that card to be cheaper than.
+
+## Usage
+
+Two servers, one flag each. Start the pool first:
+
+```bash
+python -m sglang.launch_server --model-path MODEL \
+    --afd-mode pool --afd-bootstrap-port 8999 --afd-min-batch 1 \
+    --disable-cuda-graph --port 31000
+```
+
+Then the host, pointed at it:
+
+```bash
+python -m sglang.launch_server --model-path MODEL \
+    --afd-mode host --afd-pool-addr POOL_IP:8999 \
+    --disable-cuda-graph --port 31001
+```
+
+The host serves the OpenAI-compatible API as usual. The pool serves one too, and answering requests itself is a legitimate way to use it as a colocated reference.
+
+**Restart the host whenever you restart the pool.** The host reconnects for feed-forward calls, but a pool that disappears mid-generation fails the requests in flight.
+
+### The pool owns the configuration
+
+The host configures nothing about the arrangement beyond the pool's address. At startup — before a single weight is allocated — it connects, and the pool pushes its configuration, stamped with a schema version and with the code version of the build that produced it (package version plus git commit). The host validates the stamps and the checkpoint name and adopts the settings; a mismatch is refused at load, by name:
+
+- two ends on different commits — refused, naming both versions
+- two ends serving different checkpoints — refused, naming both models
+- a host ALSO given a setting the pool pushes, explicitly and differently — refused as a contradiction; explicitly equal passes as redundant
+
+Two ends of one model cannot drift, which is the failure this replaces: a flag honoured on one end and ignored on the other measures a configuration nobody asked for, and nothing anywhere notices.
+
+### Why `--afd-min-batch 1` is in the pool command above
+
+The default is 2, which asks every departure to wait for a second caller. With a single host there is never a second caller, so each of the model's layer calls waits out `--afd-max-wait-ms` before leaving. Measured on the deployment above, same host flags, same prompt, identical output text:
+
+| pool setting | 32 tokens | throughput |
+|---|---|---|
+| `--afd-min-batch 1` | 4.256 s | 7.5 tok/s |
+| `--afd-min-batch 2` (default) | 18.205 s | 1.76 tok/s |
+
+The 436 ms a token that costs is 64 layers times the 5 ms wait. Leave the default in place once more than one host shares the pool, which is what a pool is for; at `--afd-min-batch 1` a departure still carries whatever is already queued, so batching becomes opportunistic rather than absent.
+
+## Flags
+
+The pool owns the arrangement's configuration and pushes it to the host at the HELLO,
+stamped with a schema version and both ends' code version. **A host sets none of the
+arrangement's flags and loads no configuration file** — a host started with a pool-only
+flag is refused at startup by name, because a host-side value could only agree with the
+pushed one (redundant) or disagree (a second source of truth).
+
+| Flag | Side | Meaning |
+|---|---|---|
+| `--afd-mode` | both | `host`, `pool`, or `null` (the default: attention and feed-forward stay colocated) |
+| `--afd-pool-addr` | host | `HOST:PORT` of the pool this host calls. Required in host mode, and the only AFD flag a host sets |
+| `--afd-bootstrap-port` | pool | Port a pool listens on. Default 8999 |
+| `--afd-min-batch` | pool | How many callers a pool waits for before a departure. A departure carries every caller at the stop, not the first N |
+| `--afd-max-wait-ms` | pool | How long the pool waits for `--afd-min-batch` before departing anyway |
+| `--afd-transfer-backend` | pool | `nccl` (default) or `tcp` — the transport for frames whose exchange order is fixed. The host adopts it with the pushed configuration |
+
+## The transfer backend
+
+Frames whose exchange order is fixed leave the TCP wire by default: the pool brings up a standalone NCCL pair beside it, rendezvoused off the bootstrap port and announced to the host with the rest of the pushed configuration — nothing needs configuring, and `--afd-transfer-backend tcp` turns the pair off. Receives land directly in device buffers with no Python on the data path, which is what the wire's serving cost is made of; anything whose order is not fixed (prefill, batches above one row, control) stays on the wire, later and not wrong, and a lane that cannot come up degrades to the wire cleanly.
+
+On plain Ethernet, NCCL runs its socket transport. On links with RoCE or InfiniBand and GPUDirect, the same code goes RDMA — the transport is NCCL's decision, so the fabric upgrade is a deployment's configuration, never a code change.
+
+## What a call costs
+
+The pool reads a layer's weights once per departure, and that read does not depend on how many tokens ride it. Loopback, one layer, width 5120, `--afd-min-batch 1`:
+
+| tokens a call | 1 | 4 | 16 | 64 | 256 |
+|---|---|---|---|---|---|
+| median ms | 0.55 | 0.54 | 0.61 | 0.86 | 2.14 |
+| tokens/s | 1233 | 6244 | 18232 | 29271 | 80731 |
+
+Sixteen tokens cost what one costs. That flat region is the argument for a pool: everyone on a departure shares the weight read. One pool serves roughly 1400–1800 calls/s for one layer at one or two callers, falling to about 990 at eight — connections waiting, not work.
+
+Per-layer routing across a network is round-trip bound, so AFD trades throughput for capacity density and for a card that can run the model at all. Amortising one pool across many hosts is the architecture's answer on throughput, and it is not yet measured.
+
+## The serving core's clock
+
+The pool's serving path is a chain of small interpreter operations, so its wall time
+follows the CPU frequency of the core the serving thread lands on — and a per-core
+utilization governor (schedutil) sees a thread that blocks between calls and answers
+with a reduced clock. Measured live on an EPYC pool: the same code serves a 5.5 ms
+span wall when the core runs at 4.1 GHz and a 7.4 ms one when the governor parks it
+at 1.5–2.5 GHz, and which mode a boot lands in is a scheduling accident. If you can
+set the governor, do that: `performance` on the cores the pool runs on (or a uclamp
+floor) ends the lottery. Containers often cannot — sysfs mounted read-only, RT and
+uclamp refused — so by default each pool serving thread pins itself to a core and
+keeps that core awake with a nice-19 companion process (its own interpreter — an
+in-process thread would thrash the GIL — tied to the server's life by PDEATHSIG;
+about 2% of the core's cycles). Alternated A/B on fresh boots: 21.8–22.2 s a flight
+held against 24.6–28.9 s unheld — −17% mean, and the held band is tighter (±0.2 s)
+than any unheld boot measured, because the boot lottery is exactly what it removes.
+`SGLANG_AFD_ENABLE_CLOCK_HOLD=0` turns it off; on a box whose governor is already
+pinned the hold costs only the companion cores. (The host side measured healthy —
+its serving thread boosts on its own — so the hold is a pool-side affair.)
+
+## The tour-group model
+
+How a pool serves requests whose attention times differ by two orders of magnitude, stated as
+the design actually thinks about it:
+
+One travel agency — the pool: one set of weights, one protocol. A coach — one departure: a
+batched call that rides a group of requests through the **fixed-itinerary cities**, the stages
+whose latency does not depend on anyone's context (a feed-forward is 361 µs whoever is aboard;
+a linear-attention call is 200 µs). The **free-roam city** is the softmax attention: 19 µs at
+1k context, 2397 µs at 128k — the one stage whose duration belongs to the passenger, not the
+route. There, the group dissolves: each request leaves the coach and sweeps its own KV cache
+on its own time.
+
+**Passengers take their luggage with them.** Everything per-request steps off at the boundary
+— the KV cache's new key and value, the recurrent states' advance, the convolution ring's next
+column — and the coach drives away holding nothing of anyone. That is the stateless-pool
+invariant wearing the metaphor's clothes, and it is what makes the next rule possible:
+
+**Any of the agency's coaches will do.** A request that finishes its sweep boards whichever
+departure next passes the stop — not the coach it arrived on. The boarding rule is asked
+freshly at every such boundary ("is the queue full yet?" — see `--afd-min-batch` and
+`--afd-max-wait-ms`), so a 1k request and a 128k request share a pool without the short one
+waiting out the long one's context. Several groups are on the road at once, at different
+cities of the route.
+
+**Dissolving the group is free, not merely safe.** At decode, a coach exists only where the
+work batches: the feed-forward and the projections multiply every passenger's row against the
+SAME weights, so one weight read serves the whole coach (a GEMM — sixteen tokens cost what one
+costs, measured above). The free-roam city's work is GEMV against per-request data — each
+sweep reads its own KV cache, each state advance multiplies its own recurrent state — so
+batching it reduces no memory traffic and buys no arithmetic intensity. The split by state and
+the split by batchability are the same cut: the big card is the GEMM side, the small card is
+the GEMV side, and the city where the group dissolves is precisely the city where riding
+together never paid.
+
+The pool's half of this model is what `pool_server`'s departures and `boarding.py` implement.
+The host's half — letting each request's sweep complete on its own clock instead of pacing a
+scheduler batch by its longest context — is the concurrency milestone, with its acceptance
+check stated in advance: at mixed contexts, a short request's p99 should approach its solo
+latency rather than the longest passenger's.
+
+## Output determinism
+
+Tokens match the colocated model under greedy decoding. Under concurrency they are not guaranteed to, and the reason is arithmetic rather than crosstalk.
+
+Over 1811 decoded positions, 36 (1.99%) had the top two candidates at **exactly** equal logprobs — equal to the last bit of the float32 the server returns, because the logits are bfloat16 and two tokens land on the same value. At such a position the argmax is decided by the order of a reduction, and this arrangement reduces in a different order than a colocated one. About one position in fifty is available to turn over, and none of them means a request read another's history.
+
+`benchmark/afd/how_often_tied.py` measures this against any server.
+
+## What it does not work with yet
+
+Refused at startup, by name and with the reason rather than the flag:
+
+- tensor and pipeline parallelism
+- data-parallel attention
+- speculative decoding
+- LoRA
+- multimodal inputs
+- CUDA graphs on the decode path — a captured graph cannot hold the router's blocking socket call, hence `--disable-cuda-graph`
+
+Only the Qwen3.5 family is exercised; other architectures are refused by name rather than guessed at.
+
+## Reading the source
+
+`python/sglang/srt/afd/README.md` is the entry point. `protocol.py` is the wire, `pool_server.py` the departures and the boarding rule, `roles.py` the composition root, and `absent_ffn.py` why a routed host never allocates the weights it routes away.
