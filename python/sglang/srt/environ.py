@@ -649,6 +649,45 @@ class Envs:
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================
+    # AFD disaggregation (attention host / feed-forward pool)
+    # ===================================================================
+    # Feature names AFD refuses to start beside, allowed anyway. A run that used
+    # one says so in its own startup log; see afd/compatibility.py.
+    SGLANG_AFD_ALLOW_UNTESTED = EnvTuple(())
+    # Pin each pool serving thread to a core and keep that core at full clock with
+    # a nice-19 companion process. ON by default: a governor that follows per-core
+    # utilization (schedutil) starves the blocking serving thread on some boots
+    # (-17% flight wall measured, boot-lottery variance removed), the cost is one
+    # near-idle-priority core per serving thread on a dedicated pool box, and a
+    # deployment whose governor is already pinned can turn it off explicitly.
+    # See afd/serve_clock.py for the mechanism and the shapes that lost.
+    SGLANG_AFD_ENABLE_CLOCK_HOLD = EnvBool(True)
+    # Split an MLA decode into the cache sweep and this step's join, so the sweep can
+    # start a feed-forward early. Correct either way -- held token-for-token against the
+    # fused call on a 64-token greedy continuation -- and OFF by default because at the
+    # contexts measured it LOSES: splitting runs `forward_decode` twice and merges, and
+    # over a latent cache of one KV head that costs more than the overlap it buys.
+    # Measured on Kimi-Linear-48B, decode step, host on a 5090 and pool on a PRO 6000:
+    # +16.4% at 512 and 4096 tokens of context at concurrency 1, +11.5% to +17.4% at
+    # concurrency 4, and +31.1% at 32768 -- so it loses MORE as the context grows, which
+    # is the opposite of what the sweep's own share does and is the reason this is
+    # recorded rather than reasoned about. There is no crossover between 512 and 32768.
+    # A knob rather than a deletion because the arithmetic is right and another backend,
+    # another cache layout or a longer context may yet pay for the second pass; whoever
+    # turns it on should replicate, because at 32k the prefill's own run-to-run spread is
+    # the size of the whole decode difference and one run of each says nothing.
+    SGLANG_AFD_SPLIT_MLA_DECODE = EnvBool(False)
+    # Where the pool writes its riders histogram. Unset keeps it in memory and
+    # the health check reports "unknown" rather than a guessed number.
+    SGLANG_DEBUG_AFD_RIDERS_PATH = EnvStr(None)
+    # Log the op sequence each (request, layer) receives, to catch a read or an
+    # update one step out of place -- a fault that stays fluent.
+    SGLANG_DEBUG_AFD_ORDER = EnvBool(False)
+    # Directory both ends write row 0 of each boundary tensor to, for an offline
+    # per-element comparison of the arrangement against the colocated model.
+    SGLANG_DEBUG_AFD_DUMP = EnvStr(None)
+
+    # ===================================================================
     # Distributed and model-parallel runtime
     # ===================================================================
     SGLANG_ENABLE_CP_V2 = EnvBool(False)

@@ -134,12 +134,21 @@ _ENV_MATRIX = (({}, {"SGLANG_IS_IN_CI": "true"}),)
 # are step-12 exposure like any other pair.
 _PASSED = frozenset({"model_path", "device", "random_seed"})
 
-# Empty. A pair belongs here when a reader has no bag to read -- it runs before
+# A pair belongs here when a reader has no bag to read -- it runs before
 # its process publishes -- and cannot use `resolving_view` either. The launcher's
 # pre-publish reads (`_set_envs_and_config`, the auto-parser gate) and the
 # late-resolution detection it calls all read the declarations now, so nothing
 # qualifies. A new entry needs that kind of reason next to it.
-_EXPOSED: frozenset = frozenset()
+#
+# `model_path` becomes resolution-written on the AFD host: a host whose path does
+# not exist is given `pool://IP:PORT`, because its config, tokenizer and templates
+# come from the pool rather than a filesystem. Every AFD reader of it goes through
+# `afd/checkpoint.py:effective_model_path`, which reads the BAG -- the record now
+# carries the raw input, and reading it in a published process answers with a path
+# that was never loaded. The one supplied-instance read left is that helper's own
+# fallback, for the only caller that has no bag to read: an arm's `check_args`,
+# running inside `__post_init__` before its process publishes.
+_EXPOSED: frozenset = frozenset({("afd/checkpoint.py", "model_path")})
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
 # `is_cuda()` gated): asserted on the CUDA registration, invisible to the CPU
@@ -152,7 +161,12 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # Axis two: (file, field) pairs where a supplied-instance read names a field that
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
-_OVERRIDDEN_AND_READ: frozenset = frozenset()
+#
+# The one AFD entry is the pre-publish fallback inside
+# `afd/checkpoint.py:effective_model_path` -- see the note above `_EXPOSED`. It
+# runs during resolution, before any override can have landed, so the ordering
+# judgment is "copied before any override".
+_OVERRIDDEN_AND_READ: frozenset = frozenset({("afd/checkpoint.py", "model_path")})
 
 
 def _expanded_override_keys(rel, tree, call, kw) -> set:

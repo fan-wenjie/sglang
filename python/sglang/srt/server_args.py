@@ -3153,6 +3153,40 @@ class ServerArgs:
     ] = True
 
     # -------------------------------------------------------------------------
+    # AFD: attention / feed-forward disaggregation
+    # -------------------------------------------------------------------------
+    afd_mode: A[
+        Literal["null", "host", "pool"],
+        'Attention/feed-forward disaggregation. "host" owns the KV cache and runs attention; "pool" owns the static weights and runs the feed-forward for whoever calls. If not specified, the two are colocated as usual.',
+        NS("disagg"),
+    ] = "null"
+    afd_pool_addr: A[
+        Optional[str],
+        "HOST:PORT of the feed-forward pool an --afd-mode=host server calls. Required in host mode: a host that cannot reach its pool should fail at startup, not at the first token.",
+        NS("disagg"),
+    ] = None
+    afd_bootstrap_port: A[
+        int,
+        "Port an --afd-mode=pool server listens on. Default is 8999.",
+        NS("disagg"),
+    ] = 8999
+    afd_min_batch: A[
+        int,
+        "How many callers the pool waits for before a departure. A departure carries every caller at the stop, not the first N.",
+        NS("disagg"),
+    ] = 2
+    afd_max_wait_ms: A[
+        int,
+        "How long the pool waits for --afd-min-batch before departing anyway. Without it the last caller of a draining workload waits for a partner that never arrives.",
+        NS("disagg"),
+    ] = 5
+    afd_transfer_backend: A[
+        Optional[Literal["tcp", "nccl"]],
+        'The transport for AFD frames whose exchange order is fixed. Default is "nccl": a standalone NCCL pair beside the frame wire -- receives land directly in device buffers with no Python on the data path -- while everything whose order is not fixed stays on the wire; a pair that cannot come up degrades to the wire cleanly. "tcp" turns the pair off entirely. Set it on the POOL; the host adopts it with the rest of the pushed configuration, and the rendezvous derives from the bootstrap port, so nothing else needs configuring. On plain Ethernet NCCL runs its socket transport; on links with RoCE or InfiniBand and GPUDirect the same code goes RDMA, which is the reason the transport is a backend and not an implementation detail.',
+        NS("disagg"),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # PD disaggregation
     # -------------------------------------------------------------------------
     disaggregation_mode: A[
@@ -3831,6 +3865,7 @@ class ServerArgs:
 
         # Validate PD disaggregation flags before CUDA graph config.
         self._handle_pd_disaggregation()
+        self._handle_afd()
 
         # Normalize deprecated CP aliases before validations or model-specific
         # defaults inspect enable_prefill_cp/cp_strategy.
@@ -4195,6 +4230,11 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def _handle_afd(self):
+        from sglang.srt.arg_groups.afd_hook import handle_afd
+
+        handle_afd(self)
 
     def _handle_dcp_validation(self):
         cfg = resolving_view(self)
