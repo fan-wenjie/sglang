@@ -209,8 +209,75 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_dtype: Optional[torch.dtype]
 
 
+def _load_substitutes() -> None:
+    """Import the modules that register a replacement, once.
+
+    Imported here rather than at module scope because the registration lives in packages that
+    import this one; and lazily rather than at server start because the configurator is built in
+    a spawned scheduler process, where a module-level flag set in the parent does not exist.
+    """
+    global _SUBSTITUTES_LOADED
+    if _SUBSTITUTES_LOADED:
+        return
+    _SUBSTITUTES_LOADED = True
+    try:
+        import sglang.srt.afd.remote_state  # noqa: F401
+    except Exception:  # noqa: BLE001 -- a build without AFD registers nothing
+        pass
+
+
+_SUBSTITUTES_LOADED = False
+
+
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
+    # Types registered here REPLACE this one for a process that claims it: a deployment whose
+    # pools are not this deployment's registers what it builds instead of editing what everyone
+    # else builds. `__new__` picks the first claimant, so registration order is precedence, and
+    # a process nothing claims gets this class -- which is every process today except an AFD
+    # pool. Kept a list rather than a dict because the key is a question about the PROCESS
+    # ("do you claim this one?"), not a name anything could look up in advance.
+    _substitutes = []  # noqa: RUF012 -- a registry, not a dataclass field
+
+    @classmethod
+    def register_substitute(cls, substitute: type) -> type:
+        """Register a subclass that replaces this configurator wherever it claims the process."""
+        if substitute not in cls._substitutes:
+            cls._substitutes.append(substitute)
+        return substitute
+
+    @classmethod
+    def claims(cls, **_kwargs) -> bool:
+        """Whether this class is the one to build. The base never claims: it is the default."""
+        return False
+
+    def __new__(cls, *args, **kwargs):
+        # `object.__new__`, never a zero-argument `super()`. This class is a `slots=True`
+        # dataclass, and that decorator does not decorate: it BUILDS A NEW CLASS and returns it.
+        # The `__class__` cell a zero-argument `super()` closes over still points at the class
+        # the body defined, which the new one is not a subclass of, so the call raises
+        # "super(type, obj): obj must be an instance or subtype of type" -- at construction, in
+        # a spawned scheduler process, an hour after anything read this file. The module global
+        # is safe to name because it is rebound to the new class before any instance exists.
+        if cls is KVCacheConfigurator:
+            # Only the base dispatches. A registered subclass being constructed directly --
+            # which is what the dispatch itself does -- must not look for another one, or two
+            # registrations would recurse into each other.
+            _load_substitutes()
+            for substitute in cls._substitutes:
+                if substitute.claims(**kwargs):
+                    return object.__new__(substitute)
+        return object.__new__(cls)
+
+    def pool_class(self, base: type) -> type:
+        """The class to build, given the family's own. The seam a substitute overrides.
+
+        The base answers with the family unchanged. It exists so that a configurator which needs
+        different pools says so in one method rather than in every place a class is chosen --
+        and so that the places a class is chosen stay the family's own decision.
+        """
+        return base
+
     device: str
     gpu_id: int
     ps: ParallelState
@@ -797,7 +864,7 @@ class KVCacheConfigurator:
             HybridMambaDecodeReqToTokenPool,
         )
 
-        req_to_token_pool = HybridMambaDecodeReqToTokenPool(
+        req_to_token_pool = self.pool_class(HybridMambaDecodeReqToTokenPool)(
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
@@ -874,7 +941,7 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
-        req_to_token_pool = HybridReqToTokenPool(
+        req_to_token_pool = self.pool_class(HybridReqToTokenPool)(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
@@ -960,7 +1027,7 @@ class KVCacheConfigurator:
             # Page-major is a target-pool layout choice; the draft backend
             # reads the plain per-layer contiguous layout.
             enable_page_major = False
-        mha_pool_class = (
+        mha_pool_class = self.pool_class(
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )
 
@@ -1429,7 +1496,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        token_to_kv_pool = MLATokenToKVPool(
+        token_to_kv_pool = self.pool_class(MLATokenToKVPool)(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
@@ -1571,7 +1638,7 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
-        token_to_kv_pool = HybridLinearKVPool(
+        token_to_kv_pool = self.pool_class(HybridLinearKVPool)(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
