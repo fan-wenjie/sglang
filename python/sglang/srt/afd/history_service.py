@@ -362,6 +362,38 @@ class HistoryService:
         )
         convolved = time.perf_counter()
         rows = _row_index([self.cache.slot_of(r) for r in ids], device)
+        if any(n > 1 for _, _, n in runs):
+            # A CHUNK, and everything below this is decode arithmetic: one contraction for every
+            # row against the state as it stands, then ONE advance parked for the batch. That is
+            # right when the rows are one token from each of several requests, and wrong when they
+            # are one request's consecutive tokens -- then token n must read what token n-1 wrote.
+            # Batched, every token reads the pre-chunk state and the state advances once: the
+            # first token of the chunk is exact, each later one is further off, and the error is
+            # carried in the state for the rest of the request. Nothing raises, and the model goes
+            # on producing fluent text with no memory of its own prompt.
+            #
+            # `ask_host` learned this and sends OP_STATE_SCAN for a rider with more than one row;
+            # `convolve_with_ring` learned it and keeps the chunk path apart from the one-row
+            # path. This op was added when the convolution moved to the host, and did not: it went
+            # to every rider whatever its row count. Measured on Qwen3.8-27B against the same
+            # checkpoint colocated -- exact at --chunked-prefill-size 1, and 0.22 nats of mean
+            # top-1 logprob away at 512, with top-1 itself changing at 6 of 31 prefix lengths.
+            return self._mix_chunk(
+                frame,
+                mixed,
+                rows,
+                runs=runs,
+                alpha=alpha,
+                beta=beta,
+                key_heads=key_heads,
+                value_heads=value_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                began=began,
+                cast_at=cast_at,
+                located=located,
+                convolved=convolved,
+            )
         # Taken BEFORE the mix, because the mix needs both halves: the contraction, and the query
         # it was made with. `_reading` returns the pair or does the read itself and returns no
         # query, which is the arrangement without a handler registered.
@@ -395,6 +427,112 @@ class HistoryService:
         mixed_at = time.perf_counter()
         self._parked = (frame.layer, rows, k, v, alpha, beta)
         self.reads += 1
+        self._count_mix(
+            cast_at - began,
+            located - cast_at,
+            convolved - located,
+            mixed_at - convolved,
+            time.perf_counter() - mixed_at,
+        )
+        return core
+
+    def _mix_chunk(
+        self,
+        frame,
+        mixed,
+        rows,
+        *,
+        runs,
+        alpha,
+        beta,
+        key_heads,
+        value_heads,
+        head_k_dim,
+        head_v_dim,
+        began,
+        cast_at,
+        located,
+        convolved,
+    ):
+        """`_mix` for a prefill chunk: one token at a time, each reading what the last wrote.
+
+        The same arithmetic `_mix` does, with the loop `_scan` has and for the same reason. Every
+        step reads S_(t-1) for its own row and advances the state before the next step reads, so a
+        chunk of N rows equals N single-row calls -- which is the property the test asserts,
+        because that equality IS what a chunk is. A single row never arrives here: the caller
+        sends it down the decode path, which is the same thing with the advance deferred.
+
+        The advance is applied HERE rather than parked. Parking exists so the pool's reply can go
+        out before the update lands, and it can only ever hold one: a chunk has an advance per
+        token and the next token is waiting on it, so there is nothing to defer it past.
+        """
+        from sglang.srt.afd.linear_history import (
+            expand_to_value_heads,
+            normalise,
+            query_coefficient,
+        )
+        from sglang.srt.afd.split_read_kernel import read_two_and_update
+
+        # `core_from_mixed` unrolled, because only ONE of its steps is sequential. The split, the
+        # norm, the head expansion and the query coefficient are per-token functions of the token
+        # -- they do not read the state and cannot see each other -- so they run over the whole
+        # chunk at once, and the loop below is left with the two operations that genuinely have to
+        # alternate: the contraction against S_(t-1) and the advance that writes S_t. The
+        # arithmetic is unchanged by the regrouping, which is what the test checks -- against the
+        # single-row path, which still goes through `core_from_mixed` itself.
+        n = mixed.shape[0]
+        width = key_heads * head_k_dim
+        q = mixed[:, :width].reshape(n, key_heads, head_k_dim)
+        k = mixed[:, width : 2 * width].reshape(n, key_heads, head_k_dim)
+        v = mixed[:, 2 * width :].reshape(n, value_heads, head_v_dim)
+        q, k = normalise(q, k, scale=head_k_dim**-0.5)
+        q = expand_to_value_heads(q, value_heads)
+        k = expand_to_value_heads(k, value_heads)
+        # A cooked coefficient is a decode-only arrangement, so a chunk that reached here has no
+        # reading waiting for it and makes its own.
+        q_tilde, s = query_coefficient(q, k, beta)
+
+        # ONE call a STEP, not one a row. What is sequential here is a run -- one request's own
+        # tokens -- and runs are independent of each other: `_runs` says a bus can carry several,
+        # and a mixed one carries decode rows alongside a chunk. Walking the batch row by row
+        # would serialise those too, which is not a correctness matter and is a real cost, so the
+        # loop walks the step index and takes every run's t'th row together. Different requests,
+        # different slots, no two rows sharing one -- exactly the decode shape this kernel is for.
+        # The loop is then as long as the LONGEST run rather than as long as the batch.
+        #
+        # `read_two_and_update` answers `S q~` and `S k` and advances in a single pass over the
+        # tile, and applies the decay to both itself, so the coefficient goes in undecayed.
+        state = self.cache.state[frame.layer]
+        spans = [(start, count) for _, start, count in runs]
+        longest = max(count for _, count in spans)
+        reading = torch.empty(
+            n, value_heads, head_v_dim, device=state.device, dtype=state.dtype
+        )
+        for t in range(longest):
+            live = [start + t for start, count in spans if t < count]
+            # a slice where the rows happen to be contiguous, which is every single-run chunk and
+            # so the case that matters; the gather is for a bus carrying more than one request
+            take = (
+                slice(live[0], live[0] + 1)
+                if len(live) == 1
+                else torch.tensor(live, device=rows.device, dtype=torch.long)
+            )
+            h_q, _ = read_two_and_update(
+                state,
+                rows[take],
+                q=q_tilde[take],
+                k=k[take],
+                v=v[take],
+                alpha=alpha[take],
+                beta=beta[take],
+            )
+            reading[take] = h_q.reshape(len(live), value_heads, head_v_dim).to(
+                reading.dtype
+            )
+        core = (alpha.unsqueeze(-1) * reading + s.unsqueeze(-1) * v.float()).reshape(n, -1)
+        mixed_at = time.perf_counter()
+        self.reads += 1
+        self.updates += 1
         self._count_mix(
             cast_at - began,
             located - cast_at,
