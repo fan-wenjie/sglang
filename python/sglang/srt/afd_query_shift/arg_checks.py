@@ -43,6 +43,7 @@ def _check_shift(server_args) -> None:
             f"unit is 2N-1, and a value that looks like a half-layer count here would silently "
             f"run twice the depth it names."
         )
+    _warn_the_flag_overrides_the_checkpoint(server_args, shift)
     if shift > 0 and server_args.afd_mode == "null":
         logger.warning(
             "--afd-query-shift-layers=%s with the two sides colocated: the query is read early "
@@ -57,6 +58,58 @@ def _check_shift(server_args) -> None:
             server_args.afd_mode,
         )
 
+
+
+def _warn_the_flag_overrides_the_checkpoint(server_args, shift: int) -> None:
+    """Say, every time the flag is set, that it is overriding what the checkpoint says.
+
+    A checkpoint trained for this read point declares it as `query_shift_layers` in its own
+    config, and unset is how a deployment gets that value: `checkpoint.resolve` asks the flag
+    first and the checkpoint second, so a deployment that names nothing serves what its weights
+    were repaired for. The flag exists for the measurement that has to run a checkpoint at a read
+    point it was NOT repaired for -- which is a real question and is the only thing it is correct
+    for. Every other use projects a query from an input the weights never saw.
+
+    So it warns whenever it is set, and loudest when it CONTRADICTS a checkpoint that stated its
+    own: that is the case where a repaired model is served at the wrong point, and the symptom is
+    fluent text from a model nobody trained -- there is nothing downstream to catch it.
+
+    A host is exempt from the comparison: its path is `pool://host:port`, it has no config to
+    read, and a host whose flag contradicts the pool's pushed word is already refused at adoption.
+    """
+    from sglang.srt.afd.model_files import is_pool_path
+
+    path = getattr(server_args, "model_path", None)
+    if path is None or is_pool_path(path):
+        return
+
+    from sglang.srt.afd.checkpoint import stated_shift
+
+    stated = stated_shift(path)
+    if stated is None:
+        logger.warning(
+            "--afd-query-shift-layers=%s was given and this checkpoint states no read point of "
+            "its own, so its weights were never repaired for one. This is a measurement "
+            "configuration: it prices what the rewiring costs BEFORE repair. Serving it is "
+            "serving a model nobody trained, fluently and undetectably.",
+            shift,
+        )
+    elif int(stated) != int(shift):
+        logger.warning(
+            "--afd-query-shift-layers=%s CONTRADICTS this checkpoint, which states %s. The flag "
+            "wins and the weights do not: they were repaired for %s, and every layer's query "
+            "will be projected from an input they never saw. Unset the flag to serve the "
+            "checkpoint as trained; keep it only if you are measuring the difference.",
+            shift,
+            stated,
+            stated,
+        )
+    else:
+        logger.info(
+            "--afd-query-shift-layers=%s repeats what the checkpoint already states, so it "
+            "changes nothing. Leaving it unset is how a native checkpoint is served.",
+            shift,
+        )
 
 def _check_arm_is_present(server_args) -> None:
     """An arm asked for by flag but not installed is refused at startup, not ignored.
