@@ -48,6 +48,36 @@ def skeleton_wanted() -> bool:
         return False
 
 
+def prompt_logprobs_refusal(obj, prompt_tokens: int) -> str | None:
+    """Why a weightless host cannot answer this request, or None if it can.
+
+    This host holds no LM head. The pool computes each request's LAST-ROW logits and sends them,
+    and that one row is every row this arrangement can produce -- so a request wanting logits at
+    other positions (prompt logprobs) has no answer here, whatever it is willing to wait for.
+
+    Refused at INTAKE, which is the whole point of this function. The head shim refuses too, but
+    it refuses from inside the model forward, and the scheduler does not survive an exception
+    there: one such request took the server down and every other request in flight with it. The
+    same "no", moved to where a bad request is one client's error.
+
+    A start that leaves a single row is served, because a single row is what the pool sends: the
+    boundary is the number of rows asked for, not whether the word `logprob` appears.
+    """
+    if not getattr(obj, "return_logprob", False):
+        return None
+    start = getattr(obj, "logprob_start_len", None)
+    if start is None or start < 0 or prompt_tokens - start <= 1:
+        return None
+    if not skeleton_wanted():
+        return None
+    return (
+        f"logprob_start_len={start} over {prompt_tokens} prompt token(s) asks this host for "
+        f"logits at {prompt_tokens - start} positions. This is an AFD attention host: it holds "
+        f"no head, and the pool computes only the last row of each request. Ask the pool's own "
+        f"endpoint for prompt logprobs, or run the checkpoint colocated."
+    )
+
+
 class AttentionServiceLinearLayer(nn.Module):
     """A linear-attention stop: the convolution's storage, and nothing else.
 

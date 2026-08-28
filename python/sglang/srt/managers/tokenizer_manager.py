@@ -1164,6 +1164,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        # An AFD attention host holds no LM head, so a request for logits at more than the last
+        # row has no answer here. Refused at intake: the head shim refuses too, but from inside
+        # the model forward, where the exception takes the scheduler down instead of the request.
+        from sglang.srt.afd.skeleton import prompt_logprobs_refusal
+
+        refusal = prompt_logprobs_refusal(
+            obj, len(input_ids) if input_ids is not None else 0
+        )
+        if refusal is not None:
+            raise ValueError(refusal)
+
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
