@@ -36,6 +36,25 @@ from sglang.srt.afd.pushed_config import (
 from sglang.test.test_utils import CustomTestCase
 
 
+@pytest.fixture(autouse=True)
+def _no_inherited_runtime():
+    """Every case here hands its own `server_args` in, and that only works with no bag published.
+
+    `effective_model_path` answers from the config bag wherever one exists and falls back to the
+    record only where none does -- which is right in a server and makes these cases depend on
+    whatever ran before them. `afd_tiny_stack` publishes one for a throwaway checkpoint and
+    cannot take it back (its four initialisations are process-global), so run after that file
+    these cases were comparing the pool's name against `afd-tiny-stack-<tmpdir>` and failing on
+    the identity guard several assertions before their own. Seven of them, green alone and red in
+    the suite, which is the shape of a bug nobody chases because it looks like flakiness.
+    """
+    from sglang.srt.runtime_context import reset_context
+
+    reset_context()
+    yield
+    reset_context()
+
+
 def _args(**kw):
     base = {
         "model_path": "/models/Qwen3.8-27B",
