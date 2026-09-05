@@ -20,6 +20,7 @@ deepseek_common/attention_forward_methods/forward_mla.py):
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -232,26 +233,26 @@ class VestigeMLABackend(AttentionBackend):
             if forward_batch.seq_lens_cpu is not None
             else forward_batch.seq_lens.tolist()
         )
-        # Benchmark arm switch, read per prefill: when /tmp/vestige_full exists
-        # the kept set is the FULL prefix (arm A), else compressed (arm B). Both
-        # arms then run the identical graph/refresh path, so the only difference
-        # a step sees is which rows the fused kernel attends over.
-        import os as _os
-
-        full_arm = _os.path.exists("/tmp/vestige_full")
         for slot, seq_len in zip(slots, lens):
             seq_len = int(seq_len)
             row_slots = r2t[slot, :seq_len]
-            if full_arm:
-                kept = row_slots
-            else:
-                sigma = sidecar_sigma(kbuf[row_slots][:, layer.v_head_dim :])
-                keep = select_kept(sigma, rho=self.rho, closed=seq_len, sinks=4)
-                keep[max(0, seq_len - _RECENT_WINDOW) :] = True
-                kept = row_slots[keep.nonzero(as_tuple=True)[0]]
+            kept = self._arm_aware_kept(row_slots, kbuf, seq_len, layer.v_head_dim)
             n = kept.numel()
             self._kept_buf[lid][slot, :n] = kept.to(self._kept_buf[lid].dtype)
             self._kept_len[lid][slot] = n
+
+    def _arm_aware_kept(self, row_slots, kbuf, seq_len, v_dim):
+        # The kept row set for one request, shared by the bs==1 kept-table build
+        # and the bs>1 tier-2 build so both honor the same arm. Benchmark arm
+        # switch, read per prefill: /tmp/vestige_full present -> FULL prefix (arm
+        # A, == baseline), else sidecar-residual sigma top-m + 4 sinks + recent
+        # window (arm B). Both arms then run the identical graph/refresh path.
+        if os.path.exists("/tmp/vestige_full"):
+            return row_slots
+        sigma = sidecar_sigma(kbuf[row_slots][:, v_dim:])
+        keep = select_kept(sigma, rho=self.rho, closed=seq_len, sinks=4)
+        keep[max(0, seq_len - _RECENT_WINDOW) :] = True
+        return row_slots[keep.nonzero(as_tuple=True)[0]]
 
     # ---- decode: kill-switch == base; enabled == evict + recall ----
 
@@ -418,11 +419,10 @@ class VestigeMLABackend(AttentionBackend):
     def _build_kept(self, req, lid, seq_len, kbuf, r2t, v_dim):
         # keep the m=round(rho*seq_len) most anomalous rows by sidecar-residual
         # sigma, plus sinks and a recent window; the decode tail is appended at
-        # query time so it is always attended.
+        # query time so it is always attended. Same arm-aware selector as the
+        # bs==1 path, so the FULL benchmark arm is honored here too.
         slots = r2t[req, :seq_len]
-        sigma = sidecar_sigma(kbuf[slots][:, v_dim:])
-        keep = select_kept(sigma, rho=self.rho, closed=seq_len, sinks=4)
-        keep[max(0, seq_len - _RECENT_WINDOW) :] = True
-        st = {"kept": slots[keep.nonzero(as_tuple=True)[0]], "prefix_len": seq_len}
+        kept = self._arm_aware_kept(slots, kbuf, seq_len, v_dim)
+        st = {"kept": kept, "prefix_len": seq_len}
         self._tier2[(req, lid)] = st
         return st
