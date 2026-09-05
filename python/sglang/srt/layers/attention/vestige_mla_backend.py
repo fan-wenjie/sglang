@@ -342,30 +342,37 @@ class VestigeMLABackend(AttentionBackend):
                 bufs["indices"][:n].copy_(fm.kv_indices[:n])
 
     def _refresh_graph_bufs(self, lid, forward_batch, reqs):
-        # Fixed-stride regions: batch slot i owns indices[i*stride : (i+1)*stride]
-        # and the region persists across replays, so a steady-state step writes
-        # ONE new slot per request plus indptr, instead of re-copying the set.
+        # bs > 1 graph replay: repack the CSR (contiguous, no gaps) into the
+        # fixed-address buffers the captured graph reads.
         fm = self.base.forward_metadata
         bufs = self._graph_bufs[lid]
+        # seq_lens is padded to the captured graph bs; out_cache_loc carries only
+        # the real (unpadded) requests -- see build_replay_fb_view, which takes
+        # out_cache_loc from the original batch but seq_lens from the padded
+        # capture buffers. Iterate real requests, then point every padded slot at
+        # one reserved pad row (slot 0) so its softmax is non-empty; its output is
+        # discarded. (Reading out_cache_loc[i] for a padded i used to overrun.)
         bs = forward_batch.seq_lens.shape[0]
-        # bs > 1: CSR needs contiguous packing (no gaps), so repack each step;
-        # copies are tiny (ints), the python loop is the cost -- acceptable at
-        # small bs, revisit with a triton pack kernel if profiling says so.
+        real_bs = forward_batch.out_cache_loc.shape[0]
         off = 0
         for i in range(bs):
-            req = reqs[i]
-            st = self._tier2.get((req, lid))
-            if st is None:
-                st = self._build_index_buffer(req, lid, forward_batch, i, fm)
-            buf, n = st["buf"], st["n"]
-            if n >= buf.numel():
-                buf = torch.cat([buf, buf.new_zeros(buf.numel())])
-                st["buf"] = buf
-            buf[n] = forward_batch.out_cache_loc[i]
-            st["n"] = n = n + 1
-            st["synced_req"] = None  # invalidate the bs=1 fast-path sync state
-            bufs["indices"][off : off + n].copy_(buf[:n])
-            off += n
+            if i < real_bs:
+                req = reqs[i]
+                st = self._tier2.get((req, lid))
+                if st is None:
+                    st = self._build_index_buffer(req, lid, forward_batch, i, fm)
+                buf, n = st["buf"], st["n"]
+                if n >= buf.numel():
+                    buf = torch.cat([buf, buf.new_zeros(buf.numel())])
+                    st["buf"] = buf
+                buf[n] = forward_batch.out_cache_loc[i]
+                st["n"] = n = n + 1
+                st["synced_req"] = None  # invalidate the bs=1 fast-path sync state
+                bufs["indices"][off : off + n].copy_(buf[:n])
+                off += n
+            else:
+                bufs["indices"][off : off + 1].fill_(0)
+                off += 1
             bufs["indptr"][i + 1] = off
         bufs["indptr"][0] = 0
         bufs["indptr"][bs + 1 :].fill_(off)
