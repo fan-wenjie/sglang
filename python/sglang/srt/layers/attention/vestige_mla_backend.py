@@ -81,8 +81,8 @@ class VestigeMLABackend(AttentionBackend):
         self._num_layers = model_runner.model_config.num_hidden_layers
         # 1-indexed in the checkpoint config -> 0-indexed layer ids
         self._mla_lids_static = {
-            l - 1
-            for l in model_runner.model_config.hf_config.linear_attn_config[
+            lid1 - 1
+            for lid1 in model_runner.model_config.hf_config.linear_attn_config[
                 "full_attn_layers"
             ]
         }
