@@ -120,6 +120,14 @@ class OffloaderV1(BaseOffloader):
                 # one module might have some parameters offloaded and some not
                 break
 
+            # Skip tiny params: offloading a 1KB bias saves nothing, and a small
+            # param captured by reference elsewhere (e.g. Kimi's TopK holds
+            # gate.e_score_correction_bias) breaks when its .data goes to CPU
+            # while functional_call only rebinds by name -> a CPU tensor reaches
+            # a Triton kernel.
+            if p.data.numel() * p.data.element_size() < 1_000_000:
+                continue
+
             # `torch.empty_like` does not support `pin_memory` argument
             cpu_data = torch.empty_strided(
                 size=p.data.size(),
@@ -145,7 +153,12 @@ class OffloaderV1(BaseOffloader):
                     k: v.to(device, non_blocking=True)
                     for k, v in module.state_dict().items()
                 }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                # tie_weights=False: modules that share one Parameter under two
+                # names (e.g. Kimi KDA A_log = self_attn.A_log = attn.A_log) list
+                # both in state_dict; the default untie step rejects that.
+                output = functional_call(
+                    module, device_state, args=args, kwargs=kwargs, tie_weights=False
+                )
                 module.forward = forward
                 return output
 
