@@ -74,6 +74,24 @@ def create_flashinfer_backend(runner):
         return FlashInferMLAAttnBackend(runner)
 
 
+@register_attention_backend("vestige_mla")
+def create_vestige_mla_backend(runner):
+    # VestigeKV wraps an MLA backend; for Kimi Linear the hybrid adopts this as
+    # its full_attn_backend, so MLA-layer decode flows through VestigeKV and KDA
+    # layers are untouched. See VESTIGEKV_PORT.md.
+    if not runner.use_mla_backend:
+        raise ValueError("vestige_mla backend can only be used with MLA models.")
+    import os
+
+    from sglang.srt.layers.attention.vestige_mla_backend import VestigeMLABackend
+
+    base = create_flashinfer_backend(runner)  # FlashInferMLAAttnBackend for MLA models
+    # SGLANG_VESTIGE_ENABLED=0 -> pure pass-through (kill-switch parity test);
+    # default on. TODO: promote to a --vestigekv-* server arg (env-var-conventions).
+    enabled = os.environ.get("SGLANG_VESTIGE_ENABLED", "1") != "0"
+    return VestigeMLABackend(base, runner, enabled=enabled)
+
+
 @register_attention_backend("trtllm_mla")
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
