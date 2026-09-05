@@ -115,3 +115,28 @@ flashinfer/triton bit-for-bit), then enabled for needle recovery. The two
 `forward` bodies (`_build_tier2`, `_compressed_decode`) remain to be written
 against a live ForwardBatch (they need prefill-query capture in `forward_extend`;
 the pool-read/index seam is mapped above).
+
+## Change audit: attention-confined vs. stock-file changes
+
+Everything vs. upstream base `f1f2380`, grouped per the porting rule ("confine
+changes to attention; list anything else separately for audit").
+
+### Attention-confined (the port itself; 7 files, all under `layers/attention/`)
+| file | lines | what |
+|---|---|---|
+| `vestige_mla_backend.py` | +435 | the wrapper backend (all VestigeKV logic) |
+| `vestige/{__init__,eviction,recall_tier}.py` | +203 | vendored core, bit-identical to mini-sglang (verified by test) |
+| `vestige/test_vestige_equiv.py` | +104 | GPU equivalence test vs. reference |
+| `vestige/test_vestige_graph_pad.py` | +112 | bs>1 graph-padding regression unit test |
+| `attention_registry.py` | +17 | register `vestige_mla` factory (additive) |
+
+### Stock-file changes OUTSIDE attention (4 files, 28 lines -- the audit list)
+| file | lines | why | risk |
+|---|---|---|---|
+| `kernels/ops/kvcache/set_mla_kv_buffer.py` | 8 | bugfix: `.view()` -> `.reshape()`; non-contiguous MLA latent slice at long chunked prefill crashes stock sglang too (upstream-worthy) | none: reshape is a no-op on the contiguous path |
+| `srt/environ.py` | +4 | register `SGLANG_ENABLE_VESTIGE` EnvBool (required by env-var conventions; registry entry only) | none: pure registration |
+| `srt/server_args.py` | +1 | add `"vestige_mla"` to ATTENTION_BACKEND_CHOICES | none: list entry |
+| `srt/utils/offloader.py` | 15 | cpu_offload fixes (tied-weight + small-param) from the abandoned single-GPU offload route | DORMANT in the dual-machine deployment (cpu_offload_gb=0); revertible without affecting any reported number |
+
+No other stock file is touched. The gloo->NCCL metadata experiment was reverted
+and is NOT in the tree (metadata stays on gloo by design; see nope_kv README).
