@@ -9,7 +9,6 @@ validation to the port's decision logic, leaving only the sglang I/O plumbing.
 Run: python -m sglang.srt.layers.attention.vestige.test_vestige_equiv
 (needs the mini-sglang source on sys.path; the test adds it.)
 """
-import os
 import sys
 
 import torch
@@ -31,8 +30,6 @@ def _ref_recall_tier():
 
 
 def _ref_policy_fns():
-    import importlib.util
-
     # policy.py imports .mla_pool; load it as part of the package instead.
     import minisgl.kimi.policy as pol
 

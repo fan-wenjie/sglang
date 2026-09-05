@@ -548,6 +548,10 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # VestigeKV: training-free NoPE-MLA KV-cache eviction attention backend
+    # (vestige_mla). Default on; set False for the kill-switch parity test that
+    # runs the wrapper as pure pass-through to the base MLA backend.
+    SGLANG_ENABLE_VESTIGE = EnvBool(True)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
