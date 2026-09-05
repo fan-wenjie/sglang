@@ -85,7 +85,9 @@ def create_vestige_mla_backend(runner):
 
     from sglang.srt.layers.attention.vestige_mla_backend import VestigeMLABackend
 
-    base = create_flashinfer_backend(runner)  # FlashInferMLAAttnBackend for MLA models
+    # Wrap the Triton MLA backend (SM120-safe; flashinfer's MLA JIT needs
+    # CUDA>=12.9). A base override could pick another MLA backend on capable HW.
+    base = create_triton_backend(runner)  # TritonAttnBackend (MLA-capable)
     # SGLANG_VESTIGE_ENABLED=0 -> pure pass-through (kill-switch parity test);
     # default on. TODO: promote to a --vestigekv-* server arg (env-var-conventions).
     enabled = os.environ.get("SGLANG_VESTIGE_ENABLED", "1") != "0"
