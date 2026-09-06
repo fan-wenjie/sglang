@@ -185,6 +185,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "cutedsl_mla",
     "tokenspeed_mla",
+    "vestigekv_mla",  # VestigeKV: training-free NoPE-MLA KV-cache compression wrapper
     "trtllm_mha",
     "dual_chunk_flash_attn",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
