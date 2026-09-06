@@ -142,3 +142,48 @@ def test_prefill_invalidates_stale_tier2():
     be._build_gpu_state(layer, fb)
     assert (0, LID) not in be._tier2, "stale tier-2 state survived slot re-extend"
     assert int(be._kept_len[LID][0]) > 0  # fresh kept table was built
+
+
+def _mk_check_backend(kept_lens, monkeypatch=None, full_arm=False):
+    be = object.__new__(VestigeMLABackend)
+    be._local_mla_lids = [LID]
+    be._kept_len = {LID: torch.tensor(kept_lens, dtype=torch.int64)}
+    fb = types.SimpleNamespace(
+        out_cache_loc=torch.tensor([100, 101], dtype=torch.int64),
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+        seq_lens=torch.tensor([2049, 2049], dtype=torch.int64),
+    )
+    return be, fb
+
+
+def test_row_invariant_catches_wrong_row_sets(tmp_path, monkeypatch):
+    # SGLANG_VESTIGE_CHECK semantics: the check runs BEFORE this step's append,
+    # so FULL requires kept_len >= seq_len-1; VESTIGE requires kept_len well
+    # below seq_len; kept_len==0 or a missing table always aborts.
+    import pytest as _pytest
+
+    flag = tmp_path / "vestige_full"
+    monkeypatch.setattr(
+        "sglang.srt.layers.attention.vestige_mla_backend.os.path.exists",
+        lambda p: flag.exists() if p == "/tmp/vestige_full" else False,
+    )
+    # VESTIGE arm, compressed lens -> passes
+    be, fb = _mk_check_backend([320, 320])
+    be._check_row_invariant(fb)
+    # VESTIGE arm, kept ~ seq (compression not applied) -> raises
+    be, fb = _mk_check_backend([2048, 2048])
+    with _pytest.raises(AssertionError, match="compression not applied"):
+        be._check_row_invariant(fb)
+    # FULL arm: kept_len == seq_len-1 (append pending) -> passes
+    flag.touch()
+    be, fb = _mk_check_backend([2048, 2048])
+    be._check_row_invariant(fb)
+    # FULL arm: kept short of full -> raises
+    be, fb = _mk_check_backend([320, 320])
+    with _pytest.raises(AssertionError, match="FULL arm"):
+        be._check_row_invariant(fb)
+    # missing table -> raises regardless of arm
+    be, fb = _mk_check_backend([2048, 2048])
+    be._kept_len = {}
+    with _pytest.raises(AssertionError, match="never built"):
+        be._check_row_invariant(fb)
