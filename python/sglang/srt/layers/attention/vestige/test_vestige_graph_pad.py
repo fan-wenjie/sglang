@@ -110,3 +110,37 @@ if __name__ == "__main__":
     test_unpadded_bs_matches_prior_behavior()
     test_guard_fires_without_fix()
     print("all 3 tests passed")
+
+
+def test_prefill_invalidates_stale_tier2():
+    # Slot reuse regression: a new prefill on a slot must drop the bs>1 tier-2
+    # index state left by the slot's previous occupant, else decode attends the
+    # prior request's rows (observed: VESTIGE attn time == FULL at bs=16).
+    be = object.__new__(VestigeMLABackend)
+    be.rho = 1 / 32
+    be._kept_buf, be._kept_len, be._indptr1 = {}, {}, {}
+    be._tier2 = {(0, LID): {"buf": torch.zeros(4, dtype=torch.int64), "n": 2}}
+    max_reqs, ctx, pool = 4, 64, 512
+    be.base = types.SimpleNamespace(
+        forward_metadata=types.SimpleNamespace(
+            kv_indices=torch.zeros(8, dtype=torch.int64)
+        ),
+        max_context_len=ctx,
+    )
+    be.req_to_token_pool = types.SimpleNamespace(
+        req_to_token=torch.arange(max_reqs * ctx, dtype=torch.int64).reshape(
+            max_reqs, ctx
+        )
+        % pool
+    )
+    kbuf = torch.randn(pool, 576)
+    be.token_to_kv_pool = types.SimpleNamespace(get_key_buffer=lambda lid: kbuf)
+    layer = types.SimpleNamespace(layer_id=LID, v_head_dim=512)
+    fb = types.SimpleNamespace(
+        req_pool_indices=torch.tensor([0], dtype=torch.int64),
+        seq_lens=torch.tensor([48], dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([48], dtype=torch.int64),
+    )
+    be._build_gpu_state(layer, fb)
+    assert (0, LID) not in be._tier2, "stale tier-2 state survived slot re-extend"
+    assert int(be._kept_len[LID][0]) > 0  # fresh kept table was built
