@@ -10,6 +10,7 @@ single GLOBAL top-m over all sidecar sigmas keeps the m most-anomalous rows
 (constant-m rebalance, licensed by ranking stationarity). The first `sinks`
 rows are always kept.
 """
+
 from __future__ import annotations
 
 import torch

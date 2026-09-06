@@ -4,7 +4,7 @@ Vendored VERBATIM from the validated mini-sglang stack
 (minisgl/kimi/tier2.py). It is pure-tensor (operates on [T, 576] latent rows and
 [H, 576] expanded queries), so the same code runs unchanged over sglang's
 MLATokenToKVPool rows. Kept bit-identical to the reference so the two
-implementations can be asserted equal (see tests/test_vestige_equiv.py); fix
+implementations can be asserted equal (see test/manual/test_vestige_equiv.py); fix
 record-invalidating bugs in lockstep with the reference, never one-sided.
 
 Index per MLA slot, built once at a compression event: exact 64-dim sidecar
@@ -15,6 +15,7 @@ with full-cache labels, entropy gate threshold from the same calibration
 score = sidecar + sketch + z*certificate; fire where score beats the tier-1 max
 and the gate is open; fetch top-j fired archived rows.
 """
+
 from __future__ import annotations
 
 import torch

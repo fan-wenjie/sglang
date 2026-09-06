@@ -76,7 +76,7 @@ mini-sglang stack was validated on, once the GPU frees (capqual holds it now).
 ## Validation status (2026-09-05, RTX PRO 6000 Blackwell / SM120, single card)
 
 ### DONE — core validated by bitwise equivalence (GPU)
-`layers/attention/vestige/test_vestige_equiv.py` passes on this GPU: the vendored
+`test/manual/test_vestige_equiv.py` passes on this GPU: the vendored
 sglang core (`recall_tier.py`, `eviction.py`) is BITWISE-IDENTICAL to the
 mini-sglang reference (which is validated end-to-end to 512k, PREREG19/31/32):
   - eviction: sidecar sigma bitwise-equal, keep-mask equal;
@@ -116,6 +116,20 @@ flashinfer/triton bit-for-bit), then enabled for needle recovery. The two
 against a live ForwardBatch (they need prefill-query capture in `forward_extend`;
 the pool-read/index seam is mapped above).
 
+## Upstream-readiness status (2026-09-06)
+
+- Guards added for upstream safety: NoPE-model allow-list (RoPE-MLA refused
+  with the measured collapse cited), --page-size 1 required, speculative
+  decoding refused (unwired).
+- Tier-2 recall: vendored + equivalence-tested, NOT wired into serving decode
+  (kept + tail only). An upstream feature PR either wires it or excludes it.
+- Benchmark arm switch is env-configured: SGLANG_TEST_VESTIGE_FULL_ARM_FLAG
+  names the flag file (unset by default = no switching, zero production
+  cost); bench launch scripts must export it or the A/B silently compares
+  VESTIGE against itself.
+- Standalone bugfix split out on branch fix-set-mla-kv-buffer-noncontiguous
+  (based on upstream main) for a separate PR.
+
 ## Change audit: attention-confined vs. stock-file changes
 
 Everything vs. upstream base `f1f2380`, grouped per the porting rule ("confine
@@ -126,17 +140,37 @@ changes to attention; list anything else separately for audit").
 |---|---|---|
 | `vestige_mla_backend.py` | +435 | the wrapper backend (all VestigeKV logic) |
 | `vestige/{__init__,eviction,recall_tier}.py` | +203 | vendored core, bit-identical to mini-sglang (verified by test) |
-| `vestige/test_vestige_equiv.py` | +104 | GPU equivalence test vs. reference |
-| `vestige/test_vestige_graph_pad.py` | +112 | bs>1 graph-padding regression unit test |
+| `test/manual/test_vestige_equiv.py` | +104 | GPU equivalence test vs. the mini-sglang reference (manual: needs the reference checkout) |
+| `test/registered/unit/layers/attention/test_vestige_mla_backend.py` | +190 | CI unit tests: graph padding, slot reuse, row-invariant check semantics |
 | `attention_registry.py` | +17 | register `vestige_mla` factory (additive) |
 
-### Stock-file changes OUTSIDE attention (4 files, 28 lines -- the audit list)
+### Stock-file changes OUTSIDE attention (3 files, 13 lines -- the audit list)
 | file | lines | why | risk |
 |---|---|---|---|
 | `kernels/ops/kvcache/set_mla_kv_buffer.py` | 8 | bugfix: `.view()` -> `.reshape()`; non-contiguous MLA latent slice at long chunked prefill crashes stock sglang too (upstream-worthy) | none: reshape is a no-op on the contiguous path |
 | `srt/environ.py` | +4 | register `SGLANG_ENABLE_VESTIGE` EnvBool (required by env-var conventions; registry entry only) | none: pure registration |
 | `srt/server_args.py` | +1 | add `"vestige_mla"` to ATTENTION_BACKEND_CHOICES | none: list entry |
-| `srt/utils/offloader.py` | 15 | cpu_offload fixes (tied-weight + small-param) from the abandoned single-GPU offload route | DORMANT in the dual-machine deployment (cpu_offload_gb=0); revertible without affecting any reported number |
 
 No other stock file is touched. The gloo->NCCL metadata experiment was reverted
 and is NOT in the tree (metadata stays on gloo by design; see nope_kv README).
+
+## REQUIRED completion: wire the recall tier (rule: recall is a necessary part of the paper claims, the algorithm, and the engineering; NOT closeable; tier-1-only is an incomplete state, never a supported configuration)
+
+The paper's deployment spec already declares tier-2 mandatory (the partition
+deletes nothing); this port currently serves the tier-1 floor. Wiring plan:
+
+1. Prefill: save the last-n expanded queries per (slot, MLA layer) for
+   calibration; run RecallTier.build at prefill end (off the decode path).
+2. Decode, IN-GRAPH under the cap: per MLA layer, scan = q @ [side|csk]
+   (GEMV, fixed shape), add z*certificate, topk(topj) -> write topj*H fetch
+   slots into a fixed-address buffer (pad row for unfired lanes); run the
+   stock decode kernel over the fetch partition; LSE-merge with the main
+   partition's output.
+3. STRUCTURAL FACT this design rests on: the fetch cap makes recall
+   fixed-shape and therefore graph-capturable end to end; uncapped recall is
+   variable-shape and can never be captured. Under graph serving the cap is
+   a hard requirement, not a recommendation.
+4. Memory: GPU-resident index adds (64+r) fp32 per archived row (~45% of
+   the bf16 row) -- re-size the KV pool accordingly.
+5. Re-measure both speedup axes with recall on; quality claims then extend
+   to the 128x recall-tier operating point in production.

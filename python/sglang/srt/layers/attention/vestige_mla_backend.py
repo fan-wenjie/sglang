@@ -13,9 +13,20 @@ deepseek_common/attention_forward_methods/forward_mla.py):
   gathered from req_to_token_pool.req_to_token[req_pool_indices, :seq_len] against
   the MLATokenToKVPool latent rows [N, 1, kv_lora_rank + qk_rope_head_dim]. NoPE
   holds natively (skip_rope=True -> rotary_emb is None). VestigeKV never touches
-  w_kc/w_vc, rope, or the model: eviction drops slots from that gathered set and
-  recall splices a topj-capped set of evicted slots back for the current step.
+  w_kc/w_vc, rope, or the model: eviction drops slots from that gathered set.
   See VESTIGEKV_PORT.md for the full contract.
+
+The tier-2 recall is a REQUIRED component with no production off-switch
+(SGLANG_TEST_VESTIGE_TIER1_ABLATION exists solely for the frozen ablation
+protocol). Wiring: each step records its expanded query in-graph (qbuf); the
+next step's out-of-graph refresh scans it against the per-slot index
+(stale-by-one recall -- a declared deviation from the same-step reference,
+gated on the needle/quality validation), writes fired pool rows into the
+fixed-width fetch_buf, and the packed CSR splices kept + fetched segments.
+The index self-calibrates from the first SGLANG_VESTIGE_NCAL decode steps'
+queries (decode-side calibration -- second declared deviation from the
+reference's prefill-tail calibration). Graph capture needs only the fixed
+fetch WIDTH; the uncapped algorithm runs unchanged under a safety width.
 """
 
 from __future__ import annotations
@@ -56,7 +67,7 @@ class VestigeMLABackend(AttentionBackend):
     def __init__(
         self,
         base: AttentionBackend,
-        model_runner: "ModelRunner",
+        model_runner: ModelRunner,
         *,
         enabled: bool = False,
         rho: float = 1.0 / 32,
@@ -98,17 +109,37 @@ class VestigeMLABackend(AttentionBackend):
         # GPU-side per-(pool-slot, layer) kept-index tables: built at prefill
         # (one sync there is free); decode refresh is then pure GPU ops, no
         # host sync on the critical path. bs=1 graphs read kept_buf directly.
-        self._kept_buf: dict = {}   # lid -> [max_reqs, cap] fm.kv_indices dtype
-        self._kept_len: dict = {}   # lid -> [max_reqs] int64
-        self._indptr1: dict = {}    # lid -> [2] capture-stable CSR for bs=1
+        self._kept_buf: dict = {}  # lid -> [max_reqs, cap] fm.kv_indices dtype
+        self._kept_len: dict = {}  # lid -> [max_reqs] int64
+        self._indptr1: dict = {}  # lid -> [2] capture-stable CSR for bs=1
+        # ---- recall tier (REQUIRED component; no production off-switch) ----
+        # Expanded-query dims from the model config (q_nope@W_kc | q_rope).
+        cfg = model_runner.model_config.hf_config
+        self._q_heads = model_runner.model_config.num_attention_heads
+        self._q_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim  # 512 + 64
+        from sglang.srt.environ import envs
+
+        self._n_cal = envs.SGLANG_VESTIGE_NCAL.get()
+        # Fixed fetch-buffer width: graph capture needs a fixed WIDTH, not a
+        # cap. topj>0 sets it to the capped bound; the uncapped algorithm gets
+        # a safety width above the observed worst fire (3983); overflow is
+        # truncated and counted in the histogram.
+        self._fetch_w = (
+            self.topj * self._q_heads if self.topj and self.topj > 0 else 4096
+        )
+        self._qbuf: dict = {}  # lid -> [max_reqs, H, 576] fp32, in-graph updated
+        self._fetch_buf: dict = {}  # lid -> [max_reqs, W] fm.kv_indices dtype
+        self._fetch_len: dict = {}  # lid -> [max_reqs] int64
+        self._recall: dict = {}  # (slot, lid) -> {"tier", "qcal", "qpos"}
+        self._nstep_hist: dict = {}  # fired-count -> occurrences (telemetry)
 
     # ---- metadata / cuda-graph / properties: delegate to base ----
 
-    def init_forward_metadata(self, forward_batch: "ForwardBatch"):
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.base.init_forward_metadata(forward_batch)
 
     def init_forward_metadata_out_graph(
-        self, forward_batch: "ForwardBatch", in_capture: bool = False
+        self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
         self.base.init_forward_metadata_out_graph(forward_batch, in_capture)
         if not self.enabled:
@@ -128,10 +159,9 @@ class VestigeMLABackend(AttentionBackend):
         ):
             if os.environ.get("SGLANG_VESTIGE_CHECK"):
                 self._check_row_invariant(forward_batch)
-            if forward_batch.seq_lens.shape[0] == 1:
-                return  # bs=1 refresh is captured in-graph (zero per-step python)
             reqs = forward_batch.req_pool_indices.tolist()
             for lid in self._mla_lids:
+                self._recall_step(lid, forward_batch, reqs)
                 self._refresh_graph_bufs(lid, forward_batch, reqs)
 
     def _check_row_invariant(self, forward_batch):
@@ -139,7 +169,7 @@ class VestigeMLABackend(AttentionBackend):
         # set is the intended one. Catches the silent wrong-row-set class (stale
         # slot state, never-built tables, chunk-local seq_len) that unit tests
         # and short-generate smoke tests cannot see. Syncs; debug/CI only.
-        full_arm = os.path.exists("/tmp/vestige_full")
+        full_arm = self._full_arm()
         real = forward_batch.out_cache_loc.shape[0]
         slots = forward_batch.req_pool_indices[:real].to(torch.int64)
         seq = forward_batch.seq_lens[:real]
@@ -164,7 +194,9 @@ class VestigeMLABackend(AttentionBackend):
                         f"layer {lid}: n={n.tolist()} seq={seq.tolist()}"
                     )
             else:
-                # compressed: kept must be well below seq once past the window
+                # compressed: kept (+ bounded fetch) well below seq past window
+                if lid in self._fetch_len:
+                    n = n + self._fetch_len[lid].gather(0, slots)
                 mask = seq > 4 * _RECENT_WINDOW
                 bad = ((n > (seq * 0.5).to(n.dtype)) & mask).sum()
                 if int(bad):
@@ -174,7 +206,7 @@ class VestigeMLABackend(AttentionBackend):
                         f"n={n.tolist()} seq={seq.tolist()}"
                     )
 
-    def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.base.init_forward_metadata_in_graph(forward_batch)
         # Graph-recordable per-step refresh (bs=1): append this step's slot into
         # each local MLA layer's kept table and point the CSR at that row. All
@@ -211,17 +243,17 @@ class VestigeMLABackend(AttentionBackend):
     def on_after_cuda_graph_warmup(self):
         self.base.on_after_cuda_graph_warmup()
 
-    def shared_read_ends(self, fm: "ForwardMode") -> "SharedReadEnds":
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return self.base.shared_read_ends(fm)
 
-    def get_indexer_metadata(self, layer_id: int, forward_batch: "ForwardBatch"):
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.base.get_indexer_metadata(layer_id, forward_batch)
 
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
         self.base.update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
 
     @property
-    def verify_mask(self) -> Optional["VerifyMask"]:
+    def verify_mask(self) -> Optional[VerifyMask]:
         return self.base.verify_mask
 
     @property
@@ -239,8 +271,8 @@ class VestigeMLABackend(AttentionBackend):
         q,
         k,
         v,
-        layer: "RadixAttention",
-        forward_batch: "ForwardBatch",
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         **kwargs,
     ):
@@ -265,6 +297,7 @@ class VestigeMLABackend(AttentionBackend):
             dt = fm.kv_indices.dtype if fm is not None else torch.int64
             dev = r2t.device
             self._kept_buf[lid] = torch.zeros(max_reqs, cap, dtype=dt, device=dev)
+            self._alloc_recall_bufs(lid, max_reqs, dt, dev)
             self._kept_len[lid] = torch.zeros(max_reqs, dtype=torch.int64, device=dev)
             self._indptr1[lid] = torch.zeros(2, dtype=dt, device=dev)
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)
@@ -287,6 +320,28 @@ class VestigeMLABackend(AttentionBackend):
             # request. Stale state made bs>1 decode attend the prior request's
             # row set (profiler: VESTIGE attn == FULL attn at bs=16).
             self._tier2.pop((slot, lid), None)
+            self._recall.pop((slot, lid), None)
+            if lid in self._fetch_len:
+                self._fetch_len[lid][slot] = 0
+
+    def _alloc_recall_bufs(self, lid, max_reqs, idx_dtype, dev):
+        if lid in self._qbuf:
+            return
+        self._qbuf[lid] = torch.zeros(
+            max_reqs, self._q_heads, self._q_dim, dtype=torch.float32, device=dev
+        )
+        self._fetch_buf[lid] = torch.zeros(
+            max_reqs, self._fetch_w, dtype=idx_dtype, device=dev
+        )
+        self._fetch_len[lid] = torch.zeros(max_reqs, dtype=torch.int64, device=dev)
+
+    def _full_arm(self) -> bool:
+        # Benchmark-only A/B switch (SGLANG_TEST_VESTIGE_FULL_ARM_FLAG names a
+        # flag file; present -> FULL arm). Unset in production: no file stat.
+        from sglang.srt.environ import envs
+
+        path = envs.SGLANG_TEST_VESTIGE_FULL_ARM_FLAG.get()
+        return bool(path) and os.path.exists(path)
 
     def _arm_aware_kept(self, row_slots, kbuf, seq_len, v_dim):
         # The kept row set for one request, shared by the bs==1 kept-table build
@@ -294,7 +349,7 @@ class VestigeMLABackend(AttentionBackend):
         # switch, read per prefill: /tmp/vestige_full present -> FULL prefix (arm
         # A, == baseline), else sidecar-residual sigma top-m + 4 sinks + recent
         # window (arm B). Both arms then run the identical graph/refresh path.
-        if os.path.exists("/tmp/vestige_full"):
+        if self._full_arm():
             return row_slots
         sigma = sidecar_sigma(kbuf[row_slots][:, v_dim:])
         keep = select_kept(sigma, rho=self.rho, closed=seq_len, sinks=4)
@@ -308,8 +363,8 @@ class VestigeMLABackend(AttentionBackend):
         q,
         k,
         v,
-        layer: "RadixAttention",
-        forward_batch: "ForwardBatch",
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         **kwargs,
     ):
@@ -324,23 +379,32 @@ class VestigeMLABackend(AttentionBackend):
         # tail) for this layer, then restore. num_kv_splits is left as the base
         # sized it (>= the compressed length -> correct, empty splits merge out).
         fm = self.base.forward_metadata
+        lid = layer.layer_id
+        # In-graph: record this step's expanded query into the fixed-address
+        # qbuf so the NEXT step's out-graph recall scan can read it
+        # (stale-by-one recall; fixed-shape index_copy_, capture-safe). Padded
+        # lanes may overwrite a real slot's qbuf with a padded lane's query;
+        # this only perturbs calibration/scan inputs, never row correctness.
+        if lid in self._qbuf:
+            # q arrives already in the absorbed expanded form
+            # [bs, H, kv_lora_rank + rope] (see the base's qk_head_dim view).
+            bs_q = forward_batch.seq_lens.shape[0]
+            slots_q = forward_batch.req_pool_indices[:bs_q].to(torch.int64)
+            q_exp = q.view(bs_q, self._q_heads, self._q_dim).float()
+            self._qbuf[lid].index_copy_(0, slots_q, q_exp)
         if get_is_capture_mode():
             # Capture: pure pointer swap to this layer's fixed-address buffers
             # (pre-filled outside capture by the in_capture out-graph hook; any
-            # copy or sync here would invalidate stream capture).
-            self._mla_lids.add(layer.layer_id)
+            # copy or sync here would invalidate stream capture). One uniform
+            # binding for every bs: the packed (kept + fetched) CSR buffers.
+            self._mla_lids.add(lid)
             bs = forward_batch.seq_lens.shape[0]
-            if bs == 1:
-                # tables were allocated by the pre-capture hook (outside capture)
-                lid = layer.layer_id
-                indptr = self._indptr1[lid]
-                indices = self._kept_buf[lid].view(-1)
-            else:
-                bufs = self._graph_bufs[layer.layer_id]
-                indptr, indices = bufs["indptr"][: bs + 1], bufs["indices"]
-        elif forward_batch.seq_lens.shape[0] == 1 and layer.layer_id in self._kept_buf:
-            indptr = self._indptr1[layer.layer_id]
-            indices = self._kept_buf[layer.layer_id].view(-1)
+            bufs = self._graph_bufs[lid]
+            indptr, indices = bufs["indptr"][: bs + 1], bufs["indices"]
+        elif lid in self._graph_bufs:
+            bs = forward_batch.seq_lens.shape[0]
+            bufs = self._graph_bufs[lid]
+            indptr, indices = bufs["indptr"][: bs + 1], bufs["indices"]
         else:
             indptr, indices = self._compressed_indices(layer, forward_batch)
         saved = (fm.kv_indptr, fm.kv_indices)
@@ -375,6 +439,7 @@ class VestigeMLABackend(AttentionBackend):
                     2, dtype=fm.kv_indptr.dtype, device=r2t.device
                 )
                 self._indptr1[lid][1] = 1  # capture attends one padded row
+            self._alloc_recall_bufs(lid, r2t.shape[0], fm.kv_indices.dtype, r2t.device)
             bufs = self._graph_bufs.get(lid)
             if bufs is None:
                 cap = max(self._graph_max_bs, 1) * self.base.max_context_len
@@ -387,6 +452,78 @@ class VestigeMLABackend(AttentionBackend):
             bufs["indptr"][bs + 1 :].fill_(fm.kv_indptr[bs])
             if n > 0:
                 bufs["indices"][:n].copy_(fm.kv_indices[:n])
+
+    def _recall_step(self, lid, forward_batch, reqs):
+        # Per-step recall (REQUIRED component; no production off-switch --
+        # SGLANG_TEST_VESTIGE_TIER1_ABLATION exists solely for the frozen
+        # ablation protocol). Stale-by-one: scans with the PREVIOUS step's
+        # query recorded in-graph into qbuf; fired pool rows land in the
+        # fixed-address fetch_buf that the packed CSR splices next.
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_TEST_VESTIGE_TIER1_ABLATION.get():
+            return
+        if lid not in self._qbuf or self._full_arm():
+            return
+        real = forward_batch.out_cache_loc.shape[0]
+        for i in range(real):
+            slot = reqs[i]
+            st = self._recall.get((slot, lid))
+            if st is None:
+                st = {"tier": None, "qcal": [], "qpos": []}
+                self._recall[(slot, lid)] = st
+            if st["tier"] is None:
+                st["qcal"].append(self._qbuf[lid][slot].clone())
+                st["qpos"].append(int(forward_batch.seq_lens[i]) - 1)
+                if len(st["qcal"]) >= self._n_cal:
+                    self._build_recall(slot, lid, forward_batch, i, st)
+                continue
+            fired = st["tier"].query(self._qbuf[lid][slot])
+            n = int(fired.numel())
+            self._nstep_hist[n] = self._nstep_hist.get(n, 0) + 1
+            if os.environ.get("SGLANG_VESTIGE_DEBUG_BUILD") and (
+                n > 512 or sum(self._nstep_hist.values()) % 64 == 1
+            ):
+                import logging
+
+                logging.getLogger(__name__).info(
+                    "VKREC fire lid=%s slot=%s n=%s", lid, slot, n
+                )
+            if n > self._fetch_w:
+                fired = fired[: self._fetch_w]  # width overflow: truncate
+                n = self._fetch_w
+            if n:
+                self._fetch_buf[lid][slot, :n] = fired.to(self._fetch_buf[lid].dtype)
+            self._fetch_len[lid][slot] = n
+
+    def _build_recall(self, slot, lid, forward_batch, i, st):
+        # One-time per (slot, layer), off the steady-state path: gather the
+        # prefix rows in fp32, derive the position-level keep mask from the
+        # kept table, and calibrate the tier from the buffered decode queries.
+        from sglang.srt.layers.attention.vestige.recall_tier import RecallTier
+
+        seq_len = int(forward_batch.seq_lens[i])
+        r2t = self.req_to_token_pool.req_to_token
+        row_slots = r2t[slot, :seq_len].to(torch.int64)
+        kbuf = self.token_to_kv_pool.get_key_buffer(lid)
+        rows = kbuf.reshape(-1, kbuf.shape[-1])[row_slots].float()
+        n_kept = int(self._kept_len[lid][slot])
+        kept_slots = self._kept_buf[lid][slot, :n_kept].to(torch.int64)
+        keep = torch.isin(row_slots, kept_slots)
+        q_cal = torch.stack(st["qcal"])  # [n_cal, H, 576]
+        q_pos = torch.tensor(st["qpos"], device=rows.device)
+        tier = RecallTier(r=self.index_rank, topj=self.topj)
+        stats = tier.build(rows, keep, q_cal, q_pos)
+        if os.environ.get("SGLANG_VESTIGE_DEBUG_BUILD"):
+            import logging
+
+            logging.getLogger(__name__).info(
+                "VKREC build lid=%s slot=%s T=%s stats=%s", lid, slot, seq_len, stats
+            )
+        # query() returns archive-relative selections mapped through tier.arch,
+        # which indexes into `rows` (positions); map to absolute pool rows.
+        tier.arch = row_slots[tier.arch]
+        st["tier"], st["qcal"], st["qpos"] = tier, [], []
 
     def _refresh_graph_bufs(self, lid, forward_batch, reqs):
         # bs > 1 graph replay: append this step's slot to each request's kept
@@ -411,21 +548,45 @@ class VestigeMLABackend(AttentionBackend):
         )
         lens = n + 1
         kept_len.scatter_(0, slots, lens)
-        # pack: gather each request's row [slot, :len] into a contiguous CSR.
-        # Two small D2H syncs (max, sum) replace the per-request loop.
+        # pack: gather each request's kept rows [slot, :len] plus its fired
+        # recall rows [slot, :fetch_len] into one contiguous CSR. Intra-request
+        # order is irrelevant (NoPE multiset invariance), so the two segments
+        # concatenate per request via one combined masked select. Two small
+        # D2H syncs (max, sum) replace any per-request loop.
+        if lid in self._fetch_len:
+            f_lens = self._fetch_len[lid].gather(0, slots)
+            fw = self._fetch_buf[lid].shape[1]
+        else:  # recall buffers not allocated (unit fakes): zero-fetch
+            f_lens = torch.zeros_like(lens)
+            fw = 1
+        lens_tot = lens + f_lens
         k_max = int(lens.max())
+        f_max = int(f_lens.max())
         col = torch.arange(k_max, device=kept_buf.device)
-        grid = kept_buf.view(-1).gather(
-            0, (slots[:, None] * cap + col[None, :]).reshape(-1)
-        ).view(real_bs, k_max)
+        grid = (
+            kept_buf.view(-1)
+            .gather(0, (slots[:, None] * cap + col[None, :]).reshape(-1))
+            .view(real_bs, k_max)
+        )
         valid = col[None, :] < lens[:, None]
-        total = int(lens.sum())
+        if f_max > 0:
+            fcol = torch.arange(f_max, device=kept_buf.device)
+            grid_f = (
+                self._fetch_buf[lid]
+                .view(-1)
+                .gather(0, (slots[:, None] * fw + fcol[None, :]).reshape(-1))
+                .view(real_bs, f_max)
+            )
+            valid_f = fcol[None, :] < f_lens[:, None]
+            grid = torch.cat([grid, grid_f], dim=1)
+            valid = torch.cat([valid, valid_f], dim=1)
+        total = int(lens_tot.sum())
         bufs["indices"][:total] = grid[valid]
         n_pad = bs - real_bs
         if n_pad > 0:
             bufs["indices"][total : total + n_pad].fill_(0)
         indptr = torch.zeros(bs + 1, dtype=torch.int64, device=kept_buf.device)
-        indptr[1 : real_bs + 1] = lens.cumsum(0)
+        indptr[1 : real_bs + 1] = lens_tot.cumsum(0)
         if n_pad > 0:
             indptr[real_bs + 1 :] = total + torch.arange(
                 1, n_pad + 1, device=kept_buf.device

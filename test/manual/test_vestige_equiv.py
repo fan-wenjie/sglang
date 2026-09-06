@@ -9,6 +9,7 @@ validation to the port's decision logic, leaving only the sglang I/O plumbing.
 Run: python -m sglang.srt.layers.attention.vestige.test_vestige_equiv
 (needs the mini-sglang source on sys.path; the test adds it.)
 """
+
 import sys
 
 import torch
@@ -55,7 +56,9 @@ def test_eviction_equiv(dev):
     ref_keep[:4] = True
     sgl_keep = select_kept(sgl_sigma, rho=1 / 32, closed=closed, sinks=4)
     assert torch.equal(ref_keep, sgl_keep), "keep-mask drift"
-    print(f"PASS eviction equiv: sigma bitwise-equal, keep-mask equal (m={m}, kept={int(sgl_keep.sum())})")
+    print(
+        f"PASS eviction equiv: sigma bitwise-equal, keep-mask equal (m={m}, kept={int(sgl_keep.sum())})"
+    )
 
 
 def test_recall_equiv(dev):
