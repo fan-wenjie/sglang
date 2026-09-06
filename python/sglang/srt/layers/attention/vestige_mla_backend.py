@@ -240,6 +240,11 @@ class VestigeMLABackend(AttentionBackend):
             n = kept.numel()
             self._kept_buf[lid][slot, :n] = kept.to(self._kept_buf[lid].dtype)
             self._kept_len[lid][slot] = n
+            # Slot reuse: drop the bs>1 tier-2 index state built for the slot's
+            # previous occupant; the first decode step rebuilds it for this
+            # request. Stale state made bs>1 decode attend the prior request's
+            # row set (profiler: VESTIGE attn == FULL attn at bs=16).
+            self._tier2.pop((slot, lid), None)
 
     def _arm_aware_kept(self, row_slots, kbuf, seq_len, v_dim):
         # The kept row set for one request, shared by the bs==1 kept-table build
@@ -408,15 +413,25 @@ class VestigeMLABackend(AttentionBackend):
         return kv_indptr, kv_indices
 
     def _build_index_buffer(self, req, lid, forward_batch, i, fm):
-        # One-time per (req, layer): sidecar-residual kept set over the prefix,
-        # preallocated with room for the decode tail. Sync cost paid once.
-        kbuf = self.token_to_kv_pool.get_key_buffer(lid)
-        kbuf = kbuf.reshape(-1, kbuf.shape[-1])
-        r2t = self.req_to_token_pool.req_to_token
-        seq_len = int(forward_batch.seq_lens[i])
-        kept_st = self._build_kept(req, lid, seq_len, kbuf, r2t, kbuf.shape[-1] - 64)
-        head = torch.cat([kept_st["kept"], r2t[req, kept_st["prefix_len"] : seq_len]])
-        head = head.to(fm.kv_indices.dtype)
+        # One-time per (req, layer). Source the kept set from the prefill-built
+        # kept_buf/kept_len tables (single source of truth; pure GPU copy) --
+        # recomputing sigma here put 7 x bs rFFTs over the whole prefix into the
+        # FIRST decode step, which at bs=16/S=64k ate the entire speedup.
+        if lid in self._kept_buf and int(self._kept_len[lid][req]) > 0:
+            n_kept = int(self._kept_len[lid][req])
+            head = self._kept_buf[lid][req, :n_kept].to(fm.kv_indices.dtype)
+        else:
+            # Fallback (slot never extended through this backend): compute once.
+            kbuf = self.token_to_kv_pool.get_key_buffer(lid)
+            kbuf = kbuf.reshape(-1, kbuf.shape[-1])
+            r2t = self.req_to_token_pool.req_to_token
+            seq_len = int(forward_batch.seq_lens[i])
+            kept_st = self._build_kept(
+                req, lid, seq_len, kbuf, r2t, kbuf.shape[-1] - 64
+            )
+            head = torch.cat(
+                [kept_st["kept"], r2t[req, kept_st["prefix_len"] : seq_len]]
+            ).to(fm.kv_indices.dtype)
         buf = head.new_zeros(head.numel() + _TAIL_CAPACITY)
         buf[: head.numel()] = head
         st = {"buf": buf, "n": head.numel() - 1}  # -1: current step re-appends its slot
