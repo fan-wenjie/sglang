@@ -88,7 +88,14 @@ def create_vestige_mla_backend(runner):
     # CUDA>=12.9). A base override could pick another MLA backend on capable HW.
     base = create_triton_backend(runner)  # TritonAttnBackend (MLA-capable)
     # SGLANG_ENABLE_VESTIGE=False -> pure pass-through (kill-switch parity test).
-    return VestigeMLABackend(base, runner, enabled=envs.SGLANG_ENABLE_VESTIGE.get())
+    # SGLANG_VESTIGE_TOPJ: -1 (default) = uncapped recall fetch; set > 0
+    # explicitly for the bounded-fetch cap (16 recommended).
+    return VestigeMLABackend(
+        base,
+        runner,
+        enabled=envs.SGLANG_ENABLE_VESTIGE.get(),
+        topj=envs.SGLANG_VESTIGE_TOPJ.get(),
+    )
 
 
 @register_attention_backend("trtllm_mla")

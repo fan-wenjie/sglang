@@ -552,6 +552,11 @@ class Envs:
     # (vestige_mla). Default on; set False for the kill-switch parity test that
     # runs the wrapper as pure pass-through to the base MLA backend.
     SGLANG_ENABLE_VESTIGE = EnvBool(True)
+    # VestigeKV per-head recall fetch cap (topj). Default -1 = uncapped: fetch
+    # the full fired recall set. Set > 0 explicitly (16 recommended) for the
+    # bounded-fetch guarantee; deliberate opt-in so the operator states the
+    # fetch bound they are accepting.
+    SGLANG_VESTIGE_TOPJ = EnvInt(-1)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
