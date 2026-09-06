@@ -24,17 +24,18 @@ class RecallTier:
     def __init__(
         self,
         r: int = 64,
-        topj: int = 16,
+        topj: int = -1,
         recall_target: float = 0.90,
         scale: float = 192**-0.5,
     ):
-        # topj: per-head fetch cap. DEFAULT 16 = the bounded-fetch guarantee
-        # (fetch <= topj*num_heads rows/step/layer; no degeneration to naive
-        # MLA). CONFIGURABLE: topj = -1 (or 0) disables the cap -> fetch the
-        # full fired set. Measured (PREREG33/34): removing the cap is nearly
-        # free at batch=1/<=32k and changes generation not at all (bit-identical
-        # text), recovering only a sub-0.001-bpb sliver of likelihood; it drops
-        # the worst-case bound (uncapped fire max 3983 rows vs capped 296).
+        # topj: per-head fetch cap. DEFAULT -1 = uncapped (fetch the full fired
+        # set; the fool-proof default does the WHOLE thing, never a fraction
+        # nobody typed). Set topj > 0 explicitly to enable the bounded-fetch
+        # guarantee (fetch <= topj*num_heads rows/step/layer); recommended cap
+        # is 16. Measured (PREREG33/34): the cap is nearly free at
+        # batch=1/<=32k and changes generation not at all (bit-identical text),
+        # trading a sub-0.001-bpb likelihood sliver for the worst-case bound
+        # (uncapped fire max 3983 rows vs capped 296).
         self.r = r
         self.topj = topj
         self.recall_target = recall_target

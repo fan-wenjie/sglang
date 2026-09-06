@@ -23,6 +23,9 @@ REAL_BS = 3  # real requests this step (the crash shape: 4 vs 3)
 KEPT = 5  # kept rows already indexed per request
 
 
+CAP = 64  # kept_buf row capacity in the fake
+
+
 def _mk_backend():
     be = object.__new__(VestigeMLABackend)  # bypass __init__: unit under test only
     fm = types.SimpleNamespace(
@@ -30,15 +33,14 @@ def _mk_backend():
         kv_indices=torch.zeros(1024, dtype=torch.int64),
     )
     be.base = types.SimpleNamespace(forward_metadata=fm)
-    be._tier2 = {
-        (req, LID): {
-            # per-req index buffer: KEPT kept rows + tail room
-            "buf": torch.arange(100 * req, 100 * req + 32, dtype=torch.int64),
-            "n": KEPT,
-            "synced_req": None,
-        }
-        for req in range(REAL_BS)
-    }
+    # prefill-built kept tables: request req holds rows 100*req .. 100*req+KEPT-1
+    kept_buf = torch.zeros(GRAPH_BS, CAP, dtype=torch.int64)
+    kept_len = torch.zeros(GRAPH_BS, dtype=torch.int64)
+    for req in range(GRAPH_BS):
+        kept_buf[req, :KEPT] = torch.arange(100 * req, 100 * req + KEPT)
+        kept_len[req] = KEPT
+    be._kept_buf, be._kept_len = {LID: kept_buf}, {LID: kept_len}
+    be._tier2 = {}
     be._graph_bufs = {
         LID: {
             "indptr": torch.zeros(GRAPH_BS + 2, dtype=torch.int32),
@@ -76,19 +78,15 @@ def test_padded_bs_does_not_overrun_out_cache_loc():
     # padded slot: exactly one reserved pad row (slot 0), softmax non-empty
     assert indptr[REAL_BS + 1] - indptr[REAL_BS] == 1
     assert bufs["indices"][int(indptr[REAL_BS])].item() == 0
-    # tier-2 state advanced only for real requests
+    # kept tables advanced only for real requests
     for req in range(REAL_BS):
-        assert be._tier2[(req, LID)]["n"] == per_req
+        assert int(be._kept_len[LID][req]) == per_req
+    assert int(be._kept_len[LID][REAL_BS]) == KEPT  # padded slot untouched
 
 
 def test_unpadded_bs_matches_prior_behavior():
     # real_bs == graph bs: every slot is a real request, no pad rows
     be = _mk_backend()
-    be._tier2[(3, LID)] = {
-        "buf": torch.arange(300, 332, dtype=torch.int64),
-        "n": KEPT,
-        "synced_req": None,
-    }
     fb = _mk_forward_batch()
     fb.out_cache_loc = torch.tensor([1001, 1002, 1003, 1004], dtype=torch.int64)
     be._refresh_graph_bufs(LID, fb, fb.req_pool_indices.tolist())

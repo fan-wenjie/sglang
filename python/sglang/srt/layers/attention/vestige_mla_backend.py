@@ -46,11 +46,11 @@ _TAIL_CAPACITY = 8192
 class VestigeMLABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.
 
-    topj is the per-head fetch cap: default 16 = the bounded-fetch guarantee
-    (fetch <= topj * num_heads rows / step / layer; no degeneration to naive
-    MLA). Configurable: topj = -1 (or 0) disables the cap and fetches the full
-    fired recall set. rho is the tier-1 eviction ratio; index_rank is the
-    tier-2 sketch rank r.
+    topj is the per-head fetch cap: default -1 = UNCAPPED (fetch the full
+    fired recall set). Set topj > 0 explicitly (SGLANG_VESTIGE_TOPJ; 16
+    recommended) to enable the bounded-fetch guarantee (fetch <= topj *
+    num_heads rows / step / layer). rho is the tier-1 eviction ratio;
+    index_rank is the tier-2 sketch rank r.
     """
 
     def __init__(
@@ -60,7 +60,7 @@ class VestigeMLABackend(AttentionBackend):
         *,
         enabled: bool = False,
         rho: float = 1.0 / 32,
-        topj: int = 16,
+        topj: int = -1,
         index_rank: int = 64,
     ):
         self.base = base
@@ -347,40 +347,49 @@ class VestigeMLABackend(AttentionBackend):
                 bufs["indices"][:n].copy_(fm.kv_indices[:n])
 
     def _refresh_graph_bufs(self, lid, forward_batch, reqs):
-        # bs > 1 graph replay: repack the CSR (contiguous, no gaps) into the
-        # fixed-address buffers the captured graph reads.
-        fm = self.base.forward_metadata
-        bufs = self._graph_bufs[lid]
+        # bs > 1 graph replay: append this step's slot to each request's kept
+        # table, then repack the CSR into the fixed-address buffers the captured
+        # graph reads. Vectorized (~12 tensor ops per layer); the previous
+        # per-request python loop cost ~4 ms/step at bs=16.
         # seq_lens is padded to the captured graph bs; out_cache_loc carries only
-        # the real (unpadded) requests -- see build_replay_fb_view, which takes
-        # out_cache_loc from the original batch but seq_lens from the padded
-        # capture buffers. Iterate real requests, then point every padded slot at
-        # one reserved pad row (slot 0) so its softmax is non-empty; its output is
-        # discarded. (Reading out_cache_loc[i] for a padded i used to overrun.)
+        # the real (unpadded) requests -- see build_replay_fb_view. Padded CSR
+        # slots get one reserved pad row (slot 0); their output is discarded.
+        bufs = self._graph_bufs[lid]
         bs = forward_batch.seq_lens.shape[0]
-        real_bs = forward_batch.out_cache_loc.shape[0]
-        off = 0
-        for i in range(bs):
-            if i < real_bs:
-                req = reqs[i]
-                st = self._tier2.get((req, lid))
-                if st is None:
-                    st = self._build_index_buffer(req, lid, forward_batch, i, fm)
-                buf, n = st["buf"], st["n"]
-                if n >= buf.numel():
-                    buf = torch.cat([buf, buf.new_zeros(buf.numel())])
-                    st["buf"] = buf
-                buf[n] = forward_batch.out_cache_loc[i]
-                st["n"] = n = n + 1
-                st["synced_req"] = None  # invalidate the bs=1 fast-path sync state
-                bufs["indices"][off : off + n].copy_(buf[:n])
-                off += n
-            else:
-                bufs["indices"][off : off + 1].fill_(0)
-                off += 1
-            bufs["indptr"][i + 1] = off
-        bufs["indptr"][0] = 0
-        bufs["indptr"][bs + 1 :].fill_(off)
+        loc = forward_batch.out_cache_loc
+        real_bs = loc.shape[0]
+        kept_buf, kept_len = self._kept_buf[lid], self._kept_len[lid]
+        cap = kept_buf.shape[1]
+        slots = forward_batch.req_pool_indices[:real_bs].to(torch.int64)
+        # batched append of this step's slot (same pattern as the bs=1 in-graph
+        # hook): kept_buf[slot, n_slot] = loc; kept_len[slot] += 1
+        n = kept_len.gather(0, slots)
+        kept_buf.view(-1).scatter_(
+            0, (slots * cap + n).to(torch.int64), loc.to(kept_buf.dtype)
+        )
+        lens = n + 1
+        kept_len.scatter_(0, slots, lens)
+        # pack: gather each request's row [slot, :len] into a contiguous CSR.
+        # Two small D2H syncs (max, sum) replace the per-request loop.
+        k_max = int(lens.max())
+        col = torch.arange(k_max, device=kept_buf.device)
+        grid = kept_buf.view(-1).gather(
+            0, (slots[:, None] * cap + col[None, :]).reshape(-1)
+        ).view(real_bs, k_max)
+        valid = col[None, :] < lens[:, None]
+        total = int(lens.sum())
+        bufs["indices"][:total] = grid[valid]
+        n_pad = bs - real_bs
+        if n_pad > 0:
+            bufs["indices"][total : total + n_pad].fill_(0)
+        indptr = torch.zeros(bs + 1, dtype=torch.int64, device=kept_buf.device)
+        indptr[1 : real_bs + 1] = lens.cumsum(0)
+        if n_pad > 0:
+            indptr[real_bs + 1 :] = total + torch.arange(
+                1, n_pad + 1, device=kept_buf.device
+            )
+        bufs["indptr"][: bs + 1].copy_(indptr)
+        bufs["indptr"][bs + 1 :].fill_(total + n_pad)
 
     def _compressed_indices(self, layer, forward_batch):
         # Incremental per-(req, layer) index buffer: [kept..., tail...] built once
