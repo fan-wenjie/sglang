@@ -109,9 +109,17 @@ def set_mla_kv_buffer(
     if n_loc == 0:
         return
 
-    src_nope = cache_k_nope.view(n_loc, -1) if cache_k_nope.dim() != 2 else cache_k_nope
-    src_rope = cache_k_rope.view(n_loc, -1) if cache_k_rope.dim() != 2 else cache_k_rope
-    buf = kv_buffer.view(kv_buffer.shape[0], -1) if kv_buffer.dim() != 2 else kv_buffer
+    # reshape (not view): cache_k_rope/nope can be non-contiguous at longer
+    # prefill (a strided slice of the MLA latent), where .view() raises.
+    src_nope = (
+        cache_k_nope.reshape(n_loc, -1) if cache_k_nope.dim() != 2 else cache_k_nope
+    )
+    src_rope = (
+        cache_k_rope.reshape(n_loc, -1) if cache_k_rope.dim() != 2 else cache_k_rope
+    )
+    buf = (
+        kv_buffer.reshape(kv_buffer.shape[0], -1) if kv_buffer.dim() != 2 else kv_buffer
+    )
 
     nope_bytes = src_nope.shape[-1] * src_nope.element_size()
     rope_bytes = src_rope.shape[-1] * src_rope.element_size()

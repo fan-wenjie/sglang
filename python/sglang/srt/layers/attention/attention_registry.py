@@ -75,6 +75,55 @@ def create_flashinfer_backend(runner):
         return FlashInferMLAAttnBackend(runner)
 
 
+@register_attention_backend("vestigekv_mla")
+def create_vestigekv_mla_backend(runner):
+    # VestigeKV wraps an MLA backend; for Kimi Linear the hybrid adopts this as
+    # its full_attn_backend, so MLA-layer decode flows through VestigeKV and KDA
+    # layers are untouched. See VESTIGEKV_PORT.md.
+    if not runner.use_mla_backend:
+        raise ValueError("vestigekv_mla backend can only be used with MLA models.")
+    # The eviction signal exists only in a NoPE-MLA cache: the decoupled branch
+    # must never be rotated. On a RoPE MLA model (DeepSeek-style) the identical
+    # operator collapses (measured 0.89 -> 0.08 needle retrieval at 32x), so
+    # refuse anything but the validated NoPE-MLA family instead of silently
+    # degrading quality.
+    if kimi_linear_config(runner.model_config) is None:
+        raise ValueError(
+            "vestigekv_mla is validated only for NoPE-MLA models (Kimi Linear "
+            "family, skip_rope=True). On RoPE-MLA models the sidecar eviction "
+            "signal does not exist and quality collapses; use a stock MLA "
+            "backend instead."
+        )
+    if (runner.page_size or 1) != 1:
+        raise ValueError(
+            f"vestigekv_mla requires --page-size 1 (resolved page_size="
+            f"{runner.page_size}): its kept-index tables address token "
+            "slots, not pages."
+        )
+    if get_spec().speculative_algorithm is not None:
+        raise ValueError(
+            "vestigekv_mla does not support speculative decoding yet: the "
+            "verify path's multi-token reads are not wired to the kept-index "
+            "tables."
+        )
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.vestigekv_mla_backend import VestigeKVMLABackend
+
+    # Wrap the Triton MLA backend (SM120-safe; flashinfer's MLA JIT needs
+    # CUDA>=12.9). A base override could pick another MLA backend on capable HW.
+    base = create_triton_backend(runner)  # TritonAttnBackend (MLA-capable)
+    # Selecting this backend IS the enable switch: tier-1 eviction and tier-2
+    # recall are both required components and have no per-run off switch. The
+    # dense control arm is `--attention-backend triton`, i.e. `base` alone.
+    # SGLANG_VESTIGEKV_TOPJ: -1 (default) = uncapped recall fetch; set > 0
+    # explicitly for the bounded-fetch cap (16 recommended).
+    return VestigeKVMLABackend(
+        base,
+        runner,
+        topj=envs.SGLANG_VESTIGEKV_TOPJ.get(),
+    )
+
+
 @register_attention_backend("trtllm_mla")
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:

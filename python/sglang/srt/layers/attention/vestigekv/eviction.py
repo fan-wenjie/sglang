@@ -1,0 +1,67 @@
+"""Sidecar-residual tier-1 eviction for VestigeKV (PREREG23, tax-free).
+
+Pure functions extracted VERBATIM (same math) from the validated mini-sglang
+VestigePolicy (minisgl/kimi/policy.py). Kept bit-identical to the reference so
+the sglang backend's eviction can be asserted equal to it.
+
+sigma_u = || r_u - lowpass_kappa(r)_u || over the 64-dim sidecar (the [512:576]
+decoupled branch of the latent row), rFFT-truncated along the sequence axis; a
+single GLOBAL top-m over all sidecar sigmas keeps the m most-anomalous rows
+(constant-m rebalance, licensed by ranking stationarity). The first `sinks`
+rows are always kept.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from sglang.srt.layers.attention.vestigekv import defaults as D
+
+
+def sidecar_sigma(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA) -> torch.Tensor:
+    """side: [B, 64] sidecar rows along the sequence axis. Returns [B] anomaly
+    scores = residual of a kappa-band low-pass along dim 0."""
+    f = torch.fft.rfft(side.float(), dim=0)
+    f[kappa:] = 0
+    low = torch.fft.irfft(f, n=side.shape[0], dim=0)
+    return (side.float() - low).norm(dim=-1)
+
+
+def select_kept(
+    sigma: torch.Tensor,
+    rho: float,
+    closed: int,
+    sinks: int = D.SINKS,
+    m_fixed: int | None = None,
+) -> torch.Tensor:
+    """sigma: [closed] sidecar anomaly scores. Returns a [closed] bool keep mask:
+    the top-m by sigma plus the first `sinks` rows. m = round(rho * closed) (or
+    m_fixed for a hard absolute budget)."""
+    m = m_fixed if m_fixed is not None else max(1, round(rho * closed))
+    keep = torch.zeros(closed, dtype=torch.bool, device=sigma.device)
+    keep[sigma.topk(min(m, closed)).indices] = True
+    keep[:sinks] = True
+    return keep
+
+
+def blockwise_sigma(side: torch.Tensor, block: int = D.CLOSE_BLOCK) -> torch.Tensor:
+    """sigma over full blocks only: one fixed-window rFFT per block.
+
+    The cutoff kappa counts frequency BINS, and bin k corresponds to period
+    T/k -- so a whole-prefix transform makes the cutoff drift with context
+    length (>= 256 tokens at T=4096 but >= 32k tokens at T=512k). Fixed
+    block windows keep sigma's meaning scale-invariant, match the reference
+    policy bit-for-bit, and make the computation naturally incremental: each
+    block is transformed exactly once, at close, and its sigma is immutable.
+
+    Returns sigma for the first (len(side) // block) * block rows; the
+    remainder is the unclosed tail, unconditionally attended, needing no sigma.
+    """
+    n_blocks = side.shape[0] // block
+    if n_blocks == 0:
+        return side.new_zeros(0)
+    trimmed = side[: n_blocks * block].reshape(n_blocks, block, side.shape[-1])
+    f = torch.fft.rfft(trimmed.float(), dim=1)
+    f[:, D.LOWPASS_KAPPA :] = 0
+    low = torch.fft.irfft(f, n=block, dim=1)
+    return (trimmed.float() - low).norm(dim=-1).reshape(-1)
