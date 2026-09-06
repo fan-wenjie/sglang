@@ -81,6 +81,30 @@ def create_vestige_mla_backend(runner):
     # layers are untouched. See VESTIGEKV_PORT.md.
     if not runner.use_mla_backend:
         raise ValueError("vestige_mla backend can only be used with MLA models.")
+    # The eviction signal exists only in a NoPE-MLA cache: the decoupled branch
+    # must never be rotated. On a RoPE MLA model (DeepSeek-style) the identical
+    # operator collapses (measured 0.89 -> 0.08 needle retrieval at 32x), so
+    # refuse anything but the validated NoPE-MLA family instead of silently
+    # degrading quality.
+    if kimi_linear_config(runner.model_config) is None:
+        raise ValueError(
+            "vestige_mla is validated only for NoPE-MLA models (Kimi Linear "
+            "family, skip_rope=True). On RoPE-MLA models the sidecar eviction "
+            "signal does not exist and quality collapses; use a stock MLA "
+            "backend instead."
+        )
+    if (runner.page_size or 1) != 1:
+        raise ValueError(
+            f"vestige_mla requires --page-size 1 (resolved page_size="
+            f"{runner.page_size}): its kept-index tables address token "
+            "slots, not pages."
+        )
+    if get_spec().speculative_algorithm is not None:
+        raise ValueError(
+            "vestige_mla does not support speculative decoding yet: the "
+            "verify path's multi-token reads are not wired to the kept-index "
+            "tables."
+        )
     from sglang.srt.environ import envs
     from sglang.srt.layers.attention.vestige_mla_backend import VestigeMLABackend
 

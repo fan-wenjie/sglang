@@ -552,6 +552,18 @@ class Envs:
     # (vestige_mla). Default on; set False for the kill-switch parity test that
     # runs the wrapper as pure pass-through to the base MLA backend.
     SGLANG_ENABLE_VESTIGE = EnvBool(True)
+    # VestigeKV benchmark arm switch: path of a flag file checked at each
+    # prefill; file present -> the FULL arm (attend all rows, the A/B
+    # baseline). Unset (default) disables arm switching entirely -- no
+    # file stat on any path in production.
+    SGLANG_TEST_VESTIGE_FULL_ARM_FLAG = EnvStr(None)
+    # VestigeKV recall calibration: number of decode steps whose queries
+    # feed RecallTier.build before the tier activates for a request.
+    SGLANG_VESTIGE_NCAL = EnvInt(16)
+    # TEST-ONLY tier-1 ablation hook (the pre-registered ablation protocol).
+    # Recall is a necessary component and has NO production off-switch; this
+    # test-prefixed env exists solely so the frozen ablation legs can run.
+    SGLANG_TEST_VESTIGE_TIER1_ABLATION = EnvBool(False)
     # VestigeKV per-head recall fetch cap (topj). Default -1 = uncapped: fetch
     # the full fired recall set. Set > 0 explicitly (16 recommended) for the
     # bounded-fetch guarantee; deliberate opt-in so the operator states the
