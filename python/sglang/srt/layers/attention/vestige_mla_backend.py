@@ -126,11 +126,53 @@ class VestigeMLABackend(AttentionBackend):
             and self._graph_bufs
             and forward_batch.forward_mode.is_decode()
         ):
+            if os.environ.get("SGLANG_VESTIGE_CHECK"):
+                self._check_row_invariant(forward_batch)
             if forward_batch.seq_lens.shape[0] == 1:
                 return  # bs=1 refresh is captured in-graph (zero per-step python)
             reqs = forward_batch.req_pool_indices.tolist()
             for lid in self._mla_lids:
                 self._refresh_graph_bufs(lid, forward_batch, reqs)
+
+    def _check_row_invariant(self, forward_batch):
+        # SGLANG_VESTIGE_CHECK=1: per-step loud assertion that the attended row
+        # set is the intended one. Catches the silent wrong-row-set class (stale
+        # slot state, never-built tables, chunk-local seq_len) that unit tests
+        # and short-generate smoke tests cannot see. Syncs; debug/CI only.
+        full_arm = os.path.exists("/tmp/vestige_full")
+        real = forward_batch.out_cache_loc.shape[0]
+        slots = forward_batch.req_pool_indices[:real].to(torch.int64)
+        seq = forward_batch.seq_lens[:real]
+        for lid in self._local_mla_lids:
+            if lid not in self._kept_len:
+                raise AssertionError(
+                    f"VESTIGE CHECK: layer {lid} kept table never built "
+                    f"(prefill did not reach this backend on this rank)"
+                )
+            n = self._kept_len[lid].gather(0, slots)
+            if int((n <= 0).sum()):
+                raise AssertionError(
+                    f"VESTIGE CHECK: layer {lid} kept_len==0 for an active slot "
+                    f"(slot state missing); slots={slots.tolist()}"
+                )
+            if full_arm:
+                # check precedes this step's append: kept_len lags seq_lens by 1
+                bad = (n < seq - 1).sum()
+                if int(bad):
+                    raise AssertionError(
+                        f"VESTIGE CHECK: FULL arm but kept_len < seq_len-1 on "
+                        f"layer {lid}: n={n.tolist()} seq={seq.tolist()}"
+                    )
+            else:
+                # compressed: kept must be well below seq once past the window
+                mask = seq > 4 * _RECENT_WINDOW
+                bad = ((n > (seq * 0.5).to(n.dtype)) & mask).sum()
+                if int(bad):
+                    raise AssertionError(
+                        f"VESTIGE CHECK: VESTIGE arm but kept_len ~ seq_len on "
+                        f"layer {lid} (compression not applied): "
+                        f"n={n.tolist()} seq={seq.tolist()}"
+                    )
 
     def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
         self.base.init_forward_metadata_in_graph(forward_batch)
