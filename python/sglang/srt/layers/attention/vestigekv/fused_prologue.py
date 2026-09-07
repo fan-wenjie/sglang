@@ -276,3 +276,79 @@ def fused_prologue_split(q, kr, v, nk_len, thr, sc, out, partials):
         pm, ps, pt, nk_len, thr, max1g, NSPLIT=_NSPLIT, H=H, num_warps=1,
     )
     return max1g, qside_t, qsk_t, qres
+
+
+# ---- deterministic two-phase compaction: replaces the torch cumsum chain ----
+# nsys (128k, node0): the int64 tensor_kernel_scan_innermost_dim alone cost
+# 157 us/step -- 1.5x the scan kernel itself -- plus the scatter/where chain.
+# Order-preserving two-phase compaction in int32: per-block fired counts,
+# a tiny exclusive scan over blocks, then an ordered write of arch ids into
+# fetch_buf. Deterministic by construction (same fired set -> same layout),
+# preserving the overflow guarantee the atomic-append form would lose.
+
+
+@triton.jit
+def _compact_count_kernel(
+    hit_ptr, counts_ptr, a_len_ptr, Am, BLOCK_A: tl.constexpr
+):
+    p = tl.program_id(1)
+    b = tl.program_id(0)
+    offs = b * BLOCK_A + tl.arange(0, BLOCK_A)
+    alen = tl.load(a_len_ptr + p)
+    m = (offs < Am) & (offs < alen)
+    h = tl.load(hit_ptr + p * Am + offs, mask=m, other=0)
+    nb = tl.num_programs(0)
+    tl.store(counts_ptr + p * nb + b, tl.sum((h != 0).to(tl.int32), 0))
+
+
+@triton.jit
+def _compact_scan_kernel(
+    counts_ptr, offsets_ptr, total_ptr, NB, NB2: tl.constexpr
+):
+    p = tl.program_id(0)
+    b = tl.arange(0, NB2)  # NB2 = next pow2 >= NB; masked beyond NB
+    m = b < NB
+    c = tl.load(counts_ptr + p * NB + b, mask=m, other=0)
+    excl = tl.cumsum(c, 0) - c
+    tl.store(offsets_ptr + p * NB + b, excl, mask=m)
+    tl.store(total_ptr + p, tl.sum(c, 0))
+
+
+@triton.jit
+def _compact_write_kernel(
+    hit_ptr, offsets_ptr, arch_ptr, out_ptr, out_len_ptr, li_ptr, slot_ptr,
+    total_ptr, a_len_ptr, Am, W, NSLOT, BLOCK_A: tl.constexpr
+):
+    p = tl.program_id(1)
+    b = tl.program_id(0)
+    offs = b * BLOCK_A + tl.arange(0, BLOCK_A)
+    alen = tl.load(a_len_ptr + p)
+    m = (offs < Am) & (offs < alen)
+    h = tl.load(hit_ptr + p * Am + offs, mask=m, other=0) != 0
+    nb = tl.num_programs(0)
+    base = tl.load(offsets_ptr + p * nb + b)
+    pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
+    li = tl.load(li_ptr + p)
+    slot = tl.load(slot_ptr + p)
+    arch = tl.load(arch_ptr + p * Am + offs, mask=m, other=0)
+    ok = h & (pos < W)
+    tl.store(out_ptr + li * NSLOT * W + slot * W + pos, arch, mask=ok)
+    if b == 0:
+        t = tl.load(total_ptr + p)
+        tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
+
+
+def compact_fired(hit, arch, a_len, li, slot, fetch_buf, fetch_len, scratch):
+    """Deterministic fired-row compaction. scratch: (counts, offsets, total)
+    int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W] int64-compatible."""
+    P, Am = hit.shape
+    BLOCK_A = 1024
+    NB = triton.cdiv(Am, BLOCK_A)
+    counts, offsets, total = scratch
+    _compact_count_kernel[(NB, P)](hit, counts, a_len, Am, BLOCK_A=BLOCK_A)
+    _compact_scan_kernel[(P,)](counts, offsets, total, NB, NB2=triton.next_power_of_2(NB))
+    W = fetch_buf.shape[-1]
+    _compact_write_kernel[(NB, P)](
+        hit, offsets, arch, fetch_buf, fetch_len, li, slot, total, a_len,
+        Am, W, fetch_buf.shape[1], BLOCK_A=BLOCK_A,
+    )
