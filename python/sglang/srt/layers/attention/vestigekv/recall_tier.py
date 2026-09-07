@@ -45,6 +45,10 @@ class RecallTier:
         self.recall_target = recall_target
         self.scale = scale
         self.built = False
+        # live-archive projection caches: None until the first decode-time
+        # close backfills them (extend_closed); _pos_all doubles as the fill
+        # watermark read by the close path.
+        self._pos_all = self._side_all = self._csk_all = self._rho_all = None
         self.version = 0  # bumped on in-place membership refresh (pack sync key)
         self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
         # fixed-address staging for the fused scan (capturable)
@@ -212,10 +216,13 @@ class RecallTier:
         # globally -- refreshes the index by index selection only: no
         # re-projection GEMM, no stale archive, no unrecallable rows. Mirrors
         # the reference engine's live-archive semantics.
-        self._pos_all = row_slots.clone()  # absolute pool rows, closed order
-        self._side_all = None  # filled lazily on the first close
-        self._csk_all = None
-        self._rho_all = None
+        # Caches stay None here BY CONTRACT: the close path reads
+        # `0 if _pos_all is None else _pos_all.shape[0]` as its backfill
+        # watermark, so the first decode-time close projects rows 0..c1 in
+        # one batch. An eager _pos_all with lazy side/csk desynchronized the
+        # watermark from the cache contents (first serving close: refresh
+        # indexed a 4096-row cache with full-prefix indices).
+        self._pos_all = self._side_all = self._csk_all = self._rho_all = None
         self.built = True
         return {
             "zp": zp,
