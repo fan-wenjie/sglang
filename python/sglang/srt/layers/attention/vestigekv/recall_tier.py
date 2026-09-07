@@ -257,11 +257,21 @@ class RecallTier:
         truncated -- W is sized above the observed worst fire."""
         sc_ = self.scale
         qe = qe.float()
-        skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
-        max1 = skept.max(-1).values
-        p1 = torch.softmax(skept, -1)
-        ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
-        gate = ent > self.thr_g
+        H = qe.shape[0]
+        if self.kept_rows.shape[0] == 0:
+            # No tier-1 row kept => there is no max1 baseline to beat, so every
+            # archived row is eligible: attend the whole archive this step
+            # (degenerates to full attention, never under-recalls). A kept set
+            # this small is itself anomalous (see the close/build invariant);
+            # the +inf-open form keeps serving correct while it is investigated.
+            max1 = qe.new_full((H,), float("-inf"))
+            gate = qe.new_ones(H, dtype=torch.bool)
+        else:
+            skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
+            max1 = skept.max(-1).values
+            p1 = torch.softmax(skept, -1)
+            ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
+            gate = ent > self.thr_g
         qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
         qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
         if self._qside_t is None:
@@ -343,13 +353,18 @@ class RecallTier:
         Returns absolute pool indices of rows to fetch (possibly empty)."""
         sc_ = self.scale
         qe = qe.float()
-        skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
-        max1 = skept.max(-1).values  # [H]
-        p1 = torch.softmax(skept, -1)
-        ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
-        gate = ent > self.thr_g  # [H]
-        if not bool(gate.any()):
-            return self.arch[:0]
+        if self.kept_rows.shape[0] == 0:
+            H = qe.shape[0]
+            max1 = qe.new_full((H,), float("-inf"))  # no baseline: all eligible
+            gate = qe.new_ones(H, dtype=torch.bool)
+        else:
+            skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
+            max1 = skept.max(-1).values  # [H]
+            p1 = torch.softmax(skept, -1)
+            ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
+            gate = ent > self.thr_g  # [H]
+            if not bool(gate.any()):
+                return self.arch[:0]
         qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
         qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
         idxs = (
