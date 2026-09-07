@@ -91,8 +91,13 @@ class BatchedScanPack:
         dev = tiers[0].side.device
         self.q_heads = q_heads
         P = len(tiers)
-        NKm = int(max(t.kept_rows.shape[0] for t in tiers) * self.HEADROOM)
-        Am = int(max(t.side.shape[0] for t in tiers) * self.HEADROOM)
+        # Floor to 1: an all-empty-kept capture (every pair's tier-1 kept the
+        # empty set -- the re-prefill anomaly) would otherwise allocate a
+        # zero-width kr and crash skept.max(-1). One padded row, masked off by
+        # nk_len=0, keeps the reduction well-formed; the empty pair is served
+        # as full-archive recall below.
+        NKm = max(1, int(max(t.kept_rows.shape[0] for t in tiers) * self.HEADROOM))
+        Am = max(1, int(max(t.side.shape[0] for t in tiers) * self.HEADROOM))
         r = tiers[0].r
         self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
@@ -182,6 +187,12 @@ class BatchedScanPack:
         qsk = torch.bmm(qe[:, :, : D.KV_LORA_RANK], self.v.transpose(1, 2))
         qres = (qe[:, :, : D.KV_LORA_RANK] - torch.bmm(qsk, self.v)).norm(dim=-1)
         max1g = torch.where(gate, max1, self.inf)
+        # Empty tier-1 (nk_len==0): no max1 baseline, so every archived row is
+        # eligible -- force -inf to fire the whole archive (full attention),
+        # matching query_fixed. Softmax of an all-masked row is nan, which
+        # would otherwise close the gate and UNDER-recall; this overrides it.
+        empty_kept = (self.nk_len == 0)[:, None]
+        max1g = torch.where(empty_kept, torch.full_like(max1g, float("-inf")), max1g)
         qside_t = qe[:, :, D.KV_LORA_RANK :].transpose(1, 2).contiguous()
         qsk_t = qsk.transpose(1, 2).contiguous()
         P, Am = self.hit.shape

@@ -231,3 +231,48 @@ class TestKeptSetParityWithReference(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBatchedEmptyKept(CustomTestCase):
+    """All-empty-kept capture must not crash and must fire the whole archive."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "batched pack is device-only")
+    def test_all_empty_kept_fires_archive(self):
+        import sglang.srt.layers.attention.vestigekv.defaults as D
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
+
+        torch.manual_seed(0)
+        dev = "cuda"
+        H, A = 8, 96
+
+        class T:
+            pass
+
+        def mk():
+            t = T()
+            t.kept_rows = torch.zeros(0, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
+            t.V = torch.linalg.qr(torch.randn(D.KV_LORA_RANK, 16, device=dev))[
+                0
+            ].T.contiguous()
+            t.side = torch.randn(A, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+            t.csk = torch.randn(A, 16, device=dev, dtype=torch.float16)
+            t.rho = torch.rand(A, device=dev)
+            t.arch = torch.arange(A, device=dev)
+            t.a_len = A
+            t.thr_g = 0.0
+            t.zp = 4.0
+            t.scale = 1.0 / (D.LATENT_DIM ** 0.5)
+            t.r = 16
+            t.version = 0
+            return t
+
+        tiers = [mk(), mk()]
+        pairs = [(0, 0), (1, 1)]  # (li, slot) into the per-layer stacks
+        # buffers match _alloc_recall_bufs: [n_li, max_slots, ...]
+        qbuf = torch.randn(2, 2, H, D.LATENT_DIM, device=dev)
+        fetch_buf = torch.zeros(2, 2, A + 8, dtype=torch.int64, device=dev)
+        fetch_len = torch.zeros(2, 2, dtype=torch.int64, device=dev)
+        pack = BatchedScanPack(pairs, tiers, qbuf, fetch_buf, fetch_len, H)
+        pack.run()  # must not raise (was: zero-width kr -> max(-1) crash)
+        # empty kept => whole archive eligible; both pairs fire > 0 rows
+        self.assertGreater(int(fetch_len.sum()), 0)
