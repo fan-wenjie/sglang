@@ -1122,8 +1122,8 @@ class TestEmptyKeptRows(CustomTestCase):
             0
         ].T.contiguous()
         t.kept_rows = torch.zeros(0, D.LATENT_DIM, device=dev)  # empty tier-1
-        t.side = torch.randn(A, D.SIDECAR_DIM, device=dev)
-        t.csk = torch.randn(A, 16, device=dev)
+        t.side = torch.randn(A, D.SIDECAR_DIM, device=dev).to(torch.bfloat16)
+        t.csk = torch.randn(A, 16, device=dev).half()
         t.rho = torch.rand(A, device=dev)
         t.arch = torch.arange(A, device=dev)
         t.zp = 4.0

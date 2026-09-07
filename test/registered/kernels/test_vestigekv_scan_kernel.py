@@ -23,28 +23,35 @@ SCALE = 192**-0.5
 
 
 def _eager_fire(qside_t, qsk_t, qres, max1g, side, csk, rho, sc, cc):
-    idxs = (qside_t.T @ side.T + qsk_t.T @ csk.T) * sc
-    score = idxs + cc * (qres[:, None] * rho[None, :])
+    # Reference at full fp32: upcast BEFORE the matmul. A native fp16 matmul
+    # here would use torch's reduced-precision fp16 reduction (~1e-3 error)
+    # and the REFERENCE, not the kernel, becomes the inaccurate side --
+    # measured: two rows flipped by the eager path that fp64 says must not
+    # fire, while the kernel agreed with fp64. Products of bf16/fp16 inputs
+    # are exact in fp32, so this reference differs from the kernel only by
+    # fp32 accumulation order (~1e-6), covered by the boundary tolerance.
+    idxs = qside_t.T.float() @ side.T.float() + qsk_t.T.float() @ csk.T.float()
+    score = idxs * sc + cc * (qres[:, None] * rho[None, :])
     return (score > max1g[:, None]).any(0).to(torch.int32)
 
 
 class TestVestigeScanKernel(CustomTestCase):
-    def _case(self, A, seed, closed_heads=(), quantile=0.999):
+    def _case(self, A, seed, closed_heads=(), quantile=0.999, want_extras=False):
         from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
 
         dev = "cuda"
         g = torch.Generator(device=dev).manual_seed(seed)
         rnd = lambda *s: torch.randn(*s, device=dev, generator=g)  # noqa: E731
-        qside_t = rnd(D, H).contiguous()
-        qsk_t = rnd(R, H).contiguous()
+        qside_t = rnd(D, H).contiguous().to(torch.bfloat16)
+        qsk_t = rnd(R, H).contiguous().half()
         qres = torch.rand(H, device=dev, generator=g) * 2
-        side, csk = rnd(A, D), rnd(A, R)
+        side, csk = rnd(A, D).to(torch.bfloat16), rnd(A, R).half()
         rho = torch.rand(A, device=dev, generator=g) * 2
         cc = 2.0 * SCALE / (512 - R) ** 0.5
         # place the threshold where a realistic fraction of rows fires
-        score = (qside_t.T @ side.T + qsk_t.T @ csk.T) * SCALE + cc * (
-            qres[:, None] * rho[None, :]
-        )
+        score = (
+            qside_t.T.float() @ side.T.float() + qsk_t.T.float() @ csk.T.float()
+        ) * SCALE + cc * (qres[:, None] * rho[None, :])
         max1g = torch.full(
             (H,), torch.quantile(score.flatten().float(), quantile).item(), device=dev
         )
@@ -52,14 +59,38 @@ class TestVestigeScanKernel(CustomTestCase):
             max1g[h] = float("inf")  # a closed gate folded into the threshold
         ref = _eager_fire(qside_t, qsk_t, qres, max1g, side, csk, rho, SCALE, cc)
         got = vestige_scan(qside_t, qsk_t, qres, max1g, side, csk, rho, SCALE, cc)
+        if want_extras:
+            full = (
+                qside_t.T.float() @ side.T.float() + qsk_t.T.float() @ csk.T.float()
+            ) * SCALE + cc * (qres[:, None] * rho[None, :])
+            return ref, got, (full, max1g)
         return ref, got
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_matches_eager_across_archive_sizes(self):
+        # Native tensor-core dots have exact products but a different fp32
+        # accumulation ORDER than torch's eager matmul, so single rows whose
+        # score sits within float rounding of the threshold may flip. The
+        # contract is therefore: any disagreement must be a boundary row
+        # (score within eps of its head threshold), and there may be only a
+        # handful. Systematic errors (tf32-style truncation) would flip rows
+        # far from the boundary and fail this.
+        from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan  # noqa: F401
+
         for A in (4096, 16384, 58900):
-            ref, got = self._case(A, seed=A)
-            self.assertEqual(int((ref != got).sum()), 0, f"A={A}")
+            ref, got, boundary = self._case_with_boundary(A, seed=A)
+            dis = (ref != got).nonzero().flatten()
+            self.assertLessEqual(int(dis.numel()), max(4, A // 4096), f"A={A}")
+            for i in dis.tolist():
+                self.assertTrue(bool(boundary[i]), f"A={A} non-boundary row {i} flipped")
             self.assertGreater(int(ref.sum()), 0, "threshold left nothing firing")
+
+    def _case_with_boundary(self, A, seed, closed_heads=(), quantile=0.999):
+        ref, got, extras = self._case(A, seed, closed_heads, quantile, want_extras=True)
+        score, max1g = extras
+        margin = (score - max1g[:, None]).abs().min(0).values
+        eps = 1e-5 * (1 + score.abs().max())
+        return ref, got, margin < eps
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_closed_gates_never_fire(self):

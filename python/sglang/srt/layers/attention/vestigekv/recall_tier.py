@@ -213,9 +213,12 @@ class RecallTier:
             tgt_side = self.side[pa]  # [n_hard, 64]
             tgt_csk = self.csk[pa]  # [n_hard, r]
             tgt_rho = self.rho[pa]  # [n_hard]
-            idxs_t = (qh[:, D.KV_LORA_RANK :] * tgt_side).sum(-1) + (
-                qskh * tgt_csk
-            ).sum(-1)
+            # Same rounding as the serve-time scoring path: query operands
+            # rounded to the storage dtypes before the (exact-in-fp32)
+            # products, so zp is calibrated on exactly what the kernel scores.
+            idxs_t = (
+                qh[:, D.KV_LORA_RANK :].to(torch.bfloat16).float() * tgt_side.float()
+            ).sum(-1) + (qskh.half().float() * tgt_csk.float()).sum(-1)
             idxs_t = idxs_t * sc_
             cert_t = (
                 qresh * tgt_rho * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
@@ -276,8 +279,11 @@ class RecallTier:
         qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
         if self._qside_t is None:
             H = qe.shape[0]
-            self._qside_t = qe.new_empty(D.SIDECAR_DIM, H)
-            self._qsk_t = qe.new_empty(self.r, H)
+            # Storage dtypes, matching the kernel's native-dtype dots: bf16 for
+            # the sidecar branch (exact -- qbuf is bf16), fp16 for the sketch
+            # projection (rounded here AND at calibration, so zp covers it).
+            self._qside_t = qe.new_empty(D.SIDECAR_DIM, H, dtype=torch.bfloat16)
+            self._qsk_t = qe.new_empty(self.r, H, dtype=torch.float16)
             self._hit_buf = torch.empty(
                 self.side.shape[0], dtype=torch.int32, device=qe.device
             )
@@ -290,9 +296,9 @@ class RecallTier:
             # the score matrix the top-j selection ranks. The cap is explicit
             # opt-in; the default (uncapped) path is the fused one.
             idxs = (
-            qe[:, D.KV_LORA_RANK :] @ self.side.float().T
-            + qsk @ self.csk.float().T
-        ) * sc_
+                (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16) @ self.side.T).float()
+                + (qsk.half() @ self.csk.T).float()
+            ) * sc_
             cert = (
                 (qres[:, None] * self.rho[None, :])
                 * sc_
@@ -368,8 +374,8 @@ class RecallTier:
         qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
         qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
         idxs = (
-            qe[:, D.KV_LORA_RANK :] @ self.side.float().T
-            + qsk @ self.csk.float().T
+            (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16) @ self.side.T).float()
+            + (qsk.half() @ self.csk.T).float()
         ) * sc_
         cert = (
             (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5

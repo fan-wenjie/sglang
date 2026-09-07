@@ -23,8 +23,8 @@ from sglang.srt.layers.attention.vestigekv.defaults import SCAN_BLOCK_A, SCAN_NU
 
 @triton.jit
 def _vestige_scan_kernel(
-    qside_t_ptr,  # [D, H] fp32: the query's un-roped sidecar branch, transposed
-    qsk_t_ptr,  # [R, H]  fp32: its projection onto the rank-R sketch basis
+    qside_t_ptr,  # [D, H] bf16: query sidecar branch (bf16-exact from qbuf)
+    qsk_t_ptr,  # [R, H]  fp16: sketch projection, rounded to csk's dtype
     qres_ptr,  # [H]      fp32: residual norm outside that basis
     max1g_ptr,  # [H]     fp32: best kept-row score, +inf where the gate is closed
     side_ptr,  # [A, D]   bf16 storage, promoted to fp32 in-register
@@ -46,19 +46,19 @@ def _vestige_scan_kernel(
     h = tl.arange(0, H)
     # The two per-row loads that dominate the scan's traffic. Everything after
     # this stays in registers, across every head.
-    s = tl.load(
-        side_ptr + offs[:, None] * D + d[None, :], mask=m[:, None], other=0.0
-    ).to(tl.float32)
-    c = tl.load(
-        csk_ptr + offs[:, None] * R + r[None, :], mask=m[:, None], other=0.0
-    ).to(tl.float32)
+    s = tl.load(side_ptr + offs[:, None] * D + d[None, :], mask=m[:, None], other=0.0)
+    c = tl.load(csk_ptr + offs[:, None] * R + r[None, :], mask=m[:, None], other=0.0)
     rh = tl.load(rho_ptr + offs, mask=m, other=0.0)
     qs = tl.load(qside_t_ptr + d[:, None] * H + h[None, :])
     qk = tl.load(qsk_t_ptr + r[:, None] * H + h[None, :])
-    # input_precision="ieee" is required, not a preference: the tf32 path is
-    # 1.5x faster and disagrees with the reference fire set on 6 rows in 58900,
-    # which is a silent change to which rows the model attends.
-    acc = tl.dot(s, qs, input_precision="ieee") + tl.dot(c, qk, input_precision="ieee")
+    # Native-dtype tensor-core dots with fp32 accumulation. Every bf16/fp16
+    # product is EXACT in the fp32 accumulator (8/11-bit mantissas square
+    # under 24), so no tf32-style silent truncation exists here; the query
+    # operands are rounded to the storage dtype at the call site, and the
+    # conformal zp is calibrated on this exact scoring path (quantize-then-
+    # calibrate). The previous convert-to-fp32 ieee form ran the dot on CUDA
+    # cores and was 6.6x slower (538 vs 3601 GB/s effective, measured).
+    acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
     score = acc * sc + cc * rh[:, None] * tl.load(qres_ptr + h)[None, :]
     fired = tl.max((score > tl.load(max1g_ptr + h)[None, :]).to(tl.int32), 1)
     tl.store(hit_ptr + offs, fired, mask=m)
