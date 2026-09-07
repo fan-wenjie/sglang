@@ -80,6 +80,12 @@ class VestigeKVMLABackend(AttentionBackend):
     index_rank is the tier-2 sketch rank r.
     """
 
+    # pack-content epoch: class-level defaults so __new__-constructed test
+    # fixtures see them; bumped on every host-side tier mutation. When
+    # unchanged, the replay fast path skips per-step pairs/fits bookkeeping.
+    _pack_epoch = 0
+    _pack_epoch_synced = -1
+
     def __init__(
         self,
         base: AttentionBackend,
@@ -302,22 +308,26 @@ class VestigeKVMLABackend(AttentionBackend):
                 # rather than serving D.SCAN_CAPTURE_AFTER eager steps for a
                 # stability the key has already demonstrated.
                 return self._capture_scan(key, forward_batch, reqs)
-            real = forward_batch.out_cache_loc.shape[0]
-            tiers, pairs = [], []
-            for lid in self._mla_lids:
-                if lid in self._qbuf:
-                    for i in range(real):
-                        pairs.append((self._li_map[lid], reqs[i]))
-                        tiers.append(self._recall[(reqs[i], lid)]["tier"])
-            if self._scan_batched.tier_ids != tuple(
-                (id(t), getattr(t, "version", 0)) for t in tiers
-            ):
-                # New request in a slot, or a calibration install: same shape
-                # class, new contents. In-place update (~0.03 ms) instead of
-                # the ~30-55 ms recapture this used to force.
-                if not self._scan_batched.fits(pairs, tiers):
-                    return self._capture_scan(key, forward_batch, reqs)
-                self._scan_batched.update(pairs, tiers)
+            if self._pack_epoch != self._pack_epoch_synced:
+                # Slow path only when a host-side tier mutation happened
+                # (install/close/prefill): rebuild the pair list and resync
+                # the pack. Steady-state decode skips all of this -- the
+                # per-step tuple build over id()/version was measurable host
+                # time for bookkeeping that could not have changed.
+                real = forward_batch.out_cache_loc.shape[0]
+                tiers, pairs = [], []
+                for lid in self._mla_lids:
+                    if lid in self._qbuf:
+                        for i in range(real):
+                            pairs.append((self._li_map[lid], reqs[i]))
+                            tiers.append(self._recall[(reqs[i], lid)]["tier"])
+                if self._scan_batched.tier_ids != tuple(
+                    (id(t), getattr(t, "version", 0)) for t in tiers
+                ):
+                    if not self._scan_batched.fits(pairs, tiers):
+                        return self._capture_scan(key, forward_batch, reqs)
+                    self._scan_batched.update(pairs, tiers)
+                self._pack_epoch_synced = self._pack_epoch
             self._stage_slots[:real].copy_(
                 forward_batch.req_pool_indices[:real], non_blocking=True
             )
@@ -479,6 +489,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._scan_capture_failed = self._scan_fails >= D.SCAN_CAPTURE_MAX_FAILS
             return False
         self._scan_graph, self._scan_key_cur, self._scan_kmax = graph, key, baked
+        self._pack_epoch_synced = self._pack_epoch
         self._scan_batched = batched  # the graph reads/writes its tensors
         self._scan_fails = 0
         # _run executed three times so far (two warmups plus the capture), and
@@ -497,6 +508,7 @@ class VestigeKVMLABackend(AttentionBackend):
         return True
 
     def _invalidate_scan(self):
+        self._pack_epoch += 1
         # Contents (a new request's tiers, a calibration install) no longer
         # drop the capture: the replay path compares tier identities and
         # refreshes the pack in place. What must still reset here is the
@@ -1053,6 +1065,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 delta = closed_slots[cached:c1]
                 tier.extend_closed(kbuf[delta], delta)
             tier.refresh_membership(keep, kbuf[kept_slots])
+            self._pack_epoch += 1
 
     def _collect_calibration(self, forward_batch, reqs):
         """Keep tier 2 serving from the first decode step while calibrating it
