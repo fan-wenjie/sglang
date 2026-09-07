@@ -146,3 +146,133 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None):
         num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
+
+
+# ---- split-NK variant: flash-decoding style parallelism over kept rows ----
+# The single-kernel form launches one CTA per pair (P ~= 7): >90% of the GPU
+# idles and the kept sweep runs at 140 GB/s. Splitting the NK loop across a
+# 2D grid restores occupancy; partials (m, s, t) merge exactly (the online-
+# softmax rescale identity), so the result matches the unsplit form up to
+# fp32 accumulation order.
+
+
+@triton.jit
+def _prologue_qside_kernel(
+    q_ptr, v_ptr, qside_t_ptr, qsk_t_ptr, qres_ptr,
+    H: tl.constexpr, R: tl.constexpr, KV: tl.constexpr, DD: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    p = tl.program_id(0)
+    h = tl.arange(0, H)
+    r = tl.arange(0, R)
+    qsk = tl.zeros([H, R], dtype=tl.float32)
+    qnorm2 = tl.zeros([H], dtype=tl.float32)
+    for d0 in range(0, KV, BLOCK_D):
+        d = d0 + tl.arange(0, BLOCK_D)
+        qc = tl.load(q_ptr + p * H * 576 + h[:, None] * 576 + d[None, :])
+        vc = tl.load(v_ptr + p * R * KV + r[:, None] * KV + d[None, :])
+        qsk += tl.dot(qc, tl.trans(vc), input_precision="ieee")
+        qnorm2 += tl.sum(qc * qc, 1)
+    qres = tl.sqrt(tl.maximum(qnorm2 - tl.sum(qsk * qsk, 1), 0.0))
+    tl.store(qres_ptr + p * H + h, qres)
+    dd = tl.arange(0, DD)
+    qside = tl.load(q_ptr + p * H * 576 + h[:, None] * 576 + (KV + dd)[None, :])
+    tl.store(qside_t_ptr + p * DD * H + dd[:, None] * H + h[None, :],
+             tl.trans(qside).to(tl.bfloat16))
+    tl.store(qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
+             tl.trans(qsk).to(tl.float16))
+
+
+@triton.jit
+def _prologue_scores_kernel(
+    q_ptr, kr_ptr, nk_len_ptr,
+    pm_ptr, ps_ptr, pt_ptr,  # [P, NSPLIT, H] partials
+    sc, NKm, NSPLIT: tl.constexpr,
+    H: tl.constexpr, BLOCK_NK: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    p = tl.program_id(0)
+    sp = tl.program_id(1)
+    h = tl.arange(0, H)
+    nk = tl.load(nk_len_ptr + p)
+    span = (NKm + NSPLIT - 1) // NSPLIT
+    lo = sp * span
+    hi = tl.minimum(lo + span, NKm)
+    e_max = tl.zeros([H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([H], dtype=tl.float32)
+    x_sum = tl.zeros([H], dtype=tl.float32)
+    for nk0 in range(lo, hi, BLOCK_NK):
+        offs = nk0 + tl.arange(0, BLOCK_NK)
+        mrow = (offs < hi) & (offs < nk)
+        qk = tl.zeros([H, BLOCK_NK], dtype=tl.float32)
+        for d0 in range(0, 576, BLOCK_D):
+            d = d0 + tl.arange(0, BLOCK_D)
+            qc = tl.load(q_ptr + p * H * 576 + h[:, None] * 576 + d[None, :])
+            kc = tl.load(kr_ptr + p * NKm * 576 + offs[:, None] * 576 + d[None, :],
+                         mask=mrow[:, None], other=0.0)
+            qk += tl.dot(qc.to(tl.bfloat16), tl.trans(kc)).to(tl.float32)
+        x = tl.where(mrow[None, :], qk * sc, -float("inf"))
+        n_max = tl.maximum(tl.max(x, 1), e_max)
+        alive = n_max > -float("inf")
+        n_safe = tl.where(alive, n_max, 0.0)
+        rescale = tl.where(alive, tl.exp(e_max - n_safe), 1.0)
+        pexp = tl.where(mrow[None, :], tl.exp(x - n_safe[:, None]), 0.0)
+        e_sum = e_sum * rescale + tl.sum(pexp, 1)
+        x_sum = x_sum * rescale + tl.sum(pexp * tl.where(mrow[None, :], x, 0.0), 1)
+        e_max = n_max
+    base = p * NSPLIT * H + sp * H
+    tl.store(pm_ptr + base + h, e_max)
+    tl.store(ps_ptr + base + h, e_sum)
+    tl.store(pt_ptr + base + h, x_sum)
+
+
+@triton.jit
+def _prologue_merge_kernel(
+    pm_ptr, ps_ptr, pt_ptr, nk_len_ptr, thr_ptr, max1g_ptr,
+    NSPLIT: tl.constexpr, H: tl.constexpr,
+):
+    p = tl.program_id(0)
+    h = tl.arange(0, H)
+    sp = tl.arange(0, NSPLIT)
+    base = p * NSPLIT * H
+    m = tl.load(pm_ptr + base + sp[:, None] * H + h[None, :])
+    s = tl.load(ps_ptr + base + sp[:, None] * H + h[None, :])
+    t = tl.load(pt_ptr + base + sp[:, None] * H + h[None, :])
+    gm = tl.max(m, 0)
+    alive = gm > -float("inf")
+    gm_safe = tl.where(alive, gm, 0.0)
+    w = tl.exp(m - gm_safe[None, :])
+    w = tl.where(m > -float("inf"), w, 0.0)
+    gs = tl.sum(s * w, 0)
+    gt = tl.sum(t * w, 0)
+    nk = tl.load(nk_len_ptr + p)
+    thr = tl.load(thr_ptr + p)
+    nonempty = (gs > 0.0) & (nk > 0)
+    lse = gm + tl.log(tl.where(nonempty, gs, 1.0))
+    ent = lse - gt / tl.where(nonempty, gs, 1.0)
+    gate = (ent > thr) | (~nonempty)
+    max1 = tl.where(nonempty, gm, -float("inf"))
+    tl.store(max1g_ptr + p * H + h, tl.where(gate, max1, float("inf")))
+
+
+_NSPLIT = 32
+
+
+def fused_prologue_split(q, kr, v, nk_len, thr, sc, out, partials):
+    """Split-NK prologue: same outputs as fused_prologue, occupancy-correct."""
+    P, H, _ = q.shape
+    NKm = kr.shape[1]
+    R = v.shape[1]
+    max1g, qside_t, qsk_t, qres = out
+    pm, ps, pt = partials
+    _prologue_qside_kernel[(P,)](
+        q, v, qside_t, qsk_t, qres,
+        H=H, R=R, KV=D.KV_LORA_RANK, DD=D.SIDECAR_DIM, BLOCK_D=64, num_warps=4,
+    )
+    _prologue_scores_kernel[(P, _NSPLIT)](
+        q, kr, nk_len, pm, ps, pt, sc, NKm, NSPLIT=_NSPLIT,
+        H=H, BLOCK_NK=64, BLOCK_D=64, num_warps=4,
+    )
+    _prologue_merge_kernel[(P,)](
+        pm, ps, pt, nk_len, thr, max1g, NSPLIT=_NSPLIT, H=H, num_warps=1,
+    )
+    return max1g, qside_t, qsk_t, qres

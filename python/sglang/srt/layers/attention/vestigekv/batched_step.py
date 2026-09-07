@@ -22,7 +22,10 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
-from sglang.srt.layers.attention.vestigekv.fused_prologue import fused_prologue
+from sglang.srt.layers.attention.vestigekv.fused_prologue import (
+    _NSPLIT,
+    fused_prologue_split,
+)
 
 
 @triton.jit
@@ -129,6 +132,9 @@ class BatchedScanPack:
         self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=torch.float16)
         self.qres = torch.zeros(P, H, device=dev)
         self.thr_flat = torch.zeros(P, device=dev)
+        self.pm = torch.zeros(P, _NSPLIT, H, device=dev)
+        self.ps = torch.zeros(P, _NSPLIT, H, device=dev)
+        self.pt = torch.zeros(P, _NSPLIT, H, device=dev)
         self.scratch = torch.zeros(P, W + 1, dtype=torch.int64, device=dev)
         self.qbuf, self.fetch_buf, self.fetch_len = qbuf, fetch_buf, fetch_len
         self.update(pairs, tiers)
@@ -193,7 +199,7 @@ class BatchedScanPack:
         # dominated the captured graph (VKSTATS S-sweep). Empty tier-1 pairs
         # (nk_len==0) come back with max1g=-inf: whole archive fires, full
         # attention, never under-recall.
-        fused_prologue(
+        fused_prologue_split(
             qe.contiguous(),
             self.kr,
             self.v,
@@ -201,6 +207,7 @@ class BatchedScanPack:
             self.thr_flat,
             sc,
             out=(self.max1g, self.qside_t, self.qsk_t, self.qres),
+            partials=(self.pm, self.ps, self.pt),
         )
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
         P, Am = self.hit.shape
