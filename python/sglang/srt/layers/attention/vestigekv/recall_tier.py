@@ -21,6 +21,7 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
+from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
 
 
@@ -54,6 +55,7 @@ class RecallTier:
         # fixed-address staging for the fused scan (capturable)
         self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
 
+    @ieee_fp32
     @torch.inference_mode()
     def build(
         self,
@@ -101,19 +103,30 @@ class RecallTier:
         # mem-fraction, is why an in-server build cost 3.8x its isolated time.
         A = int(self.arch.numel())
         arch_slots = row_slots[self.arch]
-        self.csk = torch.empty(A, self.r, device=dev, dtype=torch.float32)
+        # Storage precision (gated): side at bf16 is BIT-EXACT relative to the
+        # bf16 pool it is copied from (the old fp32 store was an uninformative
+        # upcast); csk keeps fp16 -- it is an fp32 GEMM product and the fire
+        # decision compares scores near a threshold, so the 11-bit mantissa
+        # (vs bf16's 8) matters, while its magnitude sits far below the fp16
+        # range cap, asserted below; rho stays fp32 (4 B/row, why touch it).
+        # Scan traffic drops 516 -> 260 B/row: slope ratio 0.475 -> 0.256.
+        # Accumulation everywhere stays fp32/ieee (the tf32 lesson).
+        self.csk = torch.empty(A, self.r, device=dev, dtype=torch.float16)
         self.rho = torch.empty(A, device=dev, dtype=torch.float32)
-        self.side = torch.empty(A, D.SIDECAR_DIM, device=dev, dtype=torch.float32)
+        self.side = torch.empty(A, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
         for a0 in range(0, A, D.BUILD_ROW_CHUNK):
             a1 = min(a0 + D.BUILD_ROW_CHUNK, A)
             blk = kbuf[arch_slots[a0:a1]].float()
             content = blk[:, : D.KV_LORA_RANK]
             c = content @ V.T
-            self.csk[a0:a1] = c
+            torch._assert_async(
+                (c.abs().amax() < 6e4).to(torch.bool)
+            )  # fp16 range guard: a violation here is a model-scale anomaly
+            self.csk[a0:a1] = c.half()
             self.rho[a0:a1] = (content - c @ V).norm(dim=-1)
-            self.side[a0:a1] = blk[:, D.KV_LORA_RANK :]
+            self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
             del blk, content, c
-        self.kept_rows = kbuf[row_slots[keep]].float()
+        self.kept_rows = kbuf[row_slots[keep]].to(torch.bfloat16)
 
         if conservative:
             # Provisional index: serve immediately, calibrate nothing. Fitting
@@ -161,7 +174,7 @@ class RecallTier:
         del best_val
         hard = ~keep[tgt]
 
-        skept = (qe @ self.kept_rows.T) * sc_
+        skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
         p1 = torch.softmax(skept, -1)
         ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
         max1 = skept.max(-1).values
@@ -233,6 +246,7 @@ class RecallTier:
         }
 
     @torch.inference_mode()
+    @ieee_fp32
     def query_fixed(
         self, qe: torch.Tensor, out: torch.Tensor, out_len: torch.Tensor, slot: int
     ) -> None:
@@ -243,7 +257,7 @@ class RecallTier:
         truncated -- W is sized above the observed worst fire."""
         sc_ = self.scale
         qe = qe.float()
-        skept = (qe @ self.kept_rows.T) * sc_
+        skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
         max1 = skept.max(-1).values
         p1 = torch.softmax(skept, -1)
         ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
@@ -265,7 +279,10 @@ class RecallTier:
             # form: the fused kernel reduces over heads and never materializes
             # the score matrix the top-j selection ranks. The cap is explicit
             # opt-in; the default (uncapped) path is the fused one.
-            idxs = (qe[:, D.KV_LORA_RANK :] @ self.side.T + qsk @ self.csk.T) * sc_
+            idxs = (
+            qe[:, D.KV_LORA_RANK :] @ self.side.float().T
+            + qsk @ self.csk.float().T
+        ) * sc_
             cert = (
                 (qres[:, None] * self.rho[None, :])
                 * sc_
@@ -320,12 +337,13 @@ class RecallTier:
         out_len[slot] = n
 
     @torch.inference_mode()
+    @ieee_fp32
     def query(self, qe: torch.Tensor) -> torch.Tensor:
         """qe: [H, 576] one decode step's expanded queries (float).
         Returns absolute pool indices of rows to fetch (possibly empty)."""
         sc_ = self.scale
         qe = qe.float()
-        skept = (qe @ self.kept_rows.T) * sc_
+        skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
         max1 = skept.max(-1).values  # [H]
         p1 = torch.softmax(skept, -1)
         ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
@@ -334,7 +352,10 @@ class RecallTier:
             return self.arch[:0]
         qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
         qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
-        idxs = (qe[:, D.KV_LORA_RANK :] @ self.side.T + qsk @ self.csk.T) * sc_
+        idxs = (
+            qe[:, D.KV_LORA_RANK :] @ self.side.float().T
+            + qsk @ self.csk.float().T
+        ) * sc_
         cert = (
             (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
         )
@@ -350,6 +371,7 @@ class RecallTier:
         return self.arch[fetch.any(0)]
 
 
+    @ieee_fp32
     @torch.inference_mode()
     def extend_closed(self, new_rows: torch.Tensor, new_slots: torch.Tensor) -> None:
         """Append a newly CLOSED block to the projection caches.
@@ -358,18 +380,21 @@ class RecallTier:
         if self._side_all is None:
             dev = new_rows.device
             self._pos_all = torch.zeros(0, dtype=torch.int64, device=dev)
-            self._side_all = torch.zeros(0, D.SIDECAR_DIM, device=dev)
-            self._csk_all = torch.zeros(0, self.r, device=dev)
+            self._side_all = torch.zeros(
+                0, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16
+            )
+            self._csk_all = torch.zeros(0, self.r, device=dev, dtype=torch.float16)
             self._rho_all = torch.zeros(0, device=dev)
         Cf = new_rows.float()
         csk = Cf[:, : D.KV_LORA_RANK] @ self.V.T
-        side = Cf[:, D.KV_LORA_RANK :]
+        side = new_rows[:, D.KV_LORA_RANK :].to(torch.bfloat16)
         rho = (Cf[:, : D.KV_LORA_RANK] - csk @ self.V).norm(dim=-1)
         self._side_all = torch.cat([self._side_all, side])
-        self._csk_all = torch.cat([self._csk_all, csk])
+        self._csk_all = torch.cat([self._csk_all, csk.half()])
         self._rho_all = torch.cat([self._rho_all, rho])
         self._pos_all = torch.cat([self._pos_all, new_slots])
 
+    @ieee_fp32
     @torch.inference_mode()
     def refresh_membership(self, keep: torch.Tensor, kept_rows: torch.Tensor) -> None:
         """Re-derive the archive from a NEW keep mask over all closed rows.
@@ -381,6 +406,6 @@ class RecallTier:
         self.csk = self._csk_all[arch_idx].contiguous()
         self.rho = self._rho_all[arch_idx].contiguous()
         self.arch = self._pos_all[arch_idx].contiguous()
-        self.kept_rows = kept_rows.float()
+        self.kept_rows = kept_rows.to(torch.bfloat16)
         self._qside_t = self._qsk_t = self._hit_buf = None  # re-size lazily
         self.version += 1
