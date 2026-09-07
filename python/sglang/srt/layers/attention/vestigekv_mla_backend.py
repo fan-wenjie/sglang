@@ -398,6 +398,15 @@ class VestigeKVMLABackend(AttentionBackend):
                     pack_tiers.append(self._recall[(reqs[i], lid)]["tier"])
         import time as _t
 
+        # Release the outgoing graph and pack BEFORE building the replacement:
+        # holding both alive doubles the pack's peak footprint, and at
+        # mem-fraction 0.88 the post-pool headroom is ~1.3 GB -- a recapture
+        # OOMed the scheduler on exactly this transient (156 MB alloc with
+        # 85 MB free). The capture that follows rebuilds everything it needs.
+        self._scan_graph = None
+        self._scan_batched = None
+        torch.cuda.empty_cache()
+
         _p0 = _t.perf_counter()
         batched = BatchedScanPack(
             pack_pairs,
