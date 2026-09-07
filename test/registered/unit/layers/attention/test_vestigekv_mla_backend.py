@@ -1147,3 +1147,26 @@ class TestEmptyKeptRows(CustomTestCase):
         out_len = torch.zeros(1, dtype=torch.int64, device="cuda")
         t.query_fixed(qe, out, out_len, 0)  # must not raise
         self.assertGreaterEqual(int(out_len[0]), 0)
+
+
+class TestEpochFastPathLocals(CustomTestCase):
+    """The epoch fast path must not reference slow-path locals.
+
+    Regression: `real` was defined only inside the epoch-mismatch branch but
+    used by the stage copies after it; the first steady-state fast-path step
+    raised UnboundLocalError and killed the scheduler (unit tests had only
+    exercised the slow path).
+    """
+
+    def test_fast_path_body_defines_real_before_branch(self):
+        import inspect
+
+        from sglang.srt.layers.attention.vestigekv_mla_backend import (
+            VestigeKVMLABackend,
+        )
+
+        src = inspect.getsource(VestigeKVMLABackend._replay_scan)
+        # `real = ...` must appear before the epoch branch in the same block
+        i_real = src.index("real = forward_batch.out_cache_loc.shape[0]")
+        i_branch = src.index("_pack_epoch != self._pack_epoch_synced")
+        self.assertLess(i_real, i_branch)

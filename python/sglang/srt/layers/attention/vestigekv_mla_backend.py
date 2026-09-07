@@ -308,13 +308,13 @@ class VestigeKVMLABackend(AttentionBackend):
                 # rather than serving D.SCAN_CAPTURE_AFTER eager steps for a
                 # stability the key has already demonstrated.
                 return self._capture_scan(key, forward_batch, reqs)
+            real = forward_batch.out_cache_loc.shape[0]
             if self._pack_epoch != self._pack_epoch_synced:
                 # Slow path only when a host-side tier mutation happened
                 # (install/close/prefill): rebuild the pair list and resync
                 # the pack. Steady-state decode skips all of this -- the
                 # per-step tuple build over id()/version was measurable host
                 # time for bookkeeping that could not have changed.
-                real = forward_batch.out_cache_loc.shape[0]
                 tiers, pairs = [], []
                 for lid in self._mla_lids:
                     if lid in self._qbuf:
