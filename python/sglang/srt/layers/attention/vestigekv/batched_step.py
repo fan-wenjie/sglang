@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 from sglang.srt.layers.attention.vestigekv.fused_prologue import (
     _NSPLIT,
+    compact_fired,
     fused_prologue_split,
 )
 
@@ -135,6 +136,10 @@ class BatchedScanPack:
         self.pm = torch.zeros(P, _NSPLIT, H, device=dev)
         self.ps = torch.zeros(P, _NSPLIT, H, device=dev)
         self.pt = torch.zeros(P, _NSPLIT, H, device=dev)
+        NB = (Am + 1023) // 1024
+        self.c_counts = torch.zeros(P, NB, dtype=torch.int32, device=dev)
+        self.c_offsets = torch.zeros(P, NB, dtype=torch.int32, device=dev)
+        self.c_total = torch.zeros(P, dtype=torch.int32, device=dev)
         self.scratch = torch.zeros(P, W + 1, dtype=torch.int64, device=dev)
         self.qbuf, self.fetch_buf, self.fetch_len = qbuf, fetch_buf, fetch_len
         self.update(pairs, tiers)
@@ -191,7 +196,6 @@ class BatchedScanPack:
     @ieee_fp32
     def run(self):
         sc = self.scale
-        W = self.fetch_buf.shape[-1]
         qe = self.qbuf[self.li, self.slot].float()  # [P, H, 576], one gather+cast
         # Fused prologue: skept/softmax/entropy/gate/qsk/qres/max1g and the
         # transpose-casts in ONE kernel (see fused_prologue.py). Replaces the
@@ -230,13 +234,10 @@ class BatchedScanPack:
             BLOCK_A=D.SCAN_BLOCK_A,
             num_warps=D.SCAN_NUM_WARPS,
         )
-        hit = self.hit != 0
-        n = hit.sum(-1).clamp(max=W)
-        pos = torch.cumsum(hit.to(torch.int64), -1) - 1
-        dst = torch.where(hit & (pos < W), pos, W)
-        self.scratch.zero_()
-        self.scratch.scatter_(1, dst, self.arch)
-        self.fetch_buf[self.li, self.slot] = self.scratch[:, :W].to(
-            self.fetch_buf.dtype
+        # Deterministic two-phase Triton compaction: the torch chain's int64
+        # cumsum alone cost 157 us/step at 128k (nsys, 1.5x the scan kernel).
+        compact_fired(
+            self.hit, self.arch, self.a_len, self.li, self.slot,
+            self.fetch_buf, self.fetch_len,
+            (self.c_counts, self.c_offsets, self.c_total),
         )
-        self.fetch_len[self.li, self.slot] = n
