@@ -22,6 +22,7 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
+from sglang.srt.layers.attention.vestigekv.fused_prologue import fused_prologue
 
 
 @triton.jit
@@ -121,6 +122,13 @@ class BatchedScanPack:
         # (masked by a_len), so anything there at init is there forever --
         # torch.empty garbage would read as fired rows of ARCH padding.
         self.hit = torch.zeros(P, Am, dtype=torch.int32, device=dev)
+        # fixed-address fused-prologue outputs (graph reads/writes in place)
+        H = q_heads
+        self.max1g = torch.zeros(P, H, device=dev)
+        self.qside_t = torch.zeros(P, D.SIDECAR_DIM, H, device=dev, dtype=torch.bfloat16)
+        self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=torch.float16)
+        self.qres = torch.zeros(P, H, device=dev)
+        self.thr_flat = torch.zeros(P, device=dev)
         self.scratch = torch.zeros(P, W + 1, dtype=torch.int64, device=dev)
         self.qbuf, self.fetch_buf, self.fetch_len = qbuf, fetch_buf, fetch_len
         self.update(pairs, tiers)
@@ -162,6 +170,7 @@ class BatchedScanPack:
             self.a_len[i] = av
             self.nk_len[i] = nk
             self.thr[i, 0] = t.thr_g
+            self.thr_flat[i] = t.thr_g
             self.cc[i] = t.zp * t.scale / (D.KV_LORA_RANK - t.r) ** 0.5
         # copy_, not reassignment: the captured graph reads THIS tensor's
         # address; a fresh tensor here would silently detach every later
@@ -178,34 +187,28 @@ class BatchedScanPack:
         sc = self.scale
         W = self.fetch_buf.shape[-1]
         qe = self.qbuf[self.li, self.slot].float()  # [P, H, 576], one gather+cast
-        skept = torch.bmm(qe.to(torch.bfloat16), self.kr.transpose(1, 2)).float()
-        skept.mul_(sc)
-        skept.masked_fill_(self.nk_mask, float("-inf"))
-        max1 = skept.max(-1).values
-        p1 = torch.softmax(skept, -1)
-        ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
-        gate = ent > self.thr
-        qsk = torch.bmm(qe[:, :, : D.KV_LORA_RANK], self.v.transpose(1, 2))
-        qres = (qe[:, :, : D.KV_LORA_RANK] - torch.bmm(qsk, self.v)).norm(dim=-1)
-        max1g = torch.where(gate, max1, self.inf)
-        # Empty tier-1 (nk_len==0): no max1 baseline, so every archived row is
-        # eligible -- force -inf to fire the whole archive (full attention),
-        # matching query_fixed. Softmax of an all-masked row is nan, which
-        # would otherwise close the gate and UNDER-recall; this overrides it.
-        empty_kept = (self.nk_len == 0)[:, None]
-        max1g = torch.where(empty_kept, torch.full_like(max1g, float("-inf")), max1g)
-        # storage dtypes for the native-dtype dots: bf16 exact (qbuf is bf16),
-        # fp16 rounding covered by calibration (same rounding in build's zp fit)
-        qside_t = (
-            qe[:, :, D.KV_LORA_RANK :].transpose(1, 2).contiguous().to(torch.bfloat16)
+        # Fused prologue: skept/softmax/entropy/gate/qsk/qres/max1g and the
+        # transpose-casts in ONE kernel (see fused_prologue.py). Replaces the
+        # ~12-launch eager chain whose fixed ~0.57 ms execution intercept
+        # dominated the captured graph (VKSTATS S-sweep). Empty tier-1 pairs
+        # (nk_len==0) come back with max1g=-inf: whole archive fires, full
+        # attention, never under-recall.
+        fused_prologue(
+            qe.contiguous(),
+            self.kr,
+            self.v,
+            self.nk_len,
+            self.thr_flat,
+            sc,
+            out=(self.max1g, self.qside_t, self.qsk_t, self.qres),
         )
-        qsk_t = qsk.transpose(1, 2).contiguous().half()
+        qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
         P, Am = self.hit.shape
         _scan_batched_kernel[(triton.cdiv(Am, D.SCAN_BLOCK_A), P)](
             qside_t,
             qsk_t,
-            qres.contiguous(),
-            max1g.contiguous(),
+            qres,
+            max1g,
             self.side,
             self.csk,
             self.rho,
