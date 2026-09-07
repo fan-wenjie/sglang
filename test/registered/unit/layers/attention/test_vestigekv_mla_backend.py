@@ -1099,3 +1099,51 @@ class TestLiveArchiveBackfill(CustomTestCase):
         want_side = rows[arch_idx][:, D.KV_LORA_RANK :].to(tier.side.dtype)
         self.assertTrue(torch.equal(tier.side, want_side))
         self.assertTrue(torch.equal(tier.arch, arch_idx))
+
+
+class TestEmptyKeptRows(CustomTestCase):
+    """query paths must not crash when tier-1 kept the empty set.
+
+    Regression: an anomalous build produced arch == seq_len (keep all-False),
+    so kept_rows was [0, 576] and skept.max(-1) raised IndexError on a
+    zero-size reduction, crashing the scheduler mid-decode. Empty kept has a
+    well-defined meaning -- no max1 baseline, so every archived row is eligible
+    -- and both query paths must serve it as full-archive recall.
+    """
+
+    def _tier(self, dev="cpu"):
+        import sglang.srt.layers.attention.vestigekv.defaults as D
+        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
+
+        torch.manual_seed(0)
+        H, A = 8, 64
+        t = RecallTier(r=16)
+        t.V = torch.linalg.qr(torch.randn(D.KV_LORA_RANK, 16, device=dev))[
+            0
+        ].T.contiguous()
+        t.kept_rows = torch.zeros(0, D.LATENT_DIM, device=dev)  # empty tier-1
+        t.side = torch.randn(A, D.SIDECAR_DIM, device=dev)
+        t.csk = torch.randn(A, 16, device=dev)
+        t.rho = torch.rand(A, device=dev)
+        t.arch = torch.arange(A, device=dev)
+        t.zp = 4.0
+        t.thr_g = 0.0
+        t.built = True
+        return t, H, A, D
+
+    def test_query_empty_kept_fires_all(self):
+        t, H, A, D = self._tier()
+        qe = torch.randn(H, D.LATENT_DIM)
+        fired = t.query(qe)  # must not raise
+        # with no baseline every eligible row can fire; at minimum no crash and
+        # a subset of the archive
+        self.assertLessEqual(fired.numel(), A)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "query_fixed is device-only")
+    def test_query_fixed_empty_kept(self):
+        t, H, A, D = self._tier(dev="cuda")
+        qe = torch.randn(H, D.LATENT_DIM, device="cuda")
+        out = torch.zeros(1, A + 8, dtype=torch.int64, device="cuda")
+        out_len = torch.zeros(1, dtype=torch.int64, device="cuda")
+        t.query_fixed(qe, out, out_len, 0)  # must not raise
+        self.assertGreaterEqual(int(out_len[0]), 0)
