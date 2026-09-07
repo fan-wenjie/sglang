@@ -21,6 +21,7 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
+from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
 
 
@@ -50,6 +51,7 @@ class RecallTier:
         # fixed-address staging for the fused scan (capturable)
         self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
 
+    @ieee_fp32
     @torch.inference_mode()
     def build(
         self,
@@ -237,6 +239,7 @@ class RecallTier:
         }
 
     @torch.inference_mode()
+    @ieee_fp32
     def query_fixed(
         self, qe: torch.Tensor, out: torch.Tensor, out_len: torch.Tensor, slot: int
     ) -> None:
@@ -327,6 +330,7 @@ class RecallTier:
         out_len[slot] = n
 
     @torch.inference_mode()
+    @ieee_fp32
     def query(self, qe: torch.Tensor) -> torch.Tensor:
         """qe: [H, 576] one decode step's expanded queries (float).
         Returns absolute pool indices of rows to fetch (possibly empty)."""
@@ -360,6 +364,7 @@ class RecallTier:
         return self.arch[fetch.any(0)]
 
 
+    @ieee_fp32
     @torch.inference_mode()
     def extend_closed(self, new_rows: torch.Tensor, new_slots: torch.Tensor) -> None:
         """Append a newly CLOSED block to the projection caches.
@@ -382,6 +387,7 @@ class RecallTier:
         self._rho_all = torch.cat([self._rho_all, rho])
         self._pos_all = torch.cat([self._pos_all, new_slots])
 
+    @ieee_fp32
     @torch.inference_mode()
     def refresh_membership(self, keep: torch.Tensor, kept_rows: torch.Tensor) -> None:
         """Re-derive the archive from a NEW keep mask over all closed rows.
