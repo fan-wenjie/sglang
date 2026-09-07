@@ -1054,3 +1054,47 @@ class TestDecodeTimeBlockClose(CustomTestCase):
         del be._close_state[(0, self.LID2)]
         be._maybe_close_blocks(self._fb(60000), [0])  # must not raise
         self.assertEqual(be._close_state, {})
+
+class TestLiveArchiveBackfill(CustomTestCase):
+    """The close path's backfill watermark must match the cache contents.
+
+    Regression: build left _pos_all eagerly set (full prefix) while
+    side/csk stayed None-until-first-close, so the first serving close
+    appended only the new block yet refresh_membership indexed it with
+    full-prefix indices; the conservative build path additionally crashed
+    with AttributeError (_pos_all never initialized). Protocol under test
+    is the one _close_one_block runs: watermark -> extend_closed(delta)
+    -> refresh_membership(keep over ALL closed rows).
+    """
+
+    def _run_protocol(self, tier, rows, c1):
+        cached = 0 if tier._pos_all is None else tier._pos_all.shape[0]
+        slots = torch.arange(c1)
+        if cached < c1:
+            tier.extend_closed(rows[cached:c1], slots[cached:])
+        keep = torch.zeros(c1, dtype=torch.bool)
+        keep[:: 3] = True
+        tier.refresh_membership(keep, rows[keep])
+        return keep
+
+    def test_backfill_aligns_archive_after_first_close(self):
+        import sglang.srt.layers.attention.vestigekv.defaults as D
+        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
+
+        torch.manual_seed(0)
+        c1 = 640
+        rows = torch.randn(c1, D.LATENT_DIM)
+        tier = RecallTier(r=16)
+        # conservative-shaped tier: built without the full-build tail
+        tier.V = torch.linalg.qr(torch.randn(D.KV_LORA_RANK, 16))[0].T.contiguous()
+        tier.built = True
+        # __init__ must have made the watermark readable (AttributeError fix)
+        self.assertIsNone(tier._pos_all)
+        keep = self._run_protocol(tier, rows, c1)
+        arch_idx = (~keep).nonzero().flatten()
+        # cache rows must be the projections of exactly the archived rows
+        self.assertEqual(tier._pos_all.shape[0], c1)
+        self.assertEqual(tier.side.shape[0], arch_idx.shape[0])
+        want_side = rows[arch_idx][:, D.KV_LORA_RANK :].to(tier.side.dtype)
+        self.assertTrue(torch.equal(tier.side, want_side))
+        self.assertTrue(torch.equal(tier.arch, arch_idx))
