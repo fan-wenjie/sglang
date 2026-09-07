@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
+from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 
 
 @triton.jit
@@ -48,16 +49,17 @@ def _scan_batched_kernel(
     d = tl.arange(0, DD)
     r = tl.arange(0, R)
     h = tl.arange(0, H)
+    # quantized storage, fp32 ieee arithmetic (see scan_kernel)
     s = tl.load(
         side_ptr + p * Amax * DD + offs[:, None] * DD + d[None, :],
         mask=m[:, None],
         other=0.0,
-    )
+    ).to(tl.float32)
     c = tl.load(
         csk_ptr + p * Amax * R + offs[:, None] * R + r[None, :],
         mask=m[:, None],
         other=0.0,
-    )
+    ).to(tl.float32)
     rh = tl.load(rho_ptr + p * Amax + offs, mask=m, other=0.0)
     qs = tl.load(qside_t_ptr + p * DD * H + d[:, None] * H + h[None, :])
     qk = tl.load(qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :])
@@ -92,10 +94,10 @@ class BatchedScanPack:
         NKm = int(max(t.kept_rows.shape[0] for t in tiers) * self.HEADROOM)
         Am = int(max(t.side.shape[0] for t in tiers) * self.HEADROOM)
         r = tiers[0].r
-        self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev)
+        self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
-        self.side = torch.zeros(P, Am, D.SIDECAR_DIM, device=dev)
-        self.csk = torch.zeros(P, Am, r, device=dev)
+        self.side = torch.zeros(P, Am, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+        self.csk = torch.zeros(P, Am, r, device=dev, dtype=torch.float16)
         self.rho = torch.zeros(P, Am, device=dev)
         self.arch = torch.zeros(P, Am, dtype=torch.int64, device=dev)
         self.a_len = torch.zeros(P, dtype=torch.int64, device=dev)
@@ -165,11 +167,12 @@ class BatchedScanPack:
         self.slot.copy_(torch.tensor([p[1] for p in pairs], device=self.li.device))
         self.tier_ids = tuple((id(t), getattr(t, "version", 0)) for t in tiers)
 
+    @ieee_fp32
     def run(self):
         sc = self.scale
         W = self.fetch_buf.shape[-1]
         qe = self.qbuf[self.li, self.slot].float()  # [P, H, 576], one gather+cast
-        skept = torch.bmm(qe, self.kr.transpose(1, 2))
+        skept = torch.bmm(qe.to(torch.bfloat16), self.kr.transpose(1, 2)).float()
         skept.mul_(sc)
         skept.masked_fill_(self.nk_mask, float("-inf"))
         max1 = skept.max(-1).values

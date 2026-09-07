@@ -974,6 +974,14 @@ class VestigeKVMLABackend(AttentionBackend):
                 slot,
             )
 
+    def _seq_lens_host(self, forward_batch):
+        """Host-side seq_lens without a device readback. The scheduler ships
+        seq_lens_cpu alongside the device tensor on the decode path; falling
+        back to the device tensor is a per-request D2H sync, acceptable only
+        because it is the exceptional path."""
+        cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        return cpu if cpu is not None else forward_batch.seq_lens
+
     def _maybe_close_blocks(self, forward_batch, reqs):
         """Decode-time compression events (reference policy semantics).
 
@@ -992,9 +1000,10 @@ class VestigeKVMLABackend(AttentionBackend):
         out -- both existing mechanisms.
         """
         real = forward_batch.out_cache_loc.shape[0]
+        seq_lens = self._seq_lens_host(forward_batch)
         for i in range(real):
             slot = reqs[i]
-            seq_len = int(forward_batch.seq_lens[i])
+            seq_len = int(seq_lens[i])
             for lid in self._local_mla_lids:
                 cl = self._close_state.get((slot, lid))
                 if cl is None:
@@ -1074,7 +1083,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 st = self._recall.get((slot, lid))
                 if st is None or st.get("qcal") is None:
                     continue
-                prefix_len = int(forward_batch.seq_lens[i]) - 1
+                prefix_len = int(self._seq_lens_host(forward_batch)[i]) - 1
                 st["qcal"].append(self._qbuf[lid][slot].clone())
                 st["qpos"].append(prefix_len)
                 if st["tier"] is None:

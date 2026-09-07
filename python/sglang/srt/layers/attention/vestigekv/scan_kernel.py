@@ -27,8 +27,8 @@ def _vestige_scan_kernel(
     qsk_t_ptr,  # [R, H]  fp32: its projection onto the rank-R sketch basis
     qres_ptr,  # [H]      fp32: residual norm outside that basis
     max1g_ptr,  # [H]     fp32: best kept-row score, +inf where the gate is closed
-    side_ptr,  # [A, D]   fp32
-    csk_ptr,  # [A, R]    fp32
+    side_ptr,  # [A, D]   bf16 storage, promoted to fp32 in-register
+    csk_ptr,  # [A, R]    fp16 storage, promoted to fp32 in-register
     rho_ptr,  # [A]       fp32: per-row residual norm
     hit_ptr,  # [A]       int32 out
     A,
@@ -46,8 +46,12 @@ def _vestige_scan_kernel(
     h = tl.arange(0, H)
     # The two per-row loads that dominate the scan's traffic. Everything after
     # this stays in registers, across every head.
-    s = tl.load(side_ptr + offs[:, None] * D + d[None, :], mask=m[:, None], other=0.0)
-    c = tl.load(csk_ptr + offs[:, None] * R + r[None, :], mask=m[:, None], other=0.0)
+    s = tl.load(
+        side_ptr + offs[:, None] * D + d[None, :], mask=m[:, None], other=0.0
+    ).to(tl.float32)
+    c = tl.load(
+        csk_ptr + offs[:, None] * R + r[None, :], mask=m[:, None], other=0.0
+    ).to(tl.float32)
     rh = tl.load(rho_ptr + offs, mask=m, other=0.0)
     qs = tl.load(qside_t_ptr + d[:, None] * H + h[None, :])
     qk = tl.load(qsk_t_ptr + r[:, None] * H + h[None, :])

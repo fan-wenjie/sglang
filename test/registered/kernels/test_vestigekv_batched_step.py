@@ -26,10 +26,13 @@ def _mk_tier(nk, a, seed, zp, thr_g):
     rnd = lambda *s: torch.randn(*s, device="cuda", generator=g)  # noqa: E731
     t = RecallTier(r=R, topj=-1)
     t.r, t.scale, t.zp, t.thr_g, t.built = R, 192**-0.5, zp, thr_g, True
-    t.kept_rows = rnd(nk, 576)
+    # storage contract mirrors RecallTier.build: side bf16, csk fp16,
+    # kept_rows bf16, rho fp32 -- a fabricated fp32 tier would make the two
+    # paths disagree for test-artifact reasons, not algorithmic ones
+    t.kept_rows = rnd(nk, 576).to(torch.bfloat16)
     t.V = rnd(R, 512)
-    t.side = rnd(a, 64)
-    t.csk = rnd(a, R)
+    t.side = rnd(a, 64).to(torch.bfloat16)
+    t.csk = rnd(a, R).to(torch.float16)
     t.rho = torch.rand(a, device="cuda", generator=g)
     t.arch = torch.randperm(500000, device="cuda")[:a] + 1  # never row 0
     t._scatter_buf = None

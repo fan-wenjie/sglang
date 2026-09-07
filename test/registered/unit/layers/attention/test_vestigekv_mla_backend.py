@@ -1055,6 +1055,7 @@ class TestDecodeTimeBlockClose(CustomTestCase):
         be._maybe_close_blocks(self._fb(60000), [0])  # must not raise
         self.assertEqual(be._close_state, {})
 
+
 class TestLiveArchiveBackfill(CustomTestCase):
     """The close path's backfill watermark must match the cache contents.
 

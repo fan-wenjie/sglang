@@ -54,14 +54,20 @@ def blockwise_sigma(side: torch.Tensor, block: int = D.CLOSE_BLOCK) -> torch.Ten
     policy bit-for-bit, and make the computation naturally incremental: each
     block is transformed exactly once, at close, and its sigma is immutable.
 
+    Deliberately a per-block loop over sidecar_sigma, NOT one batched rfft:
+    cuFFT's batched (dim=1) and single (dim=0) plans differ by ~1e-6, and
+    decode-time closes score their blocks through sidecar_sigma -- a batched
+    prefill would put two numerically divergent copies of the same statistic
+    into one global top-m. The loop runs once per prefill (~128 transforms at
+    512k) and keeps every sigma bit-identical to the close path and to the
+    reference policy.
+
     Returns sigma for the first (len(side) // block) * block rows; the
     remainder is the unclosed tail, unconditionally attended, needing no sigma.
     """
     n_blocks = side.shape[0] // block
     if n_blocks == 0:
         return side.new_zeros(0)
-    trimmed = side[: n_blocks * block].reshape(n_blocks, block, side.shape[-1])
-    f = torch.fft.rfft(trimmed.float(), dim=1)
-    f[:, D.LOWPASS_KAPPA :] = 0
-    low = torch.fft.irfft(f, n=block, dim=1)
-    return (trimmed.float() - low).norm(dim=-1).reshape(-1)
+    return torch.cat(
+        [sidecar_sigma(side[i * block : (i + 1) * block]) for i in range(n_blocks)]
+    )
