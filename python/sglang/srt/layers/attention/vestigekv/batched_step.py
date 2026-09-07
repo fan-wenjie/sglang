@@ -54,19 +54,20 @@ def _scan_batched_kernel(
         side_ptr + p * Amax * DD + offs[:, None] * DD + d[None, :],
         mask=m[:, None],
         other=0.0,
-    ).to(tl.float32)
+    )
     c = tl.load(
         csk_ptr + p * Amax * R + offs[:, None] * R + r[None, :],
         mask=m[:, None],
         other=0.0,
-    ).to(tl.float32)
+    )
     rh = tl.load(rho_ptr + p * Amax + offs, mask=m, other=0.0)
     qs = tl.load(qside_t_ptr + p * DD * H + d[:, None] * H + h[None, :])
     qk = tl.load(qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :])
     cc = tl.load(cc_ptr + p)
     # ieee, not tf32: the fast path disagreed with the eager fire set on 6 rows
     # in 58900, a silent change to which rows the model attends.
-    acc = tl.dot(s, qs, input_precision="ieee") + tl.dot(c, qk, input_precision="ieee")
+    # native-dtype tensor-core dots, fp32 accumulation -- see scan_kernel.py
+    acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
     score = acc * sc + cc * rh[:, None] * tl.load(qres_ptr + p * H + h)[None, :]
     fired = tl.max((score > tl.load(max1g_ptr + p * H + h)[None, :]).to(tl.int32), 1)
     tl.store(hit_ptr + p * Amax + offs, fired, mask=m)
@@ -193,8 +194,12 @@ class BatchedScanPack:
         # would otherwise close the gate and UNDER-recall; this overrides it.
         empty_kept = (self.nk_len == 0)[:, None]
         max1g = torch.where(empty_kept, torch.full_like(max1g, float("-inf")), max1g)
-        qside_t = qe[:, :, D.KV_LORA_RANK :].transpose(1, 2).contiguous()
-        qsk_t = qsk.transpose(1, 2).contiguous()
+        # storage dtypes for the native-dtype dots: bf16 exact (qbuf is bf16),
+        # fp16 rounding covered by calibration (same rounding in build's zp fit)
+        qside_t = (
+            qe[:, :, D.KV_LORA_RANK :].transpose(1, 2).contiguous().to(torch.bfloat16)
+        )
+        qsk_t = qsk.transpose(1, 2).contiguous().half()
         P, Am = self.hit.shape
         _scan_batched_kernel[(triton.cdiv(Am, D.SCAN_BLOCK_A), P)](
             qside_t,
