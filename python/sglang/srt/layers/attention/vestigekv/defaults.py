@@ -10,6 +10,11 @@ env vars registered in `sglang.srt.environ`; this module holds the values that
 are NOT knobs -- the ones a deployment does not get to vary.
 """
 
+import contextlib
+import math
+
+import torch
+
 # ---- model geometry (Kimi Linear MLA; the only architecture in scope) ----
 
 KV_LORA_RANK = 512
@@ -177,8 +182,7 @@ def scan_target(tau: float = RECALL_TARGET) -> float:
 def min_hard(tau: float = RECALL_TARGET) -> int:
     """Fewest hard samples for which the conformal quantile at scan_target
     exists: ceil((n+1)*t) <= n requires n >= t / (1 - t)."""
-    import math
-
+    
     t = scan_target(tau)
     # 1e-9 guard: for rational tau the ratio is often an exact integer that
     # floating point lands a hair ABOVE (0.9 -> t = 18/19, t/(1-t) = 18 but
@@ -196,3 +200,33 @@ def conformal_k(n: int, tau: float = RECALL_TARGET) -> int:
 
     return math.ceil((n + 1) * scan_target(tau) - 1e-9)  # same float guard
 
+
+@contextlib.contextmanager
+def ieee_fp32_matmul():
+    """Pin fp32 matmuls to full ieee precision on the certificate path.
+
+    The fire decision compares scores near a conformal threshold; tf32's
+    10-bit mantissa moved 6 of 58900 rows across it in measurement. The
+    scan kernels already force input_precision="ieee"; this guard covers
+    the cuBLAS bmms (qsk projection, qres residual) that would otherwise
+    follow the global --enable-tf32-matmul switch. Wrapping capture/build
+    is enough: kernel selection happens there, replay keeps it.
+    """
+    prev = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(prev)
+
+
+def ieee_fp32(fn):
+    """Decorator form of ieee_fp32_matmul for certificate-path methods."""
+
+    def wrapped(*a, **k):
+        with ieee_fp32_matmul():
+            return fn(*a, **k)
+
+    wrapped.__name__ = fn.__name__
+    wrapped.__doc__ = fn.__doc__
+    return wrapped

@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
+from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 
 
 @triton.jit
@@ -166,6 +167,7 @@ class BatchedScanPack:
         self.slot.copy_(torch.tensor([p[1] for p in pairs], device=self.li.device))
         self.tier_ids = tuple((id(t), getattr(t, "version", 0)) for t in tiers)
 
+    @ieee_fp32
     def run(self):
         sc = self.scale
         W = self.fetch_buf.shape[-1]
