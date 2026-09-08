@@ -460,9 +460,18 @@ class VestigeKVMLABackend(AttentionBackend):
         # the pack-memory footprint bounded, then free before building the
         # replacement (the OOM transient lesson).
         self._stash_active()
-        while self._scan_cache is not None and len(self._scan_cache) > 1:
-            _, old = self._scan_cache.popitem(last=False)
-            old["graph"] = old["pack"] = None
+        if self._scan_cache is not None and len(self._scan_cache) > 1:
+            # The evicted pack's LAST replay may still be executing: freeing
+            # its buffers lets the allocator hand those addresses to the new
+            # pack while the in-flight GEMM still reads them (coredump: warp
+            # illegal address inside the skept cutlass bmm -- a use-after-free
+            # introduced by the free-before-rebuild OOM fix). Synchronize
+            # before dropping the references; eviction is rare (LRU miss
+            # beyond 2 shape classes), so the sync is off the steady path.
+            torch.cuda.synchronize()
+            while len(self._scan_cache) > 1:
+                _, old = self._scan_cache.popitem(last=False)
+                old["graph"] = old["pack"] = None
         self._scan_graph = None
         self._scan_batched = None
         torch.cuda.empty_cache()
@@ -590,6 +599,7 @@ class VestigeKVMLABackend(AttentionBackend):
     def _invalidate_scan(self):
         self._pack_epoch += 1
         if self._scan_cache is not None:
+            torch.cuda.synchronize()  # in-flight replay may read these packs
             for old in self._scan_cache.values():
                 old["graph"] = old["pack"] = None
             self._scan_cache.clear()
