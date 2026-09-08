@@ -96,6 +96,7 @@ class BatchedScanPack:
         # pairs: list of (lid, slot); tiers: matching RecallTier list.
         dev = tiers[0].side.device
         self.q_heads = q_heads
+        self._pad_slot = None  # legacy packs are always fully occupied
         P = len(tiers)
         # Floor to 1: an all-empty-kept capture (every pair's tier-1 kept the
         # empty set -- the re-prefill anomaly) would otherwise allocate a
@@ -144,11 +145,72 @@ class BatchedScanPack:
         self.qbuf, self.fetch_buf, self.fetch_len = qbuf, fetch_buf, fetch_len
         self.update(pairs, tiers)
 
+    @classmethod
+    def at_capacity(cls, P, NKm, Am, r, q_heads, qbuf, fetch_buf, fetch_len, pad_slot):
+        """An empty pack sized for the worst case, for the in-graph scan.
+
+        Built once at model-graph capture time, before any tier exists: every
+        pair starts as a placeholder (a_len = nk_len = 0 -> the scan fires
+        nothing and compact writes fetch_len[pad_slot] = 0), and update() later
+        fills any subset of the P slots in place. Nothing about it ever
+        reallocates, so a model graph that baked its addresses never needs a
+        recapture."""
+        self = cls.__new__(cls)
+        dev = qbuf.device
+        self.q_heads = q_heads
+        self._pad_slot = pad_slot
+        self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
+        self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
+        self.side = torch.zeros(P, Am, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+        self.csk = torch.zeros(P, Am, r, device=dev, dtype=torch.float16)
+        self.rho = torch.zeros(P, Am, device=dev)
+        self.arch = torch.zeros(P, Am, dtype=torch.int64, device=dev)
+        self.a_len = torch.zeros(P, dtype=torch.int64, device=dev)
+        self.nk_len = torch.zeros(P, dtype=torch.int64, device=dev)
+        self.thr = torch.zeros(P, 1, device=dev)
+        self.cc = torch.zeros(P, device=dev)
+        self._nk_col = torch.arange(NKm, device=dev)
+        # all pairs empty -> every kept column masked True from step one
+        self.nk_mask = torch.ones(P, 1, NKm, dtype=torch.bool, device=dev)
+        self.scale = D.ATTN_SCALE
+        self.inf = torch.tensor(float("inf"), device=dev)
+        self.li = torch.zeros(P, dtype=torch.int64, device=dev)
+        self.slot = torch.full((P,), pad_slot, dtype=torch.int64, device=dev)
+        W = fetch_buf.shape[-1]
+        self.hit = torch.zeros(P, Am, dtype=torch.int32, device=dev)
+        H = q_heads
+        self.max1g = torch.zeros(P, H, device=dev)
+        self.qside_t = torch.zeros(
+            P, D.SIDECAR_DIM, H, device=dev, dtype=torch.bfloat16
+        )
+        self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=torch.float16)
+        self.qres = torch.zeros(P, H, device=dev)
+        self.thr_flat = torch.zeros(P, device=dev)
+        self.pm = torch.zeros(P, _NSPLIT, H, device=dev)
+        self.ps = torch.zeros(P, _NSPLIT, H, device=dev)
+        self.pt = torch.zeros(P, _NSPLIT, H, device=dev)
+        NB = (Am + 1023) // 1024
+        self.c_counts = torch.zeros(P, NB, dtype=torch.int32, device=dev)
+        self.c_offsets = torch.zeros(P, NB, dtype=torch.int32, device=dev)
+        self.c_total = torch.zeros(P, dtype=torch.int32, device=dev)
+        self.scratch = torch.zeros(P, W + 1, dtype=torch.int64, device=dev)
+        self.qbuf, self.fetch_buf, self.fetch_len = qbuf, fetch_buf, fetch_len
+        self.pairs = []
+        self.tier_ids = ()
+        return self
+
     def fits(self, pairs, tiers) -> bool:
         """Whether update() can host these pairs without reallocating (and
         therefore without invalidating the captured graph)."""
+        if not tiers:
+            return self._pad_slot is not None
+        n_ok = (
+            len(tiers) <= self.li.shape[0]
+            if self._pad_slot is not None
+            else len(tiers) == self.li.shape[0]
+        )
         return (
-            len(tiers) == self.li.shape[0]
+            n_ok
             and max(t.kept_rows.shape[0] for t in tiers) <= self.kr.shape[1]
             and max(t.side.shape[0] for t in tiers) <= self.side.shape[1]
             and all(t.r == self.csk.shape[2] for t in tiers)
@@ -186,11 +248,22 @@ class BatchedScanPack:
         # copy_, not reassignment: the captured graph reads THIS tensor's
         # address; a fresh tensor here would silently detach every later
         # update from the replayed kernel's view of the mask.
+        n = len(tiers)
+        if n < self.li.shape[0]:
+            # Capacity pack, partially occupied: the tail pairs are silenced
+            # (zero lengths -> the scan fires nothing) and their compact
+            # output lands in the pad slot's fetch row, which nothing reads.
+            # Stale kr/side contents behind the zero lengths are never read.
+            self.a_len[n:] = 0
+            self.nk_len[n:] = 0
         self.nk_mask.copy_(
             self._nk_col[None, None, :] >= self.nk_len[:, None, None]
         )
-        self.li.copy_(torch.tensor([p[0] for p in pairs], device=self.li.device))
-        self.slot.copy_(torch.tensor([p[1] for p in pairs], device=self.li.device))
+        pad = self.li.shape[0] - n
+        li_l = [p[0] for p in pairs] + [0] * pad
+        slot_l = [p[1] for p in pairs] + [self._pad_slot or 0] * pad
+        self.li.copy_(torch.tensor(li_l, device=self.li.device))
+        self.slot.copy_(torch.tensor(slot_l, device=self.li.device))
         self.tier_ids = tuple((id(t), getattr(t, "version", 0)) for t in tiers)
 
     @ieee_fp32
