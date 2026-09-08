@@ -545,30 +545,31 @@ class Envs:
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
+    # Per-call move cap on a non-urgent lazy-compaction flush, so a large
+    # backlog cannot stall the scheduler loop; urgent flushes are uncapped.
+    SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
     # VestigeKV: training-free NoPE-MLA KV-cache eviction attention backend
-    # (vestige_mla). Default on; set False for the kill-switch parity test that
+    # (vestigekv_mla). Default on; set False for the kill-switch parity test that
     # runs the wrapper as pure pass-through to the base MLA backend.
-    SGLANG_ENABLE_VESTIGE = EnvBool(True)
     # VestigeKV benchmark arm switch: path of a flag file checked at each
     # prefill; file present -> the FULL arm (attend all rows, the A/B
     # baseline). Unset (default) disables arm switching entirely -- no
     # file stat on any path in production.
-    SGLANG_TEST_VESTIGE_FULL_ARM_FLAG = EnvStr(None)
+    SGLANG_DEBUG_VESTIGEKV_ROWS = EnvBool(False)
+
+    SGLANG_DEBUG_VESTIGEKV_STATS = EnvBool(False)
+
+    SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG = EnvStr(None)
     # VestigeKV recall calibration: number of decode steps whose queries
     # feed RecallTier.build before the tier activates for a request.
-    SGLANG_VESTIGE_NCAL = EnvInt(16)
-    # TEST-ONLY tier-1 ablation hook (the pre-registered ablation protocol).
-    # Recall is a necessary component and has NO production off-switch; this
-    # test-prefixed env exists solely so the frozen ablation legs can run.
-    SGLANG_TEST_VESTIGE_TIER1_ABLATION = EnvBool(False)
     # VestigeKV per-head recall fetch cap (topj). Default -1 = uncapped: fetch
     # the full fired recall set. Set > 0 explicitly (16 recommended) for the
     # bounded-fetch guarantee; deliberate opt-in so the operator states the
     # fetch bound they are accepting.
-    SGLANG_VESTIGE_TOPJ = EnvInt(-1)
+    SGLANG_VESTIGEKV_TOPJ = EnvInt(-1)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
