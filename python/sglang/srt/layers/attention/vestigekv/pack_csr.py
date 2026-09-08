@@ -41,12 +41,14 @@ def _pack_csr_prep_kernel(
     L,
     MAXBS1,
 ):
-    # One program, three passes per layer, each reading only PRE-STEP state:
+    # One program PER LAYER (layers share no state), three passes each
+    # reading only PRE-STEP state:
     # duplicate slots (shared trash lanes) must mirror the torch scatter --
     # every colliding lane appends at the same n_old (last write wins) and
     # the length advances by one exactly once. A single mutate-as-you-walk
     # loop would let a later duplicate read the earlier lane's update.
-    for li in range(0, L):
+    li = tl.program_id(0)
+    if li < L:
         tl.store(indptr_ptr + li * MAXBS1, 0)
         run = tl.load(kept_len_ptr) * 0  # int64 scalar zero
         for i in range(0, bs):
@@ -118,7 +120,7 @@ def pack_csr_all_layers(
     indices [L, CAPI], indptr [L, MAXBS1]; slots/loc [bs]."""
     L, R1, CAP = kept_buf.shape
     bs = slots.shape[0]
-    _pack_csr_prep_kernel[(1,)](
+    _pack_csr_prep_kernel[(L,)](
         slots,
         loc,
         kept_buf,
