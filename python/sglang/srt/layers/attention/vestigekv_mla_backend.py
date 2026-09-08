@@ -1244,6 +1244,12 @@ class VestigeKVMLABackend(AttentionBackend):
             # update() cannot handle a shape-class change, and fits() failing
             # falls back to a real recapture on its own.
             self._pack_epoch += 1
+            # The step cache may hold key=None from before this tier existed
+            # (the recovery _invalidate_scan used to provide): drop it so the
+            # next step recomputes the key. Without this, a stable bs=1
+            # signature cached None forever and decode stayed eager for the
+            # whole request (bs1 ITL 8.2 -> 17.6 regression).
+            self._step_cache = None
             self._capture_asap = True
 
     def _enqueue_build(self, slot, lid, seq_len, st):
@@ -1471,6 +1477,7 @@ class VestigeKVMLABackend(AttentionBackend):
         # itself and then never be replaced (observed: proxy=True builds only).
         st["tier"], st["built_at"] = tier, seq_len
         self._pack_epoch += 1  # content swap; see _install_finished_builds
+        self._step_cache = None  # may hold key=None from the pre-tier step
         return stats
 
     def _refresh_graph_bufs(self, lid, forward_batch, reqs):
