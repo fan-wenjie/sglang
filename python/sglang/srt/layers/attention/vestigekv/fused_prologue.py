@@ -157,52 +157,6 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None):
 
 
 @triton.jit
-def _prologue_qside_kernel(
-    qbuf_ptr,  # [L, RR, H, 576] the recall query stack, read in place
-    li_ptr,  # [P] int64 layer index per pair
-    slot_ptr,  # [P] int64 pool slot per pair
-    RR,  # qbuf rows per layer (max_reqs + trash)
-    v_ptr,
-    qside_t_ptr,
-    qsk_t_ptr,
-    qres_ptr,
-    H: tl.constexpr,
-    R: tl.constexpr,
-    KV: tl.constexpr,
-    DD: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    p = tl.program_id(0)
-    h = tl.arange(0, H)
-    r = tl.arange(0, R)
-    # Read the pair's query straight from the stacked qbuf: the torch-side
-    # gather+cast+contiguous materialized [P, H, 576] fp32 every step for
-    # data that already sits at a computable address. bf16 -> fp32 is exact,
-    # so the inlined read is bit-identical to the materialized one.
-    qb = qbuf_ptr + (tl.load(li_ptr + p) * RR + tl.load(slot_ptr + p)) * H * 576
-    qsk = tl.zeros([H, R], dtype=tl.float32)
-    qnorm2 = tl.zeros([H], dtype=tl.float32)
-    for d0 in range(0, KV, BLOCK_D):
-        d = d0 + tl.arange(0, BLOCK_D)
-        qc = tl.load(qb + h[:, None] * 576 + d[None, :]).to(tl.float32)
-        vc = tl.load(v_ptr + p * R * KV + r[:, None] * KV + d[None, :])
-        qsk += tl.dot(qc, tl.trans(vc), input_precision="ieee")
-        qnorm2 += tl.sum(qc * qc, 1)
-    qres = tl.sqrt(tl.maximum(qnorm2 - tl.sum(qsk * qsk, 1), 0.0))
-    tl.store(qres_ptr + p * H + h, qres)
-    dd = tl.arange(0, DD)
-    qside = tl.load(qb + h[:, None] * 576 + (KV + dd)[None, :]).to(tl.float32)
-    tl.store(
-        qside_t_ptr + p * DD * H + dd[:, None] * H + h[None, :],
-        tl.trans(qside).to(tl.bfloat16),
-    )
-    tl.store(
-        qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
-        tl.trans(qsk).to(tl.float16),
-    )
-
-
-@triton.jit
 def _prologue_scores_kernel(
     qbuf_ptr,  # [L, RR, H, 576] recall query stack, read in place (see qside)
     li_ptr,
@@ -272,11 +226,47 @@ def _prologue_merge_kernel(
     nk_len_ptr,
     thr_ptr,
     max1g_ptr,
+    qbuf_ptr,  # qside/qsk/qres work folded in: same [P] grid as the merge,
+    li_ptr,  # and the scan (its only consumer) runs strictly after.
+    slot_ptr,
+    RR,
+    v_ptr,
+    qside_t_ptr,
+    qsk_t_ptr,
+    qres_ptr,
     NSPLIT: tl.constexpr,
     H: tl.constexpr,
+    R: tl.constexpr,
+    KV: tl.constexpr,
+    DD: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     p = tl.program_id(0)
     h = tl.arange(0, H)
+    r = tl.arange(0, R)
+    qb = qbuf_ptr + (tl.load(li_ptr + p) * RR + tl.load(slot_ptr + p)) * H * 576
+    qsk = tl.zeros([H, R], dtype=tl.float32)
+    qnorm2 = tl.zeros([H], dtype=tl.float32)
+    for d0 in range(0, KV, BLOCK_D):
+        d = d0 + tl.arange(0, BLOCK_D)
+        qc = tl.load(qb + h[:, None] * 576 + d[None, :]).to(tl.float32)
+        vc = tl.load(v_ptr + p * R * KV + r[:, None] * KV + d[None, :])
+        qsk += tl.dot(qc, tl.trans(vc), input_precision="ieee")
+        qnorm2 += tl.sum(qc * qc, 1)
+    tl.store(
+        qres_ptr + p * H + h,
+        tl.sqrt(tl.maximum(qnorm2 - tl.sum(qsk * qsk, 1), 0.0)),
+    )
+    dd = tl.arange(0, DD)
+    qside = tl.load(qb + h[:, None] * 576 + (KV + dd)[None, :]).to(tl.float32)
+    tl.store(
+        qside_t_ptr + p * DD * H + dd[:, None] * H + h[None, :],
+        tl.trans(qside).to(tl.bfloat16),
+    )
+    tl.store(
+        qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
+        tl.trans(qsk).to(tl.float16),
+    )
     sp = tl.arange(0, NSPLIT)
     base = p * NSPLIT * H
     m = tl.load(pm_ptr + base + sp[:, None] * H + h[None, :])
@@ -315,22 +305,6 @@ def fused_prologue_split(qbuf, li, slot, kr, v, nk_len, thr, sc, out, partials):
     R = v.shape[1]
     max1g, qside_t, qsk_t, qres = out
     pm, ps, pt = partials
-    _prologue_qside_kernel[(P,)](
-        qbuf,
-        li,
-        slot,
-        RR,
-        v,
-        qside_t,
-        qsk_t,
-        qres,
-        H=H,
-        R=R,
-        KV=D.KV_LORA_RANK,
-        DD=D.SIDECAR_DIM,
-        BLOCK_D=64,
-        num_warps=4,
-    )
     _prologue_scores_kernel[(P, _NSPLIT)](
         qbuf,
         li,
@@ -356,9 +330,21 @@ def fused_prologue_split(qbuf, li, slot, kr, v, nk_len, thr, sc, out, partials):
         nk_len,
         thr,
         max1g,
+        qbuf,
+        li,
+        slot,
+        RR,
+        v,
+        qside_t,
+        qsk_t,
+        qres,
         NSPLIT=_NSPLIT,
         H=H,
-        num_warps=1,
+        R=R,
+        KV=D.KV_LORA_RANK,
+        DD=D.SIDECAR_DIM,
+        BLOCK_D=64,
+        num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
 
