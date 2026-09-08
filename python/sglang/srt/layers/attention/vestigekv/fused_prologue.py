@@ -215,7 +215,12 @@ def _prologue_scores_kernel(
     nk = tl.load(nk_len_ptr + p)
     span = (NKm + NSPLIT - 1) // NSPLIT
     lo = sp * span
-    hi = tl.minimum(lo + span, NKm)
+    # Clamp by the pair's REAL kept count, not the capacity: rows past nk are
+    # fully masked, but a masked row still burns its tl.dot FLOPs. A split
+    # landing entirely past nk (or an empty pair) runs zero iterations and
+    # still stores the correct empty partial (-inf, 0, 0) below, so the merge
+    # (and the empty-kept fire-all contract) is untouched.
+    hi = tl.minimum(lo + span, tl.minimum(NKm, nk))
     e_max = tl.zeros([H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([H], dtype=tl.float32)
     x_sum = tl.zeros([H], dtype=tl.float32)
