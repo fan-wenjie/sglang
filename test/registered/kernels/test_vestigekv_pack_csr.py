@@ -46,9 +46,7 @@ def _torch_ref(backend_cls, state, slots, loc, bs):
     be._kept_len = {i: kept_len[i] for i in range(L)}
     be._fetch_len = {i: fetch_len[i] for i in range(L)}
     be._fetch_buf = {i: fetch_buf[i] for i in range(L)}
-    be._graph_bufs = {
-        i: {"indices": indices[i], "indptr": indptr[i]} for i in range(L)
-    }
+    be._graph_bufs = {i: {"indices": indices[i], "indptr": indptr[i]} for i in range(L)}
     for i in range(L):
         be._pack_csr(i, slots, loc, bs, bs, CAP)
     return state

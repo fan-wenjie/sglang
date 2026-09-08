@@ -61,7 +61,9 @@ def _pack_csr_prep_kernel(
         for i in range(0, bs):  # appends (kept_len still pristine)
             slot = tl.load(slots_ptr + i).to(tl.int64)
             n_old = tl.load(kept_len_ptr + li * R1 + slot)
-            tl.store(kept_buf_ptr + (li * R1 + slot) * CAP + n_old, tl.load(loc_ptr + i))
+            tl.store(
+                kept_buf_ptr + (li * R1 + slot) * CAP + n_old, tl.load(loc_ptr + i)
+            )
         for i in range(0, bs):  # lengths: first occurrence only (+1 once,
             slot = tl.load(slots_ptr + i).to(tl.int64)  # duplicates skip)
             dup = 0
