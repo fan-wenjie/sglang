@@ -903,7 +903,6 @@ class VestigeKVMLABackend(AttentionBackend):
             dev = r2t.device
             self._ensure_kept_stacks(max_reqs, cap, dt, dev)
             self._alloc_recall_bufs(lid, max_reqs, dt, dev)
-            self._indptr1[lid] = torch.zeros(2, dtype=dt, device=dev)
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)
         kbuf = kbuf.reshape(-1, kbuf.shape[-1])
         slots = forward_batch.req_pool_indices.tolist()
@@ -987,6 +986,9 @@ class VestigeKVMLABackend(AttentionBackend):
         for lid, i in li_map.items():
             self._kept_buf[lid] = self._kept_stack[i]
             self._kept_len[lid] = self._kept_len_stack[i]
+            if lid not in self._indptr1:
+                self._indptr1[lid] = torch.zeros(2, dtype=dt, device=dev)
+                self._indptr1[lid][1] = 1  # capture attends one padded row
 
     def _alloc_recall_bufs(self, lid, max_reqs, idx_dtype, dev):
         if lid in self._qbuf:
@@ -1134,10 +1136,6 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._ensure_kept_stacks(
                     r2t.shape[0], cap_row, fm.kv_indices.dtype, r2t.device
                 )
-                self._indptr1[lid] = torch.zeros(
-                    2, dtype=fm.kv_indptr.dtype, device=r2t.device
-                )
-                self._indptr1[lid][1] = 1  # capture attends one padded row
             self._alloc_recall_bufs(lid, r2t.shape[0], fm.kv_indices.dtype, r2t.device)
             bufs = self._graph_bufs.get(lid)
             if bufs is None:
