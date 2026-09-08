@@ -157,46 +157,11 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None):
 
 
 @triton.jit
-def _prologue_qside_kernel(
-    q_ptr,
-    v_ptr,
-    qside_t_ptr,
-    qsk_t_ptr,
-    qres_ptr,
-    H: tl.constexpr,
-    R: tl.constexpr,
-    KV: tl.constexpr,
-    DD: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    p = tl.program_id(0)
-    h = tl.arange(0, H)
-    r = tl.arange(0, R)
-    qsk = tl.zeros([H, R], dtype=tl.float32)
-    qnorm2 = tl.zeros([H], dtype=tl.float32)
-    for d0 in range(0, KV, BLOCK_D):
-        d = d0 + tl.arange(0, BLOCK_D)
-        qc = tl.load(q_ptr + p * H * 576 + h[:, None] * 576 + d[None, :])
-        vc = tl.load(v_ptr + p * R * KV + r[:, None] * KV + d[None, :])
-        qsk += tl.dot(qc, tl.trans(vc), input_precision="ieee")
-        qnorm2 += tl.sum(qc * qc, 1)
-    qres = tl.sqrt(tl.maximum(qnorm2 - tl.sum(qsk * qsk, 1), 0.0))
-    tl.store(qres_ptr + p * H + h, qres)
-    dd = tl.arange(0, DD)
-    qside = tl.load(q_ptr + p * H * 576 + h[:, None] * 576 + (KV + dd)[None, :])
-    tl.store(
-        qside_t_ptr + p * DD * H + dd[:, None] * H + h[None, :],
-        tl.trans(qside).to(tl.bfloat16),
-    )
-    tl.store(
-        qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
-        tl.trans(qsk).to(tl.float16),
-    )
-
-
-@triton.jit
 def _prologue_scores_kernel(
-    q_ptr,
+    qbuf_ptr,  # [L, RR, H, 576] recall query stack, read in place (see qside)
+    li_ptr,
+    slot_ptr,
+    RR,
     kr_ptr,
     nk_len_ptr,
     pm_ptr,
@@ -212,6 +177,7 @@ def _prologue_scores_kernel(
     p = tl.program_id(0)
     sp = tl.program_id(1)
     h = tl.arange(0, H)
+    qb = qbuf_ptr + (tl.load(li_ptr + p) * RR + tl.load(slot_ptr + p)) * H * 576
     nk = tl.load(nk_len_ptr + p)
     span = (NKm + NSPLIT - 1) // NSPLIT
     lo = sp * span
@@ -230,7 +196,7 @@ def _prologue_scores_kernel(
         qk = tl.zeros([H, BLOCK_NK], dtype=tl.float32)
         for d0 in range(0, 576, BLOCK_D):
             d = d0 + tl.arange(0, BLOCK_D)
-            qc = tl.load(q_ptr + p * H * 576 + h[:, None] * 576 + d[None, :])
+            qc = tl.load(qb + h[:, None] * 576 + d[None, :])
             kc = tl.load(
                 kr_ptr + p * NKm * 576 + offs[:, None] * 576 + d[None, :],
                 mask=mrow[:, None],
@@ -260,11 +226,47 @@ def _prologue_merge_kernel(
     nk_len_ptr,
     thr_ptr,
     max1g_ptr,
+    qbuf_ptr,  # qside/qsk/qres work folded in: same [P] grid as the merge,
+    li_ptr,  # and the scan (its only consumer) runs strictly after.
+    slot_ptr,
+    RR,
+    v_ptr,
+    qside_t_ptr,
+    qsk_t_ptr,
+    qres_ptr,
     NSPLIT: tl.constexpr,
     H: tl.constexpr,
+    R: tl.constexpr,
+    KV: tl.constexpr,
+    DD: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     p = tl.program_id(0)
     h = tl.arange(0, H)
+    r = tl.arange(0, R)
+    qb = qbuf_ptr + (tl.load(li_ptr + p) * RR + tl.load(slot_ptr + p)) * H * 576
+    qsk = tl.zeros([H, R], dtype=tl.float32)
+    qnorm2 = tl.zeros([H], dtype=tl.float32)
+    for d0 in range(0, KV, BLOCK_D):
+        d = d0 + tl.arange(0, BLOCK_D)
+        qc = tl.load(qb + h[:, None] * 576 + d[None, :]).to(tl.float32)
+        vc = tl.load(v_ptr + p * R * KV + r[:, None] * KV + d[None, :])
+        qsk += tl.dot(qc, tl.trans(vc), input_precision="ieee")
+        qnorm2 += tl.sum(qc * qc, 1)
+    tl.store(
+        qres_ptr + p * H + h,
+        tl.sqrt(tl.maximum(qnorm2 - tl.sum(qsk * qsk, 1), 0.0)),
+    )
+    dd = tl.arange(0, DD)
+    qside = tl.load(qb + h[:, None] * 576 + (KV + dd)[None, :]).to(tl.float32)
+    tl.store(
+        qside_t_ptr + p * DD * H + dd[:, None] * H + h[None, :],
+        tl.trans(qside).to(tl.bfloat16),
+    )
+    tl.store(
+        qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
+        tl.trans(qsk).to(tl.float16),
+    )
     sp = tl.arange(0, NSPLIT)
     base = p * NSPLIT * H
     m = tl.load(pm_ptr + base + sp[:, None] * H + h[None, :])
@@ -290,28 +292,24 @@ def _prologue_merge_kernel(
 _NSPLIT = 32
 
 
-def fused_prologue_split(q, kr, v, nk_len, thr, sc, out, partials):
-    """Split-NK prologue: same outputs as fused_prologue, occupancy-correct."""
-    P, H, _ = q.shape
+def fused_prologue_split(qbuf, li, slot, kr, v, nk_len, thr, sc, out, partials):
+    """Split-NK prologue reading queries in place from the stacked qbuf.
+
+    qbuf [L, RR, H, 576] (bf16 in production; fp32 accepted -- loads upcast),
+    li/slot [P] int64 select each pair's query row. Same outputs as
+    fused_prologue; replaces the per-step torch gather+cast+contiguous."""
+    P = li.shape[0]
+    H = qbuf.shape[2]
+    RR = qbuf.shape[1]
     NKm = kr.shape[1]
     R = v.shape[1]
     max1g, qside_t, qsk_t, qres = out
     pm, ps, pt = partials
-    _prologue_qside_kernel[(P,)](
-        q,
-        v,
-        qside_t,
-        qsk_t,
-        qres,
-        H=H,
-        R=R,
-        KV=D.KV_LORA_RANK,
-        DD=D.SIDECAR_DIM,
-        BLOCK_D=64,
-        num_warps=4,
-    )
     _prologue_scores_kernel[(P, _NSPLIT)](
-        q,
+        qbuf,
+        li,
+        slot,
+        RR,
         kr,
         nk_len,
         pm,
@@ -332,9 +330,21 @@ def fused_prologue_split(q, kr, v, nk_len, thr, sc, out, partials):
         nk_len,
         thr,
         max1g,
+        qbuf,
+        li,
+        slot,
+        RR,
+        v,
+        qside_t,
+        qsk_t,
+        qres,
         NSPLIT=_NSPLIT,
         H=H,
-        num_warps=1,
+        R=R,
+        KV=D.KV_LORA_RANK,
+        DD=D.SIDECAR_DIM,
+        BLOCK_D=64,
+        num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
 
@@ -349,18 +359,6 @@ def fused_prologue_split(q, kr, v, nk_len, thr, sc, out, partials):
 
 
 @triton.jit
-def _compact_count_kernel(hit_ptr, counts_ptr, a_len_ptr, Am, BLOCK_A: tl.constexpr):
-    p = tl.program_id(1)
-    b = tl.program_id(0)
-    offs = b * BLOCK_A + tl.arange(0, BLOCK_A)
-    alen = tl.load(a_len_ptr + p)
-    m = (offs < Am) & (offs < alen)
-    h = tl.load(hit_ptr + p * Am + offs, mask=m, other=0)
-    nb = tl.num_programs(0)
-    tl.store(counts_ptr + p * nb + b, tl.sum((h != 0).to(tl.int32), 0))
-
-
-@triton.jit
 def _compact_scan_kernel(counts_ptr, offsets_ptr, total_ptr, NB, NB2: tl.constexpr):
     p = tl.program_id(0)
     b = tl.arange(0, NB2)  # NB2 = next pow2 >= NB; masked beyond NB
@@ -369,6 +367,9 @@ def _compact_scan_kernel(counts_ptr, offsets_ptr, total_ptr, NB, NB2: tl.constex
     excl = tl.cumsum(c, 0) - c
     tl.store(offsets_ptr + p * NB + b, excl, mask=m)
     tl.store(total_ptr + p, tl.sum(c, 0))
+    # Reset the fused-count buckets for the NEXT step's scan (the graph
+    # replays this every step; zeroing here removes a standalone memset).
+    tl.store(counts_ptr + p * NB + b, tl.zeros([NB2], dtype=tl.int32), mask=m)
 
 
 @triton.jit
@@ -413,7 +414,8 @@ def compact_fired(hit, arch, a_len, li, slot, fetch_buf, fetch_len, scratch):
     BLOCK_A = 1024
     NB = triton.cdiv(Am, BLOCK_A)
     counts, offsets, total = scratch
-    _compact_count_kernel[(NB, P)](hit, counts, a_len, Am, BLOCK_A=BLOCK_A)
+    # counts arrive pre-filled by the scan kernel's fused per-block
+    # accumulation (zeroed at alloc and re-zeroed by the prefix below).
     _compact_scan_kernel[(P,)](
         counts, offsets, total, NB, NB2=triton.next_power_of_2(NB)
     )

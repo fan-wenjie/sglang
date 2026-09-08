@@ -41,50 +41,65 @@ def _scan_batched_kernel(
     a_len_ptr,  # [P] int64: real archive rows of this pair
     cc_ptr,  # [P] fp32: zp * sc / sqrt(kv_lora - R)
     hit_ptr,  # [P, Amax] int32 out
+    counts_ptr,  # [P, NB] int32 fused compact-count out (NB = ceil(Amax/1024))
     Amax,
     sc,
     H: tl.constexpr,
     DD: tl.constexpr,
     R: tl.constexpr,
     BLOCK_A: tl.constexpr,
+    MULTI: tl.constexpr,
 ):
     p = tl.program_id(1)
     al = tl.load(a_len_ptr + p)
-    # Grid is capacity-sized (the capture bakes it); a block fully past this
-    # pair's real archive stores nothing anyway (all-masked), but WOULD still
-    # burn its full tl.dot FLOPs -- masked rows compute, they just load zeros.
-    # Measured: an all-placeholder pack scans in the same 165 us/step as a
-    # live one. Exit before any work instead: placeholder pairs, the FULL
-    # arm, and every real pair's over-capacity tail cost one scalar load.
-    if tl.program_id(0) * BLOCK_A >= al:
+    # Grid is capacity-sized (the capture bakes it). Each program covers one
+    # 1024-row bucket (MULTI sub-blocks of BLOCK_A): a 16x smaller grid than
+    # one-block programs -- the capacity grid's launch floor was the step's
+    # largest fixed cost (117 us content-independent; an all-placeholder
+    # pack scanned as slow as a live one) -- and the fused compact count
+    # becomes a plain per-bucket store instead of a 16-way atomic. Programs
+    # fully past a_len exit on one scalar load.
+    base = tl.program_id(0) * (MULTI * BLOCK_A)
+    if base >= al:
         return
-    offs = tl.program_id(0) * BLOCK_A + tl.arange(0, BLOCK_A)
-    m = offs < al
     d = tl.arange(0, DD)
     r = tl.arange(0, R)
     h = tl.arange(0, H)
-    # quantized storage, fp32 ieee arithmetic (see scan_kernel)
-    s = tl.load(
-        side_ptr + p * Amax * DD + offs[:, None] * DD + d[None, :],
-        mask=m[:, None],
-        other=0.0,
-    )
-    c = tl.load(
-        csk_ptr + p * Amax * R + offs[:, None] * R + r[None, :],
-        mask=m[:, None],
-        other=0.0,
-    )
-    rh = tl.load(rho_ptr + p * Amax + offs, mask=m, other=0.0)
+    # pair-invariant operands load once per program, not per sub-block
     qs = tl.load(qside_t_ptr + p * DD * H + d[:, None] * H + h[None, :])
     qk = tl.load(qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :])
     cc = tl.load(cc_ptr + p)
-    # ieee, not tf32: the fast path disagreed with the eager fire set on 6 rows
-    # in 58900, a silent change to which rows the model attends.
-    # native-dtype tensor-core dots, fp32 accumulation -- see scan_kernel.py
-    acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
-    score = acc * sc + cc * rh[:, None] * tl.load(qres_ptr + p * H + h)[None, :]
-    fired = tl.max((score > tl.load(max1g_ptr + p * H + h)[None, :]).to(tl.int32), 1)
-    tl.store(hit_ptr + p * Amax + offs, fired, mask=m)
+    qr = tl.load(qres_ptr + p * H + h)
+    m1 = tl.load(max1g_ptr + p * H + h)
+    cnt = 0
+    for kb in range(MULTI):
+        offs = base + kb * BLOCK_A + tl.arange(0, BLOCK_A)
+        m = offs < al
+        # quantized storage, fp32 ieee arithmetic (see scan_kernel)
+        s = tl.load(
+            side_ptr + p * Amax * DD + offs[:, None] * DD + d[None, :],
+            mask=m[:, None],
+            other=0.0,
+        )
+        c = tl.load(
+            csk_ptr + p * Amax * R + offs[:, None] * R + r[None, :],
+            mask=m[:, None],
+            other=0.0,
+        )
+        rh = tl.load(rho_ptr + p * Amax + offs, mask=m, other=0.0)
+        # ieee, not tf32: the fast path disagreed with the eager fire set on
+        # 6 rows in 58900, a silent change to which rows the model attends.
+        # native-dtype tensor-core dots, fp32 accumulation (scan_kernel.py)
+        acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
+        score = acc * sc + cc * rh[:, None] * qr[None, :]
+        fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
+        tl.store(hit_ptr + p * Amax + offs, fired, mask=m)
+        cnt += tl.sum(tl.where(m, fired, 0), 0)
+    # Fused compact count: the program IS the 1024-row bucket, so the total
+    # is a plain store (pre-zeroing by the prefix kernel covers programs
+    # that exited above).
+    nb = (Amax + 1023) // 1024
+    tl.store(counts_ptr + p * nb + tl.program_id(0), cnt)
 
 
 class BatchedScanPack:
@@ -278,7 +293,6 @@ class BatchedScanPack:
     @ieee_fp32
     def run(self):
         sc = self.scale
-        qe = self.qbuf[self.li, self.slot].float()  # [P, H, 576], one gather+cast
         # Fused prologue: skept/softmax/entropy/gate/qsk/qres/max1g and the
         # transpose-casts in ONE kernel (see fused_prologue.py). Replaces the
         # ~12-launch eager chain whose fixed ~0.57 ms execution intercept
@@ -286,7 +300,9 @@ class BatchedScanPack:
         # (nk_len==0) come back with max1g=-inf: whole archive fires, full
         # attention, never under-recall.
         fused_prologue_split(
-            qe.contiguous(),
+            self.qbuf,
+            self.li,
+            self.slot,
             self.kr,
             self.v,
             self.nk_len,
@@ -297,7 +313,7 @@ class BatchedScanPack:
         )
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
         P, Am = self.hit.shape
-        _scan_batched_kernel[(triton.cdiv(Am, D.SCAN_BLOCK_A), P)](
+        _scan_batched_kernel[(triton.cdiv(Am, D.SCAN_BLOCK_A * 16), P)](
             qside_t,
             qsk_t,
             qres,
@@ -308,12 +324,14 @@ class BatchedScanPack:
             self.a_len,
             self.cc,
             self.hit,
+            self.c_counts,
             Am,
             sc,
             H=self.q_heads,
             DD=D.SIDECAR_DIM,
             R=self.v.shape[1],
             BLOCK_A=D.SCAN_BLOCK_A,
+            MULTI=16,  # 16 x BLOCK_A(64) = one 1024-row compact bucket
             num_warps=D.SCAN_NUM_WARPS,
         )
         # Deterministic two-phase Triton compaction: the torch chain's int64
