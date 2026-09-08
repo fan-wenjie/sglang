@@ -72,8 +72,12 @@ def bench_prologue(S):
         return qres
 
     single = lambda: fused_prologue(q, kr, v, nk_len, thr, sc, out=out)  # noqa: E731
+    # fused signature reads queries in place from the stacked qbuf
+    qbuf = q.unsqueeze(0).to(torch.bfloat16).contiguous()  # [1, P, H, 576]
+    li = torch.zeros(P, dtype=torch.int64, device=dev)
+    slot = torch.arange(P, dtype=torch.int64, device=dev)
     split = lambda: fused_prologue_split(  # noqa: E731
-        q, kr, v, nk_len, thr, sc, out=out, partials=parts
+        qbuf, li, slot, kr, v, nk_len, thr, sc, out=out, partials=parts
     )
     print(
         f"  prologue S={S // 1024}k: eager {t(eager):.3f}  single-CTA {t(single):.3f}  "

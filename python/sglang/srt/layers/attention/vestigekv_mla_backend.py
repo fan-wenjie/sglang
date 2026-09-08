@@ -284,10 +284,10 @@ class VestigeKVMLABackend(AttentionBackend):
         locs. Returns False (caller falls back to the full base hook) on any
         base shape it does not recognize.
         """
-        fa = getattr(self.base, "full_attn_backend", None)
-        lin = getattr(self.base, "linear_attn_backend", None)
-        if fa is None or lin is None:
-            return False
+        # self.base IS the full-attn TritonAttnBackend (the hybrid wrapper
+        # sits OUTSIDE this backend and calls each child's hook itself, so
+        # the linear side is not this method's concern).
+        fa = self.base
         if (
             getattr(fa, "dcp_size", 1) > 1
             or getattr(fa, "use_sliding_window_kv_pool", False)
@@ -303,7 +303,6 @@ class VestigeKVMLABackend(AttentionBackend):
             fa._fill_cuda_graph_write_locs(forward_batch, bs)
         except AttributeError:
             return False
-        lin.init_forward_metadata_out_graph(forward_batch, in_capture=False)
         return True
 
     def _step_slots(self, forward_batch):
