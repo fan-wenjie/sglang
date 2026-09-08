@@ -225,7 +225,15 @@ class VestigeKVMLABackend(AttentionBackend):
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
-        self.base.init_forward_metadata_out_graph(forward_batch, in_capture)
+        if (
+            not in_capture
+            and self._ingraph_pack is not None
+            and forward_batch.forward_mode.is_decode()
+            and self._out_graph_metadata_lite(forward_batch)
+        ):
+            pass  # lite path succeeded; the full base call is skipped
+        else:
+            self.base.init_forward_metadata_out_graph(forward_batch, in_capture)
         # in_capture=True runs BEFORE `with graph.capture()`: allocate + pre-fill
         # the per-layer fixed buffers here (copies/syncs are legal outside
         # capture); inside capture forward_decode only swaps pointers to them.
@@ -261,6 +269,42 @@ class VestigeKVMLABackend(AttentionBackend):
             for lid in self._mla_lids:
                 self._recall_step(lid, forward_batch, reqs)
                 self._refresh_graph_bufs(lid, forward_batch, reqs)
+
+    def _out_graph_metadata_lite(self, forward_batch) -> bool:
+        """Replay-prep without the dense kv_indices fill (in-graph decode).
+
+        The base's decode replay-prep spends ~99 us/step building the DENSE
+        row list (fill_packed_read_stream -> create_flashinfer_kv_indices),
+        and this wrapper then pointer-swaps every MLA layer's CSR to its own
+        packed buffers -- the fill's output is discarded whole. This lite
+        fork keeps the two pieces the step still needs, through the base's
+        own methods (no stock change): num_kv_splits sizing from the DENSE
+        lens (split count changes accumulation grouping, so resizing from
+        compressed lens would break bit-parity) and the unified-pool write
+        locs. Returns False (caller falls back to the full base hook) on any
+        base shape it does not recognize.
+        """
+        fa = getattr(self.base, "full_attn_backend", None)
+        lin = getattr(self.base, "linear_attn_backend", None)
+        if fa is None or lin is None:
+            return False
+        if (
+            getattr(fa, "dcp_size", 1) > 1
+            or getattr(fa, "use_sliding_window_kv_pool", False)
+            or forward_batch.spec_info is not None
+        ):
+            return False
+        try:
+            bs = forward_batch.batch_size
+            seq_lens = forward_batch.seq_lens[:bs]
+            kv_indptr = fa.kv_indptr[: bs + 1]
+            kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+            fa.get_num_kv_splits(fa.cuda_graph_num_kv_splits[:bs], seq_lens)
+            fa._fill_cuda_graph_write_locs(forward_batch, bs)
+        except AttributeError:
+            return False
+        lin.init_forward_metadata_out_graph(forward_batch, in_capture=False)
+        return True
 
     def _step_slots(self, forward_batch):
         """This step's pool slots and capture key, without a device readback.
