@@ -75,14 +75,18 @@ class TestVestigeScanKernel(CustomTestCase):
         # (score within eps of its head threshold), and there may be only a
         # handful. Systematic errors (tf32-style truncation) would flip rows
         # far from the boundary and fail this.
-        from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan  # noqa: F401
+        from sglang.srt.layers.attention.vestigekv.scan_kernel import (  # noqa: F401
+            vestige_scan,
+        )
 
         for A in (4096, 16384, 58900):
             ref, got, boundary = self._case_with_boundary(A, seed=A)
             dis = (ref != got).nonzero().flatten()
             self.assertLessEqual(int(dis.numel()), max(4, A // 4096), f"A={A}")
             for i in dis.tolist():
-                self.assertTrue(bool(boundary[i]), f"A={A} non-boundary row {i} flipped")
+                self.assertTrue(
+                    bool(boundary[i]), f"A={A} non-boundary row {i} flipped"
+                )
             self.assertGreater(int(ref.sum()), 0, "threshold left nothing firing")
 
     def _case_with_boundary(self, A, seed, closed_heads=(), quantile=0.999):
