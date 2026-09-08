@@ -15,7 +15,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=30, suite="base-b-test-1-gpu-small")
 
 H, R, W = 32, 64, 512
 L, MAX_REQS = 3, 8
@@ -52,8 +52,11 @@ def _mk_state(seed=0):
         for slot in (2, 5):
             nk, a = shapes[li]
             tiers[(li, slot)] = _mk_tier(
-                nk + slot, a + 100 * slot, seed=li * 10 + slot,
-                zp=float(li), thr_g=-float("inf"),
+                nk + slot,
+                a + 100 * slot,
+                seed=li * 10 + slot,
+                zp=float(li),
+                thr_g=-float("inf"),
             )
     return qbuf, fetch, flen, tiers
 
@@ -156,8 +159,13 @@ class TestCapacityPack(CustomTestCase):
 
         # content refresh without recapture: new tiers, same graph
         tiers2 = {
-            k: _mk_tier(800 + 7 * k[1], 15000 + 500 * k[1], seed=99 + k[0],
-                        zp=1.0, thr_g=-float("inf"))
+            k: _mk_tier(
+                800 + 7 * k[1],
+                15000 + 500 * k[1],
+                seed=99 + k[0],
+                zp=1.0,
+                thr_g=-float("inf"),
+            )
             for k in pairs
         }
         tl2 = [tiers2[p] for p in pairs]

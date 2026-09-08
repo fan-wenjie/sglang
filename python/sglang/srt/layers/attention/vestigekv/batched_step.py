@@ -130,7 +130,9 @@ class BatchedScanPack:
         # fixed-address fused-prologue outputs (graph reads/writes in place)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
-        self.qside_t = torch.zeros(P, D.SIDECAR_DIM, H, device=dev, dtype=torch.bfloat16)
+        self.qside_t = torch.zeros(
+            P, D.SIDECAR_DIM, H, device=dev, dtype=torch.bfloat16
+        )
         self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=torch.float16)
         self.qres = torch.zeros(P, H, device=dev)
         self.thr_flat = torch.zeros(P, device=dev)
@@ -256,9 +258,7 @@ class BatchedScanPack:
             # Stale kr/side contents behind the zero lengths are never read.
             self.a_len[n:] = 0
             self.nk_len[n:] = 0
-        self.nk_mask.copy_(
-            self._nk_col[None, None, :] >= self.nk_len[:, None, None]
-        )
+        self.nk_mask.copy_(self._nk_col[None, None, :] >= self.nk_len[:, None, None])
         pad = self.li.shape[0] - n
         li_l = [p[0] for p in pairs] + [0] * pad
         slot_l = [p[1] for p in pairs] + [self._pad_slot or 0] * pad
@@ -310,7 +310,12 @@ class BatchedScanPack:
         # Deterministic two-phase Triton compaction: the torch chain's int64
         # cumsum alone cost 157 us/step at 128k (nsys, 1.5x the scan kernel).
         compact_fired(
-            self.hit, self.arch, self.a_len, self.li, self.slot,
-            self.fetch_buf, self.fetch_len,
+            self.hit,
+            self.arch,
+            self.a_len,
+            self.li,
+            self.slot,
+            self.fetch_buf,
+            self.fetch_len,
             (self.c_counts, self.c_offsets, self.c_total),
         )

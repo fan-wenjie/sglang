@@ -7,6 +7,7 @@ kernel against the implementation it replaced, at serving shapes
 regression in any one kernel is visible in isolation rather than only in
 end-to-end serving numbers.
 """
+
 import torch
 import torch.utils.benchmark as benchmark
 
@@ -32,7 +33,10 @@ def shapes(S, dev="cuda"):
     q = torch.randn(P, H, 576, device=dev)
     kr = torch.randn(P, nk, 576, device=dev, dtype=torch.bfloat16)
     v = torch.stack(
-        [torch.linalg.qr(torch.randn(KV, R, device=dev))[0].T.contiguous() for _ in range(P)]
+        [
+            torch.linalg.qr(torch.randn(KV, R, device=dev))[0].T.contiguous()
+            for _ in range(P)
+        ]
     )
     nk_len = torch.full((P,), nk, device=dev, dtype=torch.int64)
     thr = torch.rand(P, device=dev)
@@ -71,8 +75,10 @@ def bench_prologue(S):
     split = lambda: fused_prologue_split(  # noqa: E731
         q, kr, v, nk_len, thr, sc, out=out, partials=parts
     )
-    print(f"  prologue S={S//1024}k: eager {t(eager):.3f}  single-CTA {t(single):.3f}  "
-          f"split-NK {t(split):.3f} ms")
+    print(
+        f"  prologue S={S // 1024}k: eager {t(eager):.3f}  single-CTA {t(single):.3f}  "
+        f"split-NK {t(split):.3f} ms"
+    )
 
 
 def bench_scan(S):
@@ -87,7 +93,9 @@ def bench_scan(S):
     )
     ms = t(f)
     mb = a * 260 / 1e6
-    print(f"  scan(single-pair) S={S//1024}k: {ms:.3f} ms  ({mb:.0f}MB -> {mb/ms:.0f} GB/s)")
+    print(
+        f"  scan(single-pair) S={S // 1024}k: {ms:.3f} ms  ({mb:.0f}MB -> {mb / ms:.0f} GB/s)"
+    )
 
 
 def bench_compact(S):
@@ -118,12 +126,14 @@ def bench_compact(S):
         scratch.scatter_(1, dst, arch)
 
     tri = lambda: compact_fired(hit, arch, a_len, li, slot, fb, fl, scr)  # noqa: E731
-    print(f"  compact S={S//1024}k: torch-chain {t(torch_chain):.3f}  triton {t(tri):.3f} ms")
+    print(
+        f"  compact S={S // 1024}k: torch-chain {t(torch_chain):.3f}  triton {t(tri):.3f} ms"
+    )
 
 
 if __name__ == "__main__":
     for S in (65536, 131072, 262144):
-        print(f"S = {S//1024}k")
+        print(f"S = {S // 1024}k")
         bench_prologue(S)
         bench_scan(S)
         bench_compact(S)

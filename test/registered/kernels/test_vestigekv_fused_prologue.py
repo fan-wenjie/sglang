@@ -49,7 +49,10 @@ def _case(P=4, NKm=512, seed=0, empty=()):
     q = torch.randn(P, H, 576, device=dev)
     kr = torch.randn(P, NKm, 576, device=dev, dtype=torch.bfloat16)
     v = torch.stack(
-        [torch.linalg.qr(torch.randn(KV, R, device=dev))[0].T.contiguous() for _ in range(P)]
+        [
+            torch.linalg.qr(torch.randn(KV, R, device=dev))[0].T.contiguous()
+            for _ in range(P)
+        ]
     )
     nk_len = torch.randint(NKm // 2, NKm, (P,), device=dev, dtype=torch.int64)
     for i in empty:
@@ -92,7 +95,9 @@ class TestFusedPrologue(CustomTestCase):
         g1, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, 1 / 24.0)
         self.assertTrue(bool((g1[0] == -float("inf")).all()))
         self.assertTrue(bool((g1[2] == -float("inf")).all()))
-        self.assertTrue(bool(torch.isfinite(g1[1]).any() | (g1[1] == float("inf")).any()))
+        self.assertTrue(
+            bool(torch.isfinite(g1[1]).any() | (g1[1] == float("inf")).any())
+        )
 
 
 if __name__ == "__main__":
