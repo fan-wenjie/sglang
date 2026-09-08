@@ -264,9 +264,15 @@ class VestigeKVMLABackend(AttentionBackend):
     # ---- tier-2 scan capture: 215 launches/step -> 1 ----
 
     def _scan_key(self, forward_batch, reqs):
-        # The capture is valid only while every address and shape it baked in
-        # still holds: the same requests in the same pool slots, the same set of
-        # layers with a built tier, and the same archive size per (slot, layer).
+        # The capture is valid only while every ADDRESS and SHAPE CLASS it
+        # baked still holds: the same (layer, pool-slot) pairs at the same
+        # batch size. Archive/kept SIZES deliberately stay out of the key:
+        # the kernels read a_len/nk_len per pair and the grid is sized by the
+        # pack's capacity, so content growth is the epoch fast path's job
+        # (fits() -> update() in place; a tier outgrowing capacity fails
+        # fits() and recaptures). Keying on the exact archive size made every
+        # install/close a key change -- the capture churn behind the bs4
+        # collapse (136 captures / 26 s despite the epoch path).
         real = forward_batch.out_cache_loc.shape[0]
         key = [("bs", forward_batch.seq_lens.shape[0], real)]
         for lid in self._mla_lids:
@@ -276,7 +282,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 st = self._recall.get((reqs[i], lid))
                 if st is None or st.get("tier") is None:
                     return None  # not all tiers built yet; stay eager
-                key.append((lid, reqs[i], st["tier"].arch.shape[0]))
+                key.append((lid, reqs[i]))
         return tuple(key) if len(key) > 1 else None
 
     def _kmax_exhausted(self) -> bool:

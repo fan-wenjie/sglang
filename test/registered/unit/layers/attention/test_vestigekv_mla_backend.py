@@ -313,10 +313,15 @@ class TestVestigeScanCapture(CustomTestCase):
         be = _mk_scan_backend({(0, 3): 100})  # layer 7 missing entirely
         self.assertIsNone(be._scan_key(_scan_fb(1), [0]))
 
-    def test_key_tracks_archive_size(self):
+    def test_key_ignores_archive_size(self):
+        # New contract: sizes stay OUT of the key -- kernels mask by
+        # a_len/nk_len and the grid is capacity-sized, so growth is the epoch
+        # path's job (fits()->update(); capacity overflow recaptures via
+        # fits() failing). Keying on exact size made every install/close a
+        # recapture: the bs4 capture churn (136 captures / 26 s).
         a = _mk_scan_backend({(0, 3): 100, (0, 7): 200})
         b = _mk_scan_backend({(0, 3): 100, (0, 7): 201})
-        self.assertNotEqual(
+        self.assertEqual(
             a._scan_key(_scan_fb(1), [0]), b._scan_key(_scan_fb(1), [0])
         )
 
