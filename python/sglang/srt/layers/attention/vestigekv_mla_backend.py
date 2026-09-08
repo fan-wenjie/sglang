@@ -89,6 +89,8 @@ class VestigeKVMLABackend(AttentionBackend):
     _cap_keymiss = 0
     _cap_kmax = 0
     _cap_fits = 0
+    _cap_lru_hit = 0
+    _scan_cache = None  # OrderedDict[key -> {graph, pack, kmax}], LRU cap 2
 
     def __init__(
         self,
@@ -358,6 +360,23 @@ class VestigeKVMLABackend(AttentionBackend):
                     self._kmax[lid] = self._kmax.get(lid, 0) + 1
             self._scan_graph.replay()
             return True
+        # LRU graph cache: chunked-prefill interleave oscillates the decode
+        # composition (e.g. bs 1 <-> 4), and a single graph slot thrashed on
+        # the ping-pong (VKKEYMISS showed two shape classes evicting each
+        # other 137 times). A hit swaps the active references; capture puts
+        # the outgoing entry into the cache instead of discarding it.
+        ent = self._scan_cache.get(key) if self._scan_cache is not None else None
+        if ent is not None:
+            self._scan_cache.move_to_end(key)
+            self._stash_active()
+            (self._scan_graph, self._scan_batched, self._scan_kmax,
+             self._scan_key_cur) = ent["graph"], ent["pack"], dict(ent["kmax"]), key
+            # Epoch sync is global but pack contents are per-entry: force one
+            # resync pass so a reactivated pack refreshes via fits()/update()
+            # before its first replay (stale tiers otherwise).
+            self._pack_epoch_synced = self._pack_epoch - 1
+            self._cap_lru_hit += 1
+            return self._replay_scan(forward_batch, reqs, key)
         # Amortization guard: capturing costs a warmup plus the capture itself,
         # so a short generation must not pay for a graph it replays twice.
         self._scan_steps = self._scan_steps + 1 if key == self._scan_key_seen else 1
@@ -436,11 +455,14 @@ class VestigeKVMLABackend(AttentionBackend):
                     pack_tiers.append(self._recall[(reqs[i], lid)]["tier"])
         import time as _t
 
-        # Release the outgoing graph and pack BEFORE building the replacement:
-        # holding both alive doubles the pack's peak footprint, and at
-        # mem-fraction 0.88 the post-pool headroom is ~1.3 GB -- a recapture
-        # OOMed the scheduler on exactly this transient (156 MB alloc with
-        # 85 MB free). The capture that follows rebuilds everything it needs.
+        # Stash the outgoing graph into the LRU (the ping-pong partner will
+        # want it back) instead of discarding; evict beyond capacity to keep
+        # the pack-memory footprint bounded, then free before building the
+        # replacement (the OOM transient lesson).
+        self._stash_active()
+        while self._scan_cache is not None and len(self._scan_cache) > 1:
+            _, old = self._scan_cache.popitem(last=False)
+            old["graph"] = old["pack"] = None
         self._scan_graph = None
         self._scan_batched = None
         torch.cuda.empty_cache()
@@ -518,6 +540,19 @@ class VestigeKVMLABackend(AttentionBackend):
             return False
         self._scan_graph, self._scan_key_cur, self._scan_kmax = graph, key, baked
         self._pack_epoch_synced = self._pack_epoch
+        if self._scan_cache is None:
+            import collections
+
+            self._scan_cache = collections.OrderedDict()
+        self._scan_cache[key] = {
+            "graph": graph,
+            "pack": batched,
+            "kmax": dict(baked),
+        }
+        self._scan_cache.move_to_end(key)
+        while len(self._scan_cache) > 2:
+            _, old = self._scan_cache.popitem(last=False)
+            old["graph"] = old["pack"] = None
         self._scan_batched = batched  # the graph reads/writes its tensors
         self._scan_fails = 0
         # _run executed three times so far (two warmups plus the capture), and
@@ -535,8 +570,29 @@ class VestigeKVMLABackend(AttentionBackend):
         graph.replay()
         return True
 
+    def _stash_active(self):
+        """Park the active graph/pack in the LRU under its key (no-op when
+        nothing is active). Contents may be stale; the epoch check resyncs
+        via fits()/update() on reactivation."""
+        if self._scan_graph is None or self._scan_key_cur is None:
+            return
+        if self._scan_cache is None:
+            import collections
+
+            self._scan_cache = collections.OrderedDict()
+        self._scan_cache[self._scan_key_cur] = {
+            "graph": self._scan_graph,
+            "pack": self._scan_batched,
+            "kmax": dict(self._scan_kmax),
+        }
+        self._scan_cache.move_to_end(self._scan_key_cur)
+
     def _invalidate_scan(self):
         self._pack_epoch += 1
+        if self._scan_cache is not None:
+            for old in self._scan_cache.values():
+                old["graph"] = old["pack"] = None
+            self._scan_cache.clear()
         # Contents (a new request's tiers, a calibration install) no longer
         # drop the capture: the replay path compares tier identities and
         # refreshes the pack in place. What must still reset here is the
