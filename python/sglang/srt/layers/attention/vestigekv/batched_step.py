@@ -291,7 +291,14 @@ class BatchedScanPack:
         self.tier_ids = tuple((id(t), getattr(t, "version", 0)) for t in tiers)
 
     @ieee_fp32
-    def run(self):
+    def run(self, p_live=None):
+        """p_live: number of leading pair slots this launch covers (the
+        decode graph bakes it per batch-size class: layers x class_bs).
+        update() fills live pairs contiguously from position 0, so a grid
+        clipped to p_live sees every live pair; capacity-tail placeholders
+        beyond it are never launched at all. Measured: the placeholder tax
+        was +0.32 ms/step at --cuda-graph-max-bs 16 serving bs=1."""
+        P_eff = p_live if p_live is not None else self.li.shape[0]
         sc = self.scale
         # Fused prologue: skept/softmax/entropy/gate/qsk/qres/max1g and the
         # transpose-casts in ONE kernel (see fused_prologue.py). Replaces the
@@ -312,7 +319,8 @@ class BatchedScanPack:
             partials=(self.pm, self.ps, self.pt),
         )
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
-        P, Am = self.hit.shape
+        _, Am = self.hit.shape
+        P = P_eff
         _scan_batched_kernel[(triton.cdiv(Am, D.SCAN_BLOCK_A * 16), P)](
             qside_t,
             qsk_t,

@@ -1213,7 +1213,7 @@ class VestigeKVMLABackend(AttentionBackend):
         # ONE decode graph launch. No host code runs here at replay time.
         from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
 
-        self._ingraph_pack.run()
+        self._ingraph_pack.run(p_live=len(self._local_mla_lids) * bs)
         pack_csr_all_layers(
             self._stage_slots[:bs],
             self._stage_loc[:bs],

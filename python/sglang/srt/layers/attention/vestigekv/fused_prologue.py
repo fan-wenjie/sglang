@@ -292,13 +292,15 @@ def _prologue_merge_kernel(
 _NSPLIT = 32
 
 
-def fused_prologue_split(qbuf, li, slot, kr, v, nk_len, thr, sc, out, partials):
+def fused_prologue_split(
+    qbuf, li, slot, kr, v, nk_len, thr, sc, out, partials, p_live=None
+):
     """Split-NK prologue reading queries in place from the stacked qbuf.
 
     qbuf [L, RR, H, 576] (bf16 in production; fp32 accepted -- loads upcast),
     li/slot [P] int64 select each pair's query row. Same outputs as
     fused_prologue; replaces the per-step torch gather+cast+contiguous."""
-    P = li.shape[0]
+    P = p_live if p_live is not None else li.shape[0]
     H = qbuf.shape[2]
     RR = qbuf.shape[1]
     NKm = kr.shape[1]
@@ -407,10 +409,13 @@ def _compact_write_kernel(
         tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
 
 
-def compact_fired(hit, arch, a_len, li, slot, fetch_buf, fetch_len, scratch):
+def compact_fired(
+    hit, arch, a_len, li, slot, fetch_buf, fetch_len, scratch, p_live=None
+):
     """Deterministic fired-row compaction. scratch: (counts, offsets, total)
     int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W] int64-compatible."""
-    P, Am = hit.shape
+    _, Am = hit.shape
+    P = p_live if p_live is not None else hit.shape[0]
     BLOCK_A = 1024
     NB = triton.cdiv(Am, BLOCK_A)
     counts, offsets, total = scratch
