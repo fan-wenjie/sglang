@@ -278,7 +278,6 @@ class BatchedScanPack:
     @ieee_fp32
     def run(self):
         sc = self.scale
-        qe = self.qbuf[self.li, self.slot].float()  # [P, H, 576], one gather+cast
         # Fused prologue: skept/softmax/entropy/gate/qsk/qres/max1g and the
         # transpose-casts in ONE kernel (see fused_prologue.py). Replaces the
         # ~12-launch eager chain whose fixed ~0.57 ms execution intercept
@@ -286,7 +285,9 @@ class BatchedScanPack:
         # (nk_len==0) come back with max1g=-inf: whole archive fires, full
         # attention, never under-recall.
         fused_prologue_split(
-            qe.contiguous(),
+            self.qbuf,
+            self.li,
+            self.slot,
             self.kr,
             self.v,
             self.nk_len,
