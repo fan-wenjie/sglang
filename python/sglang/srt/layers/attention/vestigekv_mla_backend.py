@@ -278,7 +278,7 @@ class VestigeKVMLABackend(AttentionBackend):
         # install/close a key change -- the capture churn behind the bs4
         # collapse (136 captures / 26 s despite the epoch path).
         real = forward_batch.out_cache_loc.shape[0]
-        key = [("bs", forward_batch.seq_lens.shape[0], real)]
+        pairs = []
         for lid in self._mla_lids:
             if lid not in self._qbuf:
                 continue
@@ -286,8 +286,15 @@ class VestigeKVMLABackend(AttentionBackend):
                 st = self._recall.get((reqs[i], lid))
                 if st is None or st.get("tier") is None:
                     return None  # not all tiers built yet; stay eager
-                key.append((lid, reqs[i]))
-        return tuple(key) if len(key) > 1 else None
+                pairs.append((lid, reqs[i]))
+        if not pairs:
+            return None
+        # Canonical order: the scheduler reorders running requests step to
+        # step, and the pack rebinds (li, slot) tensors through update(), so
+        # slot order is not part of the baked shape -- sorting keeps a mere
+        # reshuffle from reading as a new shape class (bs4: 137/137 captures
+        # were key misses).
+        return ("bs", forward_batch.seq_lens.shape[0], real) + tuple(sorted(pairs))
 
     def _kmax_exhausted(self) -> bool:
         # The capture bakes one gather width per layer. kept_len grows by one
@@ -332,6 +339,9 @@ class VestigeKVMLABackend(AttentionBackend):
                         for i in range(real):
                             pairs.append((self._li_map[lid], reqs[i]))
                             tiers.append(self._recall[(reqs[i], lid)]["tier"])
+                order = sorted(range(len(pairs)), key=lambda k: pairs[k])
+                pairs = [pairs[k] for k in order]
+                tiers = [tiers[k] for k in order]
                 if self._scan_batched.tier_ids != tuple(
                     (id(t), getattr(t, "version", 0)) for t in tiers
                 ):
@@ -358,6 +368,12 @@ class VestigeKVMLABackend(AttentionBackend):
             return False
         self._capture_asap = False
         self._cap_keymiss += 1
+        if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get() and self._cap_keymiss % 20 == 1:
+            import logging
+
+            logging.getLogger(__name__).info(
+                "VKKEYMISS old=%s new=%s", self._scan_key_cur, key
+            )
         return self._capture_scan(key, forward_batch, reqs)
 
     def _capture_scan(self, key, forward_batch, reqs) -> bool:
