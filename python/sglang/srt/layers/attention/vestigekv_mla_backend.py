@@ -85,6 +85,10 @@ class VestigeKVMLABackend(AttentionBackend):
     # unchanged, the replay fast path skips per-step pairs/fits bookkeeping.
     _pack_epoch = 0
     _pack_epoch_synced = -1
+    # capture-reason counters (diagnostic; printed by VKSTATS when stats on)
+    _cap_keymiss = 0
+    _cap_kmax = 0
+    _cap_fits = 0
 
     def __init__(
         self,
@@ -313,6 +317,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 # Same shape, just out of baked headroom: recapture at once
                 # rather than serving D.SCAN_CAPTURE_AFTER eager steps for a
                 # stability the key has already demonstrated.
+                self._cap_kmax += 1
                 return self._capture_scan(key, forward_batch, reqs)
             real = forward_batch.out_cache_loc.shape[0]
             if self._pack_epoch != self._pack_epoch_synced:
@@ -352,6 +357,7 @@ class VestigeKVMLABackend(AttentionBackend):
         if not self._capture_asap and self._scan_steps < D.SCAN_CAPTURE_AFTER:
             return False
         self._capture_asap = False
+        self._cap_keymiss += 1
         return self._capture_scan(key, forward_batch, reqs)
 
     def _capture_scan(self, key, forward_batch, reqs) -> bool:
@@ -589,6 +595,7 @@ class VestigeKVMLABackend(AttentionBackend):
         c = max(st["scan_calls"], 1)
         logging.getLogger(__name__).info(
             "VKSTATS steps=%d layers=%d replay=%.0f%% build=%.1fms x%d cap=%.1fms x%d "
+            "caps[key=%d kmax=%d fits=%d] "
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
             "pack=%.2fms/step "
             "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
@@ -600,6 +607,9 @@ class VestigeKVMLABackend(AttentionBackend):
             st["n_build"],
             1e3 * st["t_capture"],
             st["n_capture"],
+            self._cap_keymiss,
+            self._cap_kmax,
+            self._cap_fits,
             1e3 * st["t_replay"] / max(st["replays"], 1),
             1e3 * st["t_replay_host"] / max(st["replays"], 1),
             1e3 * st["t_eager"] / max(n - st["replays"], 1),
