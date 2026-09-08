@@ -49,8 +49,17 @@ def _scan_batched_kernel(
     BLOCK_A: tl.constexpr,
 ):
     p = tl.program_id(1)
+    al = tl.load(a_len_ptr + p)
+    # Grid is capacity-sized (the capture bakes it); a block fully past this
+    # pair's real archive stores nothing anyway (all-masked), but WOULD still
+    # burn its full tl.dot FLOPs -- masked rows compute, they just load zeros.
+    # Measured: an all-placeholder pack scans in the same 165 us/step as a
+    # live one. Exit before any work instead: placeholder pairs, the FULL
+    # arm, and every real pair's over-capacity tail cost one scalar load.
+    if tl.program_id(0) * BLOCK_A >= al:
+        return
     offs = tl.program_id(0) * BLOCK_A + tl.arange(0, BLOCK_A)
-    m = offs < tl.load(a_len_ptr + p)
+    m = offs < al
     d = tl.arange(0, DD)
     r = tl.arange(0, R)
     h = tl.arange(0, H)
