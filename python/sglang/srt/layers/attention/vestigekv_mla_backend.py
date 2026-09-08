@@ -857,12 +857,8 @@ class VestigeKVMLABackend(AttentionBackend):
             cap = self.base.max_context_len
             dt = fm.kv_indices.dtype if fm is not None else torch.int64
             dev = r2t.device
-            # +1 trash row (see _alloc_recall_bufs)
-            self._kept_buf[lid] = torch.zeros(max_reqs + 1, cap, dtype=dt, device=dev)
+            self._ensure_kept_stacks(max_reqs, cap, dt, dev)
             self._alloc_recall_bufs(lid, max_reqs, dt, dev)
-            self._kept_len[lid] = torch.zeros(
-                max_reqs + 1, dtype=torch.int64, device=dev
-            )
             self._indptr1[lid] = torch.zeros(2, dtype=dt, device=dev)
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)
         kbuf = kbuf.reshape(-1, kbuf.shape[-1])
@@ -930,6 +926,23 @@ class VestigeKVMLABackend(AttentionBackend):
             # built once on the first decode step for this slot; that is
             # prefill-phase work by semantics, so serving reports must bill it to
             # TTFT, not to steady-state decode throughput.
+
+    def _ensure_kept_stacks(self, max_reqs, cap, dt, dev):
+        # Stacked kept tables ([L, R1, CAP] etc.) with the per-lid dict
+        # entries as views (the _qbuf_stack pattern): eager call sites keep
+        # their dict interface, while the in-graph CSR pack addresses every
+        # layer from two kernels (see vestigekv/pack_csr.py).
+        if getattr(self, "_kept_stack", None) is not None:
+            return
+        n = len(self._local_mla_lids)
+        li_map = {L: i for i, L in enumerate(self._local_mla_lids)}
+        self._kept_stack = torch.zeros(n, max_reqs + 1, cap, dtype=dt, device=dev)
+        self._kept_len_stack = torch.zeros(
+            n, max_reqs + 1, dtype=torch.int64, device=dev
+        )
+        for lid, i in li_map.items():
+            self._kept_buf[lid] = self._kept_stack[i]
+            self._kept_len[lid] = self._kept_len_stack[i]
 
     def _alloc_recall_bufs(self, lid, max_reqs, idx_dtype, dev):
         if lid in self._qbuf:
@@ -1074,14 +1087,8 @@ class VestigeKVMLABackend(AttentionBackend):
         for lid in self._local_mla_lids:
             if lid not in self._kept_buf:
                 cap_row = self.base.max_context_len
-                self._kept_buf[lid] = torch.zeros(
-                    r2t.shape[0] + 1,
-                    cap_row,
-                    dtype=fm.kv_indices.dtype,
-                    device=r2t.device,
-                )
-                self._kept_len[lid] = torch.zeros(
-                    r2t.shape[0] + 1, dtype=torch.int64, device=r2t.device
+                self._ensure_kept_stacks(
+                    r2t.shape[0], cap_row, fm.kv_indices.dtype, r2t.device
                 )
                 self._indptr1[lid] = torch.zeros(
                     2, dtype=fm.kv_indptr.dtype, device=r2t.device
@@ -1090,12 +1097,20 @@ class VestigeKVMLABackend(AttentionBackend):
             self._alloc_recall_bufs(lid, r2t.shape[0], fm.kv_indices.dtype, r2t.device)
             bufs = self._graph_bufs.get(lid)
             if bufs is None:
-                # +1: the static-shape CSR pack scatters every masked-out
-                # entry into a trash slot at the end (see _refresh_graph_bufs).
-                cap = max(self._graph_max_bs, 1) * self.base.max_context_len + 1
+                # Stacked across layers (views per lid): the in-graph CSR pack
+                # addresses all layers from one kernel launch. +1: the legacy
+                # torch pack scatters masked-out entries into a trash slot at
+                # the end (see _refresh_graph_bufs); the Triton pack masks.
+                if getattr(self, "_gb_indices_stack", None) is None:
+                    nl = len(self._local_mla_lids)
+                    mb1 = max(self._graph_max_bs, 1) + 1
+                    cap = max(self._graph_max_bs, 1) * self.base.max_context_len + 1
+                    self._gb_indptr_stack = fm.kv_indptr.new_zeros(nl, mb1)
+                    self._gb_indices_stack = fm.kv_indices.new_zeros(nl, cap)
+                li_ = self._li_map[lid]
                 bufs = {
-                    "indptr": fm.kv_indptr.new_zeros(max(self._graph_max_bs, 1) + 1),
-                    "indices": fm.kv_indices.new_zeros(cap),
+                    "indptr": self._gb_indptr_stack[li_],
+                    "indices": self._gb_indices_stack[li_],
                 }
                 self._graph_bufs[lid] = bufs
             bufs["indptr"][: bs + 1].copy_(fm.kv_indptr[: bs + 1])
@@ -1153,14 +1168,21 @@ class VestigeKVMLABackend(AttentionBackend):
 
     def _ingraph_device_step(self, bs):
         # Runs inside run_once during capture, so the whole recall step --
-        # scan + fetch + per-layer CSR pack -- replays as nodes of the ONE
-        # decode graph launch. No host code runs here at replay time.
+        # scan + fetch + the all-layer CSR pack -- replays as nodes of the
+        # ONE decode graph launch. No host code runs here at replay time.
+        from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
+
         self._ingraph_pack.run()
-        slots = self._stage_slots[:bs]
-        loc = self._stage_loc[:bs]
-        for lid in self._local_mla_lids:
-            if lid in self._kept_buf and lid in self._graph_bufs:
-                self._pack_csr(lid, slots, loc, bs, bs, self._kept_buf[lid].shape[1])
+        pack_csr_all_layers(
+            self._stage_slots[:bs],
+            self._stage_loc[:bs],
+            self._kept_stack,
+            self._kept_len_stack,
+            self._fetch_len_stack,
+            self._fetch_stack,
+            self._gb_indices_stack,
+            self._gb_indptr_stack,
+        )
 
     def _ingraph_host_step(self, forward_batch, reqs):
         bs = forward_batch.seq_lens.shape[0]
@@ -1206,9 +1228,7 @@ class VestigeKVMLABackend(AttentionBackend):
         # (growth <= layers per step, capacity is max_context_len).
         self._ingraph_steps += 1
         if self._ingraph_steps % 1024 == 0:
-            for lid in self._local_mla_lids:
-                if lid in self._kept_len:
-                    self._kept_len[lid][self._trash_slot] = 0
+            self._kept_len_stack[:, self._trash_slot] = 0
 
     def _ingraph_disable(self, forward_batch, reqs):
         # A tier outgrew the capacity pack -- impossible under the sizing
