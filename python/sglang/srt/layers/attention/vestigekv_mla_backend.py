@@ -675,6 +675,20 @@ class VestigeKVMLABackend(AttentionBackend):
         st = self._stats
         n = max(st["steps"], 1)
         c = max(st["scan_calls"], 1)
+        if True:  # VKMEM: dynamic-memory attribution for the D12 leak hunt
+            alloc = torch.cuda.memory_allocated() / 1e9
+            ntier = len([1 for v in self._recall.values() if v.get("tier") is not None])
+            njobs = len(self._build_jobs)
+            ncache = len(self._scan_cache) if self._scan_cache is not None else 0
+            pk = 0
+            if self._scan_batched is not None:
+                b = self._scan_batched
+                pk = sum(t.numel() * t.element_size() for t in
+                         (b.side, b.csk, b.kr, b.rho, b.arch, b.hit)) / 1e9
+            logging.getLogger(__name__).info(
+                "VKMEM alloc=%.1fGB tiers=%d jobs=%d cache=%d pack=%.2fGB",
+                alloc, ntier, njobs, ncache, pk,
+            )
         logging.getLogger(__name__).info(
             "VKSTATS steps=%d layers=%d replay=%.0f%% build=%.1fms x%d cap=%.1fms x%d "
             "caps[key=%d kmax=%d fits=%d] "
