@@ -31,7 +31,7 @@ def _mk_state(seed):
         0, FW, (L, R1), dtype=torch.int64, device="cuda", generator=g
     )
     fetch_buf = torch.randint(
-        1, 5000, (L, R1, FW), dtype=torch.int64, device="cuda", generator=g
+        1, 5000, (L, R1, FW), dtype=torch.int32, device="cuda", generator=g
     )
     indices = torch.zeros(L, MAXBS * CAP + 1, dtype=torch.int32, device="cuda")
     indptr = torch.zeros(L, MAXBS + 1, dtype=torch.int32, device="cuda")
@@ -84,18 +84,26 @@ class TestPackCsrParity(CustomTestCase):
                 f"kept_buf seed={seed}",
             )
             for i in range(L):
-                total = int(r_ip[i, bs])
                 self.assertTrue(
                     torch.equal(r_ip[i, : bs + 1], g_ip[i, : bs + 1]),
                     f"indptr layer {i} seed={seed}",
                 )
-                self.assertTrue(
-                    torch.equal(
-                        r_ix[i, :total].to(torch.int64),
-                        g_ix[i, :total].to(torch.int64),
-                    ),
-                    f"indices layer {i} seed={seed}",
-                )
+                # compare per-lane segments, REAL lanes only: a duplicated
+                # trash lane's segment contains the append cell, whose
+                # collision winner the torch scatter leaves undefined (both
+                # forms are self-consistent; trash-lane attention output is
+                # discarded padding).
+                for lane in range(bs):
+                    if lanes[lane] == TRASH:
+                        continue
+                    lo, hi = int(r_ip[i, lane]), int(r_ip[i, lane + 1])
+                    self.assertTrue(
+                        torch.equal(
+                            r_ix[i, lo:hi].to(torch.int64),
+                            g_ix[i, lo:hi].to(torch.int64),
+                        ),
+                        f"indices layer {i} lane {lane} seed={seed}",
+                    )
 
 
 if __name__ == "__main__":
