@@ -182,7 +182,7 @@ def scan_target(tau: float = RECALL_TARGET) -> float:
 def min_hard(tau: float = RECALL_TARGET) -> int:
     """Fewest hard samples for which the conformal quantile at scan_target
     exists: ceil((n+1)*t) <= n requires n >= t / (1 - t)."""
-    
+
     t = scan_target(tau)
     # 1e-9 guard: for rational tau the ratio is often an exact integer that
     # floating point lands a hair ABOVE (0.9 -> t = 18/19, t/(1-t) = 18 but

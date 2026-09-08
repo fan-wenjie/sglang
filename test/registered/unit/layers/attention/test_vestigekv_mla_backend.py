@@ -321,9 +321,7 @@ class TestVestigeScanCapture(CustomTestCase):
         # recapture: the bs4 capture churn (136 captures / 26 s).
         a = _mk_scan_backend({(0, 3): 100, (0, 7): 200})
         b = _mk_scan_backend({(0, 3): 100, (0, 7): 201})
-        self.assertEqual(
-            a._scan_key(_scan_fb(1), [0]), b._scan_key(_scan_fb(1), [0])
-        )
+        self.assertEqual(a._scan_key(_scan_fb(1), [0]), b._scan_key(_scan_fb(1), [0]))
 
     def test_key_tracks_pool_slot(self):
         be = _mk_scan_backend({(0, 3): 100, (0, 7): 200, (1, 3): 100, (1, 7): 200})
@@ -415,7 +413,8 @@ class TestVestigeScanCapture(CustomTestCase):
         key = be._scan_key(fb, [0])
         be._scan_key_cur = key
         be._scan_batched = SimpleNamespace(
-            tier_ids=("stale",), fits=lambda pairs, tiers: False,
+            tier_ids=("stale",),
+            fits=lambda pairs, tiers: False,
             update=lambda *_: self.fail("must not update an undersized pack"),
         )
         be._scan_graph = SimpleNamespace(replay=lambda: None)
@@ -707,9 +706,7 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         job["done"] = SimpleNamespace(is_set=lambda: True)
         job["error"] = error
         if error is None:
-            job["tier"] = SimpleNamespace(
-                built_at=job["seq_len"], proxy=False, V="V"
-            )
+            job["tier"] = SimpleNamespace(built_at=job["seq_len"], proxy=False, V="V")
             job["stats"] = {
                 "need_more_hard": n_hard < D.min_hard(),
                 "n_hard": n_hard,
@@ -737,8 +734,12 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         be = self._backend()
         b, e = self._stubs(be)
         called = []
-        with b, e, patch.object(
-            VestigeKVMLABackend, "_invalidate_scan", lambda _s: called.append(1)
+        with (
+            b,
+            e,
+            patch.object(
+                VestigeKVMLABackend, "_invalidate_scan", lambda _s: called.append(1)
+            ),
         ):
             for step in range(D.N_CAL_START):
                 be._collect_calibration(self._fb(seq=101 + step), [0])
@@ -805,12 +806,28 @@ class TestTierTwoIsNeverOff(CustomTestCase):
             be._recall[(0, L)]["qpos"] = [0] * 8
         calls = []
         pend = SimpleNamespace(is_set=lambda: False)
-        j3 = {"slot": 0, "lid": 3, "st": be._recall[(0, 3)], "seq_len": 108,
-              "qcal": [object()] * 8, "done": pend, "error": None,
-              "tier": None, "stats": None}
-        j7 = {"slot": 0, "lid": 7, "st": be._recall[(0, 7)], "seq_len": 108,
-              "qcal": [object()] * 8, "done": pend, "error": None,
-              "tier": None, "stats": None}
+        j3 = {
+            "slot": 0,
+            "lid": 3,
+            "st": be._recall[(0, 3)],
+            "seq_len": 108,
+            "qcal": [object()] * 8,
+            "done": pend,
+            "error": None,
+            "tier": None,
+            "stats": None,
+        }
+        j7 = {
+            "slot": 0,
+            "lid": 7,
+            "st": be._recall[(0, 7)],
+            "seq_len": 108,
+            "qcal": [object()] * 8,
+            "done": pend,
+            "error": None,
+            "tier": None,
+            "stats": None,
+        }
         be._build_jobs = [j3, j7]
         be._recall[(0, 3)]["job"] = j3
         be._recall[(0, 7)]["job"] = j7
@@ -852,7 +869,10 @@ class TestTierTwoIsNeverOff(CustomTestCase):
                 be._collect_calibration(self._fb(seq=101 + step), [0])
             # slot reused by a new request: collector state reset by prefill
             be._recall[(0, LID)] = {
-                "tier": None, "built_at": 0, "qcal": [], "qpos": [],
+                "tier": None,
+                "built_at": 0,
+                "qcal": [],
+                "qpos": [],
                 "target": D.N_CAL_START,
             }
             self._finish(be.enqueued[0])
@@ -941,9 +961,7 @@ class TestStatsPathMatchesProduction(CustomTestCase):
         for call in ("_recall_step(", "_refresh_graph_bufs("):
             idx = src.index(call)
             guard = src.rindex("if not replayed:", 0, idx)
-            self.assertGreater(
-                guard, src.index("replayed = "), f"{call} not guarded"
-            )
+            self.assertGreater(guard, src.index("replayed = "), f"{call} not guarded")
 
 
 class TestCaptureDoesNotDuplicateKeptRows(CustomTestCase):
@@ -1088,7 +1106,7 @@ class TestLiveArchiveBackfill(CustomTestCase):
         if cached < c1:
             tier.extend_closed(rows[cached:c1], slots[cached:])
         keep = torch.zeros(c1, dtype=torch.bool)
-        keep[:: 3] = True
+        keep[::3] = True
         tier.refresh_membership(keep, rows[keep])
         return keep
 

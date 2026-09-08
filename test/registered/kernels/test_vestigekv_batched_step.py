@@ -54,8 +54,11 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
             for slot in slots:
                 nk, a = shapes[li]
                 tiers[(li, slot)] = _mk_tier(
-                    nk + slot, a + 100 * slot, seed=li * 10 + slot,
-                    zp=float(li), thr_g=-float("inf"),
+                    nk + slot,
+                    a + 100 * slot,
+                    seed=li * 10 + slot,
+                    zp=float(li),
+                    thr_g=-float("inf"),
                 )
         qbuf = torch.randn(L, max_reqs, H, 576, device="cuda")
         fetch = torch.zeros(L, max_reqs, W, dtype=torch.int64, device="cuda")
@@ -71,9 +74,7 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
             ref_rows[(li, slot)] = out[slot, : int(ol[slot])].clone()
 
         pairs = list(tiers.keys())
-        pack = BatchedScanPack(
-            pairs, [tiers[p] for p in pairs], qbuf, fetch, flen, H
-        )
+        pack = BatchedScanPack(pairs, [tiers[p] for p in pairs], qbuf, fetch, flen, H)
         pack.run()
         torch.cuda.synchronize()
         for li, slot in pairs:
@@ -96,9 +97,7 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         qbuf = torch.randn(1, 4, H, 576, device="cuda")
         fetch = torch.zeros(1, 4, W, dtype=torch.int64, device="cuda")
         flen = torch.zeros(1, 4, dtype=torch.int64, device="cuda")
-        pack = BatchedScanPack(
-            [(0, 0), (0, 1)], [small, wide], qbuf, fetch, flen, H
-        )
+        pack = BatchedScanPack([(0, 0), (0, 1)], [small, wide], qbuf, fetch, flen, H)
         pack.run()
         torch.cuda.synchronize()
         n_small = int(flen[0, 0])
@@ -205,9 +204,7 @@ class TestKeptSetParityWithReference(CustomTestCase):
         keep = torch.zeros(closed, dtype=torch.bool, device="cuda")
         keep[sig.topk(m).indices] = True
         keep[: D.SINKS] = True
-        expect = torch.cat(
-            [row_slots[:closed][keep], row_slots[closed:seq]]
-        )
+        expect = torch.cat([row_slots[:closed][keep], row_slots[closed:seq]])
         self.assertTrue(torch.equal(torch.sort(got).values, torch.sort(expect).values))
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
@@ -261,7 +258,7 @@ class TestBatchedEmptyKept(CustomTestCase):
             t.a_len = A
             t.thr_g = 0.0
             t.zp = 4.0
-            t.scale = 1.0 / (D.LATENT_DIM ** 0.5)
+            t.scale = 1.0 / (D.LATENT_DIM**0.5)
             t.r = 16
             t.version = 0
             return t

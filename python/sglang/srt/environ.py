@@ -562,6 +562,13 @@ class Envs:
 
     SGLANG_DEBUG_VESTIGEKV_STATS = EnvBool(False)
 
+    # Capture the tier-2 recall scan + CSR pack INSIDE the decode model graph
+    # (via init_forward_metadata_in_graph) instead of replaying a second scan
+    # graph per step: removes the second cudaGraphLaunch's fixed ~0.9 ms
+    # batch-independent cost. The production path; False falls back to the
+    # separately captured scan graph (kill-switch A/B).
+    SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN = EnvBool(True)
+
     SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG = EnvStr(None)
     # VestigeKV recall calibration: number of decode steps whose queries
     # feed RecallTier.build before the tier activates for a request.
