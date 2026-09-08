@@ -41,6 +41,7 @@ def _scan_batched_kernel(
     a_len_ptr,  # [P] int64: real archive rows of this pair
     cc_ptr,  # [P] fp32: zp * sc / sqrt(kv_lora - R)
     hit_ptr,  # [P, Amax] int32 out
+    counts_ptr,  # [P, NB] int32 fused compact-count out (NB = ceil(Amax/1024))
     Amax,
     sc,
     H: tl.constexpr,
@@ -85,6 +86,15 @@ def _scan_batched_kernel(
     score = acc * sc + cc * rh[:, None] * tl.load(qres_ptr + p * H + h)[None, :]
     fired = tl.max((score > tl.load(max1g_ptr + p * H + h)[None, :]).to(tl.int32), 1)
     tl.store(hit_ptr + p * Amax + offs, fired, mask=m)
+    # Fused compact-count: this block's fired total lands in its 1024-row
+    # bucket (BLOCK_A-sized scan blocks share buckets; integer atomics sum
+    # deterministically). Buckets are pre-zeroed by the previous step's
+    # prefix kernel; blocks fully past a_len exited above and leave theirs 0.
+    nb = (Amax + 1023) // 1024
+    tl.atomic_add(
+        counts_ptr + p * nb + (tl.program_id(0) * BLOCK_A) // 1024,
+        tl.sum(tl.where(m, fired, 0), 0),
+    )
 
 
 class BatchedScanPack:
@@ -309,6 +319,7 @@ class BatchedScanPack:
             self.a_len,
             self.cc,
             self.hit,
+            self.c_counts,
             Am,
             sc,
             H=self.q_heads,

@@ -359,18 +359,6 @@ def fused_prologue_split(qbuf, li, slot, kr, v, nk_len, thr, sc, out, partials):
 
 
 @triton.jit
-def _compact_count_kernel(hit_ptr, counts_ptr, a_len_ptr, Am, BLOCK_A: tl.constexpr):
-    p = tl.program_id(1)
-    b = tl.program_id(0)
-    offs = b * BLOCK_A + tl.arange(0, BLOCK_A)
-    alen = tl.load(a_len_ptr + p)
-    m = (offs < Am) & (offs < alen)
-    h = tl.load(hit_ptr + p * Am + offs, mask=m, other=0)
-    nb = tl.num_programs(0)
-    tl.store(counts_ptr + p * nb + b, tl.sum((h != 0).to(tl.int32), 0))
-
-
-@triton.jit
 def _compact_scan_kernel(counts_ptr, offsets_ptr, total_ptr, NB, NB2: tl.constexpr):
     p = tl.program_id(0)
     b = tl.arange(0, NB2)  # NB2 = next pow2 >= NB; masked beyond NB
@@ -379,6 +367,9 @@ def _compact_scan_kernel(counts_ptr, offsets_ptr, total_ptr, NB, NB2: tl.constex
     excl = tl.cumsum(c, 0) - c
     tl.store(offsets_ptr + p * NB + b, excl, mask=m)
     tl.store(total_ptr + p, tl.sum(c, 0))
+    # Reset the fused-count buckets for the NEXT step's scan (the graph
+    # replays this every step; zeroing here removes a standalone memset).
+    tl.store(counts_ptr + p * NB + b, tl.zeros([NB2], dtype=tl.int32), mask=m)
 
 
 @triton.jit
@@ -423,7 +414,8 @@ def compact_fired(hit, arch, a_len, li, slot, fetch_buf, fetch_len, scratch):
     BLOCK_A = 1024
     NB = triton.cdiv(Am, BLOCK_A)
     counts, offsets, total = scratch
-    _compact_count_kernel[(NB, P)](hit, counts, a_len, Am, BLOCK_A=BLOCK_A)
+    # counts arrive pre-filled by the scan kernel's fused per-block
+    # accumulation (zeroed at alloc and re-zeroed by the prefix below).
     _compact_scan_kernel[(P,)](
         counts, offsets, total, NB, NB2=triton.next_power_of_2(NB)
     )
