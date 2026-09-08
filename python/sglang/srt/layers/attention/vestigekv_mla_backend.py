@@ -1139,7 +1139,13 @@ class VestigeKVMLABackend(AttentionBackend):
             # between predictive-window rounds) cost ~4 captures/request at
             # 256k, ~60 ms each -- most of the residual S-slope.
             self._needs_recapture = False
-            self._invalidate_scan()
+            # Content swap, not a shape change: bump the epoch so the replay
+            # fast path resyncs via fits()->update() in place. Dropping the
+            # graph here caused capture churn under concurrency (bs4: 139
+            # captures / 27 s over 4050 steps -- the whole ITL collapse);
+            # update() cannot handle a shape-class change, and fits() failing
+            # falls back to a real recapture on its own.
+            self._pack_epoch += 1
             self._capture_asap = True
 
     def _enqueue_build(self, slot, lid, seq_len, st):
@@ -1366,7 +1372,7 @@ class VestigeKVMLABackend(AttentionBackend):
         # calibration collector uses, so the provisional index would install
         # itself and then never be replaced (observed: proxy=True builds only).
         st["tier"], st["built_at"] = tier, seq_len
-        self._invalidate_scan()
+        self._pack_epoch += 1  # content swap; see _install_finished_builds
         return stats
 
     def _refresh_graph_bufs(self, lid, forward_batch, reqs):

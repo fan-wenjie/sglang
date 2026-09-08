@@ -739,13 +739,17 @@ class TestTierTwoIsNeverOff(CustomTestCase):
                 be._collect_calibration(self._fb(seq=101 + step), [0])
             self._finish(be.enqueued[0])
             be._capture_asap = False  # clear the provisional-build flag
+            epoch0 = be._pack_epoch
             be._collect_calibration(self._fb(seq=120), [0])
             be._collect_calibration(self._fb(seq=121), [0])  # sticky fires here
         st = be._recall[(0, LID)]
         self.assertFalse(st["tier"].proxy)  # calibrated tier adopted
         self.assertIsNone(st["qcal"])  # collection over
         self.assertTrue(be._capture_asap)
-        self.assertEqual(called, [1])  # exactly one coalesced invalidate
+        # New contract: install is a content swap -- epoch bump, no graph drop
+        # (invalidate caused capture churn: bs4 saw 139 captures / 27 s).
+        self.assertEqual(called, [])
+        self.assertGreater(be._pack_epoch, epoch0)
 
     def test_reachable_hard_rate_jumps_the_window_predictively(self):
         # window 8, n_hard=6 -> needed = ceil(18*8/6)=24 -> next pow2 = 32,
@@ -813,9 +817,14 @@ class TestTierTwoIsNeverOff(CustomTestCase):
             self.assertEqual(calls, [])  # j7 pending: no invalidate yet
             self.assertFalse(be._recall[(0, 3)]["tier"].proxy)  # but installed
             self._finish(j7)
+            epoch0 = be._pack_epoch
             be._collect_calibration(self._fb(seq=121), [0])
             be._collect_calibration(self._fb(seq=122), [0])  # sticky fires here
-        self.assertEqual(calls, [1])  # exactly one coalesced invalidate
+        # New contract: coalesced install is a content swap -- one epoch bump,
+        # never a graph drop (invalidate caused capture churn: bs4 saw 139
+        # captures/27 s; fits() failure still recaptures on its own).
+        self.assertEqual(calls, [])
+        self.assertGreater(be._pack_epoch, epoch0)
         self.assertTrue(be._capture_asap)
 
     def test_worker_error_keeps_the_provisional_index(self):
