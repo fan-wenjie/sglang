@@ -85,7 +85,7 @@ class VestigeKVMLABackend(AttentionBackend):
     # unchanged, the replay fast path skips per-step pairs/fits bookkeeping.
     _pack_epoch = 0
     _pack_epoch_synced = -1
-    # ---- in-graph scan (SGLANG_VESTIGEKV_INGRAPH_SCAN) ----
+    # ---- in-graph scan (SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN) ----
     # Class-level defaults (unit fakes build the backend via __new__): one
     # worst-case-capacity pack whose kernels the decode model graph bakes;
     # update() refreshes contents in place, so the model graph never
@@ -385,8 +385,12 @@ class VestigeKVMLABackend(AttentionBackend):
         if ent is not None:
             self._scan_cache.move_to_end(key)
             self._stash_active()
-            (self._scan_graph, self._scan_batched, self._scan_kmax,
-             self._scan_key_cur) = ent["graph"], ent["pack"], dict(ent["kmax"]), key
+            (
+                self._scan_graph,
+                self._scan_batched,
+                self._scan_kmax,
+                self._scan_key_cur,
+            ) = ent["graph"], ent["pack"], dict(ent["kmax"]), key
             # Epoch sync is global but pack contents are per-entry: force one
             # resync pass so a reactivated pack refreshes via fits()/update()
             # before its first replay (stale tiers otherwise).
@@ -1098,7 +1102,10 @@ class VestigeKVMLABackend(AttentionBackend):
             bufs["indptr"][bs + 1 :].fill_(fm.kv_indptr[bs])
             if n > 0:
                 bufs["indices"][:n].copy_(fm.kv_indices[:n])
-        if envs.SGLANG_VESTIGEKV_INGRAPH_SCAN.get() and self._ingraph_pack is None:
+        if (
+            envs.SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN.get()
+            and self._ingraph_pack is None
+        ):
             self._build_ingraph_pack()
 
     # ---- in-graph scan: the recall step as nodes of the decode model graph ----
@@ -1176,8 +1183,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._fetch_len_stack.zero_()
                 self._ingraph_full_armed = True
         elif (
-            self._pack_epoch != self._pack_epoch_synced
-            or self._ingraph_full_armed
+            self._pack_epoch != self._pack_epoch_synced or self._ingraph_full_armed
         ) and not self._ingraph_dead:
             self._ingraph_full_armed = False
             pairs, tiers = [], []

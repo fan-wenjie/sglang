@@ -391,7 +391,6 @@ class RecallTier:
             fetch = fire
         return self.arch[fetch.any(0)]
 
-
     @ieee_fp32
     @torch.inference_mode()
     def extend_closed(self, new_rows: torch.Tensor, new_slots: torch.Tensor) -> None:

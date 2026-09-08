@@ -17,7 +17,9 @@ import torch
 sys.path.insert(0, "/home/user/fft/nope_kv/mini-sglang/python")
 
 from sglang.srt.layers.attention.vestigekv.eviction import select_kept, sidecar_sigma
-from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier as SglRecallTier
+from sglang.srt.layers.attention.vestigekv.recall_tier import (
+    RecallTier as SglRecallTier,
+)
 
 
 def _ref_recall_tier():
