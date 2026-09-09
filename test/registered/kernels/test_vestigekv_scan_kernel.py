@@ -125,3 +125,79 @@ class TestVestigeScanKernel(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOperandReuse(CustomTestCase):
+    """Calibrated rebuilds adopt the previous tier's scan operands: they are
+    pure functions of (prefix rows, basis, keep mask) and independent of the
+    calibration queries, so adoption must be BIT-exact -- operands and the
+    calibration scalars alike. Audit rule: the changed-row-set guard is also
+    driven with a known-bad input and shown to refuse."""
+
+    def _mk(self, T=4096, H=8, n_cal=16, seed=0):
+        import torch
+
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+
+        torch.manual_seed(seed)
+        dev = "cuda"
+        kbuf = torch.randn(T + 64, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
+        row_slots = torch.arange(T, device=dev, dtype=torch.int64)
+        keep = torch.zeros(T, dtype=torch.bool, device=dev)
+        keep[:: 32] = True
+        keep[-256:] = True
+        q_cal = torch.randn(n_cal, H, D.LATENT_DIM, device=dev, dtype=torch.float32)
+        q_pos = torch.arange(T - n_cal, T, device=dev, dtype=torch.long)
+        return kbuf, row_slots, keep, q_cal, q_pos
+
+    def test_adopted_build_is_bit_identical(self):
+        import torch
+
+        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
+
+        kbuf, row_slots, keep, q_cal, q_pos = self._mk()
+        prov = RecallTier(r=64, topj=-1)
+        prov.build(kbuf, row_slots, keep, q_cal[:2], q_pos[:2], conservative=True)
+        fresh = RecallTier(r=64, topj=-1)
+        s_f = fresh.build(
+            kbuf, row_slots, keep, q_cal, q_pos, conservative=False, v_init=prov.V
+        )
+        adopt = RecallTier(r=64, topj=-1)
+        s_a = adopt.build(
+            kbuf,
+            row_slots,
+            keep,
+            q_cal,
+            q_pos,
+            conservative=False,
+            v_init=prov.V,
+            operands_from=prov,
+        )
+        for name in ("csk", "rho", "side", "V", "kept_rows"):
+            self.assertTrue(
+                torch.equal(getattr(fresh, name), getattr(adopt, name)), name
+            )
+        self.assertEqual(s_f["zp"], s_a["zp"])
+        self.assertEqual(fresh.thr_g, adopt.thr_g)
+        self.assertEqual(fresh.zp, adopt.zp)
+
+    def test_changed_row_set_is_refused(self):
+        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
+
+        kbuf, row_slots, keep, q_cal, q_pos = self._mk()
+        prov = RecallTier(r=64, topj=-1)
+        prov.build(kbuf, row_slots, keep, q_cal[:2], q_pos[:2], conservative=True)
+        keep2 = keep.clone()
+        keep2[1] = ~keep2[1]  # one row moves tier -> different archive
+        bad = RecallTier(r=64, topj=-1)
+        with self.assertRaises(AssertionError):
+            bad.build(
+                kbuf,
+                row_slots,
+                keep2,
+                q_cal,
+                q_pos,
+                conservative=False,
+                v_init=prov.V,
+                operands_from=prov,
+            )

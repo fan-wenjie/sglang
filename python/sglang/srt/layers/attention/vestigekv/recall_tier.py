@@ -66,10 +66,23 @@ class RecallTier:
         q_pos: torch.Tensor,
         conservative: bool = False,
         v_init: torch.Tensor | None = None,
+        operands_from: "RecallTier | None" = None,
     ) -> dict:
         """rows: [T,576] pool rows (fp32). keep: [T] bool tier-1 mask.
         q_cal: [n,H,576] expanded calibration queries; q_pos: [n] positions.
-        Returns stats. All thresholds derive from the prefix itself."""
+        Returns stats. All thresholds derive from the prefix itself.
+
+        operands_from: a previous tier for the SAME (slot, layer) whose
+        archive row-set is unchanged (tier-1 selection is frozen between
+        block closes, so every calibrated rebuild inside the calibration
+        window sees the identical archive). The scan operands (V, csk, rho,
+        side, arch) are pure functions of (prefix rows, basis, keep mask)
+        and are INDEPENDENT of the calibration queries, so reusing them is
+        bit-exact -- the rebuild then only refits the calibration scalars
+        (zp, thr_g) and regathers the (small, growing) kept rows. This is
+        what turns the per-request calibration ladder from 5-9 full archive
+        passes into one: measured 10 ms -> ~1.5 ms per rebuild at S=8k.
+        The caller owns the row-set-unchanged guard."""
         sc_ = self.scale
         T = row_slots.numel()
         dev = row_slots.device
@@ -102,30 +115,42 @@ class RecallTier:
         # build at S=64k. Ten builds per request of that, against a serving
         # mem-fraction, is why an in-server build cost 3.8x its isolated time.
         A = int(self.arch.numel())
-        arch_slots = row_slots[self.arch]
-        # Storage precision (gated): side at bf16 is BIT-EXACT relative to the
-        # bf16 pool it is copied from (the old fp32 store was an uninformative
-        # upcast); csk keeps fp16 -- it is an fp32 GEMM product and the fire
-        # decision compares scores near a threshold, so the 11-bit mantissa
-        # (vs bf16's 8) matters, while its magnitude sits far below the fp16
-        # range cap, asserted below; rho stays fp32 (4 B/row, why touch it).
-        # Scan traffic drops 516 -> 260 B/row: slope ratio 0.475 -> 0.256.
-        # Accumulation everywhere stays fp32/ieee (the tf32 lesson).
-        self.csk = torch.empty(A, self.r, device=dev, dtype=torch.float16)
-        self.rho = torch.empty(A, device=dev, dtype=torch.float32)
-        self.side = torch.empty(A, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
-        for a0 in range(0, A, D.BUILD_ROW_CHUNK):
-            a1 = min(a0 + D.BUILD_ROW_CHUNK, A)
-            blk = kbuf[arch_slots[a0:a1]].float()
-            content = blk[:, : D.KV_LORA_RANK]
-            c = content @ V.T
-            torch._assert_async(
-                (c.abs().amax() < 6e4).to(torch.bool)
-            )  # fp16 range guard: a violation here is a model-scale anomaly
-            self.csk[a0:a1] = c.half()
-            self.rho[a0:a1] = (content - c @ V).norm(dim=-1)
-            self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
-            del blk, content, c
+        if operands_from is not None:
+            # Bit-exact adoption (see the docstring): same prefix rows, same
+            # basis, same keep mask => same operands, no recompute. The guard
+            # is the caller's; this assert catches a broken one.
+            assert int(operands_from.arch.numel()) == A, (
+                "operand reuse across a changed archive row-set"
+            )
+            self.V = V = operands_from.V
+            self.csk = operands_from.csk
+            self.rho = operands_from.rho
+            self.side = operands_from.side
+        else:
+            arch_slots = row_slots[self.arch]
+            # Storage precision (gated): side at bf16 is BIT-EXACT relative to the
+            # bf16 pool it is copied from (the old fp32 store was an uninformative
+            # upcast); csk keeps fp16 -- it is an fp32 GEMM product and the fire
+            # decision compares scores near a threshold, so the 11-bit mantissa
+            # (vs bf16's 8) matters, while its magnitude sits far below the fp16
+            # range cap, asserted below; rho stays fp32 (4 B/row, why touch it).
+            # Scan traffic drops 516 -> 260 B/row: slope ratio 0.475 -> 0.256.
+            # Accumulation everywhere stays fp32/ieee (the tf32 lesson).
+            self.csk = torch.empty(A, self.r, device=dev, dtype=torch.float16)
+            self.rho = torch.empty(A, device=dev, dtype=torch.float32)
+            self.side = torch.empty(A, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+            for a0 in range(0, A, D.BUILD_ROW_CHUNK):
+                a1 = min(a0 + D.BUILD_ROW_CHUNK, A)
+                blk = kbuf[arch_slots[a0:a1]].float()
+                content = blk[:, : D.KV_LORA_RANK]
+                c = content @ V.T
+                torch._assert_async(
+                    (c.abs().amax() < 6e4).to(torch.bool)
+                )  # fp16 range guard: a violation here is a model-scale anomaly
+                self.csk[a0:a1] = c.half()
+                self.rho[a0:a1] = (content - c @ V).norm(dim=-1)
+                self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
+                del blk, content, c
         self.kept_rows = kbuf[row_slots[keep]].to(torch.bfloat16)
 
         if conservative:

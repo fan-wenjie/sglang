@@ -1507,6 +1507,7 @@ class VestigeKVMLABackend(AttentionBackend):
             "qcal": list(st["qcal"]),
             "qpos": list(st["qpos"]),
             "v_init": self._vcache.get(lid),
+            "operands_from": self._reusable_operands(slot, lid, st),
             "ready": torch.cuda.Event(),
             "done": threading.Event(),
             "tier": None,
@@ -1548,6 +1549,7 @@ class VestigeKVMLABackend(AttentionBackend):
                         q_pos,
                         conservative=False,
                         v_init=job["v_init"],
+                        operands_from=job["operands_from"],
                     )
                     tier.arch = job["row_slots"][tier.arch]
                 self._build_stream.synchronize()
@@ -1637,6 +1639,21 @@ class VestigeKVMLABackend(AttentionBackend):
         self._build_jobs = remaining
         return installed
 
+    def _reusable_operands(self, slot, lid, st):
+        """The previous tier for this (slot, layer), IF its scan operands are
+        still bit-valid: the operands are pure functions of (prefix rows,
+        basis, tier-1 keep mask), and the keep mask only changes at a block
+        close -- so "same close epoch" is the whole guard. Returns None
+        (build from scratch) otherwise. See RecallTier.build(operands_from=).
+        """
+        prev = st.get("tier")
+        if prev is None or not getattr(prev, "built", False):
+            return None
+        cs = self._close_state.get((slot, lid))
+        if cs is None or st.get("operands_closed") != cs.get("closed"):
+            return None
+        return prev
+
     def _build_index(self, slot, lid, seq_len, st, proxy: bool):
         import time as _t
 
@@ -1680,6 +1697,7 @@ class VestigeKVMLABackend(AttentionBackend):
             q_cal.contiguous(),
             q_pos,
             conservative=proxy,
+            operands_from=self._reusable_operands(slot, lid, st),
             # Every build after a layer's first calibrated one reuses that
             # basis. The certificate is a Cauchy-Schwarz bound on the sketch
             # truncation error and is sound for ANY orthonormal basis -- a
@@ -1706,6 +1724,8 @@ class VestigeKVMLABackend(AttentionBackend):
         # calibration collector uses, so the provisional index would install
         # itself and then never be replaced (observed: proxy=True builds only).
         st["tier"], st["built_at"] = tier, seq_len
+        cs = self._close_state.get((slot, lid))
+        st["operands_closed"] = cs.get("closed") if cs is not None else None
         self._pack_epoch += 1  # content swap; see _install_finished_builds
         self._step_cache = None  # may hold key=None from the pre-tier step
         return stats
