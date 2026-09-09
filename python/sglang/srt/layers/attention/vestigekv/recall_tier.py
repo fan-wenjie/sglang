@@ -83,10 +83,6 @@ class RecallTier:
         what turns the per-request calibration ladder from 5-9 full archive
         passes into one: measured 10 ms -> ~1.5 ms per rebuild at S=8k.
         The caller owns the row-set-unchanged guard."""
-        import time as _pt
-
-        _prof = {}
-        _t = _pt.perf_counter()
         sc_ = self.scale
         T = row_slots.numel()
         dev = row_slots.device
@@ -112,9 +108,6 @@ class RecallTier:
         else:
             evals, evecs = torch.linalg.eigh(qcal_c.T @ qcal_c)
             V = evecs[:, -self.r :].T.flip(0)  # descending singular value order
-        torch.cuda.synchronize()
-        _prof["basis"] = (_pt.perf_counter() - _t) * 1e3
-        _t = _pt.perf_counter()
         self.V = V
         # Chunked, and the pool rows are never materialized in fp32 as a whole.
         # The unchunked form allocated the full [T, 576] fp32 copy plus TWO
@@ -158,13 +151,7 @@ class RecallTier:
                 self.rho[a0:a1] = (content - c @ V).norm(dim=-1)
                 self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
                 del blk, content, c
-        torch.cuda.synchronize()
-        _prof["archive"] = (_pt.perf_counter() - _t) * 1e3
-        _t = _pt.perf_counter()
         self.kept_rows = kbuf[row_slots[keep]].to(torch.bfloat16)
-        torch.cuda.synchronize()
-        _prof["kept"] = (_pt.perf_counter() - _t) * 1e3
-        self._prof = _prof
 
         if conservative:
             # Provisional index: serve immediately, calibrate nothing. Fitting
