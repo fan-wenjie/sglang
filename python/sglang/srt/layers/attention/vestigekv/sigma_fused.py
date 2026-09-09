@@ -52,16 +52,19 @@ def _basis(T: int, kappa: int, dev) -> torch.Tensor:
 
 @triton.jit
 def _sigma_fused_kernel(
-    r_ptr,      # [T, 64] bf16 sidecar block (contiguous)
+    r_ptr,      # [N, T, 64] bf16 sidecar blocks (contiguous)
     c_ptr,      # [T, 32] fp32 basis
-    sig_ptr,    # [T] fp32 out
-    hist_ptr,   # [N_BINS] int32 out (pre-zeroed)
+    sig_ptr,    # [N, T] fp32 out
+    hist_ptr,   # [N_BINS] int32 SHARED (atomic across instances)
     T,
     NB: tl.constexpr,
     BT: tl.constexpr,
     DD: tl.constexpr,   # 64
     KB: tl.constexpr,   # 32
 ):
+    inst = tl.program_id(0)
+    r_ptr = r_ptr + inst.to(tl.int64) * T * DD
+    sig_ptr = sig_ptr + inst.to(tl.int64) * T
     # pass 1: Y = C^T R   (KB x DD), fp32 ieee
     y = tl.zeros([KB, DD], dtype=tl.float32)
     for t0 in range(0, T, BT):
@@ -90,18 +93,24 @@ def _sigma_fused_kernel(
 
 
 def sigma_fused(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA):
-    """sigma + histogram for ONE fixed-window block. side: [T, 64] (bf16 ok)."""
-    T = side.shape[0]
+    """sigma + histogram. side: [T,64] (one block) or [N,T,64] (batched:
+    one program per block, ONE launch; histograms atomically accumulate
+    into a single shared table -- correct because per-record selection sums
+    block histograms anyway)."""
+    single = side.dim() == 2
+    if single:
+        side = side.unsqueeze(0)
+    N, T, DD = side.shape
     dev = side.device
     C = _basis(T, kappa, dev)
     side = side.contiguous()
-    sig = torch.empty(T, dtype=torch.float32, device=dev)
+    sig = torch.empty(N, T, dtype=torch.float32, device=dev)
     hist = torch.zeros(N_BINS, dtype=torch.int32, device=dev)
-    _sigma_fused_kernel[(1,)](
-        side, C, sig, hist, T, NB=N_BINS, BT=64, DD=side.shape[1], KB=_KB_PAD,
+    _sigma_fused_kernel[(N,)](
+        side, C, sig, hist, T, NB=N_BINS, BT=64, DD=DD, KB=_KB_PAD,
         num_warps=4, num_stages=1,
     )
-    return sig, hist
+    return (sig[0], hist) if single else (sig, hist)
 
 
 def topm_from_hist(sig: torch.Tensor, hist: torch.Tensor, m: int):
