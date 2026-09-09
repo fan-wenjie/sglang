@@ -1698,7 +1698,9 @@ class VestigeKVMLABackend(AttentionBackend):
             import logging
 
             logging.getLogger(__name__).info(
-                "VKBUILDMS lid=%s slot=%s proxy=%s ms=%.1f", lid, slot, proxy, dt * 1e3
+                "VKBUILDMS lid=%s slot=%s proxy=%s ms=%.1f prof=%s",
+                lid, slot, proxy, dt * 1e3,
+                getattr(st.get("tier"), "_prof", None) if isinstance(st, dict) else None,
             )
         return stats
 
