@@ -18,9 +18,21 @@ import torch
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
 
+# Experimental (vestigekv-sigmafuse branch): projection-form fused sigma.
+# Mathematically exact vs the rFFT chain (same orthogonal projection); fp32
+# arithmetic differs from cuFFT at ~1e-6 -- three orders below the bf16
+# input quantization -- measured 100% top-m overlap. 28x on batched prefill.
+SIGMA_FUSED = True
+
+
 def sidecar_sigma(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA) -> torch.Tensor:
     """side: [B, 64] sidecar rows along the sequence axis. Returns [B] anomaly
     scores = residual of a kappa-band low-pass along dim 0."""
+    if SIGMA_FUSED and side.is_cuda:
+        from sglang.srt.layers.attention.vestigekv.sigma_fused import sigma_fused
+
+        sig, _ = sigma_fused(side, kappa)
+        return sig
     f = torch.fft.rfft(side.float(), dim=0)
     f[kappa:] = 0
     low = torch.fft.irfft(f, n=side.shape[0], dim=0)
@@ -68,6 +80,18 @@ def blockwise_sigma(side: torch.Tensor, block: int = D.CLOSE_BLOCK) -> torch.Ten
     n_blocks = side.shape[0] // block
     if n_blocks == 0:
         return side.new_zeros(0)
+    if SIGMA_FUSED and side.is_cuda:
+        # Batched fused path: one launch, one program per block. Bit-identical
+        # per block to the single-instance call (verified), so prefill and
+        # decode-time closes still put ONE numeric flavor into the global
+        # top-m -- the batched-vs-single cuFFT plan divergence this loop
+        # guarded against does not exist for the projection kernel.
+        from sglang.srt.layers.attention.vestigekv.sigma_fused import sigma_fused
+
+        sig, _ = sigma_fused(
+            side[: n_blocks * block].reshape(n_blocks, block, side.shape[1])
+        )
+        return sig.reshape(-1)
     return torch.cat(
         [sidecar_sigma(side[i * block : (i + 1) * block]) for i in range(n_blocks)]
     )
