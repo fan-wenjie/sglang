@@ -1553,6 +1553,8 @@ class VestigeKVMLABackend(AttentionBackend):
                     )
                     tier.arch = job["row_slots"][tier.arch]
                 self._build_stream.synchronize()
+                if isinstance(stats, dict):
+                    stats["reused"] = job["operands_from"] is not None
                 job["tier"], job["stats"] = tier, stats
             except Exception as e:  # provisional keeps serving; never crash
                 job["error"] = e
@@ -1659,8 +1661,11 @@ class VestigeKVMLABackend(AttentionBackend):
 
         _t0 = _t.perf_counter()
         stats = self._build_index_timed(slot, lid, seq_len, st, proxy)
-        self._stats["t_build"] += _t.perf_counter() - _t0
+        dt = _t.perf_counter() - _t0
+        self._stats["t_build"] += dt
         self._stats["n_build"] += 1
+        if isinstance(stats, dict):
+            stats["ms"] = round(dt * 1e3, 1)
         return stats
 
     def _build_index_timed(self, slot, lid, seq_len, st, proxy: bool):
