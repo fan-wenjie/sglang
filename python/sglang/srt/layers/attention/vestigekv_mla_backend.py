@@ -1054,7 +1054,14 @@ class VestigeKVMLABackend(AttentionBackend):
         closed = (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
         if closed == 0:
             return row_slots  # too short to close anything: attend everything
-        sigma = blockwise_sigma(kbuf[row_slots][:, v_dim:], D.CLOSE_BLOCK)
+        # Spec conformance (found by the fused kernel's fixed 64-dim shape):
+        # this call sliced [:, v_head_dim:] -- 448 dims at prefill, where the
+        # un-absorbed layer has v_head_dim=128 -- while the decode-time close
+        # and the sigma record seed slice the 64-dim branch [KV_LORA_RANK:].
+        # The mixed flavor only ever survived until the first decode close
+        # (the 64-dim global rebalance replaces it), and recall covered the
+        # difference, but the paper's sigma is the branch. One flavor now.
+        sigma = blockwise_sigma(kbuf[row_slots][:, D.KV_LORA_RANK :], D.CLOSE_BLOCK)
         keep = select_kept(sigma, rho=self.rho, closed=closed, sinks=D.SINKS)
         kept_closed = row_slots[:closed][keep.nonzero(as_tuple=True)[0]]
         return torch.cat([kept_closed, row_slots[closed:]])
