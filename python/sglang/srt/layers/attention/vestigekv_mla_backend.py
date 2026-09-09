@@ -229,7 +229,7 @@ class VestigeKVMLABackend(AttentionBackend):
             not in_capture
             and self._ingraph_pack is not None
             and forward_batch.forward_mode.is_decode()
-            and self._time_lite(forward_batch)
+            and self._out_graph_metadata_lite(forward_batch)
         ):
             pass  # lite path succeeded; the full base call is skipped
         else:
@@ -259,7 +259,7 @@ class VestigeKVMLABackend(AttentionBackend):
             if self._ingraph_pack is not None:
                 # In-graph mode: the model graph itself replays the scan and
                 # the CSR pack; the host only refreshes what the graph reads.
-                self._time_host_step(forward_batch, reqs)
+                self._ingraph_host_step(forward_batch, reqs)
                 return
             if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
                 self._step_with_stats(forward_batch, reqs, key)
@@ -269,44 +269,6 @@ class VestigeKVMLABackend(AttentionBackend):
             for lid in self._mla_lids:
                 self._recall_step(lid, forward_batch, reqs)
                 self._refresh_graph_bufs(lid, forward_batch, reqs)
-
-    def _time_lite(self, forward_batch):
-        if not envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
-            return self._out_graph_metadata_lite(forward_batch)
-        import logging
-        import time as _t
-
-        torch.cuda.synchronize()
-        _t0 = _t.perf_counter()
-        r = self._out_graph_metadata_lite(forward_batch)
-        torch.cuda.synchronize()
-        self._stats["t_lite"] = self._stats.get("t_lite", 0.0) + (
-            _t.perf_counter() - _t0
-        )
-        self._stats["n_lite"] = self._stats.get("n_lite", 0) + 1
-        if self._stats["n_lite"] % 500 == 0:
-            logging.getLogger(__name__).info(
-                "VKHOST lite=%.1fus host_step=%.1fus (per step, 500-avg)",
-                self._stats["t_lite"] / self._stats["n_lite"] * 1e6,
-                self._stats.get("t_hstep", 0.0)
-                / max(self._stats.get("n_hstep", 1), 1)
-                * 1e6,
-            )
-        return r
-
-    def _time_host_step(self, forward_batch, reqs):
-        if not envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
-            return self._ingraph_host_step(forward_batch, reqs)
-        import time as _t
-
-        torch.cuda.synchronize()
-        _t0 = _t.perf_counter()
-        self._ingraph_host_step(forward_batch, reqs)
-        torch.cuda.synchronize()
-        self._stats["t_hstep"] = self._stats.get("t_hstep", 0.0) + (
-            _t.perf_counter() - _t0
-        )
-        self._stats["n_hstep"] = self._stats.get("n_hstep", 0) + 1
 
     def _out_graph_metadata_lite(self, forward_batch) -> bool:
         """Replay-prep without the dense kv_indices fill (in-graph decode).
