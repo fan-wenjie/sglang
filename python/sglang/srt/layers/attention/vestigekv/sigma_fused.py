@@ -106,10 +106,16 @@ def sigma_fused(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA):
     side = side.contiguous()
     sig = torch.empty(N, T, dtype=torch.float32, device=dev)
     hist = torch.zeros(N_BINS, dtype=torch.int32, device=dev)
-    _sigma_fused_kernel[(N,)](
-        side, C, sig, hist, T, NB=N_BINS, BT=64, DD=DD, KB=_KB_PAD,
-        num_warps=4, num_stages=1,
-    )
+    try:
+        _sigma_fused_kernel[(N,)](
+            side, C, sig, hist, T, NB=N_BINS, BT=64, DD=DD, KB=_KB_PAD,
+            num_warps=4, num_stages=1,
+        )
+    except Exception as e:  # DIAG: surface the actual failing shape
+        raise RuntimeError(
+            f"sigma_fused launch failed: N={N} T={T} DD={DD} "
+            f"side={tuple(side.shape)} dtype={side.dtype}"
+        ) from e
     return (sig[0], hist) if single else (sig, hist)
 
 
