@@ -142,29 +142,44 @@ class RecallTier:
             self.side = operands_from.side
         else:
             arch_slots = row_slots[self.arch]
-            # Storage precision (gated): side at bf16 is BIT-EXACT relative to the
-            # bf16 pool it is copied from (the old fp32 store was an uninformative
-            # upcast); csk keeps fp16 -- it is an fp32 GEMM product and the fire
-            # decision compares scores near a threshold, so the 11-bit mantissa
-            # (vs bf16's 8) matters, while its magnitude sits far below the fp16
-            # range cap, asserted below; rho stays fp32 (4 B/row, why touch it).
-            # Scan traffic drops 516 -> 260 B/row: slope ratio 0.475 -> 0.256.
-            # Accumulation everywhere stays fp32/ieee (the tf32 lesson).
-            self.csk = torch.empty(A, self.r, device=dev, dtype=torch.float16)
-            self.rho = torch.empty(A, device=dev, dtype=torch.float32)
-            self.side = torch.empty(A, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
-            for a0 in range(0, A, D.BUILD_ROW_CHUNK):
-                a1 = min(a0 + D.BUILD_ROW_CHUNK, A)
-                blk = kbuf[arch_slots[a0:a1]].float()
-                content = blk[:, : D.KV_LORA_RANK]
-                c = content @ V.T
-                torch._assert_async(
-                    (c.abs().amax() < 6e4).to(torch.bool)
-                )  # fp16 range guard: a violation here is a model-scale anomaly
-                self.csk[a0:a1] = c.half()
-                self.rho[a0:a1] = (content - c @ V).norm(dim=-1)
-                self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
-                del blk, content, c
+            from sglang.srt.layers.attention.vestigekv.operand_fused import (
+                build_operands_fused,
+            )
+
+            if kbuf.is_cuda and kbuf.dtype == torch.bfloat16:
+                # Fused single-kernel operand build: gather + project +
+                # residual + casts (operand_fused.py). Same fp32-ieee
+                # arithmetic; ~1 ulp reduction-order difference vs cuBLAS,
+                # gated by fire-set stability + retrieval.
+                self.csk, self.rho, self.side = build_operands_fused(
+                    kbuf, arch_slots, V
+                )
+            else:
+                # Storage precision (gated): side at bf16 is BIT-EXACT relative to the
+                # bf16 pool it is copied from (the old fp32 store was an uninformative
+                # upcast); csk keeps fp16 -- it is an fp32 GEMM product and the fire
+                # decision compares scores near a threshold, so the 11-bit mantissa
+                # (vs bf16's 8) matters, while its magnitude sits far below the fp16
+                # range cap, asserted below; rho stays fp32 (4 B/row, why touch it).
+                # Scan traffic drops 516 -> 260 B/row: slope ratio 0.475 -> 0.256.
+                # Accumulation everywhere stays fp32/ieee (the tf32 lesson).
+                self.csk = torch.empty(A, self.r, device=dev, dtype=torch.float16)
+                self.rho = torch.empty(A, device=dev, dtype=torch.float32)
+                self.side = torch.empty(
+                    A, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16
+                )
+                for a0 in range(0, A, D.BUILD_ROW_CHUNK):
+                    a1 = min(a0 + D.BUILD_ROW_CHUNK, A)
+                    blk = kbuf[arch_slots[a0:a1]].float()
+                    content = blk[:, : D.KV_LORA_RANK]
+                    c = content @ V.T
+                    torch._assert_async(
+                        (c.abs().amax() < 6e4).to(torch.bool)
+                    )  # fp16 range guard: a violation here is a model-scale anomaly
+                    self.csk[a0:a1] = c.half()
+                    self.rho[a0:a1] = (content - c @ V).norm(dim=-1)
+                    self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
+                    del blk, content, c
         self.kept_rows = kbuf[row_slots[keep]].to(torch.bfloat16)
 
         if conservative:
