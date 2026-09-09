@@ -105,6 +105,20 @@ class RecallTier:
             # queries beats a PCA of cache-row proxies, which is all the
             # provisional build could compute for itself.
             V = v_init
+        elif conservative:
+            # The PROVISIONAL build must never block the first decode step on a
+            # cusolver eigendecomposition (measured ~4 ms/layer, ~20 ms/request
+            # on the token path, and a one-shot ~230 ms cusolver init on the
+            # very first call). Its basis is thrown away n_cal steps later by
+            # the async calibrated build, and this index over-fetches anyway
+            # (zp clamped, gate open), so basis QUALITY is irrelevant here --
+            # only orthonormality matters for the Cauchy-Schwarz certificate.
+            # Use the leading r rows of the identity: orthonormal by
+            # construction, allocation-only, no factorization. The calibrated
+            # build (async, off the token path) still fits the real PCA basis
+            # and caches it, so every subsequent provisional build reuses that.
+            V = torch.zeros(self.r, D.KV_LORA_RANK, device=dev, dtype=qe.dtype)
+            V[torch.arange(self.r, device=dev), torch.arange(self.r, device=dev)] = 1.0
         else:
             evals, evecs = torch.linalg.eigh(qcal_c.T @ qcal_c)
             V = evecs[:, -self.r :].T.flip(0)  # descending singular value order
