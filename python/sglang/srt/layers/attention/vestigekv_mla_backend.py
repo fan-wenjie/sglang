@@ -1666,6 +1666,12 @@ class VestigeKVMLABackend(AttentionBackend):
         self._stats["n_build"] += 1
         if isinstance(stats, dict):
             stats["ms"] = round(dt * 1e3, 1)
+        if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
+            import logging
+
+            logging.getLogger(__name__).info(
+                "VKBUILDMS lid=%s slot=%s proxy=%s ms=%.1f", lid, slot, proxy, dt * 1e3
+            )
         return stats
 
     def _build_index_timed(self, slot, lid, seq_len, st, proxy: bool):
