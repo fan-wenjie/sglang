@@ -956,13 +956,6 @@ class VestigeKVMLABackend(AttentionBackend):
                 "qcal": [],
                 "qpos": [],
                 "target": D.N_CAL_START,
-                # Host mirror of kept_len[slot]: the in-graph append grows the
-                # device value by exactly one per decode step, so the mirror
-                # advances in _collect_calibration and the build/enqueue paths
-                # read it WITHOUT a device sync -- the .item() there stalled
-                # the host on all in-flight GPU work (prefill tail at step 0:
-                # measured 30+ ms against ~1 ms of actual build compute).
-                "kept_host": n,
             }
             self._collecting = True
             self._invalidate_scan()
@@ -1462,10 +1455,6 @@ class VestigeKVMLABackend(AttentionBackend):
                     pending = True
                 else:
                     pending = True
-                # Advance the host kept_len mirror AFTER any build/enqueue in
-                # this visit consumed it: at metadata time of step k the device
-                # holds n + k appends, which is exactly the pre-increment value.
-                st["kept_host"] = st.get("kept_host", 0) + 1
         if self._install_finished_builds():
             # Sticky: the install may land on a step whose collection scan
             # already counted this layer as pending; the recapture then fires
@@ -1507,7 +1496,7 @@ class VestigeKVMLABackend(AttentionBackend):
         import threading
 
         r2t = self.req_to_token_pool.req_to_token
-        n_kept = self._kept_len_nosync(slot, lid, st)
+        n_kept = int(self._kept_len[lid][slot])
         job = {
             "slot": slot,
             "lid": lid,
@@ -1652,23 +1641,6 @@ class VestigeKVMLABackend(AttentionBackend):
         self._build_jobs = remaining
         return installed
 
-    def _kept_len_nosync(self, slot, lid, st):
-        """kept_len without a device readback where the host mirror is live.
-
-        The mirror advances +1 per collected step (exactly the in-graph
-        append rate) and is only trusted while the calibration collector is
-        active for this pair; any other caller (block close, one-time eager
-        paths) still pays the sync, which is off the token path there. The
-        mirror is asserted against the device under STATS.
-        """
-        kh = st.get("kept_host") if st is not None else None
-        if kh is not None and st.get("qcal") is not None:
-            if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
-                dev = int(self._kept_len[lid][slot])
-                assert dev == kh, f"kept_host mirror drift: host={kh} dev={dev}"
-            return kh
-        return int(self._kept_len[lid][slot])
-
     def _reusable_operands(self, slot, lid, st):
         """The previous tier for this (slot, layer), IF its scan operands are
         still bit-valid: the operands are pure functions of (prefix rows,
@@ -1711,7 +1683,7 @@ class VestigeKVMLABackend(AttentionBackend):
         kbuf = kbuf.reshape(-1, kbuf.shape[-1])
         r2t = self.req_to_token_pool.req_to_token
         row_slots = r2t[slot, :seq_len].to(torch.int64)
-        n_kept = self._kept_len_nosync(slot, lid, st)
+        n_kept = int(self._kept_len[lid][slot])
         kept = self._kept_buf[lid][slot, :n_kept].to(torch.int64)
         keep = torch.isin(row_slots, kept)
         if proxy:
