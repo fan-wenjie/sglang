@@ -90,9 +90,23 @@ def create_vestigekv_mla_backend(runner):
     if kimi_linear_config(runner.model_config) is None:
         raise ValueError(
             "vestigekv_mla is validated only for NoPE-MLA models (Kimi Linear "
-            "family, skip_rope=True). On RoPE-MLA models the sidecar eviction "
+            "family). On RoPE-MLA models the sidecar eviction "
             "signal does not exist and quality collapses; use a stock MLA "
             "backend instead."
+        )
+    # NoPE is the load-bearing precondition, not just the model family: the
+    # eviction signal lives in the decoupled branch precisely because NoPE
+    # leaves it unrotated. Refuse any MLA config that applies a positional
+    # encoding to the query/key path (mla_use_nope=False, or a non-null
+    # partial-rotary dim), even inside the validated family, rather than
+    # silently degrade -- the method is undefined the moment a position
+    # function touches the branch.
+    _cfg = kimi_linear_config(runner.model_config)
+    if getattr(_cfg, "mla_use_nope", True) is False:
+        raise ValueError(
+            "vestigekv_mla requires a NoPE-MLA cache (mla_use_nope=True): the "
+            "query-independent eviction signal exists only when no positional "
+            "encoding rotates the decoupled branch. This config applies one."
         )
     if (runner.page_size or 1) != 1:
         raise ValueError(

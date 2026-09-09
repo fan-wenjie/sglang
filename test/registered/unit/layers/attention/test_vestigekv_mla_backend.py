@@ -1202,3 +1202,47 @@ class TestEpochFastPathLocals(CustomTestCase):
         i_real = src.index("real = forward_batch.out_cache_loc.shape[0]")
         i_branch = src.index("_pack_epoch != self._pack_epoch_synced")
         self.assertLess(i_real, i_branch)
+
+
+class TestNoPEPreconditionGuard(CustomTestCase):
+    """NoPE is a load-bearing precondition, not just a model family: a config
+    that applies a positional encoding to the MLA path must be refused, even
+    inside the validated family. Audit rule: the guard is driven with a
+    known-bad config and shown to refuse it, not assumed.
+    """
+
+    def _run(self, cfg):
+        from unittest.mock import MagicMock, patch
+
+        from sglang.srt.layers.attention import attention_registry as reg
+
+        runner = MagicMock()
+        runner.use_mla_backend = True
+        runner.page_size = 1
+        with patch.object(reg, "kimi_linear_config", return_value=cfg), patch.object(
+            reg, "get_spec", return_value=MagicMock(speculative_algorithm=None)
+        ):
+            reg.create_vestigekv_mla_backend(runner)
+
+    def test_rope_mla_config_is_refused(self):
+        from unittest.mock import MagicMock
+
+        bad = MagicMock()
+        bad.mla_use_nope = False  # a positional encoding rotates the branch
+        with self.assertRaises(ValueError) as e:
+            self._run(bad)
+        self.assertIn("NoPE-MLA cache", str(e.exception))
+
+    def test_nope_config_passes_the_precondition(self):
+        # A NoPE config must clear THIS guard (it may fail later on the mocked
+        # runner, but not with the NoPE ValueError).
+        from unittest.mock import MagicMock
+
+        good = MagicMock()
+        good.mla_use_nope = True
+        try:
+            self._run(good)
+        except ValueError as e:
+            self.assertNotIn("NoPE-MLA cache", str(e.exception))
+        except Exception:
+            pass  # downstream construction on a mock runner is out of scope
