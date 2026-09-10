@@ -52,12 +52,61 @@ class RecallTier:
         self._pos_all = self._csk_all = self._rho_all = None
         self._side_mat = None  # lazily materialised; see the `side` property
         self._kept_mat = None  # lazily materialised; see `kept_rows`
+        self._csk_mat = self._rho_mat = None  # selections over the _all caches
+        self._arch_idx = None  # positions of the archive in the closed prefix
+        # Index tables. These are what the tier STORES; the row tables
+        # (side, kept_rows) and the archive selections (csk, rho) are
+        # properties over them.
+        self.arch = None  # pool row ids of the archive
+        self.kept_slots = None  # pool row ids tier-1 keeps
         self._kbuf = None  # the layer's pool buffer, to re-read from
         self.version = 0  # bumped on in-place membership refresh (pack sync key)
         self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
         # fixed-address staging for the fused scan (capturable)
         self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
         self.released = False
+
+    def _from_all(self, name, cache):
+        """Select the archive's rows out of a closed-prefix cache."""
+        src = getattr(self, name)
+        if src is None or self._arch_idx is None:
+            raise RuntimeError(
+                f"{name} is not populated; build()/extend_closed() must fill "
+                "the closed-prefix caches before the archive can be selected"
+            )
+        return src.index_select(0, self._arch_idx).contiguous()
+
+    @property
+    def csk(self):
+        """The archive's sketch projections, [A, r] fp16 -- a selection over
+        _csk_all, materialised on demand. Tier-1 re-decides membership at
+        every block close, so the closed-prefix cache is the store and the
+        archive is a view of it; keeping a compacted copy alongside is the
+        same numbers twice."""
+        if self._csk_mat is None:
+            self._csk_mat = self._from_all("_csk_all", None)
+        return self._csk_mat
+
+    @csk.setter
+    def csk(self, v):
+        self._csk_mat = v
+
+    @property
+    def rho(self):
+        """The archive's residual norms, [A] fp32 -- a selection over
+        _rho_all, on the same terms as `csk`."""
+        if self._rho_mat is None:
+            self._rho_mat = self._from_all("_rho_all", None)
+        return self._rho_mat
+
+    @rho.setter
+    def rho(self, v):
+        self._rho_mat = v
+
+    def drop_operands(self):
+        """Release the materialised archive selections; the properties
+        re-derive them from the closed-prefix caches."""
+        self._csk_mat = self._rho_mat = None
 
     @property
     def kept_rows(self):
@@ -148,7 +197,8 @@ class RecallTier:
         dev = row_slots.device
         H = q_cal.shape[1]
         self.keep = keep
-        self.arch = (~keep).nonzero().flatten()
+        arch_idx = (~keep).nonzero().flatten()
+        self._arch_idx = arch_idx
         qe = q_cal.reshape(-1, D.LATENT_DIM).float()  # [n*H, 576]
 
         qcal_c = qe[:, : D.KV_LORA_RANK] - qe[:, : D.KV_LORA_RANK].mean(0, keepdim=True)
@@ -188,20 +238,35 @@ class RecallTier:
         # [A, 512] content copies (csk and rho each indexed it), ~429 MB per
         # build at S=64k. Ten builds per request of that, against a serving
         # mem-fraction, is why an in-server build cost 3.8x its isolated time.
-        A = int(self.arch.numel())
+        A = int(arch_idx.numel())
         if operands_from is not None:
             # Bit-exact adoption (see the docstring): same prefix rows, same
             # basis, same keep mask => same operands, no recompute. The guard
             # is the caller's; this assert catches a broken one.
-            assert int(operands_from.arch.numel()) == A, (
+            assert int(operands_from._arch_idx.numel()) == A, (
                 "operand reuse across a changed archive row-set"
             )
             self.V = V = operands_from.V
-            self.csk = operands_from.csk
-            self.rho = operands_from.rho
-            self.side = operands_from.side
+            # Adopt the closed-prefix CACHES, not the archive selections over
+            # them: the selections are properties now, and a tier that owns
+            # only a selection cannot re-derive one after a drop or a
+            # membership refresh. The precondition (same rows, same basis)
+            # makes the caches identical, which is what makes this bit-exact.
+            self._csk_all = operands_from._csk_all
+            self._rho_all = operands_from._rho_all
         else:
-            arch_slots = row_slots[self.arch]
+            # Project the WHOLE closed prefix, not just the archive. Tier-1's
+            # membership is re-decided at every block close, so a row that is
+            # kept now can be archived later; projecting only today's archive
+            # means the close has to re-project, and holding both a
+            # [closed, r] cache and a [A, r] compacted copy of it means
+            # storing the same numbers twice. One store, and the archive is a
+            # selection over it. The extra rows are the kept fraction, ~3%.
+            #
+            # The caches are filled TOGETHER with _pos_all here. An earlier
+            # attempt set _pos_all eagerly while side/csk stayed lazy, and the
+            # close path -- which reads _pos_all.shape[0] as its backfill
+            # watermark -- then indexed a cache that did not cover it.
             from sglang.srt.layers.attention.vestigekv.operand_fused import (
                 build_operands_fused,
             )
@@ -210,10 +275,12 @@ class RecallTier:
                 # Fused single-kernel operand build: gather + project +
                 # residual + casts (operand_fused.py). Same fp32-ieee
                 # arithmetic; ~1 ulp reduction-order difference vs cuBLAS,
-                # gated by fire-set stability + retrieval.
-                self.csk, self.rho, self.side = build_operands_fused(
-                    kbuf, arch_slots, V
+                # gated by fire-set stability + retrieval. Per row, so the
+                # values on the archived subset do not depend on the row set.
+                self._csk_all, self._rho_all, _side = build_operands_fused(
+                    kbuf, row_slots, V
                 )
+                del _side
             else:
                 # Storage precision (gated): side at bf16 is BIT-EXACT relative to the
                 # bf16 pool it is copied from (the old fp32 store was an uninformative
@@ -223,30 +290,35 @@ class RecallTier:
                 # range cap, asserted below; rho stays fp32 (4 B/row, why touch it).
                 # Scan traffic drops 516 -> 260 B/row: slope ratio 0.475 -> 0.256.
                 # Accumulation everywhere stays fp32/ieee (the tf32 lesson).
-                self.csk = torch.empty(A, self.r, device=dev, dtype=torch.float16)
-                self.rho = torch.empty(A, device=dev, dtype=torch.float32)
-                self.side = torch.empty(
-                    A, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16
-                )
-                for a0 in range(0, A, D.BUILD_ROW_CHUNK):
-                    a1 = min(a0 + D.BUILD_ROW_CHUNK, A)
-                    blk = kbuf[arch_slots[a0:a1]].float()
+                T = int(row_slots.numel())
+                self._csk_all = torch.empty(T, self.r, device=dev, dtype=torch.float16)
+                self._rho_all = torch.empty(T, device=dev, dtype=torch.float32)
+                for a0 in range(0, T, D.BUILD_ROW_CHUNK):
+                    a1 = min(a0 + D.BUILD_ROW_CHUNK, T)
+                    blk = kbuf[row_slots[a0:a1]].float()
                     content = blk[:, : D.KV_LORA_RANK]
                     c = content @ V.T
                     torch._assert_async(
                         (c.abs().amax() < 6e4).to(torch.bool)
                     )  # fp16 range guard: a violation here is a model-scale anomaly
-                    self.csk[a0:a1] = c.half()
-                    self.rho[a0:a1] = (content - c @ V).norm(dim=-1)
-                    self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
+                    self._csk_all[a0:a1] = c.half()
+                    self._rho_all[a0:a1] = (content - c @ V).norm(dim=-1)
                     del blk, content, c
+        # Index tables in place, and the closed-prefix caches now cover the
+        # built prefix, so _pos_all is an honest backfill watermark for the
+        # close path. Everything below (calibration included) reads the row
+        # tables and the archive selections through these.
         self._kbuf = kbuf
+        self._pos_all = row_slots
+        self._arch_idx = arch_idx
+        self.arch = row_slots.index_select(0, arch_idx).contiguous()
         # Pool row ids for the kept set, and nothing else: a latent row is
         # written once when its token enters the pool and never rewritten, so
         # a consumer that can address the pool wants these 4 bytes, not the
         # 1152-byte copy. `kept_rows` is a property over these.
         self.kept_slots = row_slots[keep].to(torch.int32)
-        self._kept_mat = None
+        self._kept_mat = self._side_mat = None
+        self._csk_mat = self._rho_mat = None
 
         if conservative:
             # Provisional index: serve immediately, calibrate nothing. Fitting
@@ -265,7 +337,7 @@ class RecallTier:
                 "zp": self.zp,
                 "gate_off": True,
                 "n_hard": None,
-                "arch": int(self.arch.numel()),
+                "arch": int(arch_idx.numel()),
                 "conservative": True,
             }
         # calibration: full-cache causal labels (pool is complete by invariant).
@@ -318,7 +390,9 @@ class RecallTier:
         # distribution-free marginal guarantee P(recovered) >= scan_target.
         # This replaces the former 11-rung ladder search exactly (the ladder
         # was a discretization of this quantile) and needs no fallback rung.
-        pos_in_arch = torch.searchsorted(self.arch.contiguous(), tgt)
+        # Positional, not pool ids: tgt is an index into the closed prefix
+        # and _arch_idx is the archive's positions in it, ascending.
+        pos_in_arch = torch.searchsorted(self._arch_idx.contiguous(), tgt)
         self.need_more_hard = n_hard < D.min_hard(self.recall_target)
         if n_hard == 0 or self.need_more_hard:
             # Not enough evidence for the guarantee yet: serve with the safety
@@ -352,20 +426,20 @@ class RecallTier:
         # globally -- refreshes the index by index selection only: no
         # re-projection GEMM, no stale archive, no unrecallable rows. Mirrors
         # the reference engine's live-archive semantics.
-        # Caches stay None here BY CONTRACT: the close path reads
-        # `0 if _pos_all is None else _pos_all.shape[0]` as its backfill
-        # watermark, so the first decode-time close projects rows 0..c1 in
-        # one batch. An eager _pos_all with lazy side/csk desynchronized the
-        # watermark from the cache contents (first serving close: refresh
-        # indexed a 4096-row cache with full-prefix indices).
-        self._pos_all = self._csk_all = self._rho_all = None
+        # The caches now COVER the built prefix, so _pos_all is set to match
+        # and the close path backfills only [built, c1). The earlier contract
+        # (all three None, first close re-projects 0..c1) existed because an
+        # eager _pos_all with lazy side/csk left the watermark ahead of the
+        # cache contents; filling them together is what makes the watermark
+        # honest. _arch_idx indexes the archive INTO that prefix; `arch`
+        # carries the pool row ids the scan and the fetch output use.
         self.built = True
         return {
             "zp": zp,
             "gate_off": thr_g == float("-inf"),
             "n_hard": n_hard,
             "need_more_hard": self.need_more_hard,
-            "arch": int(self.arch.numel()),
+            "arch": int(arch_idx.numel()),
         }
 
     @torch.inference_mode()
@@ -385,7 +459,7 @@ class RecallTier:
         A later rebuild (block close) simply builds from scratch: the caller's
         operand-reuse guard refuses a released tier.
         """
-        self.csk = self.rho = self.side = None
+        self._csk_mat = self._rho_mat = self._side_mat = None
         self.arch = self.kept_rows = self.kept_slots = None
         self.released = True
 
@@ -571,13 +645,14 @@ class RecallTier:
         which is the gather this now does on demand and only if asked.
         Thresholds (zp, gate) are untouched: the conformal certificate is
         sound for any archive."""
-        arch_idx = (~keep).nonzero().flatten()
-        self.arch = self._pos_all[arch_idx].contiguous()
-        self._kbuf = kbuf
-        self._side_mat = None  # re-derived from the pool on first use
-        self.csk = self._csk_all[arch_idx].contiguous()
-        self.rho = self._rho_all[arch_idx].contiguous()
+        # Membership changes are an index change, not a data movement: the
+        # closed-prefix caches already hold every row's projection, and the
+        # archive is a selection over them.
+        self._arch_idx = (~keep).nonzero().flatten()
+        self.arch = self._pos_all.index_select(0, self._arch_idx).contiguous()
         self.kept_slots = self._pos_all[keep].to(torch.int32)
-        self._kept_mat = None  # re-derived from the pool on first use
+        self._kbuf = kbuf
+        self._side_mat = self._kept_mat = None  # re-read from the pool on use
+        self._csk_mat = self._rho_mat = None  # re-selected from the caches
         self._qside_t = self._qsk_t = self._hit_buf = None  # re-size lazily
         self.version += 1

@@ -421,8 +421,21 @@ class BatchedScanPack:
             self.v[i] = t.V
             if self.side is not None:
                 self.side[o : o + av] = t.side
-            self.csk[o : o + av] = t.csk
-            self.rho[o : o + av] = t.rho
+            # Select straight out of the tier's closed-prefix caches into
+            # the arena. Going through t.csk would materialise the archive's
+            # selection first, which is the copy this change exists to avoid.
+            # A tier without those caches (a test double, or one adopted
+            # before they existed) still has the selection, so it copies.
+            has_caches = (
+                getattr(t, "_csk_all", None) is not None
+                and getattr(t, "_arch_idx", None) is not None
+            )
+            if has_caches:
+                torch.index_select(t._csk_all, 0, t._arch_idx, out=self.csk[o : o + av])
+                torch.index_select(t._rho_all, 0, t._arch_idx, out=self.rho[o : o + av])
+            else:
+                self.csk[o : o + av] = t.csk
+                self.rho[o : o + av] = t.rho
             self.arch[o : o + av] = t.arch
             self.a_len[i] = av
             self.nk_len[i] = nk

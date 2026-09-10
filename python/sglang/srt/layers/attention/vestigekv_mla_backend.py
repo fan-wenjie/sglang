@@ -1329,6 +1329,10 @@ class VestigeKVMLABackend(AttentionBackend):
                     # arch, so a later reader just pays a gather.
                     for t in tiers:
                         t.drop_side()
+                for t in tiers:
+                    # csk/rho are selections over the closed-prefix caches and
+                    # the pack now holds its own copy; the selection can go.
+                    t.drop_operands()
                 if self._ingraph_pack.kr is None:
                     # Same for the kept rows: the prologue scores them out of
                     # the pool through kslot, so the tier's copy is dead here.
@@ -1631,7 +1635,6 @@ class VestigeKVMLABackend(AttentionBackend):
                         v_init=job["v_init"],
                         operands_from=job["operands_from"],
                     )
-                    tier.arch = job["row_slots"][tier.arch]
                 self._build_stream.synchronize()
                 if isinstance(stats, dict):
                     stats["reused"] = job["operands_from"] is not None
@@ -1812,7 +1815,6 @@ class VestigeKVMLABackend(AttentionBackend):
                 proxy,
                 stats,
             )
-        tier.arch = row_slots[tier.arch]
         # Update in place: replacing the dict would drop the qcal/qpos keys the
         # calibration collector uses, so the provisional index would install
         # itself and then never be replaced (observed: proxy=True builds only).
