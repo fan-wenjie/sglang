@@ -551,6 +551,39 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # VestigeKV: training-free NoPE-MLA KV-cache eviction attention backend
+    # (vestigekv_mla). Default on; set False for the kill-switch parity test that
+    # runs the wrapper as pure pass-through to the base MLA backend.
+    # VestigeKV benchmark arm switch: path of a flag file checked at each
+    # prefill; file present -> the FULL arm (attend all rows, the A/B
+    # baseline). Unset (default) disables arm switching entirely -- no
+    # file stat on any path in production.
+    SGLANG_DEBUG_VESTIGEKV_ROWS = EnvBool(False)
+
+    SGLANG_DEBUG_VESTIGEKV_STATS = EnvBool(False)
+
+    # Capture the tier-2 recall scan + CSR pack INSIDE the decode model graph
+    # (via init_forward_metadata_in_graph) instead of replaying a second scan
+    # graph per step: removes the second cudaGraphLaunch's fixed ~0.9 ms
+    # batch-independent cost. The production path; False falls back to the
+    # separately captured scan graph (kill-switch A/B).
+    SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN = EnvBool(True)
+
+    SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG = EnvStr(None)
+    # VestigeKV recall calibration: number of decode steps whose queries
+    # feed RecallTier.build before the tier activates for a request.
+    # VestigeKV per-head recall fetch cap (topj). Default -1 = uncapped: fetch
+    # the full fired recall set. Set > 0 explicitly (16 recommended) for the
+    # bounded-fetch guarantee; deliberate opt-in so the operator states the
+    # fetch bound they are accepting.
+    SGLANG_VESTIGEKV_TOPJ = EnvInt(-1)
+
+    # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
+    # rows the KV pool already holds. Unset picks the fastest form that runs on
+    # the device (a TMA row gather where that compiles, an indirect load
+    # otherwise); 1 pins the indirect load, 2 pins the TMA gather. The two are
+    # bit-identical -- this selects instructions, never numerics.
+    SGLANG_VESTIGEKV_POOL_READ = EnvInt(None)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
