@@ -1258,6 +1258,11 @@ class VestigeKVMLABackend(AttentionBackend):
             pool_bases=pool_bases,
             pool_row=pool_row,
             pool_rows=pool_rows,
+            # The sidecar is the archived row's own tail and arch names the
+            # row, so the packed [arena, 64] table stores what the pool still
+            # holds. Dropping it is only possible when the pool is addressable
+            # at all, hence the same condition as the kept rows.
+            side_from_pool=pool_bases is not None,
         )
 
     def _ingraph_device_step(self, bs):
@@ -1316,6 +1321,14 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._ingraph_disable(forward_batch, reqs)
             else:
                 self._ingraph_pack.update(pairs, tiers)
+                if self._ingraph_pack.side is None:
+                    # The scan reads sidecars out of the pool, so the tier's
+                    # materialised copy is dead weight from here. Unlike the
+                    # release that was reverted, this cannot strand anything:
+                    # `side` is a property that re-derives itself from kbuf and
+                    # arch, so a later reader just pays a gather.
+                    for t in tiers:
+                        t.drop_side()
                 # NOTE: the tier-side operands are NOT released here, though
                 # they are pure duplication once the pack holds them. Releasing
                 # them was tried and reverted: the pack re-copies EVERY pair on
@@ -1454,7 +1467,7 @@ class VestigeKVMLABackend(AttentionBackend):
             if cached < c1:
                 delta = closed_slots[cached:c1]
                 tier.extend_closed(kbuf[delta], delta)
-            tier.refresh_membership(keep, kbuf[kept_slots])
+            tier.refresh_membership(keep, kbuf[kept_slots], kbuf)
             self._pack_epoch += 1
 
     def _collect_calibration(self, forward_batch, reqs):

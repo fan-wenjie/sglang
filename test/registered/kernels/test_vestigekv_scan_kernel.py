@@ -144,7 +144,7 @@ class TestOperandReuse(CustomTestCase):
         kbuf = torch.randn(T + 64, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
         row_slots = torch.arange(T, device=dev, dtype=torch.int64)
         keep = torch.zeros(T, dtype=torch.bool, device=dev)
-        keep[:: 32] = True
+        keep[::32] = True
         keep[-256:] = True
         q_cal = torch.randn(n_cal, H, D.LATENT_DIM, device=dev, dtype=torch.float32)
         q_pos = torch.arange(T - n_cal, T, device=dev, dtype=torch.long)

@@ -35,7 +35,9 @@ def _scan_batched_kernel(
     qsk_t_ptr,  # [P, R, H] fp32
     qres_ptr,  # [P, H] fp32
     max1g_ptr,  # [P, H] fp32, +inf where the gate is closed
-    side_ptr,  # [P, Amax, D] fp32
+    side_ptr,  # SIDE_POOL=0: [arena, D] bf16 sidecars (else unused)
+    arch_ptr,  # [arena] int32 pool row id per archive row
+    kbase_ptr,  # SIDE_POOL>0: [P] int64 pool base for the pair's layer
     csk_ptr,  # [P, Amax, R] fp32
     rho_ptr,  # [P, Amax] fp32
     a_len_ptr,  # [P] int64: real archive rows of this pair
@@ -48,6 +50,10 @@ def _scan_batched_kernel(
     H: tl.constexpr,
     DD: tl.constexpr,
     R: tl.constexpr,
+    SIDE_POOL: tl.constexpr,  # 0 packed table, 1 indirect load, 2 TMA gather
+    ROW: tl.constexpr,  # pool row width when SIDE_POOL
+    KV_OFF: tl.constexpr,  # sidecar's offset inside the row
+    POOL_ROWS: tl.constexpr,  # pool row count, for the TMA descriptor
     BLOCK_A: tl.constexpr,
     MULTI: tl.constexpr,
 ):
@@ -81,15 +87,41 @@ def _scan_batched_kernel(
     qr = tl.load(qres_ptr + p * H + h)
     m1 = tl.load(max1g_ptr + p * H + h)
     cnt = 0
+    if SIDE_POOL:
+        kbase = tl.load(kbase_ptr + p).to(tl.pointer_type(tl.bfloat16))
+    if SIDE_POOL == 2:
+        sdesc = tl.make_tensor_descriptor(
+            kbase,
+            shape=[POOL_ROWS, ROW],
+            strides=[ROW, 1],
+            block_shape=[1, DD],
+        )
     for kb in range(MULTI):
         offs = base + kb * BLOCK_A + tl.arange(0, BLOCK_A)
         m = offs < al
         # quantized storage, fp32 ieee arithmetic (see scan_kernel)
-        s = tl.load(
-            side_ptr + (abase + offs[:, None]) * DD + d[None, :],
-            mask=m[:, None],
-            other=0.0,
-        )
+        if SIDE_POOL:
+            # The sidecar is the un-roped tail of an archived pool row and arch
+            # already holds that row's id, so the packed table duplicates it --
+            # 40 MiB of the pack's 84 at 64k bs1. Reading it back through the id
+            # is a data-dependent access, which the pipeliner will not stage
+            # (see fused_prologue._pool_read_mode); the TMA form is the one that
+            # keeps it asynchronous.
+            sl = tl.load(arch_ptr + abase + offs, mask=m, other=0)
+        if SIDE_POOL == 2:
+            s = sdesc.gather(sl, KV_OFF)
+        elif SIDE_POOL == 1:
+            s = tl.load(
+                kbase + sl.to(tl.int64)[:, None] * ROW + (KV_OFF + d)[None, :],
+                mask=m[:, None],
+                other=0.0,
+            )
+        else:
+            s = tl.load(
+                side_ptr + (abase + offs[:, None]) * DD + d[None, :],
+                mask=m[:, None],
+                other=0.0,
+            )
         c = tl.load(
             csk_ptr + (abase + offs[:, None]) * R + r[None, :],
             mask=m[:, None],
@@ -127,7 +159,7 @@ class BatchedScanPack:
 
     def __init__(self, pairs, tiers, qbuf, fetch_buf, fetch_len, q_heads):
         # pairs: list of (lid, slot); tiers: matching RecallTier list.
-        dev = tiers[0].side.device
+        dev = tiers[0].arch.device
         self.q_heads = q_heads
         self._pad_slot = None  # legacy packs are always fully occupied
         P = len(tiers)
@@ -137,12 +169,13 @@ class BatchedScanPack:
         # nk_len=0, keeps the reduction well-formed; the empty pair is served
         # as full-archive recall below.
         NKm = max(1, int(max(t.kept_rows.shape[0] for t in tiers) * self.HEADROOM))
-        Am = max(1, int(max(t.side.shape[0] for t in tiers) * self.HEADROOM))
+        Am = max(1, int(max(t.arch.shape[0] for t in tiers) * self.HEADROOM))
         r = tiers[0].r
         self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
         self.nkm = NKm
         self.kslot = self.kbase = self._pool_bases = None
         self.pool_row = self._pool_rows = self.pool_mode = None
+        self.side_mode = 0
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
@@ -210,6 +243,7 @@ class BatchedScanPack:
         pool_bases=None,
         pool_row=None,
         pool_rows=None,
+        side_from_pool=False,
     ):
         """An empty pack sized for the worst case, for the in-graph scan.
 
@@ -248,6 +282,14 @@ class BatchedScanPack:
             # None = pick per device (TMA gather when it runs here);
             # set explicitly only to pin one path, as the tests do.
             self.pool_mode = None
+            # How the scan reads the sidecar when it is not packed: same
+            # choice the kept rows make, and for the same reason -- an
+            # indirect load is not staged, a TMA gather is.
+            from sglang.srt.layers.attention.vestigekv.fused_prologue import (
+                _pool_read_mode,
+            )
+
+            self.side_mode = _pool_read_mode(dev) if side_from_pool else 0
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
@@ -259,7 +301,15 @@ class BatchedScanPack:
         arena = P * Am if arena is None else max(arena, Am)
         self.arena = arena
         self.am_grid = Am
-        self.side = torch.zeros(arena, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+        # The sidecar table can go the way of the kept rows: it is the tail of
+        # an archived pool row and arch carries that row's id. csk and rho
+        # stay -- those are computed (a rank-64 projection and its residual
+        # norm), not copies of anything the pool still holds.
+        self.side = (
+            None
+            if side_from_pool
+            else torch.zeros(arena, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+        )
         self.csk = torch.zeros(arena, r, device=dev, dtype=torch.float16)
         self.rho = torch.zeros(arena, device=dev)
         self.a_off = torch.zeros(P, dtype=torch.int64, device=dev)
@@ -315,7 +365,7 @@ class BatchedScanPack:
         return (
             n_ok
             and max(t.kept_rows.shape[0] for t in tiers) <= self.nkm
-            and sum(t.side.shape[0] for t in tiers) <= self.arena
+            and sum(t.arch.shape[0] for t in tiers) <= self.arena
             and all(t.r == self.csk.shape[1] for t in tiers)
         )
 
@@ -338,10 +388,14 @@ class BatchedScanPack:
         # order. Offsets live in device memory and are refreshed here, so the
         # captured graph (which baked only the arena base and this table's
         # address) picks them up on replay.
+        # Lengths come from the INDEX tables (arch, kept_slots), never from
+        # the content tables (side, kept_rows): the content ones are becoming
+        # lazily-materialised views of the pool, and touching them for a shape
+        # would gather the whole archive to read one integer.
         offs, run = [], 0
         for t in tiers:
             offs.append(run)
-            run += t.side.shape[0]
+            run += t.arch.shape[0]
         if run > self.arena:
             raise RuntimeError(
                 f"archive arena overflow: {run} rows needed, {self.arena} "
@@ -352,7 +406,7 @@ class BatchedScanPack:
                 offs, dtype=torch.int64, device=self.a_off.device
             )
         for i, t in enumerate(tiers):
-            nk, av = t.kept_rows.shape[0], t.side.shape[0]
+            nk, av = t.kept_rows.shape[0], t.arch.shape[0]
             o = offs[i]
             if self.kslot is None:
                 self.kr[i, :nk] = t.kept_rows
@@ -365,7 +419,8 @@ class BatchedScanPack:
                 self.kslot[i, nk:] = 0
                 self.kbase[i] = self._pool_bases[pairs[i][0]]
             self.v[i] = t.V
-            self.side[o : o + av] = t.side
+            if self.side is not None:
+                self.side[o : o + av] = t.side
             self.csk[o : o + av] = t.csk
             self.rho[o : o + av] = t.rho
             self.arch[o : o + av] = t.arch
@@ -374,6 +429,20 @@ class BatchedScanPack:
             self.thr[i, 0] = t.thr_g
             self.thr_flat[i] = t.thr_g
             self.cc[i] = t.zp * t.scale / (D.KV_LORA_RANK - t.r) ** 0.5
+        if run and self.side is None and self._pool_rows is not None:
+            # The scan now reads sidecars THROUGH arch, so arch must already
+            # hold pool row ids. RecallTier.build leaves prefix POSITIONS there
+            # and the backend remaps them; a caller that skips the remap would
+            # read whatever sits at those row numbers -- plausible values, a
+            # wrong fetch set, and nothing to notice it by. Runs on a tier
+            # change, not per step.
+            hi = int(self.arch[:run].max())
+            if hi >= self._pool_rows:
+                raise RuntimeError(
+                    f"archive row id {hi} is outside the {self._pool_rows}-row "
+                    "KV pool: arch still holds prefix positions, not pool row "
+                    "ids (the backend remaps them after build)"
+                )
         # copy_, not reassignment: the captured graph reads THIS tensor's
         # address; a fresh tensor here would silently detach every later
         # update from the replayed kernel's view of the mask.
@@ -441,6 +510,8 @@ class BatchedScanPack:
             qres,
             max1g,
             self.side,
+            self.arch,
+            self.kbase,
             self.csk,
             self.rho,
             self.a_len,
@@ -453,6 +524,10 @@ class BatchedScanPack:
             H=self.q_heads,
             DD=D.SIDECAR_DIM,
             R=self.v.shape[1],
+            SIDE_POOL=0 if self.side is not None else self.side_mode,
+            ROW=self.pool_row or 0,
+            KV_OFF=D.KV_LORA_RANK,
+            POOL_ROWS=self._pool_rows or 1,
             BLOCK_A=D.SCAN_BLOCK_A,
             MULTI=16,  # 16 x BLOCK_A(64) = one 1024-row compact bucket
             num_warps=D.SCAN_NUM_WARPS,

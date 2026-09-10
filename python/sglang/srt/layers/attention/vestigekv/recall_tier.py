@@ -49,12 +49,43 @@ class RecallTier:
         # live-archive projection caches: None until the first decode-time
         # close backfills them (extend_closed); _pos_all doubles as the fill
         # watermark read by the close path.
-        self._pos_all = self._side_all = self._csk_all = self._rho_all = None
+        self._pos_all = self._csk_all = self._rho_all = None
+        self._side_mat = None  # lazily materialised; see the `side` property
+        self._kbuf = None  # the layer's pool buffer, to re-read from
         self.version = 0  # bumped on in-place membership refresh (pack sync key)
         self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
         # fixed-address staging for the fused scan (capturable)
         self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
         self.released = False
+
+    @property
+    def side(self):
+        """The archive's sidecars, [A, 64] bf16.
+
+        Materialised on demand rather than stored. The sidecar is the pool
+        row's own tail at KV_LORA_RANK and `arch` already names the row, so a
+        resident copy is bytes the pool still holds -- and it grows with the
+        context. The in-graph scan reads the pool directly and never asks for
+        this; only the eager reference path and calibration do, and both are
+        off the per-step path.
+        """
+        if self._side_mat is not None:
+            return self._side_mat
+        if self._kbuf is None or self.arch is None:
+            raise RuntimeError(
+                "tier has neither a materialised sidecar nor a pool to read it "
+                "from; build()/refresh_membership() must record kbuf"
+            )
+        self._side_mat = self._kbuf[self.arch][:, D.KV_LORA_RANK :].contiguous()
+        return self._side_mat
+
+    @side.setter
+    def side(self, v):
+        self._side_mat = v
+
+    def drop_side(self):
+        """Release the materialised sidecar; the property re-derives it."""
+        self._side_mat = None
 
     @ieee_fp32
     @torch.inference_mode()
@@ -181,6 +212,7 @@ class RecallTier:
                     self.rho[a0:a1] = (content - c @ V).norm(dim=-1)
                     self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
                     del blk, content, c
+        self._kbuf = kbuf
         kept_slots = row_slots[keep]
         self.kept_rows = kbuf[kept_slots].to(torch.bfloat16)
         # Pool row ids for the kept set. The rows themselves are a
@@ -300,7 +332,7 @@ class RecallTier:
         # one batch. An eager _pos_all with lazy side/csk desynchronized the
         # watermark from the cache contents (first serving close: refresh
         # indexed a 4096-row cache with full-prefix indices).
-        self._pos_all = self._side_all = self._csk_all = self._rho_all = None
+        self._pos_all = self._csk_all = self._rho_all = None
         self.built = True
         return {
             "zp": zp,
@@ -483,35 +515,42 @@ class RecallTier:
         """Append a newly CLOSED block to the projection caches.
         new_rows: [B, 576] pool rows of the block; new_slots: [B] pool row ids.
         """
-        if self._side_all is None:
+        if self._csk_all is None:
             dev = new_rows.device
             self._pos_all = torch.zeros(0, dtype=torch.int64, device=dev)
-            self._side_all = torch.zeros(
-                0, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16
-            )
             self._csk_all = torch.zeros(0, self.r, device=dev, dtype=torch.float16)
             self._rho_all = torch.zeros(0, device=dev)
         Cf = new_rows.float()
         csk = Cf[:, : D.KV_LORA_RANK] @ self.V.T
-        side = new_rows[:, D.KV_LORA_RANK :].to(torch.bfloat16)
         rho = (Cf[:, : D.KV_LORA_RANK] - csk @ self.V).norm(dim=-1)
-        self._side_all = torch.cat([self._side_all, side])
+        # No _side_all. The sidecar is the pool row's own tail at KV_LORA_RANK
+        # and _pos_all already names every closed row, so carrying a [closed,64]
+        # bf16 copy alongside is storing what the pool still holds -- 8 MiB per
+        # (layer, request) at 64k, and it grows with the context.
         self._csk_all = torch.cat([self._csk_all, csk.half()])
         self._rho_all = torch.cat([self._rho_all, rho])
         self._pos_all = torch.cat([self._pos_all, new_slots])
 
     @ieee_fp32
     @torch.inference_mode()
-    def refresh_membership(self, keep: torch.Tensor, kept_rows: torch.Tensor) -> None:
+    def refresh_membership(
+        self,
+        keep: torch.Tensor,
+        kept_rows: torch.Tensor,
+        kbuf: torch.Tensor,
+    ) -> None:
         """Re-derive the archive from a NEW keep mask over all closed rows.
         keep: [closed] bool (True = tier-1 keeps it); kept_rows: [n_keep, 576]
-        the live kept rows for the max1 competition. Thresholds (zp, gate)
-        are untouched: the conformal certificate is sound for any archive."""
+        the live kept rows for the max1 competition; kbuf the layer's pool
+        buffer, from which the sidecars are re-read by row id. Thresholds
+        (zp, gate) are untouched: the conformal certificate is sound for any
+        archive."""
         arch_idx = (~keep).nonzero().flatten()
-        self.side = self._side_all[arch_idx].contiguous()
+        self.arch = self._pos_all[arch_idx].contiguous()
+        self._kbuf = kbuf
+        self._side_mat = None  # re-derived from the pool on first use
         self.csk = self._csk_all[arch_idx].contiguous()
         self.rho = self._rho_all[arch_idx].contiguous()
-        self.arch = self._pos_all[arch_idx].contiguous()
         self.kept_rows = kept_rows.to(torch.bfloat16)
         self.kept_slots = self._pos_all[keep].to(torch.int32)
         self._qside_t = self._qsk_t = self._hit_buf = None  # re-size lazily
