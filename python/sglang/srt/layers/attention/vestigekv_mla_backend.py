@@ -922,9 +922,7 @@ class VestigeKVMLABackend(AttentionBackend):
             closed0 = (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
             self._close_state[(slot, lid)] = {
                 "closed": closed0,
-                "sigma": blockwise_sigma_from_pool(
-                    kbuf, row_slots, D.CLOSE_BLOCK
-                ),
+                "sigma": blockwise_sigma_from_pool(kbuf, row_slots, D.CLOSE_BLOCK),
             }
             # Host-side upper bound on kept_len, so the per-step CSR pack needs
             # no `int(lens.max())` readback. Exact by construction: every decode
@@ -1201,8 +1199,19 @@ class VestigeKVMLABackend(AttentionBackend):
         # Kept rows are bounded by tier-1's keep rate plus the un-closed tail
         # (blocks close every CLOSE_BLOCK); the slack absorbs close latency.
         nkm = int(D.RHO * max_ctx) + 3 * D.CLOSE_BLOCK
+        # Archive rows are the tokens tier-1 did NOT keep, so per layer their
+        # sum over the running batch is bounded by the KV pool itself, not by
+        # max_bs x max_context -- a batch cannot hold more tokens than the pool
+        # has slots. Sizing the shared arena by that bound is exact whenever
+        # the pool is the binding constraint (long context, small max_bs is
+        # where it is not, and there the min falls back to the old product).
+        n_lids = len(self._local_mla_lids)
+        pool_tokens = getattr(self.token_to_kv_pool, "size", None)
+        arena = n_lids * maxbs * max_ctx
+        if isinstance(pool_tokens, int) and pool_tokens > 0:
+            arena = min(arena, n_lids * (pool_tokens + D.CLOSE_BLOCK))
         self._ingraph_pack = BatchedScanPack.at_capacity(
-            len(self._local_mla_lids) * maxbs,
+            n_lids * maxbs,
             max(1, min(nkm, max_ctx)),
             max_ctx,
             self.index_rank,
@@ -1211,6 +1220,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._fetch_stack,
             self._fetch_len_stack,
             self._trash_slot,
+            arena=arena,
         )
 
     def _ingraph_device_step(self, bs):

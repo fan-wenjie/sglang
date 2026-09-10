@@ -39,6 +39,7 @@ def _scan_batched_kernel(
     csk_ptr,  # [P, Amax, R] fp32
     rho_ptr,  # [P, Amax] fp32
     a_len_ptr,  # [P] int64: real archive rows of this pair
+    a_off_ptr,  # [P] int64 arena offset per pair
     cc_ptr,  # [P] fp32: zp * sc / sqrt(kv_lora - R)
     hit_ptr,  # [P, Amax] int8 out (0/1 fired flag)
     counts_ptr,  # [P, NB] int32 fused compact-count out (NB = ceil(Amax/1024))
@@ -62,6 +63,14 @@ def _scan_batched_kernel(
     base = tl.program_id(0) * (MULTI * BLOCK_A)
     if base >= al:
         return
+    # Archive rows live in ONE per-layer arena, not in a per-pair slab: each
+    # pair's rows start at a_off[p]. The arena is sized by what the KV pool
+    # can physically hold (sum of live contexts) rather than by
+    # max_bs x max_context, which over-provisions badly at long context
+    # (2 x 512k slabs for a pool that holds 576k tokens). The graph bakes the
+    # arena base and the offset-table pointer; the offset VALUES live in
+    # device memory and are refreshed by update(), exactly like a_len.
+    abase = tl.load(a_off_ptr + p).to(tl.int64)
     d = tl.arange(0, DD)
     r = tl.arange(0, R)
     h = tl.arange(0, H)
@@ -77,23 +86,23 @@ def _scan_batched_kernel(
         m = offs < al
         # quantized storage, fp32 ieee arithmetic (see scan_kernel)
         s = tl.load(
-            side_ptr + p * Amax * DD + offs[:, None] * DD + d[None, :],
+            side_ptr + (abase + offs[:, None]) * DD + d[None, :],
             mask=m[:, None],
             other=0.0,
         )
         c = tl.load(
-            csk_ptr + p * Amax * R + offs[:, None] * R + r[None, :],
+            csk_ptr + (abase + offs[:, None]) * R + r[None, :],
             mask=m[:, None],
             other=0.0,
         )
-        rh = tl.load(rho_ptr + p * Amax + offs, mask=m, other=0.0)
+        rh = tl.load(rho_ptr + abase + offs, mask=m, other=0.0)
         # ieee, not tf32: the fast path disagreed with the eager fire set on
         # 6 rows in 58900, a silent change to which rows the model attends.
         # native-dtype tensor-core dots, fp32 accumulation (scan_kernel.py)
         acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
         score = acc * sc + cc * rh[:, None] * qr[None, :]
         fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
-        tl.store(hit_ptr + p * Amax + offs, fired.to(tl.int8), mask=m)
+        tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
         cnt += tl.sum(tl.where(m, fired, 0), 0)
     # Fused compact count: the program IS the 1024-row bucket, so the total
     # is a plain store (pre-zeroing by the prefix kernel covers programs
@@ -132,13 +141,20 @@ class BatchedScanPack:
         r = tiers[0].r
         self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
-        self.side = torch.zeros(P, Am, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
-        self.csk = torch.zeros(P, Am, r, device=dev, dtype=torch.float16)
-        self.rho = torch.zeros(P, Am, device=dev)
+        # Archive tables are ONE arena, addressed by a_off[p] (see the scan
+        # kernel): `arena` rows total instead of P x Am, which at long context
+        # is what the pool can hold rather than max_bs x max_context.
+        arena = P * Am  # eager path: one contiguous slab, offsets are p*Am
+        self.am_grid = Am
+        self.arena = arena
+        self.side = torch.zeros(arena, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+        self.csk = torch.zeros(arena, r, device=dev, dtype=torch.float16)
+        self.rho = torch.zeros(arena, device=dev)
+        self.a_off = torch.arange(P, dtype=torch.int64, device=dev) * Am
         # int32: archive entries are pool row indices, bounded by max_total_tokens
         # (~2M), and the fetch buffer they land in is already the stock
         # kv-indices dtype. Halves this table.
-        self.arch = torch.zeros(P, Am, dtype=torch.int32, device=dev)
+        self.arch = torch.zeros(arena, dtype=torch.int32, device=dev)
         self.a_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.nk_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.thr = torch.zeros(P, 1, device=dev)
@@ -154,7 +170,7 @@ class BatchedScanPack:
         # (masked by a_len), so anything there at init is there forever --
         # torch.empty garbage would read as fired rows of ARCH padding.
         # int8: a 0/1 fired flag; the compaction reads it as a predicate.
-        self.hit = torch.zeros(P, Am, dtype=torch.int8, device=dev)
+        self.hit = torch.zeros(arena, dtype=torch.int8, device=dev)
         # fixed-address fused-prologue outputs (graph reads/writes in place)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
@@ -176,7 +192,9 @@ class BatchedScanPack:
         self.update(pairs, tiers)
 
     @classmethod
-    def at_capacity(cls, P, NKm, Am, r, q_heads, qbuf, fetch_buf, fetch_len, pad_slot):
+    def at_capacity(
+        cls, P, NKm, Am, r, q_heads, qbuf, fetch_buf, fetch_len, pad_slot, arena=None
+    ):
         """An empty pack sized for the worst case, for the in-graph scan.
 
         Built once at model-graph capture time, before any tier exists: every
@@ -191,13 +209,24 @@ class BatchedScanPack:
         self._pad_slot = pad_slot
         self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
-        self.side = torch.zeros(P, Am, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
-        self.csk = torch.zeros(P, Am, r, device=dev, dtype=torch.float16)
-        self.rho = torch.zeros(P, Am, device=dev)
+        # Archive tables are ONE arena, addressed by a_off[p] (see the scan
+        # kernel): `arena` rows total instead of P x Am, which at long context
+        # is what the pool can hold rather than max_bs x max_context.
+        # Default P * Am reproduces the old per-pair slab exactly; a caller
+        # that knows the KV pool's own bound passes it instead, which is what
+        # actually shrinks the footprint (the pool caps the SUM of the
+        # per-pair archives well below max_bs x max_context).
+        arena = P * Am if arena is None else max(arena, Am)
+        self.arena = arena
+        self.am_grid = Am
+        self.side = torch.zeros(arena, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+        self.csk = torch.zeros(arena, r, device=dev, dtype=torch.float16)
+        self.rho = torch.zeros(arena, device=dev)
+        self.a_off = torch.zeros(P, dtype=torch.int64, device=dev)
         # int32: archive entries are pool row indices, bounded by max_total_tokens
         # (~2M), and the fetch buffer they land in is already the stock
         # kv-indices dtype. Halves this table.
-        self.arch = torch.zeros(P, Am, dtype=torch.int32, device=dev)
+        self.arch = torch.zeros(arena, dtype=torch.int32, device=dev)
         self.a_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.nk_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.thr = torch.zeros(P, 1, device=dev)
@@ -211,7 +240,7 @@ class BatchedScanPack:
         self.slot = torch.full((P,), pad_slot, dtype=torch.int64, device=dev)
         W = fetch_buf.shape[-1]
         # int8: a 0/1 fired flag; the compaction reads it as a predicate.
-        self.hit = torch.zeros(P, Am, dtype=torch.int8, device=dev)
+        self.hit = torch.zeros(arena, dtype=torch.int8, device=dev)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
         self.qside_t = torch.zeros(
@@ -246,8 +275,8 @@ class BatchedScanPack:
         return (
             n_ok
             and max(t.kept_rows.shape[0] for t in tiers) <= self.kr.shape[1]
-            and max(t.side.shape[0] for t in tiers) <= self.side.shape[1]
-            and all(t.r == self.csk.shape[2] for t in tiers)
+            and sum(t.side.shape[0] for t in tiers) <= self.arena
+            and all(t.r == self.csk.shape[1] for t in tiers)
         )
 
     def update(self, pairs, tiers):
@@ -265,15 +294,33 @@ class BatchedScanPack:
         requests leave garbage that is never read.
         """
         self.pairs = list(pairs)
+        # Assign each pair a contiguous run in the archive arena, in pair
+        # order. Offsets live in device memory and are refreshed here, so the
+        # captured graph (which baked only the arena base and this table's
+        # address) picks them up on replay.
+        offs, run = [], 0
+        for t in tiers:
+            offs.append(run)
+            run += t.side.shape[0]
+        if run > self.arena:
+            raise RuntimeError(
+                f"archive arena overflow: {run} rows needed, {self.arena} "
+                f"available -- fits() should have refused this update"
+            )
+        if offs:
+            self.a_off[: len(offs)] = torch.tensor(
+                offs, dtype=torch.int64, device=self.a_off.device
+            )
         for i, t in enumerate(tiers):
             nk, av = t.kept_rows.shape[0], t.side.shape[0]
+            o = offs[i]
             self.kr[i, :nk] = t.kept_rows
             self.kr[i, nk:] = 0
             self.v[i] = t.V
-            self.side[i, :av] = t.side
-            self.csk[i, :av] = t.csk
-            self.rho[i, :av] = t.rho
-            self.arch[i, :av] = t.arch
+            self.side[o : o + av] = t.side
+            self.csk[o : o + av] = t.csk
+            self.rho[o : o + av] = t.rho
+            self.arch[o : o + av] = t.arch
             self.a_len[i] = av
             self.nk_len[i] = nk
             self.thr[i, 0] = t.thr_g
@@ -327,7 +374,12 @@ class BatchedScanPack:
             partials=(self.pm, self.ps, self.pt),
         )
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
-        _, Am = self.hit.shape
+        # Grid covers the LARGEST per-pair archive, not the arena: programs
+        # past a pair's a_len exit on one scalar load, so a grid sized for the
+        # arena would waste 1/P of its blocks on every pair. am_grid is baked
+        # at capture (max_bs x max_context worth of rows is still the worst
+        # case a single pair can reach), while the arena only bounds the SUM.
+        Am = self.am_grid
         P = P_eff
         _scan_batched_kernel[(triton.cdiv(Am, D.SCAN_BLOCK_A * 16), P)](
             qside_t,
@@ -338,6 +390,7 @@ class BatchedScanPack:
             self.csk,
             self.rho,
             self.a_len,
+            self.a_off,
             self.cc,
             self.hit,
             self.c_counts,
@@ -356,9 +409,11 @@ class BatchedScanPack:
             self.hit,
             self.arch,
             self.a_len,
+            self.a_off,
             self.li,
             self.slot,
             self.fetch_buf,
             self.fetch_len,
             (self.c_counts, self.c_offsets, self.c_total),
+            self.am_grid,
         )

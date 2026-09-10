@@ -17,7 +17,6 @@ import torch
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
-
 # Experimental (vestigekv-sigmafuse branch): projection-form fused sigma.
 # Mathematically exact vs the rFFT chain (same orthogonal projection); fp32
 # arithmetic differs from cuFFT at ~1e-6 -- three orders below the bf16

@@ -273,3 +273,88 @@ class TestBatchedEmptyKept(CustomTestCase):
         pack.run()  # must not raise (was: zero-width kr -> max(-1) crash)
         # empty kept => whole archive eligible; both pairs fire > 0 rows
         self.assertGreater(int(fetch_len.sum()), 0)
+
+
+class TestArchiveArenaAddressing(CustomTestCase):
+    """A tight shared arena must fetch what the per-pair reference fetches.
+
+    The capacity pack keeps every pair's archive rows in ONE table addressed
+    by a_off[p], sized by what the KV pool can hold rather than by
+    max_bs x max_context. That is purely a change of address arithmetic in two
+    Triton kernels, so the check is against query_fixed -- the ABSOLUTE
+    reference. Comparing the two layouts against each other would not do: a
+    base that is ignored collapses both to offset zero and the two agree while
+    both are wrong (that mutation was run, and a differential test passed it).
+    Archive lengths are unequal so every pair but the first sits at a non-zero
+    offset that no aliasing can reproduce.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_tight_arena_matches_the_per_pair_reference(self):
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
+
+        torch.manual_seed(7)
+        lens = [9000, 5000, 7000, 3000]  # unequal on purpose: offsets differ
+        n_lids, max_reqs = 2, 2
+        P, Am = n_lids * max_reqs, max(lens)
+        qbuf = torch.randn(n_lids, max_reqs, H, 576, device="cuda")
+        f = torch.zeros(n_lids, max_reqs, W, dtype=torch.int64, device="cuda")
+        ln = torch.zeros(n_lids, max_reqs, dtype=torch.int64, device="cuda")
+
+        pairs, tiers = [], []
+        for li in range(n_lids):
+            for slot in range(max_reqs):
+                p = li * max_reqs + slot
+                pairs.append((li, slot))
+                tiers.append(
+                    _mk_tier(800 + p, lens[p], seed=100 + p, zp=1.0, thr_g=-1e30)
+                )
+
+        ref_rows, ref_n = [], []
+        out = torch.zeros(max_reqs, W, dtype=torch.int64, device="cuda")
+        ol = torch.zeros(max_reqs, dtype=torch.int64, device="cuda")
+        for (li, slot), t in zip(pairs, tiers):
+            t.query_fixed(qbuf[li, slot], out, ol, slot)
+            ref_n.append(int(ol[slot]))
+            ref_rows.append(out[slot, : int(ol[slot])].clone())
+
+        # arena = the exact sum, i.e. the tightest the pool bound can ever be
+        pack = BatchedScanPack.at_capacity(
+            P, 900, Am, R, H, qbuf, f, ln, 0, arena=sum(lens)
+        )
+        self.assertTrue(pack.fits(pairs, tiers))
+        pack.update(pairs, tiers)
+        pack.run()
+        torch.cuda.synchronize()
+
+        self.assertGreater(sum(ref_n), 0, "a reference that fetched nothing")
+        for i, (li, slot) in enumerate(pairs):
+            n = int(ln[li, slot])
+            self.assertEqual(n, ref_n[i], f"pair {(li, slot)} fetch count")
+            self.assertTrue(
+                torch.equal(f[li, slot, :n], ref_rows[i]),
+                f"pair {(li, slot)} fetch set differs from query_fixed",
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_arena_smaller_than_the_sum_is_refused_not_corrupted(self):
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
+
+        lens = [9000, 5000, 7000, 3000]
+        P, Am = 4, max(lens)
+        qbuf = torch.zeros(2, 2, H, 576, device="cuda")
+        f = torch.zeros(2, 2, W, dtype=torch.int64, device="cuda")
+        ln = torch.zeros(2, 2, dtype=torch.int64, device="cuda")
+        pack = BatchedScanPack.at_capacity(
+            P, 900, Am, R, H, qbuf, f, ln, 0, arena=sum(lens) - 1
+        )
+        pairs = [(li, s) for li in range(2) for s in range(2)]
+        tiers = [
+            _mk_tier(800 + p, lens[p], seed=200 + p, zp=1.0, thr_g=-1e30)
+            for p in range(4)
+        ]
+        # fits() is the gate; update() past it must still refuse rather than
+        # write outside the arena, so the overflow can never be silent.
+        self.assertFalse(pack.fits(pairs, tiers))
+        with self.assertRaises(RuntimeError):
+            pack.update(pairs, tiers)

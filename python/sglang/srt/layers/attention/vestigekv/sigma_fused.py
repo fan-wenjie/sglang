@@ -52,19 +52,19 @@ def _basis(T: int, kappa: int, dev) -> torch.Tensor:
 
 @triton.jit
 def _sigma_fused_kernel(
-    r_ptr,      # FROM_POOL=0: [N,T,64] gathered sidecars. =1: [pool,ROW] pool
+    r_ptr,  # FROM_POOL=0: [N,T,64] gathered sidecars. =1: [pool,ROW] pool
     slots_ptr,  # FROM_POOL=1: [N*T] int64 pool row indices (else unused)
-    c_ptr,      # [T, 32] fp32 basis
-    sig_ptr,    # [N, T] fp32 out
-    hist_ptr,   # [N_BINS] int32 SHARED (atomic across instances)
+    c_ptr,  # [T, 32] fp32 basis
+    sig_ptr,  # [N, T] fp32 out
+    hist_ptr,  # [N_BINS] int32 SHARED (atomic across instances)
     T,
     NB: tl.constexpr,
     BT: tl.constexpr,
-    DD: tl.constexpr,   # 64
-    KB: tl.constexpr,   # 32
+    DD: tl.constexpr,  # 64
+    KB: tl.constexpr,  # 32
     FROM_POOL: tl.constexpr,
-    ROW: tl.constexpr,      # pool row width (576)
-    KV_OFF: tl.constexpr,   # branch offset inside the row (512)
+    ROW: tl.constexpr,  # pool row width (576)
+    KV_OFF: tl.constexpr,  # branch offset inside the row (512)
 ):
     inst = tl.program_id(0)
     sig_ptr = sig_ptr + inst.to(tl.int64) * T
@@ -84,13 +84,20 @@ def _sigma_fused_kernel(
             sl = tl.load(slots_ptr + t, mask=m, other=0).to(tl.int64)
             r = tl.load(
                 r_ptr + sl[:, None] * ROW + (KV_OFF + tl.arange(0, DD))[None, :],
-                mask=m[:, None], other=0.0,
+                mask=m[:, None],
+                other=0.0,
             ).to(tl.float32)
         else:
-            r = tl.load(r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
-                        mask=m[:, None], other=0.0).to(tl.float32)
-        c = tl.load(c_ptr + t[:, None] * KB + tl.arange(0, KB)[None, :],
-                    mask=m[:, None], other=0.0)
+            r = tl.load(
+                r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
+                mask=m[:, None],
+                other=0.0,
+            ).to(tl.float32)
+        c = tl.load(
+            c_ptr + t[:, None] * KB + tl.arange(0, KB)[None, :],
+            mask=m[:, None],
+            other=0.0,
+        )
         y += tl.dot(tl.trans(c), r, input_precision="ieee")
     # pass 2: residual norm + histogram
     for t0 in range(0, T, BT):
@@ -103,13 +110,20 @@ def _sigma_fused_kernel(
             sl = tl.load(slots_ptr + t, mask=m, other=0).to(tl.int64)
             r = tl.load(
                 r_ptr + sl[:, None] * ROW + (KV_OFF + tl.arange(0, DD))[None, :],
-                mask=m[:, None], other=0.0,
+                mask=m[:, None],
+                other=0.0,
             ).to(tl.float32)
         else:
-            r = tl.load(r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
-                        mask=m[:, None], other=0.0).to(tl.float32)
-        c = tl.load(c_ptr + t[:, None] * KB + tl.arange(0, KB)[None, :],
-                    mask=m[:, None], other=0.0)
+            r = tl.load(
+                r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
+                mask=m[:, None],
+                other=0.0,
+            ).to(tl.float32)
+        c = tl.load(
+            c_ptr + t[:, None] * KB + tl.arange(0, KB)[None, :],
+            mask=m[:, None],
+            other=0.0,
+        )
         recon = tl.dot(c, y, input_precision="ieee")
         d = r - recon
         sig = tl.sqrt(tl.sum(d * d, 1))
@@ -120,7 +134,9 @@ def _sigma_fused_kernel(
 
 
 def sigma_fused_from_pool(
-    kbuf: torch.Tensor, slots: torch.Tensor, block: int,
+    kbuf: torch.Tensor,
+    slots: torch.Tensor,
+    block: int,
     kappa: int = D.LOWPASS_KAPPA,
 ):
     """sigma for the blocks of `slots`, read STRAIGHT from the pool.
@@ -139,10 +155,21 @@ def sigma_fused_from_pool(
         return sig.new_zeros(0), hist
     slots = slots[: n * block].contiguous().to(torch.int64)
     _sigma_fused_kernel[(n,)](
-        kbuf, slots, C, sig, hist, block, NB=N_BINS, BT=64,
-        DD=D.SIDECAR_DIM, KB=_KB_PAD, FROM_POOL=1,
-        ROW=kbuf.shape[-1], KV_OFF=D.KV_LORA_RANK,
-        num_warps=4, num_stages=1,
+        kbuf,
+        slots,
+        C,
+        sig,
+        hist,
+        block,
+        NB=N_BINS,
+        BT=64,
+        DD=D.SIDECAR_DIM,
+        KB=_KB_PAD,
+        FROM_POOL=1,
+        ROW=kbuf.shape[-1],
+        KV_OFF=D.KV_LORA_RANK,
+        num_warps=4,
+        num_stages=1,
     )
     return sig.reshape(-1), hist
 
@@ -162,9 +189,21 @@ def sigma_fused(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA):
     sig = torch.empty(N, T, dtype=torch.float32, device=dev)
     hist = torch.zeros(N_BINS, dtype=torch.int32, device=dev)
     _sigma_fused_kernel[(N,)](
-        side, side, C, sig, hist, T, NB=N_BINS, BT=64, DD=DD, KB=_KB_PAD,
-        FROM_POOL=0, ROW=DD, KV_OFF=0,
-        num_warps=4, num_stages=1,
+        side,
+        side,
+        C,
+        sig,
+        hist,
+        T,
+        NB=N_BINS,
+        BT=64,
+        DD=DD,
+        KB=_KB_PAD,
+        FROM_POOL=0,
+        ROW=DD,
+        KV_OFF=0,
+        num_warps=4,
+        num_stages=1,
     )
     return (sig[0], hist) if single else (sig, hist)
 

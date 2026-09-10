@@ -385,6 +385,7 @@ def _compact_write_kernel(
     slot_ptr,
     total_ptr,
     a_len_ptr,
+    a_off_ptr,  # [P] int64 arena offset per pair
     Am,
     W,
     NSLOT,
@@ -395,13 +396,14 @@ def _compact_write_kernel(
     offs = b * BLOCK_A + tl.arange(0, BLOCK_A)
     alen = tl.load(a_len_ptr + p)
     m = (offs < Am) & (offs < alen)
-    h = tl.load(hit_ptr + p * Am + offs, mask=m, other=0) != 0
+    abase = tl.load(a_off_ptr + p).to(tl.int64)
+    h = tl.load(hit_ptr + abase + offs, mask=m, other=0) != 0
     nb = tl.num_programs(0)
     base = tl.load(offsets_ptr + p * nb + b)
     pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
     li = tl.load(li_ptr + p)
     slot = tl.load(slot_ptr + p)
-    arch = tl.load(arch_ptr + p * Am + offs, mask=m, other=0)
+    arch = tl.load(arch_ptr + abase + offs, mask=m, other=0)
     ok = h & (pos < W)
     tl.store(out_ptr + li * NSLOT * W + slot * W + pos, arch, mask=ok)
     if b == 0:
@@ -410,12 +412,27 @@ def _compact_write_kernel(
 
 
 def compact_fired(
-    hit, arch, a_len, li, slot, fetch_buf, fetch_len, scratch, p_live=None
+    hit,
+    arch,
+    a_len,
+    a_off,
+    li,
+    slot,
+    fetch_buf,
+    fetch_len,
+    scratch,
+    am_grid,
+    p_live=None,
 ):
     """Deterministic fired-row compaction. scratch: (counts, offsets, total)
-    int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W] int64-compatible."""
-    _, Am = hit.shape
-    P = p_live if p_live is not None else hit.shape[0]
+    int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W] int64-compatible.
+
+    am_grid is the largest archive a SINGLE pair can hold -- the bucket grid
+    and the counts table are sized by it, not by the shared arena (which only
+    bounds the sum). Rows are addressed as a_off[p] + i, masked by a_len[p].
+    """
+    Am = am_grid
+    P = p_live if p_live is not None else a_len.shape[0]
     BLOCK_A = 1024
     NB = triton.cdiv(Am, BLOCK_A)
     counts, offsets, total = scratch
@@ -435,6 +452,7 @@ def compact_fired(
         slot,
         total,
         a_len,
+        a_off,
         Am,
         W,
         fetch_buf.shape[1],
