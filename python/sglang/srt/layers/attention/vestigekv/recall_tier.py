@@ -73,7 +73,7 @@ class RecallTier:
                 f"{name} is not populated; build()/extend_closed() must fill "
                 "the closed-prefix caches before the archive can be selected"
             )
-        return src.index_select(0, self._arch_idx).contiguous()
+        return src.index_select(0, self._arch_idx.to(torch.int64)).contiguous()
 
     @property
     def csk(self):
@@ -174,7 +174,7 @@ class RecallTier:
         q_pos: torch.Tensor,
         conservative: bool = False,
         v_init: torch.Tensor | None = None,
-        operands_from: "RecallTier | None" = None,
+        operands_from: RecallTier | None = None,
     ) -> dict:
         """rows: [T,576] pool rows (fp32). keep: [T] bool tier-1 mask.
         q_cal: [n,H,576] expanded calibration queries; q_pos: [n] positions.
@@ -330,8 +330,11 @@ class RecallTier:
         # tables and the archive selections through these.
         self._kbuf = kbuf
         self._pos_all = row_slots
-        self._arch_idx = arch_idx
-        self.arch = row_slots.index_select(0, arch_idx).contiguous()
+        # int32 throughout: a pool row id indexes a pool with far fewer
+        # than 2^31 slots, and these two are 15.5 B/token at int64 --
+        # 9% of the whole index.
+        self._arch_idx = arch_idx.to(torch.int32)
+        self.arch = row_slots.index_select(0, arch_idx).to(torch.int32)
         # Pool row ids for the kept set, and nothing else: a latent row is
         # written once when its token enters the pool and never rewritten, so
         # a consumer that can address the pool wants these 4 bytes, not the
@@ -412,7 +415,7 @@ class RecallTier:
         # was a discretization of this quantile) and needs no fallback rung.
         # Positional, not pool ids: tgt is an index into the closed prefix
         # and _arch_idx is the archive's positions in it, ascending.
-        pos_in_arch = torch.searchsorted(self._arch_idx.contiguous(), tgt)
+        pos_in_arch = torch.searchsorted(self._arch_idx.to(torch.int64), tgt)
         self.need_more_hard = n_hard < D.min_hard(self.recall_target)
         if n_hard == 0 or self.need_more_hard:
             # Not enough evidence for the guarantee yet: serve with the safety
@@ -424,9 +427,20 @@ class RecallTier:
             qskh = qh[:, : D.KV_LORA_RANK] @ V.T
             qresh = (qh[:, : D.KV_LORA_RANK] - qskh @ V).norm(dim=-1)
             pa = pos_in_arch[hard]
-            tgt_side = self.side[pa]  # [n_hard, 64]
-            tgt_csk = self.csk[pa]  # [n_hard, r]
-            tgt_rho = self.rho[pa]  # [n_hard]
+            # Gather the n_hard rows out of the caches directly. Going through
+            # self.side / self.csk / self.rho would materialise the WHOLE
+            # archive's selection to read a few dozen rows of it, and those
+            # three views are the entire difference between the steady-state
+            # footprint and the peak -- which is the figure that decides
+            # whether a long request fits.
+            pa64 = pa.to(torch.int64)
+            arch_rows = self.arch.to(torch.int64).index_select(0, pa64)
+            tgt_side = self._kbuf.index_select(0, arch_rows)[
+                :, D.KV_LORA_RANK :
+            ]  # [n_hard, 64]
+            src = self._arch_idx.to(torch.int64).index_select(0, pa64)
+            tgt_csk = self._csk_all.index_select(0, src)  # [n_hard, r]
+            tgt_rho = self._rho_all.index_select(0, src)  # [n_hard]
             # Same rounding as the serve-time scoring path: query operands
             # rounded to the storage dtypes before the (exact-in-fp32)
             # products, so zp is calibrated on exactly what the kernel scores.
@@ -644,8 +658,9 @@ class RecallTier:
         # Membership changes are an index change, not a data movement: the
         # closed-prefix caches already hold every row's projection, and the
         # archive is a selection over them.
-        self._arch_idx = (~keep).nonzero().flatten()
-        self.arch = self._pos_all.index_select(0, self._arch_idx).contiguous()
+        idx = (~keep).nonzero().flatten()
+        self._arch_idx = idx.to(torch.int32)
+        self.arch = self._pos_all.index_select(0, idx).to(torch.int32)
         self.kept_slots = self._pos_all[keep].to(torch.int32)
         self._kbuf = kbuf
         self._side_mat = self._kept_mat = None  # re-read from the pool on use

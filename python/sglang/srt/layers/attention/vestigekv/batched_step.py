@@ -501,14 +501,25 @@ class BatchedScanPack:
                         "pack reads projections from the tier's cache, but this "
                         "tier carries none (_csk_all/_arch_idx missing)"
                     )
-                self.aidx[o : o + av] = t._arch_idx.to(torch.int32)
+                self.aidx[o : o + av] = t._arch_idx
                 self.cbase[i] = t._csk_all.data_ptr()
                 csk_refs.append(t._csk_all)
                 rows = max(rows, int(t._csk_all.shape[0]))
-                torch.index_select(t._rho_all, 0, t._arch_idx, out=self.rho[o : o + av])
+                torch.index_select(
+                    t._rho_all,
+                    0,
+                    t._arch_idx.to(torch.int64),
+                    out=self.rho[o : o + av],
+                )
             elif has_caches:
-                torch.index_select(t._csk_all, 0, t._arch_idx, out=self.csk[o : o + av])
-                torch.index_select(t._rho_all, 0, t._arch_idx, out=self.rho[o : o + av])
+                aidx64 = t._arch_idx.to(torch.int64)
+                torch.index_select(t._csk_all, 0, aidx64, out=self.csk[o : o + av])
+                torch.index_select(
+                    t._rho_all,
+                    0,
+                    t._arch_idx.to(torch.int64),
+                    out=self.rho[o : o + av],
+                )
             else:
                 self.csk[o : o + av] = t.csk
                 self.rho[o : o + av] = t.rho
