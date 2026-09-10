@@ -243,8 +243,26 @@ class RecallTier:
             # Bit-exact adoption (see the docstring): same prefix rows, same
             # basis, same keep mask => same operands, no recompute. The guard
             # is the caller's; this assert catches a broken one.
+            # Two conditions, not one. The archive must have the same size,
+            # AND the donor's closed-prefix cache must cover THIS tier's
+            # prefix -- _arch_idx indexes into that cache, so a donor built on
+            # a shorter prefix makes every selection an out-of-bounds gather.
+            # The old code adopted the already-compacted selection, where the
+            # size check alone was sufficient; adopting the cache is what makes
+            # the second condition load-bearing.
+            donor_pos = operands_from._pos_all
             assert int(operands_from._arch_idx.numel()) == A, (
                 "operand reuse across a changed archive row-set"
+            )
+            assert donor_pos is not None and donor_pos.numel() == int(
+                row_slots.numel()
+            ), (
+                "operand reuse from a tier whose closed prefix differs: donor "
+                f"{None if donor_pos is None else donor_pos.numel()} rows vs "
+                f"{int(row_slots.numel())} here"
+            )
+            assert torch.equal(donor_pos, row_slots), (
+                "operand reuse from a tier holding a different prefix row-set"
             )
             self.V = V = operands_from.V
             # Adopt the closed-prefix CACHES, not the archive selections over
@@ -254,6 +272,9 @@ class RecallTier:
             # makes the caches identical, which is what makes this bit-exact.
             self._csk_all = operands_from._csk_all
             self._rho_all = operands_from._rho_all
+            assert self._csk_all.shape[0] == int(row_slots.numel()), (
+                "adopted cache does not cover the prefix it will be indexed by"
+            )
         else:
             # Project the WHOLE closed prefix, not just the archive. Tier-1's
             # membership is re-decided at every block close, so a row that is

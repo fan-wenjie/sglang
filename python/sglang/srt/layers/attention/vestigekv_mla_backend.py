@@ -1591,7 +1591,7 @@ class VestigeKVMLABackend(AttentionBackend):
             "qcal": list(st["qcal"]),
             "qpos": list(st["qpos"]),
             "v_init": self._vcache.get(lid),
-            "operands_from": self._reusable_operands(slot, lid, st),
+            "operands_from": self._reusable_operands(slot, lid, st, seq_len),
             "ready": torch.cuda.Event(),
             "done": threading.Event(),
             "tier": None,
@@ -1719,17 +1719,26 @@ class VestigeKVMLABackend(AttentionBackend):
                 # below -- one capture for all layers instead of one each
                 # (5 extra ~100 ms captures per request at 256k).
                 st["tier"], st["built_at"] = job["tier"], job["seq_len"]
+                # The reuse guard compares against this; an async build
+                # that did not record it would let a later rebuild at a
+                # different prefix adopt a cache that does not cover it.
+                st["operands_seq_len"] = job["seq_len"]
                 st["qcal"] = st["qpos"] = None
                 installed = True
         self._build_jobs = remaining
         return installed
 
-    def _reusable_operands(self, slot, lid, st):
+    def _reusable_operands(self, slot, lid, st, seq_len):
         """The previous tier for this (slot, layer), IF its scan operands are
-        still bit-valid: the operands are pure functions of (prefix rows,
-        basis, tier-1 keep mask), and the keep mask only changes at a block
-        close -- so "same close epoch" is the whole guard. Returns None
-        (build from scratch) otherwise. See RecallTier.build(operands_from=).
+        still bit-valid.
+
+        The operands are pure functions of (prefix rows, basis, tier-1 keep
+        mask). The keep mask only changes at a block close -- but the PREFIX
+        grows with every decoded token, and row_slots is r2t[:seq_len], so
+        "same close epoch" is not the whole guard: a rebuild at a longer
+        seq_len indexes the donor's closed-prefix cache past its end. Both
+        conditions are checked here, and RecallTier.build asserts them again
+        on the callee side.
         """
         prev = st.get("tier")
         if prev is None or not getattr(prev, "built", False):
@@ -1739,6 +1748,8 @@ class VestigeKVMLABackend(AttentionBackend):
         cs = self._close_state.get((slot, lid))
         if cs is None or st.get("operands_closed") != cs.get("closed"):
             return None
+        if st.get("operands_seq_len") != seq_len:
+            return None  # prefix grew; the cache no longer covers it
         return prev
 
     def _build_index(self, slot, lid, seq_len, st, proxy: bool):
@@ -1793,7 +1804,7 @@ class VestigeKVMLABackend(AttentionBackend):
             q_cal.contiguous(),
             q_pos,
             conservative=proxy,
-            operands_from=self._reusable_operands(slot, lid, st),
+            operands_from=self._reusable_operands(slot, lid, st, seq_len),
             # Every build after a layer's first calibrated one reuses that
             # basis. The certificate is a Cauchy-Schwarz bound on the sketch
             # truncation error and is sound for ANY orthonormal basis -- a
@@ -1821,6 +1832,7 @@ class VestigeKVMLABackend(AttentionBackend):
         st["tier"], st["built_at"] = tier, seq_len
         cs = self._close_state.get((slot, lid))
         st["operands_closed"] = cs.get("closed") if cs is not None else None
+        st["operands_seq_len"] = seq_len
         self._pack_epoch += 1  # content swap; see _install_finished_builds
         self._step_cache = None  # may hold key=None from the pre-tier step
         return stats
