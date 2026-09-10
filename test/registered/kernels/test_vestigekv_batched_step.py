@@ -561,3 +561,145 @@ class TestKeptRowsFromPool(CustomTestCase):
                     f"mode {mode}: pair {(li, slot)} fetch set differs",
                 )
         del bufs
+
+
+class TestProjectionsFromTierCache(CustomTestCase):
+    """The pack may read the sketch projections instead of copying them.
+
+    csk is a selection over the tier's closed-prefix cache, so a compacted
+    copy in the arena is the same numbers twice -- 128 bytes per archived row.
+    The pack can carry the 4-byte row index and read through it, the same
+    pattern the kept rows and sidecars use against the KV pool, except the
+    cache is reallocated by torch.cat at every block close. That is why its
+    address comes from a device table refreshed by update() rather than from
+    anything baked into a graph, and why the pack holds a reference to the
+    cache while it points at one.
+
+    All three ways of getting csk must produce the same fetch set.
+    """
+
+    FETCH_W = 8192
+
+    def _fixture(self, n_lids=2, max_reqs=2, pool_rows=8192):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
+
+        g = torch.Generator(device="cuda").manual_seed(51)
+        bufs = []
+        for _ in range(n_lids):
+            B = torch.randn(24, 576, device="cuda", generator=g)
+            A = torch.randn(pool_rows, 24, device="cuda", generator=g)
+            mag = torch.rand(pool_rows, 1, device="cuda", generator=g) ** 4 * 8 + 0.2
+            bufs.append(((A @ B) / 24**0.5 * mag).to(torch.bfloat16))
+        pairs, tiers = [], []
+        n_toks = [6000, 4000, 5200, 3100]
+        for li in range(n_lids):
+            for slot in range(max_reqs):
+                p = li * max_reqs + slot
+                kb = bufs[li]
+                gg = torch.Generator(device="cuda").manual_seed(300 + p)
+                slots = torch.randperm(pool_rows, device="cuda", generator=gg)[
+                    : n_toks[p]
+                ]
+                nkeep = max(1, int(D.RHO * n_toks[p]))
+                keep = torch.zeros(n_toks[p], dtype=torch.bool, device="cuda")
+                keep[kb[slots].float().norm(dim=-1).topk(nkeep).indices] = True
+                qcal = torch.randn(32, H, 576, device="cuda", generator=gg)
+                qpos = torch.randint(0, n_toks[p], (32,), device="cuda", generator=gg)
+                t = RecallTier(r=R, topj=-1)
+                t.build(kb, slots, keep, qcal, qpos)
+                pairs.append((li, slot))
+                tiers.append(t)
+        qbuf = torch.randn(n_lids, max_reqs, H, 576, device="cuda")
+        return bufs, pairs, tiers, qbuf
+
+    def _run(self, pairs, tiers, qbuf, bufs, from_tier, mode=None, slack=0):
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
+
+        n_lids, max_reqs = qbuf.shape[0], qbuf.shape[1]
+        arch_lens = [t.arch.shape[0] for t in tiers]
+        f = torch.zeros(
+            n_lids, max_reqs, self.FETCH_W, dtype=torch.int64, device="cuda"
+        )
+        ln = torch.zeros(n_lids, max_reqs, dtype=torch.int64, device="cuda")
+        pack = BatchedScanPack.at_capacity(
+            n_lids * max_reqs,
+            max(t.kept_rows.shape[0] for t in tiers) + slack,
+            max(arch_lens),
+            R,
+            H,
+            qbuf,
+            f,
+            ln,
+            0,
+            arena=sum(arch_lens) + slack,
+            pool_bases=[b.data_ptr() for b in bufs],
+            pool_row=576,
+            pool_rows=bufs[0].shape[0],
+            csk_from_tier=from_tier,
+        )
+        if mode is not None:
+            pack.csk_mode = mode
+        self.assertEqual(pack.csk is None, from_tier)
+        pack.update(pairs, tiers)
+        pack.run()
+        torch.cuda.synchronize()
+        return pack, f, ln
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_read_through_matches_the_packed_copy(self):
+        from sglang.srt.layers.attention.vestigekv import fused_prologue as FP
+
+        torch.manual_seed(51)
+        bufs, pairs, tiers, qbuf = self._fixture()
+        _, ref_f, ref_n = self._run(pairs, tiers, qbuf, bufs, from_tier=False)
+        arch_lens = [t.arch.shape[0] for t in tiers]
+        for i, (li, slot) in enumerate(pairs):
+            n = int(ref_n[li, slot])
+            self.assertTrue(
+                0 < n < arch_lens[i],
+                f"pair {i} fired {n} of {arch_lens[i]} -- fixture is not selective",
+            )
+        modes = {1}
+        if FP._pool_read_mode(qbuf.device) == 2:
+            modes.add(2)
+        for m in sorted(modes):
+            _, f, ln = self._run(pairs, tiers, qbuf, bufs, from_tier=True, mode=m)
+            self.assertTrue(torch.equal(ref_n, ln), f"csk mode {m}: counts differ")
+            for li, slot in pairs:
+                n = int(ref_n[li, slot])
+                self.assertTrue(
+                    torch.equal(ref_f[li, slot, :n], f[li, slot, :n]),
+                    f"csk mode {m}: pair {(li, slot)} fetch set differs",
+                )
+        del bufs
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_pack_holds_the_cache_alive_and_tracks_reallocation(self):
+        """cbase is a raw address; the pack must keep the cache from being
+        freed, and must pick up the new address after a block close."""
+        torch.manual_seed(51)
+        bufs, pairs, tiers, qbuf = self._fixture()
+        # slack for the close below, which grows one pair's archive
+        pack, _, _ = self._run(pairs, tiers, qbuf, bufs, from_tier=True, slack=4096)
+        self.assertEqual(len(pack._csk_refs), len(tiers), "caches not retained")
+        for t, ref in zip(tiers, pack._csk_refs):
+            self.assertIs(ref, t._csk_all)
+        before = pack.cbase.clone()
+
+        # a close reallocates the cache; update() must refresh cbase
+        t0 = tiers[0]
+        extra = torch.arange(64, device="cuda", dtype=torch.int64)
+        t0.extend_closed(bufs[0][extra], extra)
+        self.assertIsNot(t0._csk_all, pack._csk_refs[0], "cat did not reallocate")
+        n_closed = t0._pos_all.shape[0]
+        k2 = torch.zeros(n_closed, dtype=torch.bool, device="cuda")
+        k2[: max(1, n_closed // 32)] = True
+        t0.refresh_membership(k2, bufs[0])
+        self.assertTrue(pack.fits(pairs, tiers), "capacity check refused the update")
+        pack.update(pairs, tiers)
+        torch.cuda.synchronize()
+        self.assertNotEqual(
+            int(before[0]), int(pack.cbase[0]), "cbase kept a stale address"
+        )
+        self.assertEqual(int(pack.cbase[0]), t0._csk_all.data_ptr())

@@ -1263,6 +1263,12 @@ class VestigeKVMLABackend(AttentionBackend):
             # holds. Dropping it is only possible when the pool is addressable
             # at all, hence the same condition as the kept rows.
             side_from_pool=pool_bases is not None,
+            # The sketch projections are a selection over the tier's
+            # closed-prefix cache, so the pack carries the row index and reads
+            # through it rather than holding a compacted copy of the same
+            # numbers. Unlike the pool, that cache is reallocated at every
+            # block close, which update() handles by refreshing the address.
+            csk_from_tier=True,
         )
 
     def _ingraph_device_step(self, bs):
