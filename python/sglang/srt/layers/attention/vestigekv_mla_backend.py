@@ -1302,7 +1302,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._pack_epoch != self._pack_epoch_synced or self._ingraph_full_armed
         ) and not self._ingraph_dead:
             self._ingraph_full_armed = False
-            pairs, tiers, settled = [], [], []
+            pairs, tiers = [], []
             for lid in self._local_mla_lids:
                 if lid not in self._qbuf:
                     continue
@@ -1312,23 +1312,19 @@ class VestigeKVMLABackend(AttentionBackend):
                     if tier is not None:
                         pairs.append((self._li_map[lid], reqs[i]))
                         tiers.append(tier)
-                        settled.append(
-                            (st, tier)
-                            if st.get("qcal") is None and "job" not in st
-                            else None
-                        )
             if not self._ingraph_pack.fits(pairs, tiers):
                 self._ingraph_disable(forward_batch, reqs)
             else:
                 self._ingraph_pack.update(pairs, tiers)
-                # The pack now owns a copy of every operand it was given, and
-                # in-graph serving reads only the pack. Drop the tier-side
-                # copy of any pair whose calibration has settled (no pending
-                # window, no in-flight build) -- it is pure duplication from
-                # here on. A later block close rebuilds from scratch.
-                for item in settled:
-                    if item is not None and not getattr(item[1], "released", False):
-                        item[1].release_operands()
+                # NOTE: the tier-side operands are NOT released here, though
+                # they are pure duplication once the pack holds them. Releasing
+                # them was tried and reverted: the pack re-copies EVERY pair on
+                # any epoch bump, so the next request to join the batch sends
+                # the released tier back through fits()/update() with nothing
+                # left to copy. bs=1 never bumps, so only a two-node bs>1 run
+                # finds it -- which is what happened. Making the release safe
+                # needs update() to skip pairs already resident, and that needs
+                # a stable pair->arena slot across updates; see DEFECTS.md.
             self._pack_epoch_synced = self._pack_epoch
         # The captured pack appends one row per padded lane per layer to the
         # trash slot's kept table; reset it before it can reach capacity

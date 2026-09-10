@@ -578,6 +578,13 @@ class Envs:
     # fetch bound they are accepting.
     SGLANG_VESTIGEKV_TOPJ = EnvInt(-1)
 
+    # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
+    # rows the KV pool already holds. Unset picks the fastest form that runs on
+    # the device (a TMA row gather where that compiles, an indirect load
+    # otherwise); 1 pins the indirect load, 2 pins the TMA gather. The two are
+    # bit-identical -- this selects instructions, never numerics.
+    SGLANG_VESTIGEKV_POOL_READ = EnvInt(None)
+
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch

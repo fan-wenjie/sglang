@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
 logger = logging.getLogger(__name__)
@@ -346,6 +347,7 @@ _NSPLIT = 32
 _TILE = {False: (64, 64, 4, 3), True: (64, 64, 8, 3)}
 
 _TMA_ALLOCATOR_SET = False
+_TMA_SCRATCH = None
 _POOL_MODE = None
 
 
@@ -369,15 +371,16 @@ def _pool_read_mode(device):
     global _POOL_MODE, _TMA_ALLOCATOR_SET
     if _POOL_MODE is not None:
         return _POOL_MODE
+    forced = envs.SGLANG_VESTIGEKV_POOL_READ.get()
+    if forced in (1, 2):
+        if forced == 2:
+            _set_tma_allocator(device)
+        _POOL_MODE = forced
+        logger.info("vestigekv: kept-row read pinned to mode %d", forced)
+        return _POOL_MODE
     _POOL_MODE = 1
     if hasattr(tl, "make_tensor_descriptor"):
-        if not _TMA_ALLOCATOR_SET:
-            triton.set_allocator(
-                lambda size, alignment, stream: torch.empty(
-                    size, device=device, dtype=torch.int8
-                )
-            )
-            _TMA_ALLOCATOR_SET = True
+        _set_tma_allocator(device)
         try:
             src = torch.zeros(64, 64, device=device, dtype=torch.bfloat16)
             idx = torch.zeros(32, device=device, dtype=torch.int32)
@@ -392,6 +395,28 @@ def _pool_read_mode(device):
                 type(e).__name__,
             )
     return _POOL_MODE
+
+
+def _set_tma_allocator(device):
+    """TMA descriptors need a global scratch allocator; set it once.
+
+    The buffer is cached and handed back, not re-allocated per launch: this
+    runs inside a decode step with the KV pool already holding almost all of
+    the device, where a fresh allocation per launch is both churn and a real
+    OOM risk.
+    """
+    global _TMA_ALLOCATOR_SET, _TMA_SCRATCH
+    if _TMA_ALLOCATOR_SET:
+        return
+
+    def _alloc(size, alignment, stream):
+        global _TMA_SCRATCH
+        if _TMA_SCRATCH is None or _TMA_SCRATCH.numel() < size:
+            _TMA_SCRATCH = torch.empty(size, device=device, dtype=torch.int8)
+        return _TMA_SCRATCH[:size]
+
+    triton.set_allocator(_alloc)
+    _TMA_ALLOCATOR_SET = True
 
 
 @triton.jit
