@@ -40,7 +40,7 @@ def _scan_batched_kernel(
     rho_ptr,  # [P, Amax] fp32
     a_len_ptr,  # [P] int64: real archive rows of this pair
     cc_ptr,  # [P] fp32: zp * sc / sqrt(kv_lora - R)
-    hit_ptr,  # [P, Amax] int32 out
+    hit_ptr,  # [P, Amax] int8 out (0/1 fired flag)
     counts_ptr,  # [P, NB] int32 fused compact-count out (NB = ceil(Amax/1024))
     Amax,
     sc,
@@ -93,7 +93,7 @@ def _scan_batched_kernel(
         acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
         score = acc * sc + cc * rh[:, None] * qr[None, :]
         fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
-        tl.store(hit_ptr + p * Amax + offs, fired, mask=m)
+        tl.store(hit_ptr + p * Amax + offs, fired.to(tl.int8), mask=m)
         cnt += tl.sum(tl.where(m, fired, 0), 0)
     # Fused compact count: the program IS the 1024-row bucket, so the total
     # is a plain store (pre-zeroing by the prefix kernel covers programs
@@ -135,7 +135,10 @@ class BatchedScanPack:
         self.side = torch.zeros(P, Am, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
         self.csk = torch.zeros(P, Am, r, device=dev, dtype=torch.float16)
         self.rho = torch.zeros(P, Am, device=dev)
-        self.arch = torch.zeros(P, Am, dtype=torch.int64, device=dev)
+        # int32: archive entries are pool row indices, bounded by max_total_tokens
+        # (~2M), and the fetch buffer they land in is already the stock
+        # kv-indices dtype. Halves this table.
+        self.arch = torch.zeros(P, Am, dtype=torch.int32, device=dev)
         self.a_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.nk_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.thr = torch.zeros(P, 1, device=dev)
@@ -150,7 +153,8 @@ class BatchedScanPack:
         # zeros, not empty: the kernel never stores to the padded region
         # (masked by a_len), so anything there at init is there forever --
         # torch.empty garbage would read as fired rows of ARCH padding.
-        self.hit = torch.zeros(P, Am, dtype=torch.int32, device=dev)
+        # int8: a 0/1 fired flag; the compaction reads it as a predicate.
+        self.hit = torch.zeros(P, Am, dtype=torch.int8, device=dev)
         # fixed-address fused-prologue outputs (graph reads/writes in place)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
@@ -190,7 +194,10 @@ class BatchedScanPack:
         self.side = torch.zeros(P, Am, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
         self.csk = torch.zeros(P, Am, r, device=dev, dtype=torch.float16)
         self.rho = torch.zeros(P, Am, device=dev)
-        self.arch = torch.zeros(P, Am, dtype=torch.int64, device=dev)
+        # int32: archive entries are pool row indices, bounded by max_total_tokens
+        # (~2M), and the fetch buffer they land in is already the stock
+        # kv-indices dtype. Halves this table.
+        self.arch = torch.zeros(P, Am, dtype=torch.int32, device=dev)
         self.a_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.nk_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.thr = torch.zeros(P, 1, device=dev)
@@ -203,7 +210,8 @@ class BatchedScanPack:
         self.li = torch.zeros(P, dtype=torch.int64, device=dev)
         self.slot = torch.full((P,), pad_slot, dtype=torch.int64, device=dev)
         W = fetch_buf.shape[-1]
-        self.hit = torch.zeros(P, Am, dtype=torch.int32, device=dev)
+        # int8: a 0/1 fired flag; the compaction reads it as a predicate.
+        self.hit = torch.zeros(P, Am, dtype=torch.int8, device=dev)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
         self.qside_t = torch.zeros(
