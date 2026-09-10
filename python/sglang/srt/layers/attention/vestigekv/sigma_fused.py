@@ -52,7 +52,8 @@ def _basis(T: int, kappa: int, dev) -> torch.Tensor:
 
 @triton.jit
 def _sigma_fused_kernel(
-    r_ptr,      # [N, T, 64] bf16 sidecar blocks (contiguous)
+    r_ptr,      # FROM_POOL=0: [N,T,64] gathered sidecars. =1: [pool,ROW] pool
+    slots_ptr,  # FROM_POOL=1: [N*T] int64 pool row indices (else unused)
     c_ptr,      # [T, 32] fp32 basis
     sig_ptr,    # [N, T] fp32 out
     hist_ptr,   # [N_BINS] int32 SHARED (atomic across instances)
@@ -61,17 +62,33 @@ def _sigma_fused_kernel(
     BT: tl.constexpr,
     DD: tl.constexpr,   # 64
     KB: tl.constexpr,   # 32
+    FROM_POOL: tl.constexpr,
+    ROW: tl.constexpr,      # pool row width (576)
+    KV_OFF: tl.constexpr,   # branch offset inside the row (512)
 ):
     inst = tl.program_id(0)
-    r_ptr = r_ptr + inst.to(tl.int64) * T * DD
     sig_ptr = sig_ptr + inst.to(tl.int64) * T
+    if FROM_POOL:
+        slots_ptr = slots_ptr + inst.to(tl.int64) * T
+    else:
+        r_ptr = r_ptr + inst.to(tl.int64) * T * DD
     # pass 1: Y = C^T R   (KB x DD), fp32 ieee
     y = tl.zeros([KB, DD], dtype=tl.float32)
     for t0 in range(0, T, BT):
         t = t0 + tl.arange(0, BT)
         m = t < T
-        r = tl.load(r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
-                    mask=m[:, None], other=0.0).to(tl.float32)
+        if FROM_POOL:
+            # Strided read straight out of the 576-dim pool row: the branch is
+            # a contiguous 64-dim slice at KV_OFF, so no [T,576] intermediate
+            # is materialised (the caller used to gather then slice).
+            sl = tl.load(slots_ptr + t, mask=m, other=0).to(tl.int64)
+            r = tl.load(
+                r_ptr + sl[:, None] * ROW + (KV_OFF + tl.arange(0, DD))[None, :],
+                mask=m[:, None], other=0.0,
+            ).to(tl.float32)
+        else:
+            r = tl.load(r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
+                        mask=m[:, None], other=0.0).to(tl.float32)
         c = tl.load(c_ptr + t[:, None] * KB + tl.arange(0, KB)[None, :],
                     mask=m[:, None], other=0.0)
         y += tl.dot(tl.trans(c), r, input_precision="ieee")
@@ -79,8 +96,18 @@ def _sigma_fused_kernel(
     for t0 in range(0, T, BT):
         t = t0 + tl.arange(0, BT)
         m = t < T
-        r = tl.load(r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
-                    mask=m[:, None], other=0.0).to(tl.float32)
+        if FROM_POOL:
+            # Strided read straight out of the 576-dim pool row: the branch is
+            # a contiguous 64-dim slice at KV_OFF, so no [T,576] intermediate
+            # is materialised (the caller used to gather then slice).
+            sl = tl.load(slots_ptr + t, mask=m, other=0).to(tl.int64)
+            r = tl.load(
+                r_ptr + sl[:, None] * ROW + (KV_OFF + tl.arange(0, DD))[None, :],
+                mask=m[:, None], other=0.0,
+            ).to(tl.float32)
+        else:
+            r = tl.load(r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
+                        mask=m[:, None], other=0.0).to(tl.float32)
         c = tl.load(c_ptr + t[:, None] * KB + tl.arange(0, KB)[None, :],
                     mask=m[:, None], other=0.0)
         recon = tl.dot(c, y, input_precision="ieee")
@@ -90,6 +117,34 @@ def _sigma_fused_kernel(
         bits = sig.to(tl.int32, bitcast=True)
         bin_ = bits >> 21  # top 11 bits: monotone for sigma >= 0, max 1020 < NB
         tl.atomic_add(hist_ptr + bin_, 1, mask=m)
+
+
+def sigma_fused_from_pool(
+    kbuf: torch.Tensor, slots: torch.Tensor, block: int,
+    kappa: int = D.LOWPASS_KAPPA,
+):
+    """sigma for the blocks of `slots`, read STRAIGHT from the pool.
+
+    kbuf: [pool, ROW] bf16 rows; slots: [n_blocks*block] int64 pool indices.
+    Identical arithmetic to sigma_fused(); the only difference is that the
+    64-dim branch slice is addressed inside the kernel instead of being
+    gathered into a [T, ROW] intermediate and then sliced by the caller.
+    """
+    n = slots.numel() // block
+    dev = kbuf.device
+    C = _basis(block, kappa, dev)
+    sig = torch.empty(max(n, 1), block, dtype=torch.float32, device=dev)
+    hist = torch.zeros(N_BINS, dtype=torch.int32, device=dev)
+    if n == 0:
+        return sig.new_zeros(0), hist
+    slots = slots[: n * block].contiguous().to(torch.int64)
+    _sigma_fused_kernel[(n,)](
+        kbuf, slots, C, sig, hist, block, NB=N_BINS, BT=64,
+        DD=D.SIDECAR_DIM, KB=_KB_PAD, FROM_POOL=1,
+        ROW=kbuf.shape[-1], KV_OFF=D.KV_LORA_RANK,
+        num_warps=4, num_stages=1,
+    )
+    return sig.reshape(-1), hist
 
 
 def sigma_fused(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA):
@@ -106,16 +161,11 @@ def sigma_fused(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA):
     side = side.contiguous()
     sig = torch.empty(N, T, dtype=torch.float32, device=dev)
     hist = torch.zeros(N_BINS, dtype=torch.int32, device=dev)
-    try:
-        _sigma_fused_kernel[(N,)](
-            side, C, sig, hist, T, NB=N_BINS, BT=64, DD=DD, KB=_KB_PAD,
-            num_warps=4, num_stages=1,
-        )
-    except Exception as e:  # DIAG: surface the actual failing shape
-        raise RuntimeError(
-            f"sigma_fused launch failed: N={N} T={T} DD={DD} "
-            f"side={tuple(side.shape)} dtype={side.dtype}"
-        ) from e
+    _sigma_fused_kernel[(N,)](
+        side, side, C, sig, hist, T, NB=N_BINS, BT=64, DD=DD, KB=_KB_PAD,
+        FROM_POOL=0, ROW=DD, KV_OFF=0,
+        num_warps=4, num_stages=1,
+    )
     return (sig[0], hist) if single else (sig, hist)
 
 

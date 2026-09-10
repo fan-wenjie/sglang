@@ -44,9 +44,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.eviction import (
-    blockwise_sigma,
+    blockwise_sigma_from_pool,
     select_kept,
-    sidecar_sigma,
 )
 
 if TYPE_CHECKING:
@@ -923,8 +922,8 @@ class VestigeKVMLABackend(AttentionBackend):
             closed0 = (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
             self._close_state[(slot, lid)] = {
                 "closed": closed0,
-                "sigma": blockwise_sigma(
-                    kbuf[row_slots][:, D.KV_LORA_RANK :], D.CLOSE_BLOCK
+                "sigma": blockwise_sigma_from_pool(
+                    kbuf, row_slots, D.CLOSE_BLOCK
                 ),
             }
             # Host-side upper bound on kept_len, so the per-step CSR pack needs
@@ -1061,7 +1060,7 @@ class VestigeKVMLABackend(AttentionBackend):
         # The mixed flavor only ever survived until the first decode close
         # (the 64-dim global rebalance replaces it), and recall covered the
         # difference, but the paper's sigma is the branch. One flavor now.
-        sigma = blockwise_sigma(kbuf[row_slots][:, D.KV_LORA_RANK :], D.CLOSE_BLOCK)
+        sigma = blockwise_sigma_from_pool(kbuf, row_slots, D.CLOSE_BLOCK)
         keep = select_kept(sigma, rho=self.rho, closed=closed, sinks=D.SINKS)
         kept_closed = row_slots[:closed][keep.nonzero(as_tuple=True)[0]]
         return torch.cat([kept_closed, row_slots[closed:]])
@@ -1374,7 +1373,7 @@ class VestigeKVMLABackend(AttentionBackend):
         c0 = cl["closed"]
         c1 = c0 + D.CLOSE_BLOCK
         block_slots = r2t[slot, c0:c1].to(torch.int64)
-        sigma = sidecar_sigma(kbuf[block_slots][:, D.KV_LORA_RANK :])
+        sigma = blockwise_sigma_from_pool(kbuf, block_slots, D.CLOSE_BLOCK)
         cl["sigma"] = torch.cat([cl["sigma"], sigma])
         cl["closed"] = c1
         # global rebalance over every closed row

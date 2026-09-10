@@ -56,6 +56,26 @@ def select_kept(
     return keep
 
 
+def blockwise_sigma_from_pool(
+    kbuf: torch.Tensor, slots: torch.Tensor, block: int = D.CLOSE_BLOCK
+) -> torch.Tensor:
+    """blockwise_sigma without the caller's [T, ROW] gather: the fused kernel
+    addresses the 64-dim branch inside the pool row directly. Bit-identical
+    to blockwise_sigma(kbuf[slots][:, KV_LORA_RANK:], block) (asserted in the
+    registered test); falls back to that path off-CUDA."""
+    n_blocks = slots.shape[0] // block
+    if n_blocks == 0:
+        return kbuf.new_zeros(0, dtype=torch.float32)
+    if SIGMA_FUSED and kbuf.is_cuda:
+        from sglang.srt.layers.attention.vestigekv.sigma_fused import (
+            sigma_fused_from_pool,
+        )
+
+        sig, _ = sigma_fused_from_pool(kbuf, slots, block)
+        return sig
+    return blockwise_sigma(kbuf[slots][:, D.KV_LORA_RANK :], block)
+
+
 def blockwise_sigma(side: torch.Tensor, block: int = D.CLOSE_BLOCK) -> torch.Tensor:
     """sigma over full blocks only: one fixed-window rFFT per block.
 

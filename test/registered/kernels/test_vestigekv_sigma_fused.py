@@ -79,6 +79,23 @@ class TestSigmaFused(CustomTestCase):
         self.assertEqual(idx.numel(), m)
         self.assertTrue(must <= set(idx.tolist()))
 
+    def test_from_pool_is_bit_identical(self):
+        """The in-kernel strided read must equal the gather-then-slice path
+        exactly: same arithmetic, only the addressing differs."""
+        from sglang.srt.layers.attention.vestigekv.sigma_fused import (
+            sigma_fused,
+            sigma_fused_from_pool,
+        )
+
+        torch.manual_seed(3)
+        pool = torch.randn(50000, 576, device="cuda").to(torch.bfloat16)
+        blk, nb = 4096, 3
+        slots = torch.randperm(50000, device="cuda")[: blk * nb].to(torch.int64)
+        s_gather, h_gather = sigma_fused(pool[slots][:, 512:].reshape(nb, blk, 64))
+        s_pool, h_pool = sigma_fused_from_pool(pool, slots, blk)
+        self.assertTrue(torch.equal(s_gather.reshape(-1), s_pool))
+        self.assertTrue(torch.equal(h_gather, h_pool))
+
 
 class TestOperandFused(CustomTestCase):
     """Fused operand builder vs the chunked torch loop: side bit-identical,
