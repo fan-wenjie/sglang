@@ -421,7 +421,7 @@ class TestKeptRowsFromPool(CustomTestCase):
         qbuf = torch.randn(n_lids, max_reqs, H, 576, device="cuda")
         return bufs, pairs, tiers, qbuf
 
-    def _run(self, pairs, tiers, qbuf, pool_bases):
+    def _run(self, pairs, tiers, qbuf, pool_bases, pool_rows=None, mode=None):
         from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
 
         n_lids, max_reqs = qbuf.shape[0], qbuf.shape[1]
@@ -441,7 +441,10 @@ class TestKeptRowsFromPool(CustomTestCase):
             0,
             arena=sum(arch_lens),
             pool_bases=pool_bases,
+            pool_rows=pool_rows,
         )
+        if mode is not None:
+            pack.pool_mode = mode
         self.assertEqual(pack.kr is None, pool_bases is not None)
         self.assertTrue(pack.fits(pairs, tiers))
         pack.update(pairs, tiers)
@@ -467,7 +470,9 @@ class TestKeptRowsFromPool(CustomTestCase):
                 f"pair {i} fired {n} of {arch_lens[i]} -- fixture is not selective",
             )
 
-        pool_f, pool_n = self._run(pairs, tiers, qbuf, [b.data_ptr() for b in bufs])
+        pool_f, pool_n = self._run(
+            pairs, tiers, qbuf, [b.data_ptr() for b in bufs], bufs[0].shape[0]
+        )
         self.assertTrue(torch.equal(snap_n, pool_n), "fetch counts differ")
         for li, slot in pairs:
             n = int(snap_n[li, slot])
@@ -502,7 +507,9 @@ class TestKeptRowsFromPool(CustomTestCase):
             t.query_fixed(qbuf[li, slot], out, ol, slot)
             ref.append(set(out[slot, : int(ol[slot])].tolist()))
 
-        f, ln = self._run(pairs, tiers, qbuf, [b.data_ptr() for b in bufs])
+        f, ln = self._run(
+            pairs, tiers, qbuf, [b.data_ptr() for b in bufs], bufs[0].shape[0]
+        )
         for i, (li, slot) in enumerate(pairs):
             got = set(f[li, slot, : int(ln[li, slot])].tolist())
             sym = len(got ^ ref[i])
@@ -512,4 +519,41 @@ class TestKeptRowsFromPool(CustomTestCase):
                 f"pair {i}: {sym} of {len(ref[i])} rows "
                 f"({100 * sym / len(ref[i]):.2f}%) differ from the eager reference",
             )
+        del bufs
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_both_pool_read_modes_match_the_snapshot(self):
+        """Whichever way the kernel reads the pool, it reads the same rows.
+
+        Kept rows come out of the pool either through a TMA row gather or
+        through an indirect load, picked at runtime by whether the gather
+        compiles and runs here. Only one of those runs on any given machine,
+        so the other would go untested -- both are pinned here, against the
+        snapshot the pack used to carry.
+        """
+        from sglang.srt.layers.attention.vestigekv import fused_prologue as FP
+
+        torch.manual_seed(31)
+        bufs, pairs, tiers, qbuf = self._fixture()
+        bases, rows = [b.data_ptr() for b in bufs], bufs[0].shape[0]
+        snap_f, snap_n = self._run(pairs, tiers, qbuf, None)
+        arch_lens = [t.side.shape[0] for t in tiers]
+        for i, (li, slot) in enumerate(pairs):
+            n = int(snap_n[li, slot])
+            self.assertTrue(
+                0 < n < arch_lens[i],
+                f"pair {i} fired {n} of {arch_lens[i]} -- fixture is not selective",
+            )
+        available = {1}
+        if FP._pool_read_mode(qbuf.device) == 2:
+            available.add(2)
+        for mode in sorted(available):
+            f, ln = self._run(pairs, tiers, qbuf, bases, rows, mode=mode)
+            self.assertTrue(torch.equal(snap_n, ln), f"mode {mode}: counts differ")
+            for li, slot in pairs:
+                n = int(snap_n[li, slot])
+                self.assertTrue(
+                    torch.equal(snap_f[li, slot, :n], f[li, slot, :n]),
+                    f"mode {mode}: pair {(li, slot)} fetch set differs",
+                )
         del bufs

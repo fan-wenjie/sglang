@@ -16,11 +16,15 @@ Residual via Pythagoras (V rows orthonormal): ||q - qsk V||^2 = ||q||^2 -
 qk chunks, qsk chunks, and ||q||^2 together.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -173,8 +177,9 @@ def _prologue_scores_kernel(
     NKm,
     NSPLIT: tl.constexpr,
     H: tl.constexpr,
-    FROM_POOL: tl.constexpr,
+    FROM_POOL: tl.constexpr,  # 0 snapshot, 1 indirect load, 2 TMA gather
     ROW: tl.constexpr,  # pool row width (576); unused when FROM_POOL=0
+    POOL_ROWS: tl.constexpr,  # pool row count, for the TMA descriptor
     BLOCK_NK: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -190,6 +195,13 @@ def _prologue_scores_kernel(
     # of a captured graph.
     if FROM_POOL:
         kbase = tl.load(kbase_ptr + p).to(tl.pointer_type(tl.bfloat16))
+    if FROM_POOL == 2:
+        desc = tl.make_tensor_descriptor(
+            kbase,
+            shape=[POOL_ROWS, ROW],
+            strides=[ROW, 1],
+            block_shape=[1, BLOCK_D],
+        )
     span = (NKm + NSPLIT - 1) // NSPLIT
     lo = sp * span
     # Clamp by the pair's REAL kept count, not the capacity: rows past nk are
@@ -205,12 +217,21 @@ def _prologue_scores_kernel(
         offs = nk0 + tl.arange(0, BLOCK_NK)
         mrow = (offs < hi) & (offs < nk)
         qk = tl.zeros([H, BLOCK_NK], dtype=tl.float32)
-        if FROM_POOL:
+        if FROM_POOL == 1:
             sl = tl.load(kslot_ptr + p * NKm + offs, mask=mrow, other=0).to(tl.int64)
+        if FROM_POOL == 2:
+            sl32 = tl.load(kslot_ptr + p * NKm + offs, mask=mrow, other=0)
         for d0 in range(0, 576, BLOCK_D):
             d = d0 + tl.arange(0, BLOCK_D)
             qc = tl.load(qb + h[:, None] * 576 + d[None, :])
-            if FROM_POOL:
+            if FROM_POOL == 2:
+                # TMA row gather: the ONE way to get a data-dependent index
+                # staged into shared memory asynchronously. A plain indirect
+                # tl.load is not affine, so the pipeliner emits no cp.async for
+                # it and falls back to synchronous ld.global (measured on this
+                # kernel: 26 cp.async / 3 ld.global becomes 11 / 68).
+                kc = desc.gather(sl32, d0)
+            elif FROM_POOL:
                 # A latent row is written once, when its token enters the
                 # pool, and never rewritten -- so reading it here is
                 # bit-identical to the snapshot this kernel used to carry, at
@@ -319,7 +340,68 @@ _NSPLIT = 32
 # per pair, while the pool read issues one request per row, so what each
 # request covers is the lever there and not here. Swept on a 5-layer 64k and
 # 256k config; see the pool-read commit for the numbers.
-_TILE = {False: (64, 64, 4), True: (64, 64, 4)}
+# (BLOCK_NK, BLOCK_D, num_warps, num_stages) keyed by whether kept rows come
+# from the pool. The two sources want different tiles because they compile to
+# different memory instructions -- see _pool_read_mode.
+_TILE = {False: (64, 64, 4, 3), True: (64, 64, 8, 3)}
+
+_TMA_ALLOCATOR_SET = False
+_POOL_MODE = None
+
+
+def _pool_read_mode(device):
+    """Pick how the kernel reads kept rows out of the pool: 2 = TMA gather,
+    1 = indirect tl.load.
+
+    An indirect load is not affine, so Triton's pipeliner emits no cp.async
+    for it and falls back to synchronous ld.global -- measured on this kernel,
+    26 cp.async / 3 ld.global becomes 11 / 68, registers go 96 -> 236, and the
+    prologue costs +5% at 64k and +23% at 256k. Neither num_stages nor
+    num_warps moves that: the loads simply are not staged. A TMA row gather is
+    the one form of data-dependent read the hardware will stage into shared
+    memory asynchronously, and it restores both (25 cp.async + 12 gather4,
+    125 registers, +0.3% / +8.8%).
+
+    Decided once per process by compiling a gather and running it, not by an
+    architecture table: what matters is whether this Triton and this device
+    agree, and only running it answers that.
+    """
+    global _POOL_MODE, _TMA_ALLOCATOR_SET
+    if _POOL_MODE is not None:
+        return _POOL_MODE
+    _POOL_MODE = 1
+    if hasattr(tl, "make_tensor_descriptor"):
+        if not _TMA_ALLOCATOR_SET:
+            triton.set_allocator(
+                lambda size, alignment, stream: torch.empty(
+                    size, device=device, dtype=torch.int8
+                )
+            )
+            _TMA_ALLOCATOR_SET = True
+        try:
+            src = torch.zeros(64, 64, device=device, dtype=torch.bfloat16)
+            idx = torch.zeros(32, device=device, dtype=torch.int32)
+            out = torch.zeros(32, 64, device=device, dtype=torch.bfloat16)
+            _tma_probe_kernel[(1,)](src, idx, out, 64, W=64, N=32)
+            torch.cuda.synchronize()
+            _POOL_MODE = 2
+        except Exception as e:  # unsupported arch, older Triton, no allocator
+            logger.info(
+                "vestigekv: TMA row gather unavailable (%s), reading kept rows "
+                "with indirect loads instead",
+                type(e).__name__,
+            )
+    return _POOL_MODE
+
+
+@triton.jit
+def _tma_probe_kernel(src, idx_ptr, out, R, W: tl.constexpr, N: tl.constexpr):
+    """Smallest thing that fails if TMA gather does not work here."""
+    desc = tl.make_tensor_descriptor(
+        src, shape=[R, W], strides=[W, 1], block_shape=[1, W]
+    )
+    t = desc.gather(tl.load(idx_ptr + tl.arange(0, N)), 0)
+    tl.store(out + tl.arange(0, N)[:, None] * W + tl.arange(0, W)[None, :], t)
 
 
 def fused_prologue_split(
@@ -338,6 +420,8 @@ def fused_prologue_split(
     kbase=None,
     nkm=None,
     row=None,
+    pool_rows=None,
+    mode=None,
 ):
     """Split-NK prologue reading queries in place from the stacked qbuf.
 
@@ -359,8 +443,13 @@ def fused_prologue_split(
                 "the wrong rows silently"
             )
         NKm, ROW = nkm, row
+        if mode is None:
+            mode = _pool_read_mode(qbuf.device)
+        if mode == 2 and pool_rows is None:
+            raise ValueError("the TMA descriptor needs the pool's row count")
     else:
         NKm, ROW = kr.shape[1], 0
+        mode = 0
     P = p_live if p_live is not None else li.shape[0]
     H = qbuf.shape[2]
     RR = qbuf.shape[1]
@@ -383,11 +472,13 @@ def fused_prologue_split(
         NKm,
         NSPLIT=_NSPLIT,
         H=H,
-        FROM_POOL=1 if from_pool else 0,
+        FROM_POOL=mode,
         ROW=ROW,
+        POOL_ROWS=pool_rows or 1,
         BLOCK_NK=_TILE[from_pool][0],
         BLOCK_D=_TILE[from_pool][1],
         num_warps=_TILE[from_pool][2],
+        num_stages=_TILE[from_pool][3],
     )
     _prologue_merge_kernel[(P,)](
         pm,

@@ -1221,7 +1221,7 @@ class VestigeKVMLABackend(AttentionBackend):
         kbufs = [
             self.token_to_kv_pool.get_key_buffer(lid) for lid in self._local_mla_lids
         ]
-        pool_bases, pool_row = None, None
+        pool_bases, pool_row, pool_rows = None, None, None
         # The stride is elements per TOKEN ROW, not the last dimension: a pool
         # shaped [size, 1, 576] gives the same number, one shaped [size, 2, 288]
         # does not, and only the first is what the kernel can address.
@@ -1232,6 +1232,7 @@ class VestigeKVMLABackend(AttentionBackend):
         ):
             pool_bases = [k.data_ptr() for k in kbufs]
             pool_row = row_elems[0]
+            pool_rows = kbufs[0].shape[0]
         else:
             # A pool this path cannot address (a non-contiguous view, a dtype
             # the scan does not read, a row that is not the latent row) falls
@@ -1256,6 +1257,7 @@ class VestigeKVMLABackend(AttentionBackend):
             arena=arena,
             pool_bases=pool_bases,
             pool_row=pool_row,
+            pool_rows=pool_rows,
         )
 
     def _ingraph_device_step(self, bs):

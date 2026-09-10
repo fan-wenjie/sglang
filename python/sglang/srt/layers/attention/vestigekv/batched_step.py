@@ -141,7 +141,8 @@ class BatchedScanPack:
         r = tiers[0].r
         self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
         self.nkm = NKm
-        self.kslot = self.kbase = self._pool_bases = self.pool_row = None
+        self.kslot = self.kbase = self._pool_bases = None
+        self.pool_row = self._pool_rows = self.pool_mode = None
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
@@ -208,6 +209,7 @@ class BatchedScanPack:
         arena=None,
         pool_bases=None,
         pool_row=None,
+        pool_rows=None,
     ):
         """An empty pack sized for the worst case, for the in-graph scan.
 
@@ -231,7 +233,8 @@ class BatchedScanPack:
             self.kr = torch.zeros(
                 P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16
             )
-            self.kslot = self.kbase = self._pool_bases = self.pool_row = None
+            self.kslot = self.kbase = self._pool_bases = None
+            self.pool_row = self._pool_rows = self.pool_mode = None
         else:
             self.kr = None
             self.kslot = torch.zeros(P, NKm, dtype=torch.int32, device=dev)
@@ -241,6 +244,10 @@ class BatchedScanPack:
             # the buffer the caller actually hands over is what keeps a pool
             # layout change from silently addressing the wrong rows.
             self.pool_row = D.LATENT_DIM if pool_row is None else pool_row
+            self._pool_rows = pool_rows
+            # None = pick per device (TMA gather when it runs here);
+            # set explicitly only to pin one path, as the tests do.
+            self.pool_mode = None
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
@@ -417,6 +424,8 @@ class BatchedScanPack:
             kbase=self.kbase,
             nkm=self.nkm,
             row=self.pool_row,
+            pool_rows=self._pool_rows,
+            mode=self.pool_mode,
         )
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
         # Grid covers the LARGEST per-pair archive, not the arena: programs
