@@ -1344,15 +1344,10 @@ class VestigeKVMLABackend(AttentionBackend):
                     # the pool through kslot, so the tier's copy is dead here.
                     for t in tiers:
                         t.drop_kept_rows()
-                # NOTE: the tier-side operands are NOT released here, though
-                # they are pure duplication once the pack holds them. Releasing
-                # them was tried and reverted: the pack re-copies EVERY pair on
-                # any epoch bump, so the next request to join the batch sends
-                # the released tier back through fits()/update() with nothing
-                # left to copy. bs=1 never bumps, so only a two-node bs>1 run
-                # finds it -- which is what happened. Making the release safe
-                # needs update() to skip pairs already resident, and that needs
-                # a stable pair->arena slot across updates; see DEFECTS.md.
+                # The tier keeps no copy of what the pack holds: side and
+                # kept_rows are views over the pool, and csk/rho are selections
+                # over one per-request cache the pack reads through. There is
+                # nothing left here to release.
             self._pack_epoch_synced = self._pack_epoch
         # The captured pack appends one row per padded lane per layer to the
         # trash slot's kept table; reset it before it can reach capacity
@@ -1749,8 +1744,6 @@ class VestigeKVMLABackend(AttentionBackend):
         prev = st.get("tier")
         if prev is None or not getattr(prev, "built", False):
             return None
-        if getattr(prev, "released", False):
-            return None  # operands handed to the pack and dropped; rebuild
         cs = self._close_state.get((slot, lid))
         if cs is None or st.get("operands_closed") != cs.get("closed"):
             return None

@@ -64,7 +64,6 @@ class RecallTier:
         self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
         # fixed-address staging for the fused scan (capturable)
         self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
-        self.released = False
 
     def _from_all(self, name, cache):
         """Select the archive's rows out of a closed-prefix cache."""
@@ -465,25 +464,6 @@ class RecallTier:
 
     @torch.inference_mode()
     @ieee_fp32
-    def release_operands(self):
-        """Drop the tier's own scan operands once the in-graph pack holds them.
-
-        After BatchedScanPack.update() has copied csk/rho/side/arch/kept_rows
-        into the pack's capacity buffers, the serving path reads ONLY the
-        pack (the eager query_fixed path is unreachable once the in-graph pack
-        exists). Keeping the tier's copy alive doubles the index footprint for
-        nothing: measured 97 MB per request at 64k with 5 local MLA layers.
-
-        V is deliberately NOT dropped -- it is the sketch basis reused across
-        rebuilds and cached per layer.
-
-        A later rebuild (block close) simply builds from scratch: the caller's
-        operand-reuse guard refuses a released tier.
-        """
-        self._csk_mat = self._rho_mat = self._side_mat = None
-        self.arch = self.kept_rows = self.kept_slots = None
-        self.released = True
-
     def query_fixed(
         self, qe: torch.Tensor, out: torch.Tensor, out_len: torch.Tensor, slot: int
     ) -> None:
@@ -495,11 +475,6 @@ class RecallTier:
         sc_ = self.scale
         qe = qe.float()
         H = qe.shape[0]
-        if self.released:
-            raise RuntimeError(
-                "query_fixed on a tier whose operands were released: the eager "
-                "scan path must not run once the in-graph pack owns them"
-            )
         if self.kept_slots.shape[0] == 0:
             # No tier-1 row kept => there is no max1 baseline to beat, so every
             # archived row is eligible: attend the whole archive this step
