@@ -35,6 +35,7 @@ safety width.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -67,6 +68,8 @@ if TYPE_CHECKING:
 # Preallocated decode-tail slots per (req, layer) index buffer; grown 2x on
 # overflow, so this only sizes the common case.
 _TAIL_CAPACITY = 8192
+
+logger = logging.getLogger(__name__)
 
 
 class VestigeKVMLABackend(AttentionBackend):
@@ -1210,6 +1213,36 @@ class VestigeKVMLABackend(AttentionBackend):
         arena = n_lids * maxbs * max_ctx
         if isinstance(pool_tokens, int) and pool_tokens > 0:
             arena = min(arena, n_lids * (pool_tokens + D.CLOSE_BLOCK))
+        # Kept rows are scored in place in the KV pool: the pack carries the
+        # pool row ids (4 bytes each) instead of a bf16 copy of every row,
+        # which was 87% of it at bs16. The pool is one allocation per layer,
+        # so the kernel needs a base pointer per layer; it is allocated once
+        # for the server's life, so those addresses survive graph capture.
+        kbufs = [
+            self.token_to_kv_pool.get_key_buffer(lid) for lid in self._local_mla_lids
+        ]
+        pool_bases, pool_row = None, None
+        # The stride is elements per TOKEN ROW, not the last dimension: a pool
+        # shaped [size, 1, 576] gives the same number, one shaped [size, 2, 288]
+        # does not, and only the first is what the kernel can address.
+        row_elems = [k[0].numel() if k.numel() else 0 for k in kbufs]
+        if all(
+            k.is_contiguous() and k.dtype == torch.bfloat16 and n == self._q_dim
+            for k, n in zip(kbufs, row_elems)
+        ):
+            pool_bases = [k.data_ptr() for k in kbufs]
+            pool_row = row_elems[0]
+        else:
+            # A pool this path cannot address (a non-contiguous view, a dtype
+            # the scan does not read, a row that is not the latent row) falls
+            # back to the snapshot rather than guessing a stride.
+            logger.warning(
+                "vestigekv: KV pool is not addressable row-wise "
+                "(contig=%s dtype=%s row_elems=%s); keeping the kept-row snapshot",
+                [k.is_contiguous() for k in kbufs],
+                [str(k.dtype) for k in kbufs],
+                row_elems,
+            )
         self._ingraph_pack = BatchedScanPack.at_capacity(
             n_lids * maxbs,
             max(1, min(nkm, max_ctx)),
@@ -1221,6 +1254,8 @@ class VestigeKVMLABackend(AttentionBackend):
             self._fetch_len_stack,
             self._trash_slot,
             arena=arena,
+            pool_bases=pool_bases,
+            pool_row=pool_row,
         )
 
     def _ingraph_device_step(self, bs):

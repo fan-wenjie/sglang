@@ -140,6 +140,8 @@ class BatchedScanPack:
         Am = max(1, int(max(t.side.shape[0] for t in tiers) * self.HEADROOM))
         r = tiers[0].r
         self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
+        self.nkm = NKm
+        self.kslot = self.kbase = self._pool_bases = self.pool_row = None
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
@@ -193,7 +195,19 @@ class BatchedScanPack:
 
     @classmethod
     def at_capacity(
-        cls, P, NKm, Am, r, q_heads, qbuf, fetch_buf, fetch_len, pad_slot, arena=None
+        cls,
+        P,
+        NKm,
+        Am,
+        r,
+        q_heads,
+        qbuf,
+        fetch_buf,
+        fetch_len,
+        pad_slot,
+        arena=None,
+        pool_bases=None,
+        pool_row=None,
     ):
         """An empty pack sized for the worst case, for the in-graph scan.
 
@@ -207,7 +221,26 @@ class BatchedScanPack:
         dev = qbuf.device
         self.q_heads = q_heads
         self._pad_slot = pad_slot
-        self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
+        # Kept rows: either a snapshot this pack owns, or -- when the caller
+        # hands over the pool's per-layer base pointers -- 4 bytes of row id
+        # per kept row, scored in place out of the KV pool. The snapshot was
+        # the pack's largest table by far (87% of it at bs16), and every byte
+        # of it duplicated a pool row that can no longer change.
+        self.nkm = NKm
+        if pool_bases is None:
+            self.kr = torch.zeros(
+                P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16
+            )
+            self.kslot = self.kbase = self._pool_bases = self.pool_row = None
+        else:
+            self.kr = None
+            self.kslot = torch.zeros(P, NKm, dtype=torch.int32, device=dev)
+            self.kbase = torch.zeros(P, dtype=torch.int64, device=dev)
+            self._pool_bases = pool_bases
+            # The row stride is the POOL's, not this module's: taking it from
+            # the buffer the caller actually hands over is what keeps a pool
+            # layout change from silently addressing the wrong rows.
+            self.pool_row = D.LATENT_DIM if pool_row is None else pool_row
         self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
@@ -274,7 +307,7 @@ class BatchedScanPack:
         )
         return (
             n_ok
-            and max(t.kept_rows.shape[0] for t in tiers) <= self.kr.shape[1]
+            and max(t.kept_rows.shape[0] for t in tiers) <= self.nkm
             and sum(t.side.shape[0] for t in tiers) <= self.arena
             and all(t.r == self.csk.shape[1] for t in tiers)
         )
@@ -314,8 +347,16 @@ class BatchedScanPack:
         for i, t in enumerate(tiers):
             nk, av = t.kept_rows.shape[0], t.side.shape[0]
             o = offs[i]
-            self.kr[i, :nk] = t.kept_rows
-            self.kr[i, nk:] = 0
+            if self.kslot is None:
+                self.kr[i, :nk] = t.kept_rows
+                self.kr[i, nk:] = 0
+            else:
+                # Row ids only. Rows past nk are never read (the scan clamps
+                # by nk_len), but a stale id there would read a live pool row
+                # if that clamp ever slipped, so zero it like the snapshot did.
+                self.kslot[i, :nk] = t.kept_slots
+                self.kslot[i, nk:] = 0
+                self.kbase[i] = self._pool_bases[pairs[i][0]]
             self.v[i] = t.V
             self.side[o : o + av] = t.side
             self.csk[o : o + av] = t.csk
@@ -372,6 +413,10 @@ class BatchedScanPack:
             sc,
             out=(self.max1g, self.qside_t, self.qsk_t, self.qres),
             partials=(self.pm, self.ps, self.pt),
+            kslot=self.kslot,
+            kbase=self.kbase,
+            nkm=self.nkm,
+            row=self.pool_row,
         )
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
         # Grid covers the LARGEST per-pair archive, not the arena: programs

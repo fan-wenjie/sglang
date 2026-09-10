@@ -162,7 +162,9 @@ def _prologue_scores_kernel(
     li_ptr,
     slot_ptr,
     RR,
-    kr_ptr,
+    kr_ptr,  # FROM_POOL=0: [P, NKm, 576] bf16 kept rows (else unused)
+    kslot_ptr,  # FROM_POOL=1: [P, NKm] int32 pool row ids (else unused)
+    kbase_ptr,  # FROM_POOL=1: [P] int64 pool base for the pair's layer
     nk_len_ptr,
     pm_ptr,
     ps_ptr,
@@ -171,6 +173,8 @@ def _prologue_scores_kernel(
     NKm,
     NSPLIT: tl.constexpr,
     H: tl.constexpr,
+    FROM_POOL: tl.constexpr,
+    ROW: tl.constexpr,  # pool row width (576); unused when FROM_POOL=0
     BLOCK_NK: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -179,6 +183,13 @@ def _prologue_scores_kernel(
     h = tl.arange(0, H)
     qb = qbuf_ptr + (tl.load(li_ptr + p) * RR + tl.load(slot_ptr + p)) * H * 576
     nk = tl.load(nk_len_ptr + p)
+    # The KV pool is one allocation PER LAYER, so a kernel batched across
+    # layers cannot reach it from a single base plus a stride; the pair's base
+    # comes from a device pointer table instead. The pool is allocated once
+    # for the server's life, so those addresses are stable across the replays
+    # of a captured graph.
+    if FROM_POOL:
+        kbase = tl.load(kbase_ptr + p).to(tl.pointer_type(tl.bfloat16))
     span = (NKm + NSPLIT - 1) // NSPLIT
     lo = sp * span
     # Clamp by the pair's REAL kept count, not the capacity: rows past nk are
@@ -194,14 +205,27 @@ def _prologue_scores_kernel(
         offs = nk0 + tl.arange(0, BLOCK_NK)
         mrow = (offs < hi) & (offs < nk)
         qk = tl.zeros([H, BLOCK_NK], dtype=tl.float32)
+        if FROM_POOL:
+            sl = tl.load(kslot_ptr + p * NKm + offs, mask=mrow, other=0).to(tl.int64)
         for d0 in range(0, 576, BLOCK_D):
             d = d0 + tl.arange(0, BLOCK_D)
             qc = tl.load(qb + h[:, None] * 576 + d[None, :])
-            kc = tl.load(
-                kr_ptr + p * NKm * 576 + offs[:, None] * 576 + d[None, :],
-                mask=mrow[:, None],
-                other=0.0,
-            )
+            if FROM_POOL:
+                # A latent row is written once, when its token enters the
+                # pool, and never rewritten -- so reading it here is
+                # bit-identical to the snapshot this kernel used to carry, at
+                # 4 bytes of row id per kept row instead of a 1152-byte copy.
+                kc = tl.load(
+                    kbase + sl[:, None] * ROW + d[None, :],
+                    mask=mrow[:, None],
+                    other=0.0,
+                )
+            else:
+                kc = tl.load(
+                    kr_ptr + p * NKm * 576 + offs[:, None] * 576 + d[None, :],
+                    mask=mrow[:, None],
+                    other=0.0,
+                )
             qk += tl.dot(qc.to(tl.bfloat16), tl.trans(kc)).to(tl.float32)
         x = tl.where(mrow[None, :], qk * sc, -float("inf"))
         n_max = tl.maximum(tl.max(x, 1), e_max)
@@ -290,20 +314,56 @@ def _prologue_merge_kernel(
 
 
 _NSPLIT = 32
+# (BLOCK_NK, BLOCK_D, num_warps) keyed by whether kept rows come from the pool.
+# The two paths want different tiles: the snapshot streams one contiguous block
+# per pair, while the pool read issues one request per row, so what each
+# request covers is the lever there and not here. Swept on a 5-layer 64k and
+# 256k config; see the pool-read commit for the numbers.
+_TILE = {False: (64, 64, 4), True: (64, 64, 4)}
 
 
 def fused_prologue_split(
-    qbuf, li, slot, kr, v, nk_len, thr, sc, out, partials, p_live=None
+    qbuf,
+    li,
+    slot,
+    kr,
+    v,
+    nk_len,
+    thr,
+    sc,
+    out,
+    partials,
+    p_live=None,
+    kslot=None,
+    kbase=None,
+    nkm=None,
+    row=None,
 ):
     """Split-NK prologue reading queries in place from the stacked qbuf.
 
     qbuf [L, RR, H, 576] (bf16 in production; fp32 accepted -- loads upcast),
     li/slot [P] int64 select each pair's query row. Same outputs as
-    fused_prologue; replaces the per-step torch gather+cast+contiguous."""
+    fused_prologue; replaces the per-step torch gather+cast+contiguous.
+
+    Kept rows come from one of two places. Pass `kr` [P, NKm, 576] to score a
+    snapshot the caller owns, or pass `kslot` [P, NKm] int32 + `kbase` [P]
+    int64 (a pool base pointer per pair) and `nkm` to score the rows in place
+    in the KV pool, which holds them already. The two are bit-identical: a
+    latent row never changes after the write that created it."""
+    from_pool = kslot is not None
+    if from_pool:
+        if kbase is None or nkm is None or row is None:
+            raise ValueError(
+                "kslot needs kbase, nkm and row: there is no tensor here whose "
+                "shape they could be read off, and a guessed row stride reads "
+                "the wrong rows silently"
+            )
+        NKm, ROW = nkm, row
+    else:
+        NKm, ROW = kr.shape[1], 0
     P = p_live if p_live is not None else li.shape[0]
     H = qbuf.shape[2]
     RR = qbuf.shape[1]
-    NKm = kr.shape[1]
     R = v.shape[1]
     max1g, qside_t, qsk_t, qres = out
     pm, ps, pt = partials
@@ -313,6 +373,8 @@ def fused_prologue_split(
         slot,
         RR,
         kr,
+        kslot,
+        kbase,
         nk_len,
         pm,
         ps,
@@ -321,9 +383,11 @@ def fused_prologue_split(
         NKm,
         NSPLIT=_NSPLIT,
         H=H,
-        BLOCK_NK=64,
-        BLOCK_D=64,
-        num_warps=4,
+        FROM_POOL=1 if from_pool else 0,
+        ROW=ROW,
+        BLOCK_NK=_TILE[from_pool][0],
+        BLOCK_D=_TILE[from_pool][1],
+        num_warps=_TILE[from_pool][2],
     )
     _prologue_merge_kernel[(P,)](
         pm,

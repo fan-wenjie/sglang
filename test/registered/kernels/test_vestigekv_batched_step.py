@@ -358,3 +358,158 @@ class TestArchiveArenaAddressing(CustomTestCase):
         self.assertFalse(pack.fits(pairs, tiers))
         with self.assertRaises(RuntimeError):
             pack.update(pairs, tiers)
+
+
+class TestKeptRowsFromPool(CustomTestCase):
+    """Scoring kept rows in place in the KV pool must equal scoring a snapshot.
+
+    The pack used to carry its own bf16 copy of every kept row -- 87% of the
+    pack at bs16, and every byte a duplicate, because a latent row is written
+    once when its token enters the pool and never rewritten. Handing the
+    kernel 4 bytes of row id plus the pool's per-layer base pointer has to
+    produce the SAME fetch set, so the check is against query_fixed, which
+    scores the snapshot.
+
+    The fixture is built by RecallTier.build over a fake per-layer pool, with
+    LOW-RANK, heavy-tailed rows. Independent Gaussian rows do not work: every
+    archived row is then genuinely competitive with the kept set, the whole
+    archive fires for any query, and the fetch set stops depending on the kept
+    scores at all -- a test written that way passed a deliberately wrong base
+    pointer. Here roughly a fifth of the archive fires, so max1 (and with it
+    every kept row the kernel reads) decides the answer.
+    """
+
+    FETCH_W = 8192  # above the observed fire, so truncation hides nothing
+
+    def _pool(self, n_lids, pool_rows, seed):
+        """Separate per-layer allocations, as the real MLA pool has."""
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        bufs = []
+        for _ in range(n_lids):
+            B = torch.randn(24, 576, device="cuda", generator=g)
+            A = torch.randn(pool_rows, 24, device="cuda", generator=g)
+            mag = torch.rand(pool_rows, 1, device="cuda", generator=g) ** 4 * 8 + 0.2
+            bufs.append(((A @ B) / 24**0.5 * mag).to(torch.bfloat16))
+        return bufs
+
+    def _tier(self, kbuf, n_tok, pool_rows, seed):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
+
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        slots = torch.randperm(pool_rows, device="cuda", generator=g)[:n_tok]
+        nkeep = max(1, int(D.RHO * n_tok))
+        keep = torch.zeros(n_tok, dtype=torch.bool, device="cuda")
+        # tier-1 keeps the high-sigma rows, so the kept set is the large ones
+        keep[kbuf[slots].float().norm(dim=-1).topk(nkeep).indices] = True
+        qcal = torch.randn(32, H, 576, device="cuda", generator=g)
+        qpos = torch.randint(0, n_tok, (32,), device="cuda", generator=g)
+        t = RecallTier(r=R, topj=-1)
+        t.build(kbuf, slots, keep, qcal, qpos)
+        return t
+
+    def _fixture(self):
+        n_lids, max_reqs, pool_rows = 2, 2, 8192
+        n_toks = [6000, 4000, 5200, 3100]  # unequal, and none a block multiple
+        bufs = self._pool(n_lids, pool_rows, seed=31)
+        pairs, tiers = [], []
+        for li in range(n_lids):
+            for slot in range(max_reqs):
+                p = li * max_reqs + slot
+                pairs.append((li, slot))
+                tiers.append(self._tier(bufs[li], n_toks[p], pool_rows, 300 + p))
+        qbuf = torch.randn(n_lids, max_reqs, H, 576, device="cuda")
+        return bufs, pairs, tiers, qbuf
+
+    def _run(self, pairs, tiers, qbuf, pool_bases):
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
+
+        n_lids, max_reqs = qbuf.shape[0], qbuf.shape[1]
+        WW = self.FETCH_W
+        arch_lens = [t.side.shape[0] for t in tiers]
+        f = torch.zeros(n_lids, max_reqs, WW, dtype=torch.int64, device="cuda")
+        ln = torch.zeros(n_lids, max_reqs, dtype=torch.int64, device="cuda")
+        pack = BatchedScanPack.at_capacity(
+            n_lids * max_reqs,
+            max(t.kept_rows.shape[0] for t in tiers),
+            max(arch_lens),
+            R,
+            H,
+            qbuf,
+            f,
+            ln,
+            0,
+            arena=sum(arch_lens),
+            pool_bases=pool_bases,
+        )
+        self.assertEqual(pack.kr is None, pool_bases is not None)
+        self.assertTrue(pack.fits(pairs, tiers))
+        pack.update(pairs, tiers)
+        pack.run()
+        torch.cuda.synchronize()
+        return f, ln
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_from_pool_is_bit_identical_to_the_snapshot(self):
+        torch.manual_seed(31)
+        bufs, pairs, tiers, qbuf = self._fixture()
+        for t in tiers:
+            self.assertIsNotNone(t.kept_slots, "build must record the pool row ids")
+
+        # the fixture must SELECT: on a saturated one the fetch set stops
+        # depending on the kept scores, and a wrong base pointer goes unseen
+        arch_lens = [t.side.shape[0] for t in tiers]
+        snap_f, snap_n = self._run(pairs, tiers, qbuf, None)
+        for i, (li, slot) in enumerate(pairs):
+            n = int(snap_n[li, slot])
+            self.assertTrue(
+                0 < n < arch_lens[i],
+                f"pair {i} fired {n} of {arch_lens[i]} -- fixture is not selective",
+            )
+
+        pool_f, pool_n = self._run(pairs, tiers, qbuf, [b.data_ptr() for b in bufs])
+        self.assertTrue(torch.equal(snap_n, pool_n), "fetch counts differ")
+        for li, slot in pairs:
+            n = int(snap_n[li, slot])
+            self.assertTrue(
+                torch.equal(snap_f[li, slot, :n], pool_f[li, slot, :n]),
+                f"pair {(li, slot)} fetch set differs between snapshot and pool",
+            )
+        del bufs
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_from_pool_tracks_the_eager_reference(self):
+        """Anchor to query_fixed, which the fused path matches only closely.
+
+        The fused kernel and the eager reference disagree on a handful of rows
+        at the fire boundary: measured here at 0.00 / 0.10 / 0.28 / 0.48% of
+        the fired set. That gap is older than this pool-read -- it reproduces
+        identically on the four commits before it -- and was invisible while
+        every fixture fired its whole archive. It is recorded in DEFECTS.md.
+
+        The bar is 1% of the fired set: twice the observed worst, and still
+        two orders of magnitude below what a misaddressed read costs (a wrong
+        base pointer scores different rows entirely, and disagrees on nearly
+        all of them).
+        """
+        torch.manual_seed(31)
+        bufs, pairs, tiers, qbuf = self._fixture()
+        WW = self.FETCH_W
+        out = torch.zeros(qbuf.shape[1], WW, dtype=torch.int64, device="cuda")
+        ol = torch.zeros(qbuf.shape[1], dtype=torch.int64, device="cuda")
+        ref = []
+        for (li, slot), t in zip(pairs, tiers):
+            t.query_fixed(qbuf[li, slot], out, ol, slot)
+            ref.append(set(out[slot, : int(ol[slot])].tolist()))
+
+        f, ln = self._run(pairs, tiers, qbuf, [b.data_ptr() for b in bufs])
+        for i, (li, slot) in enumerate(pairs):
+            got = set(f[li, slot, : int(ln[li, slot])].tolist())
+            sym = len(got ^ ref[i])
+            self.assertLessEqual(
+                sym,
+                0.01 * len(ref[i]),
+                f"pair {i}: {sym} of {len(ref[i])} rows "
+                f"({100 * sym / len(ref[i]):.2f}%) differ from the eager reference",
+            )
+        del bufs

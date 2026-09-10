@@ -181,7 +181,14 @@ class RecallTier:
                     self.rho[a0:a1] = (content - c @ V).norm(dim=-1)
                     self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
                     del blk, content, c
-        self.kept_rows = kbuf[row_slots[keep]].to(torch.bfloat16)
+        kept_slots = row_slots[keep]
+        self.kept_rows = kbuf[kept_slots].to(torch.bfloat16)
+        # Pool row ids for the kept set. The rows themselves are a
+        # duplicate of what the pool already holds -- a latent row is
+        # written once when its token enters the pool and never
+        # rewritten -- so a consumer that can address the pool wants
+        # these 4 bytes, not the 1152-byte copy.
+        self.kept_slots = kept_slots.to(torch.int32)
 
         if conservative:
             # Provisional index: serve immediately, calibrate nothing. Fitting
@@ -321,7 +328,7 @@ class RecallTier:
         operand-reuse guard refuses a released tier.
         """
         self.csk = self.rho = self.side = None
-        self.arch = self.kept_rows = None
+        self.arch = self.kept_rows = self.kept_slots = None
         self.released = True
 
     def query_fixed(
@@ -506,5 +513,6 @@ class RecallTier:
         self.rho = self._rho_all[arch_idx].contiguous()
         self.arch = self._pos_all[arch_idx].contiguous()
         self.kept_rows = kept_rows.to(torch.bfloat16)
+        self.kept_slots = self._pos_all[keep].to(torch.int32)
         self._qside_t = self._qsk_t = self._hit_buf = None  # re-size lazily
         self.version += 1
