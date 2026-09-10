@@ -1329,6 +1329,11 @@ class VestigeKVMLABackend(AttentionBackend):
                     # arch, so a later reader just pays a gather.
                     for t in tiers:
                         t.drop_side()
+                if self._ingraph_pack.kr is None:
+                    # Same for the kept rows: the prologue scores them out of
+                    # the pool through kslot, so the tier's copy is dead here.
+                    for t in tiers:
+                        t.drop_kept_rows()
                 # NOTE: the tier-side operands are NOT released here, though
                 # they are pure duplication once the pack holds them. Releasing
                 # them was tried and reverted: the pack re-copies EVERY pair on
@@ -1467,7 +1472,7 @@ class VestigeKVMLABackend(AttentionBackend):
             if cached < c1:
                 delta = closed_slots[cached:c1]
                 tier.extend_closed(kbuf[delta], delta)
-            tier.refresh_membership(keep, kbuf[kept_slots], kbuf)
+            tier.refresh_membership(keep, kbuf)
             self._pack_epoch += 1
 
     def _collect_calibration(self, forward_batch, reqs):

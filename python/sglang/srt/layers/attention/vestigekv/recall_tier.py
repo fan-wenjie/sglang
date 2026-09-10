@@ -51,12 +51,40 @@ class RecallTier:
         # watermark read by the close path.
         self._pos_all = self._csk_all = self._rho_all = None
         self._side_mat = None  # lazily materialised; see the `side` property
+        self._kept_mat = None  # lazily materialised; see `kept_rows`
         self._kbuf = None  # the layer's pool buffer, to re-read from
         self.version = 0  # bumped on in-place membership refresh (pack sync key)
         self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
         # fixed-address staging for the fused scan (capturable)
         self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
         self.released = False
+
+    @property
+    def kept_rows(self):
+        """Tier-1's kept rows, [nk, 576] bf16 -- lazily materialised.
+
+        Same story as `side`: kept_slots names them and the pool holds them, so
+        a resident bf16 copy is 1152 bytes per row of nothing new. The in-graph
+        prologue scores them straight out of the pool; the eager reference path
+        and the max1 competition in query_fixed are what still want the rows.
+        """
+        if self._kept_mat is not None:
+            return self._kept_mat
+        if self._kbuf is None or self.kept_slots is None:
+            raise RuntimeError(
+                "tier has neither materialised kept rows nor a pool to read "
+                "them from; build()/refresh_membership() must record kbuf"
+            )
+        self._kept_mat = self._kbuf[self.kept_slots.to(torch.int64)].to(torch.bfloat16)
+        return self._kept_mat
+
+    @kept_rows.setter
+    def kept_rows(self, v):
+        self._kept_mat = v
+
+    def drop_kept_rows(self):
+        """Release the materialised kept rows; the property re-derives them."""
+        self._kept_mat = None
 
     @property
     def side(self):
@@ -213,14 +241,12 @@ class RecallTier:
                     self.side[a0:a1] = blk[:, D.KV_LORA_RANK :].to(torch.bfloat16)
                     del blk, content, c
         self._kbuf = kbuf
-        kept_slots = row_slots[keep]
-        self.kept_rows = kbuf[kept_slots].to(torch.bfloat16)
-        # Pool row ids for the kept set. The rows themselves are a
-        # duplicate of what the pool already holds -- a latent row is
-        # written once when its token enters the pool and never
-        # rewritten -- so a consumer that can address the pool wants
-        # these 4 bytes, not the 1152-byte copy.
-        self.kept_slots = kept_slots.to(torch.int32)
+        # Pool row ids for the kept set, and nothing else: a latent row is
+        # written once when its token enters the pool and never rewritten, so
+        # a consumer that can address the pool wants these 4 bytes, not the
+        # 1152-byte copy. `kept_rows` is a property over these.
+        self.kept_slots = row_slots[keep].to(torch.int32)
+        self._kept_mat = None
 
         if conservative:
             # Provisional index: serve immediately, calibrate nothing. Fitting
@@ -379,7 +405,7 @@ class RecallTier:
                 "query_fixed on a tier whose operands were released: the eager "
                 "scan path must not run once the in-graph pack owns them"
             )
-        if self.kept_rows.shape[0] == 0:
+        if self.kept_slots.shape[0] == 0:
             # No tier-1 row kept => there is no max1 baseline to beat, so every
             # archived row is eligible: attend the whole archive this step
             # (degenerates to full attention, never under-recalls). A kept set
@@ -477,7 +503,7 @@ class RecallTier:
         Returns absolute pool indices of rows to fetch (possibly empty)."""
         sc_ = self.scale
         qe = qe.float()
-        if self.kept_rows.shape[0] == 0:
+        if self.kept_slots.shape[0] == 0:
             H = qe.shape[0]
             max1 = qe.new_full((H,), float("-inf"))  # no baseline: all eligible
             gate = qe.new_ones(H, dtype=torch.bool)
@@ -536,22 +562,22 @@ class RecallTier:
     def refresh_membership(
         self,
         keep: torch.Tensor,
-        kept_rows: torch.Tensor,
         kbuf: torch.Tensor,
     ) -> None:
         """Re-derive the archive from a NEW keep mask over all closed rows.
-        keep: [closed] bool (True = tier-1 keeps it); kept_rows: [n_keep, 576]
-        the live kept rows for the max1 competition; kbuf the layer's pool
-        buffer, from which the sidecars are re-read by row id. Thresholds
-        (zp, gate) are untouched: the conformal certificate is sound for any
-        archive."""
+        keep: [closed] bool (True = tier-1 keeps it); kbuf the layer's pool
+        buffer, which both the sidecars and the kept rows are re-read from by
+        row id -- the caller used to gather the kept rows and hand them in,
+        which is the gather this now does on demand and only if asked.
+        Thresholds (zp, gate) are untouched: the conformal certificate is
+        sound for any archive."""
         arch_idx = (~keep).nonzero().flatten()
         self.arch = self._pos_all[arch_idx].contiguous()
         self._kbuf = kbuf
         self._side_mat = None  # re-derived from the pool on first use
         self.csk = self._csk_all[arch_idx].contiguous()
         self.rho = self._rho_all[arch_idx].contiguous()
-        self.kept_rows = kept_rows.to(torch.bfloat16)
         self.kept_slots = self._pos_all[keep].to(torch.int32)
+        self._kept_mat = None  # re-derived from the pool on first use
         self._qside_t = self._qsk_t = self._hit_buf = None  # re-size lazily
         self.version += 1

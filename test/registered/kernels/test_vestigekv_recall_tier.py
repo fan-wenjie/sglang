@@ -54,8 +54,7 @@ class TestTierSidecarFromPool(CustomTestCase):
         g = torch.Generator(device="cuda").manual_seed(5)
         new_keep = torch.zeros(n, dtype=torch.bool, device="cuda")
         new_keep[torch.randperm(n, device="cuda", generator=g)[: n // 32]] = True
-        kept_slots = slots[new_keep]
-        t.refresh_membership(new_keep, kbuf[kept_slots], kbuf)
+        t.refresh_membership(new_keep, kbuf)
 
         arch_idx = (~new_keep).nonzero().flatten()
         self.assertGreater(arch_idx.numel(), 0, "an empty archive proves nothing")
@@ -114,9 +113,63 @@ class TestLazySidecar(CustomTestCase):
         nk2 = torch.zeros(n, dtype=torch.bool, device="cuda")
         nk2[torch.randperm(n, device="cuda", generator=g)[: n // 32]] = True
         t.drop_side()
-        t.refresh_membership(nk2, kbuf[slots[nk2]], kbuf)
+        t.refresh_membership(nk2, kbuf)
         arch_idx = (~nk2).nonzero().flatten()
         self.assertTrue(
             torch.equal(t.side, kbuf[slots[arch_idx]][:, D.KV_LORA_RANK :]),
             "sidecar after a refresh does not match the pool rows arch names",
         )
+
+
+class TestLazyKeptRows(CustomTestCase):
+    """kept_rows is the pool's own rows under kept_slots, and nothing else."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_kept_rows_are_the_pool_rows_kept_slots_names(self):
+        t, kbuf, slots, keep, D = _mk(6000, 31)
+        want = kbuf[slots[keep]]
+        self.assertGreater(want.shape[0], 0)
+        self.assertTrue(
+            torch.equal(t.kept_rows, want),
+            "materialised kept rows differ from the pool rows kept_slots names",
+        )
+        t.drop_kept_rows()
+        self.assertIsNone(t._kept_mat)
+        self.assertTrue(torch.equal(t.kept_rows, want), "re-derivation differs")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_build_records_ids_and_the_rows_are_droppable(self):
+        """Calibration does score the kept rows, so a build legitimately leaves
+        the cache warm. What must hold is that the rows are recoverable from
+        ids alone, so serving can drop them -- which is where the saving is."""
+        t, kbuf, slots, keep, D = _mk(6000, 32)
+        self.assertEqual(t.kept_slots.dtype, torch.int32)
+        self.assertEqual(t.kept_slots.numel(), int(keep.sum()))
+        t.drop_kept_rows()
+        self.assertIsNone(t._kept_mat)
+        self.assertTrue(torch.equal(t.kept_rows, kbuf[slots[keep]]))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_an_empty_kept_set_is_detected_without_a_gather(self):
+        """The empty-kept check reads a length; reading it off the row table
+        would gather the whole thing to learn one integer."""
+        t, kbuf, slots, keep, D = _mk(6000, 34)
+        t.drop_kept_rows()
+        out = torch.zeros(2, 512, dtype=torch.int64, device="cuda")
+        ol = torch.zeros(2, dtype=torch.int64, device="cuda")
+        t.query_fixed(torch.randn(H, 576, device="cuda"), out, ol, 0)
+        self.assertIsNotNone(t.kept_slots)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_refresh_leaves_nothing_materialised(self):
+        t, kbuf, slots, keep, D = _mk(6000, 33)
+        t.extend_closed(kbuf[slots], slots)
+        n = slots.numel()
+        g = torch.Generator(device="cuda").manual_seed(9)
+        nk2 = torch.zeros(n, dtype=torch.bool, device="cuda")
+        nk2[torch.randperm(n, device="cuda", generator=g)[: n // 32]] = True
+        _ = t.kept_rows, t.side  # force both caches to exist
+        t.refresh_membership(nk2, kbuf)
+        self.assertIsNone(t._kept_mat, "refresh re-materialised the kept rows")
+        self.assertIsNone(t._side_mat, "refresh re-materialised the sidecar")
+        self.assertTrue(torch.equal(t.kept_rows, kbuf[slots[nk2]]))

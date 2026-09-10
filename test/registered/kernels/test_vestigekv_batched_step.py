@@ -29,6 +29,10 @@ def _mk_tier(nk, a, seed, zp, thr_g):
     # storage contract mirrors RecallTier.build: side bf16, csk fp16,
     # kept_rows bf16, rho fp32 -- a fabricated fp32 tier would make the two
     # paths disagree for test-artifact reasons, not algorithmic ones
+    # kept_slots is the index and kept_rows the view over it; a tier without
+    # the index is not a tier any more (lengths are read off the index, so
+    # asking one cannot gather a row table).
+    t.kept_slots = torch.arange(nk, dtype=torch.int32, device="cuda")
     t.kept_rows = rnd(nk, 576).to(torch.bfloat16)
     t.V = rnd(R, 512)
     t.side = rnd(a, 64).to(torch.bfloat16)
