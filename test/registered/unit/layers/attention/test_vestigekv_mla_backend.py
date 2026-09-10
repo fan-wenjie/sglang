@@ -1107,7 +1107,11 @@ class TestLiveArchiveBackfill(CustomTestCase):
             tier.extend_closed(rows[cached:c1], slots[cached:])
         keep = torch.zeros(c1, dtype=torch.bool)
         keep[::3] = True
-        tier.refresh_membership(keep, rows[keep])
+        # refresh_membership takes the POOL buffer, not a gathered subset: the
+        # tier re-reads rows by id now rather than being handed copies. Passing
+        # rows[keep] here would make `side` index a 214-row tensor with
+        # full-prefix positions.
+        tier.refresh_membership(keep, rows)
         return keep
 
     def test_backfill_aligns_archive_after_first_close(self):
@@ -1130,7 +1134,11 @@ class TestLiveArchiveBackfill(CustomTestCase):
         self.assertEqual(tier.side.shape[0], arch_idx.shape[0])
         want_side = rows[arch_idx][:, D.KV_LORA_RANK :].to(tier.side.dtype)
         self.assertTrue(torch.equal(tier.side, want_side))
-        self.assertTrue(torch.equal(tier.arch, arch_idx))
+        # arch carries POOL ROW IDS. This protocol feeds slots = arange, so the
+        # ids coincide with the positions -- assert against _pos_all[arch_idx]
+        # so the check stays honest when they do not.
+        self.assertTrue(torch.equal(tier.arch, tier._pos_all[arch_idx]))
+        self.assertTrue(torch.equal(tier._arch_idx, arch_idx))
 
 
 class TestEmptyKeptRows(CustomTestCase):
@@ -1153,7 +1161,11 @@ class TestEmptyKeptRows(CustomTestCase):
         t.V = torch.linalg.qr(torch.randn(D.KV_LORA_RANK, 16, device=dev))[
             0
         ].T.contiguous()
-        t.kept_rows = torch.zeros(0, D.LATENT_DIM, device=dev)  # empty tier-1
+        # Empty tier-1. The tier stores INDICES and derives the rows, so the
+        # empty set is an empty kept_slots; kept_rows is set alongside because
+        # this fake tier has no pool to derive them from.
+        t.kept_slots = torch.zeros(0, dtype=torch.int32, device=dev)
+        t.kept_rows = torch.zeros(0, D.LATENT_DIM, device=dev)
         t.side = torch.randn(A, D.SIDECAR_DIM, device=dev).to(torch.bfloat16)
         t.csk = torch.randn(A, 16, device=dev).half()
         t.rho = torch.rand(A, device=dev)
@@ -1219,8 +1231,11 @@ class TestNoPEPreconditionGuard(CustomTestCase):
         runner = MagicMock()
         runner.use_mla_backend = True
         runner.page_size = 1
-        with patch.object(reg, "kimi_linear_config", return_value=cfg), patch.object(
-            reg, "get_spec", return_value=MagicMock(speculative_algorithm=None)
+        with (
+            patch.object(reg, "kimi_linear_config", return_value=cfg),
+            patch.object(
+                reg, "get_spec", return_value=MagicMock(speculative_algorithm=None)
+            ),
         ):
             reg.create_vestigekv_mla_backend(runner)
 
