@@ -347,7 +347,6 @@ _NSPLIT = 32
 _TILE = {False: (64, 64, 4, 3), True: (64, 64, 8, 3)}
 
 _TMA_ALLOCATOR_SET = False
-_TMA_SCRATCH = None
 _POOL_MODE = None
 
 
@@ -400,20 +399,18 @@ def _pool_read_mode(device):
 def _set_tma_allocator(device):
     """TMA descriptors need a global scratch allocator; set it once.
 
-    The buffer is cached and handed back, not re-allocated per launch: this
-    runs inside a decode step with the KV pool already holding almost all of
-    the device, where a fresh allocation per launch is both churn and a real
-    OOM risk.
+    Allocate fresh and let the caching allocator recycle, exactly as
+    sglang.kernels.ops.moe.fused_moe_triton_kernels does. triton.set_allocator
+    is process-GLOBAL and this model's MoE path sets one too, so whichever runs
+    last serves both: a cached buffer handed to two unrelated kernels is shared
+    mutable scratch, and it pins its high-water mark for the process.
     """
-    global _TMA_ALLOCATOR_SET, _TMA_SCRATCH
+    global _TMA_ALLOCATOR_SET
     if _TMA_ALLOCATOR_SET:
         return
 
-    def _alloc(size, alignment, stream):
-        global _TMA_SCRATCH
-        if _TMA_SCRATCH is None or _TMA_SCRATCH.numel() < size:
-            _TMA_SCRATCH = torch.empty(size, device=device, dtype=torch.int8)
-        return _TMA_SCRATCH[:size]
+    def _alloc(size: int, alignment: int, stream):
+        return torch.empty(size, device=device, dtype=torch.int8)
 
     triton.set_allocator(_alloc)
     _TMA_ALLOCATOR_SET = True
