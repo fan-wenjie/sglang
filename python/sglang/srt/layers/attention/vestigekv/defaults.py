@@ -116,6 +116,17 @@ refreshes by index selection. Without this, rows generated after prefill are
 never evicted (the attended set grows 1:1 with generation) and rows evicted by
 a close would be unrecallable -- both wrong at long generation."""
 
+SCAN_GRID_CAP = 128
+"""Cap on the capacity-baked block grid of the batched scan and compact-write
+kernels. The grid must cover the worst-case archive (max_context rows ->
+cdiv(524288, 1024) = 512 buckets) and its shape is baked into the decode CUDA
+graph, but programs past a pair's a_len exit on one scalar load -- so the
+launch floor scales with the grid, not the archive (measured: 38 us/step of
+pure dispatch at 512 x 7 programs over a 9k archive). A grid-stride loop
+covers the buckets with SCAN_GRID_CAP programs per pair: same worst-case
+coverage, ~8x smaller dispatch floor, and real work (which is bandwidth-bound)
+is unaffected."""
+
 SCAN_CAPTURE_AFTER = 8
 """Decode steps one scan shape must hold before it is captured, so a short
 generation does not pay for a graph it replays a handful of times."""

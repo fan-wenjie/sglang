@@ -63,15 +63,20 @@ def _scan_batched_kernel(
 ):
     p = tl.program_id(1)
     al = tl.load(a_len_ptr + p)
-    # Grid is capacity-sized (the capture bakes it). Each program covers one
-    # 1024-row bucket (MULTI sub-blocks of BLOCK_A): a 16x smaller grid than
-    # one-block programs -- the capacity grid's launch floor was the step's
-    # largest fixed cost (117 us content-independent; an all-placeholder
-    # pack scanned as slow as a live one) -- and the fused compact count
-    # becomes a plain per-bucket store instead of a 16-way atomic. Programs
-    # fully past a_len exit on one scalar load.
-    base = tl.program_id(0) * (MULTI * BLOCK_A)
-    if base >= al:
+    # Grid is capacity-sized (the capture bakes it) but capped at SCAN_GRID_CAP
+    # programs per pair: program pid covers buckets pid, pid+G, ... by a
+    # grid-stride loop, so worst-case coverage is unchanged while the dispatch
+    # floor (programs fully past a_len exit after one scalar load) shrinks
+    # ~8x. Each bucket is one MULTI*BLOCK_A=1024-row compact unit; the fused
+    # compact count is a plain per-bucket store (the prefix kernel's
+    # pre-zeroing covers buckets nobody ran).
+    BUCKET = MULTI * BLOCK_A
+    nb = (Amax + BUCKET - 1) // BUCKET
+    pid = tl.program_id(0)
+    G = tl.num_programs(0)
+    nb_live = ((al + BUCKET - 1) // BUCKET).to(tl.int32)
+    trips = (tl.maximum(nb_live - pid, 0) + G - 1) // G
+    if trips <= 0:
         return
     # Archive rows live in ONE per-layer arena, not in a per-pair slab: each
     # pair's rows start at a_off[p]. The arena is sized by what the KV pool
@@ -90,7 +95,6 @@ def _scan_batched_kernel(
     cc = tl.load(cc_ptr + p)
     qr = tl.load(qres_ptr + p * H + h)
     m1 = tl.load(max1g_ptr + p * H + h)
-    cnt = 0
     if SIDE_POOL:
         kbase = tl.load(kbase_ptr + p).to(tl.pointer_type(tl.bfloat16))
     if CSK_TIER:
@@ -115,62 +119,64 @@ def _scan_batched_kernel(
             strides=[ROW, 1],
             block_shape=[1, DD],
         )
-    for kb in range(MULTI):
-        offs = base + kb * BLOCK_A + tl.arange(0, BLOCK_A)
-        m = offs < al
-        # quantized storage, fp32 ieee arithmetic (see scan_kernel)
-        if SIDE_POOL:
-            # The sidecar is the un-roped tail of an archived pool row and arch
-            # already holds that row's id, so the packed table duplicates it --
-            # 40 MiB of the pack's 84 at 64k bs1. Reading it back through the id
-            # is a data-dependent access, which the pipeliner will not stage
-            # (see fused_prologue._pool_read_mode); the TMA form is the one that
-            # keeps it asynchronous.
-            sl = tl.load(arch_ptr + abase + offs, mask=m, other=0)
-        if SIDE_POOL == 2:
-            s = sdesc.gather(sl, KV_OFF)
-        elif SIDE_POOL == 1:
-            s = tl.load(
-                kbase + sl.to(tl.int64)[:, None] * ROW + (KV_OFF + d)[None, :],
-                mask=m[:, None],
-                other=0.0,
-            )
-        else:
-            s = tl.load(
-                side_ptr + (abase + offs[:, None]) * DD + d[None, :],
-                mask=m[:, None],
-                other=0.0,
-            )
-        if CSK_TIER:
-            ai = tl.load(aidx_ptr + abase + offs, mask=m, other=0)
-        if CSK_TIER == 2:
-            c = cdesc.gather(ai, 0)
-        elif CSK_TIER == 1:
-            c = tl.load(
-                cbase + ai.to(tl.int64)[:, None] * R + r[None, :],
-                mask=m[:, None],
-                other=0.0,
-            )
-        else:
-            c = tl.load(
-                csk_ptr + (abase + offs[:, None]) * R + r[None, :],
-                mask=m[:, None],
-                other=0.0,
-            )
-        rh = tl.load(rho_ptr + abase + offs, mask=m, other=0.0)
-        # ieee, not tf32: the fast path disagreed with the eager fire set on
-        # 6 rows in 58900, a silent change to which rows the model attends.
-        # native-dtype tensor-core dots, fp32 accumulation (scan_kernel.py)
-        acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
-        score = acc * sc + cc * rh[:, None] * qr[None, :]
-        fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
-        tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
-        cnt += tl.sum(tl.where(m, fired, 0), 0)
-    # Fused compact count: the program IS the 1024-row bucket, so the total
-    # is a plain store (pre-zeroing by the prefix kernel covers programs
-    # that exited above).
-    nb = (Amax + 1023) // 1024
-    tl.store(counts_ptr + p * nb + tl.program_id(0), cnt)
+    for i in range(trips):
+        b = pid + i * G
+        base = b * BUCKET
+        cnt = 0
+        for kb in range(MULTI):
+            offs = base + kb * BLOCK_A + tl.arange(0, BLOCK_A)
+            m = offs < al
+            # quantized storage, fp32 ieee arithmetic (see scan_kernel)
+            if SIDE_POOL:
+                # The sidecar is the un-roped tail of an archived pool row and arch
+                # already holds that row's id, so the packed table duplicates it --
+                # 40 MiB of the pack's 84 at 64k bs1. Reading it back through the id
+                # is a data-dependent access, which the pipeliner will not stage
+                # (see fused_prologue._pool_read_mode); the TMA form is the one that
+                # keeps it asynchronous.
+                sl = tl.load(arch_ptr + abase + offs, mask=m, other=0)
+            if SIDE_POOL == 2:
+                s = sdesc.gather(sl, KV_OFF)
+            elif SIDE_POOL == 1:
+                s = tl.load(
+                    kbase + sl.to(tl.int64)[:, None] * ROW + (KV_OFF + d)[None, :],
+                    mask=m[:, None],
+                    other=0.0,
+                )
+            else:
+                s = tl.load(
+                    side_ptr + (abase + offs[:, None]) * DD + d[None, :],
+                    mask=m[:, None],
+                    other=0.0,
+                )
+            if CSK_TIER:
+                ai = tl.load(aidx_ptr + abase + offs, mask=m, other=0)
+            if CSK_TIER == 2:
+                c = cdesc.gather(ai, 0)
+            elif CSK_TIER == 1:
+                c = tl.load(
+                    cbase + ai.to(tl.int64)[:, None] * R + r[None, :],
+                    mask=m[:, None],
+                    other=0.0,
+                )
+            else:
+                c = tl.load(
+                    csk_ptr + (abase + offs[:, None]) * R + r[None, :],
+                    mask=m[:, None],
+                    other=0.0,
+                )
+            rh = tl.load(rho_ptr + abase + offs, mask=m, other=0.0)
+            # ieee, not tf32: the fast path disagreed with the eager fire set on
+            # 6 rows in 58900, a silent change to which rows the model attends.
+            # native-dtype tensor-core dots, fp32 accumulation (scan_kernel.py)
+            acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
+            score = acc * sc + cc * rh[:, None] * qr[None, :]
+            fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
+            tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
+            cnt += tl.sum(tl.where(m, fired, 0), 0)
+        # Fused compact count: the bucket index is the store slot (pre-zeroing
+        # by the prefix kernel covers buckets no program ran).
+        tl.store(counts_ptr + p * nb + b, cnt)
 
 
 class BatchedScanPack:
@@ -600,16 +606,22 @@ class BatchedScanPack:
             row=self.pool_row,
             pool_rows=self._pool_rows,
             mode=self.pool_mode,
+            a_len=self.a_len,
         )
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
         # Grid covers the LARGEST per-pair archive, not the arena: programs
-        # past a pair's a_len exit on one scalar load, so a grid sized for the
-        # arena would waste 1/P of its blocks on every pair. am_grid is baked
-        # at capture (max_bs x max_context worth of rows is still the worst
-        # case a single pair can reach), while the arena only bounds the SUM.
+        # past a pair's a_len do no work, so a grid sized for the arena would
+        # waste 1/P of its blocks on every pair. am_grid is baked at capture
+        # (max_bs x max_context worth of rows is still the worst case a single
+        # pair can reach), while the arena only bounds the SUM. The launch is
+        # capped at SCAN_GRID_CAP programs per pair and the kernel grid-strides
+        # over the 1024-row buckets: same worst-case coverage, much smaller
+        # dispatch floor at short context (defaults.SCAN_GRID_CAP).
         Am = self.am_grid
         P = P_eff
-        _scan_batched_kernel[(triton.cdiv(Am, D.SCAN_BLOCK_A * 16), P)](
+        _scan_batched_kernel[
+            (min(triton.cdiv(Am, D.SCAN_BLOCK_A * 16), D.SCAN_GRID_CAP), P)
+        ](
             qside_t,
             qsk_t,
             qres,

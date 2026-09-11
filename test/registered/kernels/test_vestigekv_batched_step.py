@@ -179,12 +179,20 @@ class TestKeptSetParityWithReference(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_prefill_selection_matches_reference_policy(self):
         from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.environ import envs
+
+        # Activation threshold is a config knob (environ), not a defaults
+        # constant; tests run against its default value.
+        ACT_MIN = envs.SGLANG_VESTIGEKV_ACTIVATION_MIN_TOKENS.get()
         from sglang.srt.layers.attention.vestigekv_mla_backend import (
             VestigeKVMLABackend,
         )
 
         torch.manual_seed(3)
-        seq = 2 * D.CLOSE_BLOCK + 777  # two closable blocks + tail
+        # Past the activation threshold so compression is on; below it the
+        # backend deliberately serves dense and there is nothing to pin.
+        nblocks = ACT_MIN // D.CLOSE_BLOCK + 1
+        seq = nblocks * D.CLOSE_BLOCK + 777  # closable blocks + tail
         kbuf = torch.randn(seq + 10, 576, device="cuda")
         row_slots = torch.arange(seq, device="cuda")
         be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
@@ -195,9 +203,9 @@ class TestKeptSetParityWithReference(CustomTestCase):
             got = be._arm_aware_kept(row_slots, kbuf, seq, 512)
 
         # reference policy math, independently written
-        closed = 2 * D.CLOSE_BLOCK
+        closed = nblocks * D.CLOSE_BLOCK
         sigmas = []
-        for b in range(2):
+        for b in range(nblocks):
             side = kbuf[b * D.CLOSE_BLOCK : (b + 1) * D.CLOSE_BLOCK, 512:]
             f = torch.fft.rfft(side.float(), dim=0)
             f[D.LOWPASS_KAPPA :] = 0

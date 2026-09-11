@@ -1,11 +1,12 @@
 """GPU-resident recall tier for VestigeKV (PREREG19/20).
 
-Vendored VERBATIM from the validated mini-sglang stack
-(minisgl/kimi/tier2.py). It is pure-tensor (operates on [T, 576] latent rows and
-[H, 576] expanded queries), so the same code runs unchanged over sglang's
-MLATokenToKVPool rows. Kept bit-identical to the reference so the two
-implementations can be asserted equal (see test/manual/test_vestige_equiv.py); fix
-record-invalidating bugs in lockstep with the reference, never one-sided.
+Originally vendored from the validated mini-sglang stack
+(minisgl/kimi/tier2.py); deliberately changed since (conformal closed-form
+zp, storage-dtype scoring, eigh basis, live-archive caches -- see the
+vestigekv-dev history for each why). The equivalence net is self-contained:
+test/manual/test_vestigekv_equiv.py asserts this module equal to an in-test
+naive reference encoding the same math; change the math only in lockstep
+with that reference, never one-sided.
 
 Index per MLA slot, built once at a compression event: exact 64-dim sidecar
 summand over archived rows, rank-r sketch of the 512-dim content (PCA basis of

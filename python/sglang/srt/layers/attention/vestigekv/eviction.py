@@ -7,8 +7,8 @@ the sglang backend's eviction can be asserted equal to it.
 sigma_u = || r_u - lowpass_kappa(r)_u || over the 64-dim sidecar (the [512:576]
 decoupled branch of the latent row), rFFT-truncated along the sequence axis; a
 single GLOBAL top-m over all sidecar sigmas keeps the m most-anomalous rows
-(constant-m rebalance, licensed by ranking stationarity). The first `sinks`
-rows are always kept.
+(m = round(rho * closed), a proportional-m rebalance re-run at every close).
+The first `sinks` rows are always kept.
 """
 
 from __future__ import annotations
