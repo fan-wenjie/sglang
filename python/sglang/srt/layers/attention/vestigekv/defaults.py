@@ -116,6 +116,30 @@ refreshes by index selection. Without this, rows generated after prefill are
 never evicted (the attended set grows 1:1 with generation) and rows evicted by
 a close would be unrecallable -- both wrong at long generation."""
 
+ACTIVATION_MIN_TOKENS = 8 * CLOSE_BLOCK  # 32768
+"""Below this length a request is served dense: nothing is closed, nothing is
+archived, kept == the whole prefix, and the recall kernels early-exit on the
+empty archive. Rationale, measured on this stack (RTX PRO 6000 x2, TP=2): the
+recall pipeline costs a near-flat ~114 us/step (torch profiler, 9k context:
+prologue 57 + scan 38 + compact/pack 19) while dense attention below ~32k is
+cheaper than kept+scan+fetch (attention-only crossover measured at ~32k;
+end-to-end crossover at ~44-48k). Below the threshold compression buys
+nothing, so the dense form is both faster and lossless. At the crossing the
+close loop catches up all full blocks in one step; blockwise sigma is
+immutable per block and the global top-m commutes with closing order, so the
+kept set is identical to having compressed from token 0."""
+
+SCAN_GRID_CAP = 128
+"""Cap on the capacity-baked block grid of the batched scan and compact-write
+kernels. The grid must cover the worst-case archive (max_context rows ->
+cdiv(524288, 1024) = 512 buckets) and its shape is baked into the decode CUDA
+graph, but programs past a pair's a_len exit on one scalar load -- so the
+launch floor scales with the grid, not the archive (measured: 38 us/step of
+pure dispatch at 512 x 7 programs over a 9k archive). A grid-stride loop
+covers the buckets with SCAN_GRID_CAP programs per pair: same worst-case
+coverage, ~8x smaller dispatch floor, and real work (which is bandwidth-bound)
+is unaffected."""
+
 SCAN_CAPTURE_AFTER = 8
 """Decode steps one scan shape must hold before it is captured, so a short
 generation does not pay for a graph it replays a handful of times."""

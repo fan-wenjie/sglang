@@ -20,6 +20,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 LID = 3
+# Calibration/close are gated on ACTIVATION_MIN_TOKENS; tests of that state
+# machine run at offsets above the threshold.
+SEQ_BASE = D.ACTIVATION_MIN_TOKENS + 100
 GRAPH_BS = 4  # captured graph size
 REAL_BS = 3  # real requests this step (the crash shape: 4 vs 3)
 KEPT = 5  # kept rows already indexed per request
@@ -135,7 +138,7 @@ class TestSlotReuseInvalidation(CustomTestCase):
     def test_prefill_invalidates_stale_tier2(self):
         be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
         be.rho = 1 / 32
-        be._kept_buf, be._kept_len, be._indptr1, be._kmax = {}, {}, {}, {}
+        be._kept_buf, be._kept_len, be._kmax = {}, {}, {}
         be._close_state = {}
         be._qbuf, be._fetch_buf, be._fetch_len, be._recall = {}, {}, {}, {}
         be._q_heads, be._q_dim, be._fetch_w = 4, 576, 8
@@ -187,9 +190,10 @@ class TestRowInvariantCheck(CustomTestCase):
         fb = SimpleNamespace(
             out_cache_loc=torch.tensor([100, 101], dtype=torch.int64),
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            # above the assert floor (4 * CLOSE_BLOCK): below it the
-            # unclosed tail alone makes kept ~= seq legitimately
-            seq_lens=torch.tensor([20000, 20000], dtype=torch.int64),
+            # above the assert floor: max(4 * CLOSE_BLOCK, ACTIVATION_MIN_TOKENS
+            # + CLOSE_BLOCK) -- below the activation threshold the VESTIGE arm
+            # deliberately runs dense, so "not compressing" is correct there
+            seq_lens=torch.tensor([40000, 40000], dtype=torch.int64),
         )
         return be, fb
 
@@ -202,12 +206,12 @@ class TestRowInvariantCheck(CustomTestCase):
         self._run(be, fb, full_arm=False)
 
     def test_vestige_arm_uncompressed_raises(self):
-        be, fb = self._mk([19000, 19000])  # kept ~= seq: not compressing
+        be, fb = self._mk([39000, 39000])  # kept ~= seq: not compressing
         with self.assertRaisesRegex(AssertionError, "compression not applied"):
             self._run(be, fb, full_arm=False)
 
     def test_full_arm_pending_append_passes(self):
-        be, fb = self._mk([19999, 19999])
+        be, fb = self._mk([39999, 39999])
         self._run(be, fb, full_arm=True)
 
     def test_full_arm_short_raises(self):
@@ -672,7 +676,7 @@ class TestTierTwoIsNeverOff(CustomTestCase):
     def _fb(self, real_bs=1, seq=101):
         return SimpleNamespace(
             out_cache_loc=torch.zeros(real_bs, dtype=torch.int64),
-            seq_lens=torch.full((real_bs,), seq, dtype=torch.int64),
+            seq_lens=torch.full((real_bs,), SEQ_BASE + seq, dtype=torch.int64),
         )
 
     def _stubs(self, be):
@@ -712,12 +716,24 @@ class TestTierTwoIsNeverOff(CustomTestCase):
                 "n_hard": n_hard,
             }
 
+    def test_below_activation_threshold_defers_collection(self):
+        # Below ACTIVATION_MIN_TOKENS the request runs dense: no archive, so
+        # nothing to calibrate and no index to build. Collection must stay
+        # pending so the provisional build fires on the crossing step.
+        be = self._backend()
+        b, e = self._stubs(be)
+        with b, e:
+            be._collect_calibration(self._fb(seq=101 - SEQ_BASE), [0])
+        self.assertEqual(be.built, [])
+        self.assertEqual(be._recall[(0, LID)]["qcal"], [])
+        self.assertTrue(be._collecting)
+
     def test_provisional_index_is_built_synchronously_on_step_one(self):
         be = self._backend()
         b, e = self._stubs(be)
         with b, e:
             be._collect_calibration(self._fb(), [0])
-        self.assertEqual(be.built, [(101, True)])
+        self.assertEqual(be.built, [(SEQ_BASE + 101, True)])
         self.assertIsNotNone(be._recall[(0, LID)]["tier"])
         self.assertEqual(be.enqueued, [])
 
@@ -976,20 +992,56 @@ class TestCaptureDoesNotDuplicateKeptRows(CustomTestCase):
         import inspect
 
         src = inspect.getsource(VestigeKVMLABackend._capture_scan_timed)
-        rewind = src.index("- 3")
+        rewind = src.rindex("- n")
         replay = src.rindex("graph.replay()")
         self.assertLess(rewind, replay, "rewind must run before the replay")
+
+    def test_failed_capture_rewinds_the_partial_appends(self):
+        # A capture that dies mid-warmup has already appended this step's row
+        # one or more times. The except path must undo exactly those appends
+        # (tracked per layer, not assumed), or the eager fallback resumes
+        # from an inflated kept table.
+        import inspect
+
+        src = inspect.getsource(VestigeKVMLABackend._capture_scan_timed)
+        except_body = src[src.index("except (RuntimeError") :]
+        except_body = except_body[: except_body.index("return False")]
+        self.assertIn("appended.items()", except_body)
+        self.assertIn("- n", except_body)
+        # the counter must be incremented after each successful pack, inside _run
+        run_body = src[src.index("def _run()") : src.index("except (RuntimeError")]
+        pack = run_body.index("_pack_csr(")
+        incr = run_body.index("appended[lid] = appended.get(lid, 0) + 1")
+        self.assertLess(pack, incr, "count only appends that actually happened")
 
     def test_net_effect_of_a_capture_is_one_append(self):
         # simulate: three extra appends happened; the rewind must leave the
         # table exactly one row longer than before the step
         kept_len = torch.tensor([10, 20], dtype=torch.int64)
         slots = torch.tensor([0, 1])
+        appended = 0
         for _ in range(3):  # warmups + capture
             kept_len.scatter_(0, slots, kept_len.gather(0, slots) + 1)
-        kept_len.scatter_(0, slots, (kept_len.gather(0, slots) - 3).clamp_min_(0))
+            appended += 1
+        kept_len.scatter_(0, slots, (kept_len.gather(0, slots) - appended).clamp_min_(0))
         kept_len.scatter_(0, slots, kept_len.gather(0, slots) + 1)  # the replay
         self.assertEqual(kept_len.tolist(), [11, 21])
+
+    def test_net_effect_of_a_failed_capture_is_zero_appends(self):
+        # the second warmup dies after one layer packed: only that layer's
+        # count is rewound, and the table returns to its pre-step state
+        kept_len = torch.tensor([10, 20], dtype=torch.int64)
+        slots = torch.tensor([0, 1])
+        appended = {"layer_a": 0, "layer_b": 0}
+        for _ in range(2):  # warmup 1 fully, warmup 2 dies after layer_a
+            for lid in appended:
+                kept_len.scatter_(0, slots, kept_len.gather(0, slots) + 1)
+                appended[lid] += 1
+                if lid == "layer_a" and appended[lid] == 2:
+                    break
+        for lid, n in appended.items():
+            kept_len.scatter_(0, slots, (kept_len.gather(0, slots) - n).clamp_min_(0))
+        self.assertEqual(kept_len.tolist(), [10, 20])
 
 
 class TestDecodeTimeBlockClose(CustomTestCase):
@@ -1030,17 +1082,38 @@ class TestDecodeTimeBlockClose(CustomTestCase):
         )
 
     def test_no_close_before_a_full_block(self):
+        be = self._backend(prefill=D.ACTIVATION_MIN_TOKENS)
+        be._maybe_close_blocks(
+            self._fb(D.ACTIVATION_MIN_TOKENS + D.CLOSE_BLOCK - 1), [0]
+        )
+        self.assertEqual(
+            be._close_state[(0, self.LID2)]["closed"], D.ACTIVATION_MIN_TOKENS
+        )
+
+    def test_no_close_below_the_activation_threshold(self):
+        # Dense regime: even with whole closable blocks outstanding, nothing
+        # closes below ACTIVATION_MIN_TOKENS.
         be = self._backend(prefill=8192)
-        be._maybe_close_blocks(self._fb(8192 + D.CLOSE_BLOCK - 1), [0])
+        be._maybe_close_blocks(self._fb(8192 + 3 * D.CLOSE_BLOCK + 1), [0])
         self.assertEqual(be._close_state[(0, self.LID2)]["closed"], 8192)
 
-    def test_close_advances_and_rewrites_kept(self):
+    def test_crossing_the_threshold_catches_up_all_blocks(self):
+        # The crossing step closes every outstanding full block in one pass;
+        # sigma is per-block immutable and the top-m rebalance is global, so
+        # the kept set matches having compressed from the start.
         be = self._backend(prefill=8192)
-        seq = 8192 + D.CLOSE_BLOCK + 7
+        be._maybe_close_blocks(self._fb(D.ACTIVATION_MIN_TOKENS + 7), [0])
+        self.assertEqual(
+            be._close_state[(0, self.LID2)]["closed"], D.ACTIVATION_MIN_TOKENS
+        )
+
+    def test_close_advances_and_rewrites_kept(self):
+        be = self._backend(prefill=D.ACTIVATION_MIN_TOKENS)
+        seq = D.ACTIVATION_MIN_TOKENS + D.CLOSE_BLOCK + 7
         be._maybe_close_blocks(self._fb(seq), [0])
         cl = be._close_state[(0, self.LID2)]
-        self.assertEqual(cl["closed"], 8192 + D.CLOSE_BLOCK)
-        self.assertEqual(cl["sigma"].shape[0], 8192 + D.CLOSE_BLOCK)
+        self.assertEqual(cl["closed"], D.ACTIVATION_MIN_TOKENS + D.CLOSE_BLOCK)
+        self.assertEqual(cl["sigma"].shape[0], D.ACTIVATION_MIN_TOKENS + D.CLOSE_BLOCK)
         n = int(be._kept_len[self.LID2][0])
         m = max(1, round(be.rho * cl["closed"]))
         tail = seq - cl["closed"]
@@ -1056,15 +1129,16 @@ class TestDecodeTimeBlockClose(CustomTestCase):
         self.assertGreaterEqual(be._kmax[self.LID2], n)
 
     def test_multiple_blocks_close_in_one_step(self):
-        be = self._backend(prefill=8192)
-        seq = 8192 + 3 * D.CLOSE_BLOCK + 1
+        be = self._backend(prefill=D.ACTIVATION_MIN_TOKENS)
+        seq = D.ACTIVATION_MIN_TOKENS + 3 * D.CLOSE_BLOCK + 1
         be._maybe_close_blocks(self._fb(seq), [0])
         self.assertEqual(
-            be._close_state[(0, self.LID2)]["closed"], 8192 + 3 * D.CLOSE_BLOCK
+            be._close_state[(0, self.LID2)]["closed"],
+            D.ACTIVATION_MIN_TOKENS + 3 * D.CLOSE_BLOCK,
         )
 
     def test_close_refreshes_a_built_tier(self):
-        be = self._backend(prefill=8192)
+        be = self._backend(prefill=D.ACTIVATION_MIN_TOKENS)
         calls = []
         tier = SimpleNamespace(
             built=True,
@@ -1075,10 +1149,10 @@ class TestDecodeTimeBlockClose(CustomTestCase):
             ),
         )
         be._recall[(0, self.LID2)] = {"tier": tier}
-        seq = 8192 + D.CLOSE_BLOCK
+        seq = D.ACTIVATION_MIN_TOKENS + D.CLOSE_BLOCK
         be._maybe_close_blocks(self._fb(seq), [0])
         # first close: caches empty -> extend covers ALL closed rows
-        self.assertEqual(calls[0], ("extend", 8192 + D.CLOSE_BLOCK))
+        self.assertEqual(calls[0], ("extend", D.ACTIVATION_MIN_TOKENS + D.CLOSE_BLOCK))
         self.assertEqual(calls[1][0], "refresh")
 
     def test_unarmed_slot_is_ignored(self):

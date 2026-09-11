@@ -171,6 +171,7 @@ def _prologue_scores_kernel(
     kslot_ptr,  # FROM_POOL=1: [P, NKm] int32 pool row ids (else unused)
     kbase_ptr,  # FROM_POOL=1: [P] int64 pool base for the pair's layer
     nk_len_ptr,
+    a_len_ptr,  # [P] int64 archive rows; 0 -> skip the kept sweep below
     pm_ptr,
     ps_ptr,
     pt_ptr,  # [P, NSPLIT, H] partials
@@ -189,6 +190,7 @@ def _prologue_scores_kernel(
     h = tl.arange(0, H)
     qb = qbuf_ptr + (tl.load(li_ptr + p) * RR + tl.load(slot_ptr + p)) * H * 576
     nk = tl.load(nk_len_ptr + p)
+    al = tl.load(a_len_ptr + p)
     # The KV pool is one allocation PER LAYER, so a kernel batched across
     # layers cannot reach it from a single base plus a stride; the pair's base
     # comes from a device pointer table instead. The pool is allocated once
@@ -211,6 +213,11 @@ def _prologue_scores_kernel(
     # still stores the correct empty partial (-inf, 0, 0) below, so the merge
     # (and the empty-kept fire-all contract) is untouched.
     hi = tl.minimum(lo + span, tl.minimum(NKm, nk))
+    # Empty archive (al == 0): the kept set is a subset of the archive's live
+    # prefix, so nothing to score -- collapse the sweep to zero iterations.
+    # The empty partial (-inf, 0, 0) is stored below as usual, and the
+    # merge's empty-kept fire-all contract is untouched.
+    hi = tl.where(al > 0, hi, lo)
     e_max = tl.zeros([H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([H], dtype=tl.float32)
     x_sum = tl.zeros([H], dtype=tl.float32)
@@ -270,6 +277,7 @@ def _prologue_merge_kernel(
     ps_ptr,
     pt_ptr,
     nk_len_ptr,
+    a_len_ptr,  # [P] int64 archive rows; 0 -> nothing downstream to feed
     thr_ptr,
     max1g_ptr,
     qbuf_ptr,  # qside/qsk/qres work folded in: same [P] grid as the merge,
@@ -288,6 +296,12 @@ def _prologue_merge_kernel(
     BLOCK_D: tl.constexpr,
 ):
     p = tl.program_id(0)
+    if tl.load(a_len_ptr + p) == 0:
+        # Empty archive: the scan exits before loading max1g, so max1g /
+        # qside_t / qsk_t / qres have no consumer this step -- skip the whole
+        # D-loop and merge. An empty KEPT set with a nonempty archive (nk==0,
+        # al>0) still runs and keeps its fire-all contract.
+        return
     h = tl.arange(0, H)
     r = tl.arange(0, R)
     qb = qbuf_ptr + (tl.load(li_ptr + p) * RR + tl.load(slot_ptr + p)) * H * 576
@@ -437,6 +451,8 @@ def fused_prologue_split(
     sc,
     out,
     partials,
+    a_len,  # [P] int64 archive rows per pair; REQUIRED -- the empty-archive
+    # early exits key off it, and a silent default here once hid the wiring
     p_live=None,
     kslot=None,
     kbase=None,
@@ -450,6 +466,10 @@ def fused_prologue_split(
     qbuf [L, RR, H, 576] (bf16 in production; fp32 accepted -- loads upcast),
     li/slot [P] int64 select each pair's query row. Same outputs as
     fused_prologue; replaces the per-step torch gather+cast+contiguous.
+    `a_len` [P] int64 is each pair's archive row count: pairs with a_len == 0
+    skip the kept sweep and the merge entirely (their outputs have no
+    consumer -- the scan exits first). Callers without an archive concept
+    (direct tests, capture warmups) pass torch.ones_like(nk_len) explicitly.
 
     Kept rows come from one of two places. Pass `kr` [P, NKm, 576] to score a
     snapshot the caller owns, or pass `kslot` [P, NKm] int32 + `kbase` [P]
@@ -487,6 +507,7 @@ def fused_prologue_split(
         kslot,
         kbase,
         nk_len,
+        a_len,
         pm,
         ps,
         pt,
@@ -507,6 +528,7 @@ def fused_prologue_split(
         ps,
         pt,
         nk_len,
+        a_len,
         thr,
         max1g,
         qbuf,
@@ -569,23 +591,30 @@ def _compact_write_kernel(
     BLOCK_A: tl.constexpr,
 ):
     p = tl.program_id(1)
-    b = tl.program_id(0)
-    offs = b * BLOCK_A + tl.arange(0, BLOCK_A)
-    alen = tl.load(a_len_ptr + p)
-    m = (offs < Am) & (offs < alen)
-    abase = tl.load(a_off_ptr + p).to(tl.int64)
-    h = tl.load(hit_ptr + abase + offs, mask=m, other=0) != 0
-    nb = tl.num_programs(0)
-    base = tl.load(offsets_ptr + p * nb + b)
-    pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
+    pid = tl.program_id(0)
+    G = tl.num_programs(0)  # capped launch grid; live buckets stride over it
+    nb = (Am + BLOCK_A - 1) // BLOCK_A  # TOTAL bucket count, not the grid
     li = tl.load(li_ptr + p)
     slot = tl.load(slot_ptr + p)
-    arch = tl.load(arch_ptr + abase + offs, mask=m, other=0)
-    ok = h & (pos < W)
-    tl.store(out_ptr + li * NSLOT * W + slot * W + pos, arch, mask=ok)
-    if b == 0:
+    if pid == 0:
+        # fetch_len is consumed every step, even by an empty pair, so its
+        # write cannot ride on bucket 0 existing in the (capped) grid.
         t = tl.load(total_ptr + p)
         tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
+    alen = tl.load(a_len_ptr + p)
+    live = tl.minimum(nb, (alen + BLOCK_A - 1) // BLOCK_A)
+    trips = (tl.maximum(live - pid, 0) + G - 1) // G
+    abase = tl.load(a_off_ptr + p).to(tl.int64)
+    for i in range(trips):
+        b = pid + i * G
+        offs = b * BLOCK_A + tl.arange(0, BLOCK_A)
+        m = (offs < Am) & (offs < alen)
+        h = tl.load(hit_ptr + abase + offs, mask=m, other=0) != 0
+        base = tl.load(offsets_ptr + p * nb + b)
+        pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
+        arch = tl.load(arch_ptr + abase + offs, mask=m, other=0)
+        ok = h & (pos < W)
+        tl.store(out_ptr + li * NSLOT * W + slot * W + pos, arch, mask=ok)
 
 
 def compact_fired(
@@ -619,7 +648,11 @@ def compact_fired(
         counts, offsets, total, NB, NB2=triton.next_power_of_2(NB)
     )
     W = fetch_buf.shape[-1]
-    _compact_write_kernel[(NB, P)](
+    # Grid-stride launch: cap the bucket grid at SCAN_GRID_CAP and let each
+    # program walk live buckets. The uncapped (NB, P) grid dispatched ~512
+    # CTAs per pair at 512k capacity; almost all of them masked out and
+    # exited, but the dispatch floor alone was ~12 us at short context.
+    _compact_write_kernel[(min(NB, D.SCAN_GRID_CAP), P)](
         hit,
         offsets,
         arch,

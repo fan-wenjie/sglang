@@ -77,7 +77,10 @@ def bench_prologue(S):
     li = torch.zeros(P, dtype=torch.int64, device=dev)
     slot = torch.arange(P, dtype=torch.int64, device=dev)
     split = lambda: fused_prologue_split(  # noqa: E731
-        qbuf, li, slot, kr, v, nk_len, thr, sc, out=out, partials=parts
+        qbuf, li, slot, kr, v, nk_len, thr, sc, out=out, partials=parts,
+        # no archive concept in this bench: ones = never take the empty-
+        # archive early exits (the conservative-but-explicit form)
+        a_len=torch.ones_like(nk_len),
     )
     print(
         f"  prologue S={S // 1024}k: eager {t(eager):.3f}  single-CTA {t(single):.3f}  "
@@ -120,6 +123,8 @@ def bench_compact(S):
         torch.zeros(P, dtype=torch.int32, device=dev),
     )
     scratch = torch.zeros(P, W + 1, dtype=torch.int64, device=dev)
+    a_off = torch.zeros(P, dtype=torch.int64, device=dev)
+    counts_src = hit.view(P, NB, 1024).sum(-1, dtype=torch.int32)
 
     def torch_chain():
         h = hit != 0
@@ -129,7 +134,11 @@ def bench_compact(S):
         scratch.zero_()
         scratch.scatter_(1, dst, arch)
 
-    tri = lambda: compact_fired(hit, arch, a_len, li, slot, fb, fl, scr)  # noqa: E731
+    def tri():
+        # production fills scr[0] inside the scan kernel; standalone we
+        # refill per call (the kernel re-zeros the table), same as serving.
+        scr[0].copy_(counts_src)
+        compact_fired(hit, arch, a_len, a_off, li, slot, fb, fl, scr, a)
     print(
         f"  compact S={S // 1024}k: torch-chain {t(torch_chain):.3f}  triton {t(tri):.3f} ms"
     )
