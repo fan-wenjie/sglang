@@ -88,12 +88,14 @@ def create_vestigekv_mla_backend(runner):
     # operator collapses (measured 0.89 -> 0.08 needle retrieval at 32x), so
     # refuse anything but the validated NoPE-MLA family instead of silently
     # degrading quality.
-    if kimi_linear_config(runner.model_config) is None:
+    _kimi = kimi_linear_config(runner.model_config)
+    _glm = glm5_next_config(runner.model_config)
+    if _kimi is None and _glm is None:
         raise ValueError(
             "vestigekv_mla is validated only for NoPE-MLA models (Kimi Linear "
-            "family). On RoPE-MLA models the sidecar eviction "
-            "signal does not exist and quality collapses; use a stock MLA "
-            "backend instead."
+            "family; GLM-5.3-Flash with the DSA indexer's top-k switched off). "
+            "On RoPE-MLA models the sidecar eviction signal does not exist and "
+            "quality collapses; use a stock MLA backend instead."
         )
     # NoPE is the load-bearing precondition, not just the model family: the
     # eviction signal lives in the decoupled branch precisely because NoPE
@@ -102,13 +104,25 @@ def create_vestigekv_mla_backend(runner):
     # partial-rotary dim), even inside the validated family, rather than
     # silently degrade -- the method is undefined the moment a position
     # function touches the branch.
-    _cfg = kimi_linear_config(runner.model_config)
-    if getattr(_cfg, "mla_use_nope", True) is False:
+    if _kimi is not None and getattr(_kimi, "mla_use_nope", True) is False:
         raise ValueError(
             "vestigekv_mla requires a NoPE-MLA cache (mla_use_nope=True): the "
             "query-independent eviction signal exists only when no positional "
             "encoding rotates the decoupled branch. This config applies one."
         )
+    if _glm is not None:
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        if _glm.qk_rope_head_dim != 0:
+            raise ValueError(
+                "vestigekv_mla on GLM-5.3 requires a rope-less MLA "
+                f"(qk_rope_head_dim == 0, got {_glm.qk_rope_head_dim})."
+            )
+        if is_deepseek_dsa(_glm):
+            raise ValueError(
+                "vestigekv_mla replaces DSA: switch the indexer's top-k off with "
+                "--json-model-override-args '{\"text_config\": {\"index_topk\": null}}'."
+            )
     if (runner.page_size or 1) != 1:
         raise ValueError(
             f"vestigekv_mla requires --page-size 1 (resolved page_size="

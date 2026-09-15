@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import glm5_next_config, kimi_linear_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.vestigekv import defaults as D
@@ -51,6 +52,7 @@ from sglang.srt.layers.attention.vestigekv.eviction import (
 from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR, Geometry
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
@@ -133,6 +135,7 @@ class VestigeKVMLABackend(AttentionBackend):
         recall_threshold="max",
         prefill_calibration=False,
     )
+    geom = KIMI_LINEAR  # __init__ derives the served model's; fakes keep the default
 
     def __init__(
         self,
@@ -172,13 +175,12 @@ class VestigeKVMLABackend(AttentionBackend):
         self._graph_bufs: dict = {}
         self._graph_max_bs = 0
         self._num_layers = model_runner.model_config.num_hidden_layers
-        # 1-indexed in the checkpoint config -> 0-indexed layer ids
-        self._mla_lids_static = {
-            lid1 - 1
-            for lid1 in model_runner.model_config.hf_config.linear_attn_config[
-                "full_attn_layers"
-            ]
-        }
+        # The text config normalises the checkpoint's layer list (1-indexed on
+        # Kimi Linear, 0-indexed on GLM-5.3-Flash) to 0-indexed layer ids.
+        text_cfg = kimi_linear_config(model_runner.model_config) or glm5_next_config(
+            model_runner.model_config
+        )
+        self._mla_lids_static = set(text_cfg.full_attention_layer_ids)
         # this PP rank's MLA layers, from the hybrid pool's authoritative map
         # (HybridLinearKVPool.full_attention_layer_id_mapping)
         self._local_mla_lids = sorted(
@@ -206,12 +208,30 @@ class VestigeKVMLABackend(AttentionBackend):
         self._li_map: dict = {}
         # ---- recall tier (REQUIRED component; no production off-switch) ----
         # Expanded-query dims from the model config (q_nope@W_kc | q_rope).
-        cfg = model_runner.model_config.hf_config
         self._q_heads = model_runner.model_config.get_num_attention_heads(
             model_runner.server_args.tp_size
         )
-        self._q_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim  # 512 + 64
+        self.geom = Geometry.from_hf_config(text_cfg)
+        self._q_dim = self.geom.latent_dim  # kv_lora_rank + un-roped sidecar
         logger.info("VestigeKV: %s", config.describe())
+        # Salience channel outside the latent row: one bf16 [pool rows, sigma_dim]
+        # table per local MLA layer, row-aligned with that layer's KV pool and
+        # filled by the model through write_salience.
+        self._side_pool: dict = {}
+        self._side_scale: dict = {}  # fp8 pool only: [pool rows] fp32 per-row scale
+        self._side_fp8 = envs.SGLANG_VESTIGEKV_USE_FP8_SIDE_POOL.get()
+        if not self.geom.sigma_in_row:
+            dev = model_runner.device
+            for lid in self._local_mla_lids:
+                rows = base.token_to_kv_pool.get_key_buffer(lid).shape[0]
+                self._side_pool[lid] = torch.zeros(
+                    rows,
+                    self.geom.sigma_dim,
+                    dtype=torch.float8_e4m3fn if self._side_fp8 else torch.bfloat16,
+                    device=dev,
+                )
+                if self._side_fp8:
+                    self._side_scale[lid] = torch.zeros(rows, dtype=torch.float32, device=dev)
         # Fixed fetch-buffer width: graph capture needs a fixed WIDTH, not a
         # cap. A fire past it raises the pair's overflow flag; the pack then
         # fences that step to the full row set (config.overflow_fallback) or
@@ -1028,7 +1048,9 @@ class VestigeKVMLABackend(AttentionBackend):
         for i, (slot, seq_len) in enumerate(zip(slots, lens)):
             seq_len = int(seq_len)
             row_slots = r2t[slot, :seq_len]
-            kept = self._arm_aware_kept(row_slots, kbuf, seq_len, layer.v_head_dim)
+            kept = self._arm_aware_kept(
+                row_slots, kbuf, seq_len, layer.v_head_dim, lid=lid
+            )
             n = kept.numel()
             self._kept_buf[lid][slot, :n] = kept.to(self._kept_buf[lid].dtype)
             self._kept_len[lid][slot] = n
@@ -1044,9 +1066,7 @@ class VestigeKVMLABackend(AttentionBackend):
             )
             self._close_state[(slot, lid)] = {
                 "closed": closed0,
-                "sigma": blockwise_sigma_from_pool(
-                    kbuf, row_slots[:closed0], D.CLOSE_BLOCK
-                ),
+                "sigma": self._block_sigma(kbuf, row_slots[:closed0], lid=lid),
             }
             # Host-side upper bound on kept_len, so the per-step CSR pack needs
             # no `int(lens.max())` readback. Exact by construction: every decode
@@ -1234,7 +1254,44 @@ class VestigeKVMLABackend(AttentionBackend):
         path = envs.SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG.get()
         return bool(path) and os.path.exists(path)
 
-    def _arm_aware_kept(self, row_slots, kbuf, seq_len, v_dim):
+    def write_salience(self, *, layer_id: int, loc: torch.Tensor, key: torch.Tensor):
+        """Store this forward's salience keys at their tokens' KV rows."""
+        if key.shape[0] != loc.shape[0]:
+            raise ValueError(
+                f"salience keys ({key.shape[0]}) and cache slots ({loc.shape[0]}) "
+                "disagree; hidden states must be one row per token of the batch"
+            )
+        loc = loc.to(torch.int64)
+        if self._side_fp8:
+            from sglang.srt.layers.attention.vestigekv.salience import quantize_salience
+
+            q, scale = quantize_salience(key)
+            # byte view: index_copy_ has no fp8 kernel on every device
+            self._side_pool[layer_id].view(torch.uint8).index_copy_(
+                0, loc, q.view(torch.uint8)
+            )
+            self._side_scale[layer_id].index_copy_(0, loc, scale)
+            return
+        self._side_pool[layer_id].index_copy_(0, loc, key.to(torch.bfloat16))
+
+    def _block_sigma(self, kbuf, slots, *, lid):
+        """Tier-1 sigma over the closed blocks of `slots`, from the geometry's
+        salience channel."""
+        g = self.geom
+        if g.sigma_in_row:
+            return blockwise_sigma_from_pool(
+                kbuf, slots, D.CLOSE_BLOCK, offset=g.sigma_offset, dim=g.sigma_dim
+            )
+        return blockwise_sigma_from_pool(
+            self._side_pool[lid],
+            slots,
+            D.CLOSE_BLOCK,
+            offset=0,
+            dim=g.sigma_dim,
+            scale=self._side_scale.get(lid),
+        )
+
+    def _arm_aware_kept(self, row_slots, kbuf, seq_len, v_dim, lid=None):
         # The kept row set for one request, shared by the bs==1 kept-table build
         # and the bs>1 tier-2 build so both honor the same arm. Benchmark arm
         # switch, read per prefill: /tmp/vestige_full present -> FULL prefix (arm
@@ -1269,7 +1326,7 @@ class VestigeKVMLABackend(AttentionBackend):
         # The mixed flavor only ever survived until the first decode close
         # (the 64-dim global rebalance replaces it), and recall covered the
         # difference, but the paper's sigma is the branch. One flavor now.
-        sigma = blockwise_sigma_from_pool(kbuf, row_slots, D.CLOSE_BLOCK)
+        sigma = self._block_sigma(kbuf, row_slots, lid=lid)
         keep = select_kept(sigma, rho=self.rho, closed=closed, sinks=D.SINKS)
         kept_closed = row_slots[:closed][keep.nonzero(as_tuple=True)[0]]
         return torch.cat([kept_closed, row_slots[closed:]])
@@ -1479,6 +1536,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._fetch_ovf_stack,
             self._ovf_count_stack,
             self._trash_slot,
+            geom=self.geom,
             arena=arena,
             pool_bases=pool_bases,
             pool_row=pool_row,
@@ -1762,7 +1820,7 @@ class VestigeKVMLABackend(AttentionBackend):
         c0 = cl["closed"]
         c1 = c0 + D.CLOSE_BLOCK
         block_slots = r2t[slot, c0:c1].to(torch.int64)
-        sigma = blockwise_sigma_from_pool(kbuf, block_slots, D.CLOSE_BLOCK)
+        sigma = self._block_sigma(kbuf, block_slots, lid=lid)
         cl["sigma"] = torch.cat([cl["sigma"], sigma])
         cl["closed"] = c1
         # global rebalance over every closed row
@@ -1947,10 +2005,11 @@ class VestigeKVMLABackend(AttentionBackend):
                         job["qpos"], device=kbuf.device, dtype=torch.long
                     )
                     tier = RecallTier(
-            r=self.index_rank,
-            margin=self.config.recall_margin,
-            threshold=self.config.recall_threshold,
-        )
+                        r=self.index_rank,
+                        margin=self.config.recall_margin,
+                        threshold=self.config.recall_threshold,
+                        geom=self.geom,
+                    )
                     stats = tier.build(
                         kbuf,
                         job["row_slots"],
@@ -2166,7 +2225,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 kbuf[row_slots[-n_cal:]]
                 .float()
                 .unsqueeze(1)
-                .expand(n_cal, self._q_heads, D.LATENT_DIM)
+                .expand(n_cal, self._q_heads, self._q_dim)
             )
             q_pos = torch.arange(
                 seq_len - n_cal, seq_len, device=row_slots.device, dtype=torch.long
@@ -2178,6 +2237,7 @@ class VestigeKVMLABackend(AttentionBackend):
             r=self.index_rank,
             margin=self.config.recall_margin,
             threshold=self.config.recall_threshold,
+            geom=self.geom,
         )
         stats = tier.build(
             kbuf,

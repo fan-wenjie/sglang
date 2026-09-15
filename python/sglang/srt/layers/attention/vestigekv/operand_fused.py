@@ -36,10 +36,10 @@ def _operand_fused_kernel(
     A,
     BA: tl.constexpr,  # rows per program
     BD: tl.constexpr,  # content K-chunk
-    R: tl.constexpr,  # 64
-    KV: tl.constexpr,  # 512
-    SD: tl.constexpr,  # 64
-    ROW: tl.constexpr,  # 576
+    R: tl.constexpr,  # sketch rank
+    KV: tl.constexpr,  # content width
+    SD: tl.constexpr,  # sidecar width (0 = none)
+    ROW: tl.constexpr,  # pool row width
 ):
     p = tl.program_id(0)
     a = p * BA + tl.arange(0, BA)
@@ -74,22 +74,32 @@ def _operand_fused_kernel(
     tl.atomic_max(amax_ptr, tl.max(tl.abs(csk)))
     # side: branch slice cast (bf16 -> bf16 passthrough copy into the operand
     # table's own layout)
-    sd = tl.arange(0, SD)
-    s = tl.load(
-        kbuf_ptr + slots[:, None] * ROW + (KV + sd)[None, :], mask=m[:, None], other=0.0
-    )
-    tl.store(side_ptr + a[:, None] * SD + sd[None, :], s, mask=m[:, None])
+    if SD > 0:
+        sd = tl.arange(0, SD)
+        s = tl.load(
+            kbuf_ptr + slots[:, None] * ROW + (KV + sd)[None, :],
+            mask=m[:, None],
+            other=0.0,
+        )
+        tl.store(side_ptr + a[:, None] * SD + sd[None, :], s, mask=m[:, None])
 
 
-def build_operands_fused(kbuf: torch.Tensor, arch_slots: torch.Tensor, V: torch.Tensor):
-    """kbuf [pool,576] bf16; arch_slots [A] int64; V [r,512] fp32.
-    Returns (csk fp16 [A,r], rho fp32 [A], side bf16 [A,64])."""
+def build_operands_fused(
+    kbuf: torch.Tensor,
+    arch_slots: torch.Tensor,
+    V: torch.Tensor,
+    *,
+    kv: int = D.KV_LORA_RANK,
+    side_dim: int = D.SIDECAR_DIM,
+):
+    """kbuf [pool,ROW] bf16; arch_slots [A] int64; V [r,kv] fp32.
+    Returns (csk fp16 [A,r], rho fp32 [A], side bf16 [A,side_dim])."""
     A = arch_slots.numel()
     dev = kbuf.device
     r = V.shape[0]
     csk = torch.empty(A, r, dtype=torch.float16, device=dev)
     rho = torch.empty(A, dtype=torch.float32, device=dev)
-    side = torch.empty(A, D.SIDECAR_DIM, dtype=torch.bfloat16, device=dev)
+    side = torch.empty(A, side_dim, dtype=torch.bfloat16, device=dev)
     amax = torch.zeros(1, dtype=torch.float32, device=dev)
     if A == 0:
         return csk, rho, side
@@ -107,8 +117,8 @@ def build_operands_fused(kbuf: torch.Tensor, arch_slots: torch.Tensor, V: torch.
         BA=ba,
         BD=D.d_block_for_rank(r),
         R=r,
-        KV=D.KV_LORA_RANK,
-        SD=D.SIDECAR_DIM,
+        KV=kv,
+        SD=side_dim,
         ROW=kbuf.shape[-1],
         num_warps=4,
     )

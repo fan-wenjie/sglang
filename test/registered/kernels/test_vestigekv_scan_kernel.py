@@ -123,6 +123,38 @@ class TestVestigeScanKernel(CustomTestCase):
             self.assertEqual(int((ref != got).sum()), 0, f"A={A}")
 
 
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_no_sidecar_scores_from_the_sketch_alone(self):
+        # D == 0 (rope-less MLA): the kernel must skip the sidecar dot rather
+        # than index an empty range, and agree with the eager sketch-only score.
+        from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
+
+        dev = "cuda"
+        A = 8192
+        g = torch.Generator(device=dev).manual_seed(7)
+        rnd = lambda *s: torch.randn(*s, device=dev, generator=g)  # noqa: E731
+        qside_t = torch.empty(0, H, device=dev, dtype=torch.bfloat16)
+        qsk_t = rnd(R, H).contiguous().half()
+        qres = torch.rand(H, device=dev, generator=g) * 2
+        side = torch.empty(A, 0, device=dev, dtype=torch.bfloat16)
+        csk = rnd(A, R).half()
+        rho = torch.rand(A, device=dev, generator=g) * 2
+        cc = 2.0 * SCALE / (512 - R) ** 0.5
+        score = (qsk_t.T.float() @ csk.T.float()) * SCALE + cc * (qres[:, None] * rho[None, :])
+        max1g = torch.full(
+            (H,), torch.quantile(score.flatten().float(), 0.99).item(), device=dev
+        )
+        ref = _eager_fire(qside_t, qsk_t, qres, max1g, side, csk, rho, SCALE, cc)
+        got = vestige_scan(qside_t, qsk_t, qres, max1g, side, csk, rho, SCALE, cc)
+        margin = (score - max1g[:, None]).abs().min(0).values
+        boundary = margin < 1e-5 * (1 + score.abs().max())
+        dis = (ref != got).nonzero().flatten()
+        self.assertLessEqual(int(dis.numel()), 4)
+        for i in dis.tolist():
+            self.assertTrue(bool(boundary[i]), f"non-boundary row {i} flipped")
+        self.assertGreater(int(ref.sum()), 0)
+
 if __name__ == "__main__":
     unittest.main()
 
