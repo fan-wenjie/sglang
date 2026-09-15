@@ -14,7 +14,8 @@ defaults.py and the vestigekv-dev git history for the why of each change):
   historical (d08b1e155e)                     current
   -----------------------------------------   -------------------------------------
   gate quantile 0.03, hard-coded n>5          gate_alpha(tau)=0.05, n >= min_hard
-  11-rung zp ladder, zp=2.0 when no evidence  closed-form conformal kthvalue, Z_MAX
+  11-rung zp ladder, zp=2.0 when no evidence  closed-form conformal kthvalue over every
+                                              query's best archived row, Z_MAX
   fp32 scoring everywhere                     storage-dtype scoring (bf16 side /
                                               fp16 sketch), quantize-then-calibrate
   SVD basis                                   eigh basis (same subspace, 4x faster)
@@ -128,16 +129,20 @@ def _naive_build(kbuf, row_slots, keep, q_cal, q_pos, r, recall_target, scale):
         if float((ent > thr_g).float().mean()) > D.GATE_SELF_DISABLE_FRACTION:
             thr_g = float("-inf")
 
-        pos_in_arch = torch.searchsorted(arch_idx, tgt)
-        need_more = n_hard < D.min_hard(recall_target)
-        if n_hard == 0 or need_more:
+        # zp: every query's best ARCHIVED row must be certified at or above
+        # its true score (the engine's calibration target)
+        s_arch = s.masked_fill(keep[None, :], torch.finfo(torch.float32).min)
+        abest, atgt = s_arch.max(-1)
+        has_arch = abest > torch.finfo(torch.float32).min
+        n_cal_q = int(has_arch.sum())
+        need_more = n_cal_q < D.min_hard(recall_target)
+        if need_more:
             zp = D.Z_MAX
         else:
-            qh = qe[hard]
+            qh = qe[has_arch]
             qskh = qh[:, :KV] @ V.T
             qresh = (qh[:, :KV] - qskh @ V).norm(dim=-1)
-            pa = pos_in_arch[hard]
-            apos = arch_idx[pa]
+            apos = atgt[has_arch]
             tgt_side = rows[apos, KV:]
             tgt_csk = csk_all[apos]
             tgt_rho = rho_all[apos]
@@ -148,8 +153,8 @@ def _naive_build(kbuf, row_slots, keep, q_cal, q_pos, r, recall_target, scale):
             cert_t = (
                 qresh * tgt_rho * sc_ / (KV - r) ** 0.5
             ).clamp_min(D.ENTROPY_EPS)
-            z_req = (max1[hard] - idxs_t) / cert_t
-            k = D.conformal_k(n_hard, recall_target)
+            z_req = (abest[has_arch] - idxs_t) / cert_t
+            k = D.conformal_k(n_cal_q, recall_target)
             zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
 
     return {
