@@ -49,6 +49,7 @@ from sglang.srt.layers.attention.vestigekv.eviction import (
     select_kept,
 )
 from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
+from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
@@ -98,6 +99,8 @@ class VestigeKVMLABackend(AttentionBackend):
     _cap_lru_hit = 0
     _scan_cache = None  # OrderedDict[key -> {graph, pack}], LRU cap 2
     _dense_cache = None  # (forward_batch, dense rows) of the eager step's fence
+    _fetch_hist = None
+    _stat_acc = None
     # The flag defaults, for __new__-constructed fakes; a registered test pins
     # them to the ExecKernel field defaults.
     config = VestigeKVConfig(
@@ -198,6 +201,8 @@ class VestigeKVMLABackend(AttentionBackend):
         self._stats = dict.fromkeys(
             ("steps", "scan_calls", "fetched", "kept", "seq", "replays"), 0
         )
+        self._fetch_hist = None  # stats only: [W + 1] int64 device histogram
+        self._stat_acc = None  # stats only: [fetched, kept, seq] int64 device sums
         self._scan_graph = None
         self._scan_key_cur = self._scan_key_seen = None
         self._scan_steps = 0
@@ -681,7 +686,6 @@ class VestigeKVMLABackend(AttentionBackend):
         import time as _t
 
         st = self._stats
-        real = forward_batch.out_cache_loc.shape[0]
         st["steps"] += 1
         # Must take the SAME branch production takes: measuring _recall_step
         # directly would price the eager path on a step that actually replays a
@@ -716,16 +720,40 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._refresh_graph_bufs(lid, forward_batch, reqs)
             torch.cuda.synchronize()
             st["t_pack"] += _t.perf_counter() - t1
+        self._account_step(forward_batch)
+
+    def _account_step(self, forward_batch):
+        # SGLANG_DEBUG_VESTIGEKV_STATS=1 bookkeeping for one decode step, on
+        # every launch path, with no host readback: the per-scan sums
+        # (fetched, kept, seq) and a histogram of the fetched-row count per
+        # (layer, request) scan -- last step's fetch_len, an overflowed scan
+        # counting as the capacity -- accumulate on the device and are read
+        # back together in _dump_stats.
+        st = self._stats
+        real = forward_batch.out_cache_loc.shape[0]
+        slots = forward_batch.req_pool_indices[:real].to(torch.int64)
         for lid in self._mla_lids:
             if lid in self._qbuf:
                 st["scan_calls"] += real
                 fl = self._fetch_len.get(lid)
                 kl = self._kept_len.get(lid)
                 if fl is not None:
-                    slots = forward_batch.req_pool_indices[:real].to(torch.int64)
-                    st["fetched"] += int(fl.gather(0, slots).sum())
-                    st["kept"] += int(kl.gather(0, slots).sum())
-                    st["seq"] += int(forward_batch.seq_lens[:real].sum())
+                    if self._fetch_hist is None:
+                        self._fetch_hist = torch.zeros(
+                            self._fetch_w + 1, dtype=torch.int64, device=fl.device
+                        )
+                        self._stat_acc = torch.zeros(3, dtype=torch.int64, device=fl.device)
+                    fetched = fl.gather(0, slots).to(torch.int64)
+                    self._stat_acc += torch.stack(
+                        [
+                            fetched.sum(),
+                            kl.gather(0, slots).to(torch.int64).sum(),
+                            forward_batch.seq_lens[:real].to(torch.int64).sum(),
+                        ]
+                    )
+                    self._fetch_hist += torch.bincount(
+                        fetched.clamp_(0, self._fetch_w), minlength=self._fetch_w + 1
+                    )
         if st["steps"] % 50 == 0:
             self._dump_stats()
 
@@ -735,9 +763,14 @@ class VestigeKVMLABackend(AttentionBackend):
         st = self._stats
         n = max(st["steps"], 1)
         c = max(st["scan_calls"], 1)
+        overflow = self._overflow_total()
+        hist = self._fetch_hist.tolist() if self._fetch_hist is not None else []
+        if self._stat_acc is not None:  # the only readback of the per-scan sums
+            st["fetched"], st["kept"], st["seq"] = self._stat_acc.tolist()
         logging.getLogger(__name__).info(
             "VKSTATS steps=%d layers=%d replay=%.0f%% build=%.1fms x%d cap=%.1fms x%d "
-            "caps[key=%d fits=%d] overflow=%d "
+            "caps[key=%d fits=%d] overflow=%d fetch[p50=%d p90=%d p99=%d] fallback=%.5f "
+            "mem[alloc=%.2fGB reserved=%.2fGB] "
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
             "pack=%.2fms/step "
             "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
@@ -751,7 +784,11 @@ class VestigeKVMLABackend(AttentionBackend):
             st["n_capture"],
             self._cap_keymiss,
             self._cap_fits,
-            self._overflow_total(),
+            overflow,
+            *hist_percentiles(hist, (0.5, 0.9, 0.99)),
+            overflow / c,
+            torch.cuda.memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0,
+            torch.cuda.memory_reserved() / 2**30 if torch.cuda.is_available() else 0.0,
             1e3 * st["t_replay"] / max(st["replays"], 1),
             1e3 * st["t_replay_host"] / max(st["replays"], 1),
             1e3 * st["t_eager"] / max(n - st["replays"], 1),
@@ -900,7 +937,6 @@ class VestigeKVMLABackend(AttentionBackend):
         # Registered here, not at graph capture: an eager decode step (CUDA
         # graph off) collects calibration and recalls only for these layers.
         self._mla_lids.add(lid)
-        fm = self.base.forward_metadata
         r2t = self.req_to_token_pool.req_to_token
         if lid not in self._kept_buf:
             max_reqs = r2t.shape[0]
@@ -1369,6 +1405,9 @@ class VestigeKVMLABackend(AttentionBackend):
     def _ingraph_host_step(self, forward_batch, reqs):
         real = forward_batch.out_cache_loc.shape[0]
         self._stage_step(forward_batch, forward_batch.seq_lens.shape[0])
+        if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
+            self._stats["steps"] += 1
+            self._account_step(forward_batch)
         if self._full_arm():
             if not self._ingraph_full_armed:
                 # FULL arm: kept_buf already holds every row (_arm_aware_kept),
@@ -1721,6 +1760,7 @@ class VestigeKVMLABackend(AttentionBackend):
                         conservative=False,
                         v_init=job["v_init"],
                         operands_from=job["operands_from"],
+                        diag=envs.SGLANG_DEBUG_VESTIGEKV_STATS.get(),
                     )
                 self._build_stream.synchronize()
                 if isinstance(stats, dict):
@@ -1890,6 +1930,7 @@ class VestigeKVMLABackend(AttentionBackend):
             q_pos,
             conservative=proxy,
             operands_from=self._reusable_operands(slot, lid, st, seq_len),
+            diag=envs.SGLANG_DEBUG_VESTIGEKV_STATS.get(),
             # Every build after a layer's first calibrated one reuses that
             # basis. The certificate is a Cauchy-Schwarz bound on the sketch
             # truncation error and is sound for ANY orthonormal basis -- a
