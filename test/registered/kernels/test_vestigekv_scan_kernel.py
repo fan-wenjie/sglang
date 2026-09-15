@@ -156,13 +156,13 @@ class TestOperandReuse(CustomTestCase):
         from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
 
         kbuf, row_slots, keep, q_cal, q_pos = self._mk()
-        prov = RecallTier(r=64, topj=-1)
+        prov = RecallTier(r=64)
         prov.build(kbuf, row_slots, keep, q_cal[:2], q_pos[:2], conservative=True)
-        fresh = RecallTier(r=64, topj=-1)
+        fresh = RecallTier(r=64)
         s_f = fresh.build(
             kbuf, row_slots, keep, q_cal, q_pos, conservative=False, v_init=prov.V
         )
-        adopt = RecallTier(r=64, topj=-1)
+        adopt = RecallTier(r=64)
         s_a = adopt.build(
             kbuf,
             row_slots,
@@ -185,11 +185,11 @@ class TestOperandReuse(CustomTestCase):
         from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
 
         kbuf, row_slots, keep, q_cal, q_pos = self._mk()
-        prov = RecallTier(r=64, topj=-1)
+        prov = RecallTier(r=64)
         prov.build(kbuf, row_slots, keep, q_cal[:2], q_pos[:2], conservative=True)
         keep2 = keep.clone()
         keep2[1] = ~keep2[1]  # one row moves tier -> different archive
-        bad = RecallTier(r=64, topj=-1)
+        bad = RecallTier(r=64)
         with self.assertRaises(AssertionError):
             bad.build(
                 kbuf,

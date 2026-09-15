@@ -10,19 +10,36 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
-from sglang.srt.environ import envs
+from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv_mla_backend import VestigeKVMLABackend
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-# Activation threshold is a config knob (environ), not a defaults
-# constant; tests run against its default value.
-ACT_MIN = envs.SGLANG_VESTIGEKV_ACTIVATION_MIN_TOKENS.get()
+# The activation threshold is a server flag whose default is 0 (every request
+# compresses); the state-machine tests below need a nonzero one, pinned on
+# the class-level config the __new__-constructed fakes read.
+ACT_MIN = 32768
+FLAG_DEFAULT_CONFIG = VestigeKVMLABackend.config
+_CONFIG_PATCH = patch.object(
+    VestigeKVMLABackend,
+    "config",
+    msgspec.structs.replace(FLAG_DEFAULT_CONFIG, activation_min_tokens=ACT_MIN),
+)
+
+
+def setUpModule():
+    _CONFIG_PATCH.start()
+
+
+def tearDownModule():
+    _CONFIG_PATCH.stop()
+
 
 LID = 3
 # Calibration/close are gated on ACTIVATION_MIN_TOKENS; tests of that state
@@ -49,8 +66,10 @@ def _mk_backend():
         kept_buf[req, :KEPT] = torch.arange(100 * req, 100 * req + KEPT)
         kept_len[req] = KEPT
     be._kept_buf, be._kept_len = {LID: kept_buf}, {LID: kept_len}
-    be._tier2 = {}
     be._qbuf, be._fetch_buf, be._fetch_len, be._recall = {}, {}, {}, {}
+    be._fetch_ovf = {}
+    # every slot has prefilled through the backend (compressed state exists)
+    be._close_state = {(req, LID): {} for req in range(GRAPH_BS)}
     # _kmax: host-side upper bound the static-shape CSR pack gathers with;
     # KEPT here, raised by one per decode step exactly as prefill does.
     be._kmax = {LID: KEPT}
@@ -140,18 +159,25 @@ class TestFetchSplice(CustomTestCase):
 
 
 class TestSlotReuseInvalidation(CustomTestCase):
-    def test_prefill_invalidates_stale_tier2(self):
+    """A pool slot re-extended for a new request must not carry the previous
+    occupant's recall state into the new request's first decode step: the
+    tier is dropped, the fetch buffer emptied and the overflow flag cleared
+    (stale state once made bs>1 decode attend the prior request's row set)."""
+
+    def _backend(self):
         be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
         be.rho = 1 / 32
         be._kept_buf, be._kept_len, be._kmax = {}, {}, {}
         be._close_state = {}
         be._qbuf, be._fetch_buf, be._fetch_len, be._recall = {}, {}, {}, {}
+        be._fetch_ovf = {}
         be._q_heads, be._q_dim, be._fetch_w = 4, 576, 8
         be._qbuf_stack = be._fetch_stack = be._fetch_len_stack = None
+        be._fetch_ovf_stack = be._ovf_count_stack = None
         be._li_map = {}
         be._local_mla_lids = [LID]
-        be._n_cal, be.index_rank, be.topj = 4, 8, -1
-        be._tier2 = {(0, LID): {"buf": torch.zeros(4, dtype=torch.int64), "n": 2}}
+        be._mla_lids = set()
+        be._n_cal, be.index_rank = 4, 8
         max_reqs, ctx, pool = 4, 64, 512
         be.base = SimpleNamespace(
             forward_metadata=SimpleNamespace(
@@ -167,18 +193,39 @@ class TestSlotReuseInvalidation(CustomTestCase):
         )
         kbuf = torch.randn(pool, 576)
         be.token_to_kv_pool = SimpleNamespace(get_key_buffer=lambda lid: kbuf)
+        return be
+
+    def _prefill(self, be, seq):
         layer = SimpleNamespace(layer_id=LID, v_head_dim=512)
         fb = SimpleNamespace(
             req_pool_indices=torch.tensor([0], dtype=torch.int64),
-            seq_lens=torch.tensor([48], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([48], dtype=torch.int64),
+            seq_lens=torch.tensor([seq], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([seq], dtype=torch.int64),
             # chunked-prefill fields: this extend completes the prefix
             extend_prefix_lens_cpu=[0],
-            extend_seq_lens_cpu=[48],
+            extend_seq_lens_cpu=[seq],
         )
         be._build_gpu_state(layer, fb)
-        self.assertNotIn((0, LID), be._tier2)
+
+    def test_prefill_registers_the_layer_for_decode(self):
+        # Layer membership used to be learned at graph capture only, so with
+        # CUDA graph off no layer ever collected calibration or recalled.
+        be = self._backend()
+        self._prefill(be, 48)
+        self.assertEqual(be._mla_lids, {LID})
+
+    def test_prefill_resets_the_slot_recall_state(self):
+        be = self._backend()
+        self._prefill(be, 48)
         self.assertGreater(int(be._kept_len[LID][0]), 0)
+        # the previous occupant's decode left a tier and a fired fetch behind
+        be._recall[(0, LID)]["tier"] = "stale"
+        be._fetch_len[LID][0] = 3
+        be._fetch_ovf[LID][0] = 1
+        self._prefill(be, 40)
+        self.assertIsNone(be._recall[(0, LID)]["tier"])
+        self.assertEqual(int(be._fetch_len[LID][0]), 0)
+        self.assertEqual(int(be._fetch_ovf[LID][0]), 0)
 
 
 class TestRowInvariantCheck(CustomTestCase):
@@ -191,7 +238,8 @@ class TestRowInvariantCheck(CustomTestCase):
         be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
         be._local_mla_lids = [LID]
         be._kept_len = {LID: torch.tensor(kept_lens, dtype=torch.int64)}
-        be._fetch_len = {}
+        be._fetch_len, be._fetch_ovf = {}, {}
+        be._close_state = {(0, LID): {}, (1, LID): {}}
         fb = SimpleNamespace(
             out_cache_loc=torch.tensor([100, 101], dtype=torch.int64),
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
@@ -229,6 +277,110 @@ class TestRowInvariantCheck(CustomTestCase):
         be._kept_len = {}
         with self.assertRaisesRegex(AssertionError, "never built"):
             self._run(be, fb, full_arm=False)
+
+
+
+
+    def test_lane_without_state_is_outside_the_invariant(self):
+        # the warmup's dummy batch has no compressed state for its slots and
+        # packs dense; the check must not read that as a missing table
+        be, fb = self._mk([0, 0])
+        be._close_state = {}
+        with patch.object(VestigeKVMLABackend, "_full_arm", return_value=False):
+            be._check_row_invariant(fb)  # must not raise
+
+
+
+
+class TestConfig(CustomTestCase):
+    def test_fake_default_matches_the_flag_defaults(self):
+        # The __new__ fakes read the class-level config; if a flag default
+        # moves without it, every CPU case here runs a configuration the
+        # server never does.
+        from sglang.srt.arg_groups.fields.exec_ import ExecKernel
+
+        self.assertEqual(
+            VestigeKVConfig.from_kernel_config(ExecKernel()), FLAG_DEFAULT_CONFIG
+        )
+
+    def test_disable_flag_switches_the_fallback_off(self):
+        from sglang.srt.arg_groups.fields.exec_ import ExecKernel
+
+        cfg = VestigeKVConfig.from_kernel_config(
+            ExecKernel(disable_vestigekv_recall_overflow_fallback=True)
+        )
+        self.assertFalse(cfg.overflow_fallback)
+
+    def test_out_of_range_values_are_refused(self):
+        base = FLAG_DEFAULT_CONFIG
+        for bad in (
+            {"recall_capacity": 0},
+            {"activation_min_tokens": -1},
+        ):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                msgspec.structs.replace(base, **bad).validate()
+
+
+
+class TestOverflowFence(CustomTestCase):
+    """A lane whose recall fire overflowed the fetch capacity attends its full
+    row set that step -- req_to_token[slot, :seq] with this step's slot last
+    -- while the other lanes and the kept-table append are unchanged. With
+    the fallback disabled the lane packs its truncated fetch as before.
+    """
+
+    W = 8
+    R2T = 16
+
+    def _backend(self, fallback):
+        be = _mk_backend()
+        be.config = msgspec.structs.replace(be.config, overflow_fallback=fallback)
+        be._fetch_buf = {LID: torch.zeros(GRAPH_BS, self.W, dtype=torch.int32)}
+        be._fetch_len = {LID: torch.zeros(GRAPH_BS, dtype=torch.int32)}
+        be._fetch_ovf = {LID: torch.zeros(GRAPH_BS, dtype=torch.int32)}
+        # request 1 fired past the capacity (buffer full, flag up); request 2
+        # fired two rows and fits
+        be._fetch_buf[LID][1] = torch.arange(900, 900 + self.W)
+        be._fetch_len[LID][1] = self.W
+        be._fetch_ovf[LID][1] = 1
+        be._fetch_buf[LID][2, :2] = torch.tensor([701, 702])
+        be._fetch_len[LID][2] = 2
+        be.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(GRAPH_BS * self.R2T, dtype=torch.int32).reshape(
+                GRAPH_BS, self.R2T
+            )
+        )
+        return be
+
+    def _segments(self, be):
+        bufs = be._graph_bufs[LID]
+        indptr = bufs["indptr"]
+        return [
+            bufs["indices"][int(indptr[i]) : int(indptr[i + 1])].tolist()
+            for i in range(REAL_BS)
+        ]
+
+    def test_fenced_lane_attends_its_full_row_set(self):
+        be = self._backend(fallback=True)
+        fb = _mk_forward_batch()  # seq_lens 7, real lanes 0..2
+        be._refresh_graph_bufs(LID, fb, fb.req_pool_indices.tolist())
+        seg = self._segments(be)
+        r2t = be.req_to_token_pool.req_to_token
+        self.assertEqual(seg[1], r2t[1, :6].tolist() + [1002])
+        self.assertEqual(seg[0], list(range(0, KEPT)) + [1001])
+        self.assertEqual(seg[2], list(range(200, 200 + KEPT)) + [1003, 701, 702])
+        for req in range(REAL_BS):  # the append happened on every lane
+            self.assertEqual(int(be._kept_len[LID][req]), KEPT + 1)
+        self.assertEqual(int(be._kept_buf[LID][1, KEPT]), 1002)
+
+    def test_fallback_off_packs_the_truncated_fetch(self):
+        be = self._backend(fallback=False)
+        fb = _mk_forward_batch()
+        be._refresh_graph_bufs(LID, fb, fb.req_pool_indices.tolist())
+        seg = self._segments(be)
+        self.assertEqual(
+            seg[1], list(range(100, 100 + KEPT)) + [1002] + list(range(900, 908))
+        )
 
 
 if __name__ == "__main__":
@@ -294,7 +446,6 @@ def _mk_scan_backend(archs, built=True):
     be._scan_pool = None
     be._scan_capture_failed = False
     be._capture_asap = False
-    be._scan_kmax = {}
     be._stage_slots = be._stage_loc = None
     be._kept_buf, be._kmax = {}, {}
     be._step_cache = None
@@ -407,6 +558,7 @@ class TestVestigeScanCapture(CustomTestCase):
         be._kept_buf, be._kmax = {}, {}
         be._stage_slots = torch.zeros(4, dtype=torch.int64)
         be._stage_loc = torch.zeros(4, dtype=torch.int64)
+        be._stage_seq = torch.zeros(4, dtype=torch.int64)
         fb2 = SimpleNamespace(
             out_cache_loc=torch.zeros(1, dtype=torch.int64),
             seq_lens=torch.zeros(1, dtype=torch.int64),
@@ -453,33 +605,6 @@ class TestVestigeScanCapture(CustomTestCase):
                     )
                 self.assertEqual(cap.call_count, 0)
 
-    def test_headroom_guard_fires_before_rows_are_dropped(self):
-        # A capture bakes one gather width; kept_len grows every step. Driven
-        # directly with a bound that has just caught up to the baked width, the
-        # guard must report exhausted -- one step BEFORE a row would be lost.
-        be = _mk_scan_backend({(0, 3): 100, (0, 7): 200})
-        be._scan_kmax = {3: 10, 7: 10}
-        be._kmax = {3: 8, 7: 8}
-        self.assertFalse(be._kmax_exhausted())
-        be._kmax = {3: 9, 7: 8}  # 9 + 1 == 10, still exactly representable
-        self.assertFalse(be._kmax_exhausted())
-        be._kmax = {3: 10, 7: 8}  # 10 + 1 > 10 -> would drop the newest row
-        self.assertTrue(be._kmax_exhausted())
-
-    def test_exhausted_headroom_recaptures_instead_of_replaying(self):
-        be = _mk_scan_backend({(0, 3): 100, (0, 7): 200})
-        fb = _scan_fb(1)
-        be._scan_key_cur = be._scan_key(fb, [0])
-        be._scan_graph = SimpleNamespace(replay=lambda: self.fail("replayed stale"))
-        be._scan_kmax = {3: 10}
-        be._kmax = {3: 10}
-        with patch.object(VestigeKVMLABackend, "_full_arm", return_value=False):
-            with patch.object(
-                VestigeKVMLABackend, "_capture_scan", return_value=True
-            ) as cap:
-                self.assertTrue(be._replay_scan(fb, [0], be._scan_key(fb, [0])))
-                self.assertEqual(cap.call_count, 1)
-
     def test_full_arm_never_captures(self):
         be = _mk_scan_backend({(0, 3): 100, (0, 7): 200})
         with patch.object(VestigeKVMLABackend, "_full_arm", return_value=True):
@@ -519,6 +644,8 @@ class TestStaticPackMatchesReference(CustomTestCase):
             fetch_len[r] = f_lens[r]
         be._kept_buf, be._kept_len = {LID: kept_buf}, {LID: kept_len}
         be._fetch_buf, be._fetch_len = {LID: fetch_buf}, {LID: fetch_len}
+        be._fetch_ovf = {}
+        be._close_state = {(req, LID): {} for req in range(graph_bs)}
         be._kmax = {LID: max(k_lens) - 1}
         be._graph_bufs = {
             LID: {
@@ -951,15 +1078,24 @@ class TestCollectionRunsOnBothPaths(CustomTestCase):
         self.assertIsNotNone(be._scan_key(_scan_fb(1), [0]))
 
     def test_collection_happens_before_the_paths_diverge(self):
-        # the step block must collect whether or not the graph then replays
+        # the shared prologue collects; every path (replay, stats, in-graph,
+        # eager) runs it before its recall
         import inspect
 
+        prologue = inspect.getsource(VestigeKVMLABackend._decode_prologue)
+        self.assertIn("_collect_calibration", prologue)
         src = inspect.getsource(VestigeKVMLABackend.init_forward_metadata_out_graph)
-        collect = src.index("_collect_calibration")
+        collect = src.index("_decode_prologue(")
         replay = src.index("_replay_scan")
         stats = src.index("_step_with_stats")
         self.assertLess(collect, replay, "collection must precede the replay")
         self.assertLess(collect, stats, "collection must precede the stats path")
+        eager = inspect.getsource(VestigeKVMLABackend._eager_decode_step)
+        self.assertLess(
+            eager.index("_decode_prologue("),
+            eager.index("_recall_step("),
+            "collection must precede the eager recall",
+        )
 
 
 class TestStatsPathMatchesProduction(CustomTestCase):
@@ -997,26 +1133,25 @@ class TestCaptureDoesNotDuplicateKeptRows(CustomTestCase):
         import inspect
 
         src = inspect.getsource(VestigeKVMLABackend._capture_scan_timed)
-        rewind = src.rindex("- n")
+        rewind = src.rindex("_rewind_appends(")
         replay = src.rindex("graph.replay()")
         self.assertLess(rewind, replay, "rewind must run before the replay")
 
     def test_failed_capture_rewinds_the_partial_appends(self):
         # A capture that dies mid-warmup has already appended this step's row
         # one or more times. The except path must undo exactly those appends
-        # (tracked per layer, not assumed), or the eager fallback resumes
-        # from an inflated kept table.
+        # (counted, not assumed), or the eager fallback resumes from an
+        # inflated kept table.
         import inspect
 
         src = inspect.getsource(VestigeKVMLABackend._capture_scan_timed)
         except_body = src[src.index("except (RuntimeError") :]
         except_body = except_body[: except_body.index("return False")]
-        self.assertIn("appended.items()", except_body)
-        self.assertIn("- n", except_body)
+        self.assertIn("_rewind_appends(slots, appended[0])", except_body)
         # the counter must be incremented after each successful pack, inside _run
         run_body = src[src.index("def _run()") : src.index("except (RuntimeError")]
-        pack = run_body.index("_pack_csr(")
-        incr = run_body.index("appended[lid] = appended.get(lid, 0) + 1")
+        pack = run_body.index("_pack_all_layers(")
+        incr = run_body.index("appended[0] += 1")
         self.assertLess(pack, incr, "count only appends that actually happened")
 
     def test_net_effect_of_a_capture_is_one_append(self):
@@ -1268,7 +1403,8 @@ class TestEmptyKeptRows(CustomTestCase):
         qe = torch.randn(H, D.LATENT_DIM, device="cuda")
         out = torch.zeros(1, A + 8, dtype=torch.int64, device="cuda")
         out_len = torch.zeros(1, dtype=torch.int64, device="cuda")
-        t.query_fixed(qe, out, out_len, 0)  # must not raise
+        out_ovf = torch.zeros(1, dtype=torch.int32, device="cuda")
+        t.query_fixed(qe, out, out_len, out_ovf, 0)  # must not raise
         self.assertGreaterEqual(int(out_len[0]), 0)
 
 
@@ -1342,16 +1478,16 @@ class TestNoPEPreconditionGuard(CustomTestCase):
             pass  # downstream construction on a mock runner is out of scope
 
 
-class TestEagerDecodeBeyondCapturedBs(CustomTestCase):
-    """Eager decode with a batch larger than the captured graph sizes must
-    not slice the undersized graph indptr (graph_max_bs + 1 rows): the slice
-    silently truncates and the base kernel's q/kv_indptr shape assertion
-    fires downstream. The backend must fall back to _compressed_indices
-    (observed in serving: eager decode at bs > cuda-graph-max-bs crashed
-    with `assert q.shape[0] <= kv_indptr.shape[0] - 1`)."""
+class TestEagerDecodeUsesThePackedBuffers(CustomTestCase):
+    """An eager decode step attends the CSR its metadata hook packed into the
+    per-layer buffers -- the same buffers the graphs read. A batch those
+    buffers cannot hold must fail loudly: slicing a short indptr silently
+    truncates and trips the base kernel's q/kv_indptr assertion downstream
+    (observed in serving at bs > cuda-graph-max-bs before the buffers were
+    sized for the request table)."""
 
     def _run_decode(self, be, bs):
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
 
         fm = be.base.forward_metadata
         layer = SimpleNamespace(layer_id=LID)
@@ -1360,11 +1496,6 @@ class TestEagerDecodeBeyondCapturedBs(CustomTestCase):
             req_pool_indices=torch.arange(bs, dtype=torch.int64),
             out_cache_loc=torch.arange(2000, 2000 + bs, dtype=torch.int64),
         )
-        sentinel = (
-            torch.arange(bs + 1, dtype=torch.int32),
-            torch.zeros(8 * bs, dtype=torch.int64),
-        )
-        be._compressed_indices = MagicMock(return_value=sentinel)
         seen = {}
 
         def fake_base_decode(q, k, v, layer, forward_batch, **kw):
@@ -1377,21 +1508,107 @@ class TestEagerDecodeBeyondCapturedBs(CustomTestCase):
             return_value=False,
         ):
             be.forward_decode(None, None, None, layer, fb)
-        return seen, sentinel
+        return seen
 
-    def test_oversized_eager_decode_falls_back_to_compressed_indices(self):
-        be = _mk_backend()
-        bs = be._graph_bufs[LID]["indptr"].shape[0] + 2  # beyond capacity
-        seen, sentinel = self._run_decode(be, bs)
-        be._compressed_indices.assert_called_once()
-        self.assertIs(seen["indptr"], sentinel[0])
-        self.assertIs(seen["indices"], sentinel[1])
-
-    def test_in_range_eager_decode_uses_the_graph_buffers(self):
+    def test_eager_decode_uses_the_packed_buffers(self):
         be = _mk_backend()
         bufs = be._graph_bufs[LID]
-        seen, _ = self._run_decode(be, 2)
-        be._compressed_indices.assert_not_called()
+        seen = self._run_decode(be, 2)
         self.assertEqual(seen["indptr"].shape[0], 3)
         self.assertEqual(seen["indptr"].data_ptr(), bufs["indptr"].data_ptr())
         self.assertIs(seen["indices"], bufs["indices"])
+
+    def test_a_batch_the_buffers_cannot_hold_is_refused(self):
+        be = _mk_backend()
+        bs = be._graph_bufs[LID]["indptr"].shape[0] + 2
+        with self.assertRaises(RuntimeError):
+            self._run_decode(be, bs)
+
+
+class TestUnseenSlotDecodesDense(CustomTestCase):
+    """A decode lane whose slot holds no compressed state for the layer (a
+    warmup/dummy batch, or a slot that never extended through this backend)
+    packs its full row set -- what the base backend attends -- while lanes
+    with state pack kept + fetched. The warmup crashed with "no packed CSR"
+    when such a lane packed nothing."""
+
+    def test_lane_without_state_packs_the_dense_rows(self):
+        be = _mk_backend()
+        del be._close_state[(1, LID)]  # slot 1 never prefilled here
+        be.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(GRAPH_BS * 16, dtype=torch.int32).reshape(
+                GRAPH_BS, 16
+            )
+        )
+        fb = _mk_forward_batch()  # seq_lens 7, real lanes 0..2
+        be._refresh_graph_bufs(LID, fb, fb.req_pool_indices.tolist())
+        bufs, indptr = be._graph_bufs[LID], be._graph_bufs[LID]["indptr"]
+        seg = [
+            bufs["indices"][int(indptr[i]) : int(indptr[i + 1])].tolist()
+            for i in range(REAL_BS)
+        ]
+        r2t = be.req_to_token_pool.req_to_token
+        self.assertEqual(seg[1], r2t[1, :6].tolist() + [1002])
+        self.assertEqual(seg[0], list(range(0, KEPT)) + [1001])
+        self.assertEqual(seg[2], list(range(200, 200 + KEPT)) + [1003])
+
+
+class TestEagerDecodeRunsTheStep(CustomTestCase):
+    """A decode step no graph replays (CUDA graph off, or a batch beyond the
+    captured sizes) must run the replay hook's step -- block closes,
+    calibration, recall, CSR pack -- on the same buffers. It used to run
+    nothing: the request was served its prefill kept set plus the tail, with
+    no recall and no decode-time eviction."""
+
+    def _fake(self, decode, prefilled=True):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.base = SimpleNamespace(init_forward_metadata=lambda fb: None)
+        be._kept_buf = {LID: torch.zeros(1, 1)} if prefilled else {}
+        be._local_mla_lids = [LID, LID + 1]
+        be._collecting = True
+        calls = []
+
+        def rec(name, *a):
+            calls.append((name,) + a)
+
+        be._ensure_graph_bufs = lambda: rec("bufs")
+        be._step_slots = lambda fb: ([0], None)
+        be._maybe_close_blocks = lambda fb, reqs: rec("close", reqs)
+        be._collect_calibration = lambda fb, reqs: rec("collect", reqs)
+        be._recall_step = lambda lid, fb, reqs: rec("recall", lid)
+        be._refresh_graph_bufs = lambda lid, fb, reqs: rec("pack", lid)
+        fb = SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: decode))
+        return be, fb, calls
+
+    def test_decode_runs_the_whole_step_per_layer(self):
+        be, fb, calls = self._fake(decode=True)
+        be.init_forward_metadata(fb)
+        self.assertEqual(
+            calls,
+            [
+                ("bufs",),
+                ("close", [0]),
+                ("collect", [0]),
+                ("recall", LID),
+                ("pack", LID),
+                ("recall", LID + 1),
+                ("pack", LID + 1),
+            ],
+        )
+
+    def test_extend_runs_nothing(self):
+        be, fb, calls = self._fake(decode=False)
+        be.init_forward_metadata(fb)
+        self.assertEqual(calls, [])
+
+    def test_decode_before_any_prefill_still_packs(self):
+        # the flashinfer autotune warmup decodes a dummy batch before any
+        # request extended through the backend; it must get a packed CSR
+        # (the dense rows, see TestUnseenSlotDecodesDense), not a crash
+        be, fb, calls = self._fake(decode=True, prefilled=False)
+        be.init_forward_metadata(fb)
+        self.assertEqual(calls[0], ("bufs",))
+        self.assertIn(("pack", LID), calls)
+
+if __name__ == "__main__":
+    unittest.main()

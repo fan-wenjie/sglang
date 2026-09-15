@@ -19,6 +19,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     import_backend_class,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
     get_spec,
@@ -120,7 +121,7 @@ def create_vestigekv_mla_backend(runner):
             "verify path's multi-token reads are not wired to the kept-index "
             "tables."
         )
-    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
     from sglang.srt.layers.attention.vestigekv_mla_backend import VestigeKVMLABackend
 
     # Wrap the Triton MLA backend (SM120-safe; flashinfer's MLA JIT needs
@@ -129,13 +130,10 @@ def create_vestigekv_mla_backend(runner):
     # Selecting this backend IS the enable switch: tier-1 eviction and tier-2
     # recall are both required components and have no per-run off switch. The
     # dense control arm is `--attention-backend triton`, i.e. `base` alone.
-    # SGLANG_VESTIGEKV_TOPJ: -1 (default) = uncapped recall fetch; set > 0
-    # explicitly for the bounded-fetch cap (16 recommended).
-    return VestigeKVMLABackend(
-        base,
-        runner,
-        topj=envs.SGLANG_VESTIGEKV_TOPJ.get(),
-    )
+    # The --vestigekv-* flags are read once here and cross-checked in the
+    # backend against the model's geometry.
+    config = VestigeKVConfig.from_kernel_config(get_exec().kernel)
+    return VestigeKVMLABackend(base, runner, config=config)
 
 
 @register_attention_backend("trtllm_mla")

@@ -48,6 +48,7 @@ from sglang.srt.layers.attention.vestigekv.eviction import (
     blockwise_sigma_from_pool,
     select_kept,
 )
+from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
@@ -62,33 +63,18 @@ if TYPE_CHECKING:
 # tier-2 scan is captured. Capture costs a warmup plus the capture itself, so a
 # short generation would otherwise pay for a graph it replays a handful of
 # times. 8 keeps that below 1% for the 128-token benchmark and shorter.
-# Extra kept-table columns baked into a capture. kept_len grows by one per
-# decode step, so this is how many steps one capture survives before the graph
-# would start dropping the newest rows and must be rebuilt.
-# Preallocated decode-tail slots per (req, layer) index buffer; grown 2x on
-# overflow, so this only sizes the common case.
-_TAIL_CAPACITY = 8192
 
 logger = logging.getLogger(__name__)
-
-
-def _activation_min_tokens() -> int:
-    # Config knob, not a structural constant (so it lives in environ, not
-    # defaults): requests shorter than this are served dense -- nothing
-    # closed/archived/recalled. 0 disables the fallback; all published
-    # experiments run with 0 so the compressed path is measured at every
-    # length.
-    return envs.SGLANG_VESTIGEKV_ACTIVATION_MIN_TOKENS.get()
 
 
 class VestigeKVMLABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.
 
-    topj is the per-head fetch cap: default -1 = UNCAPPED (fetch the full
-    fired recall set). Set topj > 0 explicitly (SGLANG_VESTIGEKV_TOPJ; 16
-    recommended) to enable the bounded-fetch guarantee (fetch <= topj *
-    num_heads rows / step / layer). rho is the tier-1 eviction ratio;
-    index_rank is the tier-2 sketch rank r.
+    `config` carries the deployment knobs (the `--vestigekv-*` flags): the
+    recall fetch capacity per (layer, request, step), whether a step whose
+    fire overflows it attends the request's full row set instead of a
+    truncated fetch, the activation threshold and the side-pool dtype. rho
+    is the tier-1 eviction ratio; index_rank is the tier-2 sketch rank r.
     """
 
     # pack-content epoch: class-level defaults so __new__-constructed test
@@ -104,26 +90,33 @@ class VestigeKVMLABackend(AttentionBackend):
     # slot-indexed buffer that absorbs padded/placeholder lanes.
     _ingraph_pack = None
     _trash_slot: int | None = None
-    _ingraph_steps = 0
     _ingraph_full_armed = False
     _ingraph_dead = False
     # capture-reason counters (diagnostic; printed by VKSTATS when stats on)
     _cap_keymiss = 0
-    _cap_kmax = 0
     _cap_fits = 0
     _cap_lru_hit = 0
-    _scan_cache = None  # OrderedDict[key -> {graph, pack, kmax}], LRU cap 2
+    _scan_cache = None  # OrderedDict[key -> {graph, pack}], LRU cap 2
+    _dense_cache = None  # (forward_batch, dense rows) of the eager step's fence
+    # The flag defaults, for __new__-constructed fakes; a registered test pins
+    # them to the ExecKernel field defaults.
+    config = VestigeKVConfig(
+        recall_capacity=4096,
+        overflow_fallback=True,
+        activation_min_tokens=0,
+    )
 
     def __init__(
         self,
         base: AttentionBackend,
         model_runner: ModelRunner,
         *,
+        config: VestigeKVConfig,
         rho: float = D.RHO,
-        topj: int = -1,
         index_rank: int = D.INDEX_RANK,
     ):
         self.base = base
+        self.config = config
         self.attn_backend_list = [base]  # let generic snapshot/restore reach the child
         # Capability flags are class attributes, not methods, so delegation has
         # to be explicit: inheriting the AttentionBackend defaults instead of
@@ -141,14 +134,11 @@ class VestigeKVMLABackend(AttentionBackend):
         ):
             setattr(self, _flag, getattr(base, _flag))
         self.rho = rho
-        self.topj = topj
         self.index_rank = index_rank
         # Pool handles shared with the base (the latent rows VestigeKV compresses).
         self.token_to_kv_pool = base.token_to_kv_pool
         self.req_to_token_pool = base.req_to_token_pool
         self.kv_index_translator = base.kv_index_translator
-        # Per-request tier-2 index, keyed by req_pool_index; built at prefill end.
-        self._tier2: dict = {}
         # Per-layer capture-stable index buffers for CUDA-graph decode: the graph
         # records these addresses; the out-graph hook refreshes contents per step.
         self._graph_bufs: dict = {}
@@ -166,8 +156,9 @@ class VestigeKVMLABackend(AttentionBackend):
         self._local_mla_lids = sorted(
             base.token_to_kv_pool.full_attention_layer_id_mapping
         )
-        # MLA layer ids actually routed to this backend, learned at capture time
-        # (the hybrid never sends KDA layers here); replay refreshes only these.
+        # MLA layer ids actually routed to this backend (the hybrid never sends
+        # KDA layers here), learned at prefill; every decode step's calibration
+        # and recall loop over these.
         self._mla_lids: set = set()
         # GPU-side per-(pool-slot, layer) kept-index tables: built at prefill
         # (one sync there is free); decode refresh is then pure GPU ops, no
@@ -184,6 +175,7 @@ class VestigeKVMLABackend(AttentionBackend):
         self._build_worker = None
         self._build_stream = None
         self._qbuf_stack = self._fetch_stack = self._fetch_len_stack = None
+        self._fetch_ovf_stack = self._ovf_count_stack = None
         self._li_map: dict = {}
         # ---- recall tier (REQUIRED component; no production off-switch) ----
         # Expanded-query dims from the model config (q_nope@W_kc | q_rope).
@@ -192,18 +184,16 @@ class VestigeKVMLABackend(AttentionBackend):
             model_runner.server_args.tp_size
         )
         self._q_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim  # 512 + 64
+        logger.info("VestigeKV: %s", config.describe())
         # Fixed fetch-buffer width: graph capture needs a fixed WIDTH, not a
-        # cap. topj>0 sets it to the capped bound; the uncapped algorithm gets
-        # a safety width above the observed worst fire (3983); overflow is
-        # truncated and counted in the histogram.
-        self._fetch_w = (
-            self.topj * self._q_heads
-            if self.topj and self.topj > 0
-            else D.FETCH_WIDTH_UNCAPPED
-        )
+        # cap. A fire past it raises the pair's overflow flag; the pack then
+        # fences that step to the full row set (config.overflow_fallback) or
+        # attends the first W fired rows.
+        self._fetch_w = config.recall_capacity
         self._qbuf: dict = {}  # lid -> [max_reqs, H, 576] fp32, in-graph updated
-        self._fetch_buf: dict = {}  # lid -> [max_reqs, W] fm.kv_indices dtype
-        self._fetch_len: dict = {}  # lid -> [max_reqs] int64
+        self._fetch_buf: dict = {}  # lid -> [max_reqs, W] D.INDEX_DTYPE
+        self._fetch_len: dict = {}  # lid -> [max_reqs] D.INDEX_DTYPE
+        self._fetch_ovf: dict = {}  # lid -> [max_reqs] int32 overflow flag
         self._recall: dict = {}  # (slot, lid) -> {"tier", "built_at"}
         self._stats = dict.fromkeys(
             ("steps", "scan_calls", "fetched", "kept", "seq", "replays"), 0
@@ -215,8 +205,7 @@ class VestigeKVMLABackend(AttentionBackend):
         self._scan_fails = 0
         self._scan_batched = None
         self._capture_asap = False
-        self._scan_kmax: dict = {}  # lid -> gather width baked into the capture
-        self._stage_slots = self._stage_loc = None
+        self._stage_slots = self._stage_loc = self._stage_seq = None
         self._step_cache = None  # ((bs, real_bs), reqs, scan key) -- see _step_slots
         self._collecting = False  # any request still gathering calibration queries
         self._needs_recapture = False  # an install awaits its coalesced recapture
@@ -227,12 +216,39 @@ class VestigeKVMLABackend(AttentionBackend):
             self._stats[_k] = 0.0
         for _k in ("t_scan", "t_pack", "t_launch"):
             self._stats[_k] = 0.0
-        self._nstep_hist: dict = {}  # fired-count -> occurrences (telemetry)
 
     # ---- metadata / cuda-graph / properties: delegate to base ----
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.base.init_forward_metadata(forward_batch)
+        if forward_batch.forward_mode.is_decode():
+            self._eager_decode_step(forward_batch)
+
+    def _eager_decode_step(self, forward_batch):
+        # No decode graph replays this step (CUDA graph off, or a batch beyond
+        # the captured sizes): run the replay hook's step on the same buffers,
+        # so the attended row set does not depend on how the step is launched.
+        # A slot with no compressed state (a warmup batch, a slot that never
+        # extended here) packs its dense row set, see _dense_rows.
+        self._ensure_graph_bufs()
+        reqs, _ = self._decode_prologue(forward_batch)
+        for lid in self._local_mla_lids:
+            self._recall_step(lid, forward_batch, reqs)
+            self._refresh_graph_bufs(lid, forward_batch, reqs)
+
+    def _decode_prologue(self, forward_batch):
+        # Host-side bookkeeping every decode step runs ahead of its recall,
+        # however the step is launched.
+        if envs.SGLANG_DEBUG_VESTIGEKV_ROWS.get():
+            self._check_row_invariant(forward_batch)
+        reqs, key = self._step_slots(forward_batch)
+        self._maybe_close_blocks(forward_batch, reqs)
+        # Collecting a calibration query is five 74 KB clones; it does not
+        # need the eager scan path, and tying it to that path cost 16 eager
+        # steps per request at 11.3 ms each against 1.5 ms for a replay.
+        if self._collecting:
+            self._collect_calibration(forward_batch, reqs)
+        return reqs, key
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
@@ -259,15 +275,7 @@ class VestigeKVMLABackend(AttentionBackend):
             and self._graph_bufs
             and forward_batch.forward_mode.is_decode()
         ):
-            if envs.SGLANG_DEBUG_VESTIGEKV_ROWS.get():
-                self._check_row_invariant(forward_batch)
-            reqs, key = self._step_slots(forward_batch)
-            self._maybe_close_blocks(forward_batch, reqs)
-            # Collecting a calibration query is five 74 KB clones; it does not
-            # need the eager scan path, and tying it to that path cost 16 eager
-            # steps per request at 11.3 ms each against 1.5 ms for a replay.
-            if self._collecting:
-                self._collect_calibration(forward_batch, reqs)
+            reqs, key = self._decode_prologue(forward_batch)
             if self._ingraph_pack is not None:
                 # In-graph mode: the model graph itself replays the scan and
                 # the CSR pack; the host only refreshes what the graph reads.
@@ -369,15 +377,6 @@ class VestigeKVMLABackend(AttentionBackend):
         # were key misses).
         return ("bs", forward_batch.seq_lens.shape[0], real) + tuple(sorted(pairs))
 
-    def _kmax_exhausted(self) -> bool:
-        # The capture bakes one gather width per layer. kept_len grows by one
-        # every decode step, so a graph replayed past its baked headroom would
-        # silently drop the newest rows -- the exact silent-wrong-row-set class
-        # the row invariant exists to catch. Recapture one step early instead.
-        return any(
-            self._kmax.get(lid, 0) + 1 > baked for lid, baked in self._scan_kmax.items()
-        )
-
     def _replay_scan(self, forward_batch, reqs, key) -> bool:
         """Run this step's tier-2 scan from a captured graph. Returns False if
         the caller must fall back to the eager per-layer path.
@@ -393,12 +392,6 @@ class VestigeKVMLABackend(AttentionBackend):
         if key is None or self._full_arm() or self._scan_capture_failed:
             return False
         if key == self._scan_key_cur:
-            if self._kmax_exhausted():
-                # Same shape, just out of baked headroom: recapture at once
-                # rather than serving D.SCAN_CAPTURE_AFTER eager steps for a
-                # stability the key has already demonstrated.
-                self._cap_kmax += 1
-                return self._capture_scan(key, forward_batch, reqs)
             real = forward_batch.out_cache_loc.shape[0]
             if self._pack_epoch != self._pack_epoch_synced:
                 # Slow path only when a host-side tier mutation happened
@@ -422,10 +415,7 @@ class VestigeKVMLABackend(AttentionBackend):
                         return self._capture_scan(key, forward_batch, reqs)
                     self._scan_batched.update(pairs, tiers)
                 self._pack_epoch_synced = self._pack_epoch
-            self._stage_slots[:real].copy_(
-                forward_batch.req_pool_indices[:real], non_blocking=True
-            )
-            self._stage_loc[:real].copy_(forward_batch.out_cache_loc, non_blocking=True)
+            self._stage_step(forward_batch, forward_batch.seq_lens.shape[0])
             for lid in self._mla_lids:
                 if lid in self._kept_buf:
                     self._kmax[lid] = self._kmax.get(lid, 0) + 1
@@ -440,12 +430,8 @@ class VestigeKVMLABackend(AttentionBackend):
         if ent is not None:
             self._scan_cache.move_to_end(key)
             self._stash_active()
-            (
-                self._scan_graph,
-                self._scan_batched,
-                self._scan_kmax,
-                self._scan_key_cur,
-            ) = ent["graph"], ent["pack"], dict(ent["kmax"]), key
+            self._scan_graph, self._scan_batched = ent["graph"], ent["pack"]
+            self._scan_key_cur = key
             # Epoch sync is global but pack contents are per-entry: force one
             # resync pass so a reactivated pack refreshes via fits()/update()
             # before its first replay (stale tiers otherwise).
@@ -494,27 +480,10 @@ class VestigeKVMLABackend(AttentionBackend):
         bs = forward_batch.seq_lens.shape[0]
         # slots and out_cache_loc arrive in a fresh ForwardBatch every step, so
         # the capture cannot read them where they land; stage them into fixed
-        # buffers the graph can bake (two copies per step).
-        if self._stage_slots is None or self._stage_slots.shape[0] < bs:
-            dev = forward_batch.req_pool_indices.device
-            self._stage_slots = torch.zeros(max(bs, 1), dtype=torch.int64, device=dev)
-            self._stage_loc = torch.zeros(
-                max(bs, 1), dtype=forward_batch.out_cache_loc.dtype, device=dev
-            )
-        self._stage_slots[:real].copy_(forward_batch.req_pool_indices[:real])
-        self._stage_loc[:real].copy_(forward_batch.out_cache_loc)
+        # buffers the graph can bake.
+        self._ensure_stage(bs, forward_batch.req_pool_indices.device)
+        self._stage_step(forward_batch, bs)
         slots = self._stage_slots[:real]
-        loc = self._stage_loc[:real]
-        # Bake one gather width per layer, with headroom so the graph survives
-        # D.SCAN_KMAX_HEADROOM more decode steps before it must be recaptured.
-        baked = {
-            lid: min(
-                self._kmax.get(lid, 0) + D.SCAN_KMAX_HEADROOM,
-                self._kept_buf[lid].shape[1],
-            )
-            for lid in self._mla_lids
-            if lid in self._kept_buf
-        }
 
         # Stack every (layer, slot) pair once, outside capture. The batched
         # step then runs ~34 kernels where the per-pair loop ran 180 -- the
@@ -558,23 +527,22 @@ class VestigeKVMLABackend(AttentionBackend):
             self._qbuf_stack,
             self._fetch_stack,
             self._fetch_len_stack,
+            self._fetch_ovf_stack,
+            self._ovf_count_stack,
             self._q_heads,
         )
         torch.cuda.synchronize()
         self._stats["_ph_pack"] = _t.perf_counter() - _p0
 
-        # Each _pack_csr call appends one row to that layer's kept table.
-        # Count them per layer so both the failure path below and the success
-        # path can rewind exactly the appends this capture performed, even
-        # when a warmup died mid-loop (partial layer coverage).
-        appended: dict = {}
+        # Each pack appends one row to every layer's kept table. Count the
+        # runs so both the failure path below and the success path can rewind
+        # exactly the appends this capture performed.
+        appended = [0]
 
         def _run():
             batched.run()
-            for lid in self._mla_lids:
-                if lid in self._kept_buf:
-                    self._pack_csr(lid, slots, loc, real, bs, baked[lid])
-                    appended[lid] = appended.get(lid, 0) + 1
+            self._pack_all_layers(bs)
+            appended[0] += 1
 
         self._scan_key_cur = None
         try:
@@ -623,11 +591,9 @@ class VestigeKVMLABackend(AttentionBackend):
                 e,
             )
             # Rewind whatever appends the failed warmups/capture already made
-            # (batched.run() may have died before any _pack_csr, or mid-loop),
-            # so the eager fallback starts from an untouched kept table.
-            for lid, n in appended.items():
-                kl = self._kept_len[lid]
-                kl.scatter_(0, slots, (kl.gather(0, slots) - n).clamp_min_(0))
+            # (batched.run() may have died before any pack), so the eager
+            # fallback starts from an untouched kept table.
+            self._rewind_appends(slots, appended[0])
             self._scan_graph = None
             # A single refusal can be transient (a busy stream, a momentary
             # OOM), and latching on the first one costs every later step of the
@@ -635,17 +601,13 @@ class VestigeKVMLABackend(AttentionBackend):
             self._scan_fails += 1
             self._scan_capture_failed = self._scan_fails >= D.SCAN_CAPTURE_MAX_FAILS
             return False
-        self._scan_graph, self._scan_key_cur, self._scan_kmax = graph, key, baked
+        self._scan_graph, self._scan_key_cur = graph, key
         self._pack_epoch_synced = self._pack_epoch
         if self._scan_cache is None:
             import collections
 
             self._scan_cache = collections.OrderedDict()
-        self._scan_cache[key] = {
-            "graph": graph,
-            "pack": batched,
-            "kmax": dict(baked),
-        }
+        self._scan_cache[key] = {"graph": graph, "pack": batched}
         self._scan_cache.move_to_end(key)
         while len(self._scan_cache) > 2:
             _, old = self._scan_cache.popitem(last=False)
@@ -661,12 +623,22 @@ class VestigeKVMLABackend(AttentionBackend):
         # Rewind the extra appends (the count is tracked, not assumed, so a
         # partial failure mid-capture cannot skew the table); the replay below
         # then performs this step's single real append.
-        for lid, n in appended.items():
-            kl = self._kept_len[lid]
-            kl.scatter_(0, slots, (kl.gather(0, slots) - n).clamp_min_(0))
-            self._kmax[lid] = self._kmax.get(lid, 0) + 1
+        self._rewind_appends(slots, appended[0])
+        for lid in self._local_mla_lids:
+            if lid in self._kept_buf:
+                self._kmax[lid] = self._kmax.get(lid, 0) + 1
         graph.replay()
         return True
+
+    def _rewind_appends(self, slots, n):
+        # The pack's prep kernel appends to every layer of the kept stack; the
+        # padded (trash) lanes are not rewound, their table is emptied per step.
+        if n == 0:
+            return
+        for lid in self._local_mla_lids:
+            kl = self._kept_len.get(lid)
+            if kl is not None:
+                kl.scatter_(0, slots, (kl.gather(0, slots) - n).clamp_min_(0))
 
     def _stash_active(self):
         """Park the active graph/pack in the LRU under its key (no-op when
@@ -681,7 +653,6 @@ class VestigeKVMLABackend(AttentionBackend):
         self._scan_cache[self._scan_key_cur] = {
             "graph": self._scan_graph,
             "pack": self._scan_batched,
-            "kmax": dict(self._scan_kmax),
         }
         self._scan_cache.move_to_end(self._scan_key_cur)
 
@@ -766,7 +737,7 @@ class VestigeKVMLABackend(AttentionBackend):
         c = max(st["scan_calls"], 1)
         logging.getLogger(__name__).info(
             "VKSTATS steps=%d layers=%d replay=%.0f%% build=%.1fms x%d cap=%.1fms x%d "
-            "caps[key=%d kmax=%d fits=%d] "
+            "caps[key=%d fits=%d] overflow=%d "
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
             "pack=%.2fms/step "
             "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
@@ -779,8 +750,8 @@ class VestigeKVMLABackend(AttentionBackend):
             1e3 * st["t_capture"],
             st["n_capture"],
             self._cap_keymiss,
-            self._cap_kmax,
             self._cap_fits,
+            self._overflow_total(),
             1e3 * st["t_replay"] / max(st["replays"], 1),
             1e3 * st["t_replay_host"] / max(st["replays"], 1),
             1e3 * st["t_eager"] / max(n - st["replays"], 1),
@@ -794,6 +765,13 @@ class VestigeKVMLABackend(AttentionBackend):
             (st["fetched"] + st["kept"]) / max(st["seq"], 1),
         )
 
+    def _overflow_total(self) -> int:
+        # Recall fires that exceeded the fetch capacity, summed over layers
+        # since startup. Device counter, read back only here (stats dump).
+        if self._ovf_count_stack is None:
+            return 0
+        return int(self._ovf_count_stack.sum())
+
     def _check_row_invariant(self, forward_batch):
         # SGLANG_DEBUG_VESTIGEKV_ROWS=1: per-step loud assertion that the attended row
         # set is the intended one. Catches the silent wrong-row-set class (stale
@@ -801,14 +779,25 @@ class VestigeKVMLABackend(AttentionBackend):
         # and short-generate smoke tests cannot see. Syncs; debug/CI only.
         full_arm = self._full_arm()
         real = forward_batch.out_cache_loc.shape[0]
-        slots = forward_batch.req_pool_indices[:real].to(torch.int64)
-        seq = forward_batch.seq_lens[:real]
+        all_slots = forward_batch.req_pool_indices[:real].to(torch.int64)
+        all_seq = forward_batch.seq_lens[:real]
         for lid in self._local_mla_lids:
             if lid not in self._kept_len:
                 raise AssertionError(
                     f"VESTIGE CHECK: layer {lid} kept table never built "
                     f"(prefill did not reach this backend on this rank)"
                 )
+            # Lanes without compressed state (a warmup batch, a slot never
+            # extended here) are packed dense by design; the invariant is
+            # about the lanes that compress.
+            seen = torch.tensor(
+                [self._close_state.get((s, lid)) is not None for s in all_slots.tolist()],
+                dtype=torch.bool,
+                device=all_slots.device,
+            )
+            if not bool(seen.any()):
+                continue
+            slots, seq = all_slots[seen], all_seq[seen]
             n = self._kept_len[lid].gather(0, slots)
             if int((n <= 0).sum()):
                 raise AssertionError(
@@ -829,7 +818,7 @@ class VestigeKVMLABackend(AttentionBackend):
                     n = n + self._fetch_len[lid].gather(0, slots)
                 mask = seq > max(
                     D.CHECK_MIN_SEQ_BLOCKS * D.CLOSE_BLOCK,
-                    _activation_min_tokens() + D.CLOSE_BLOCK,
+                    self.config.activation_min_tokens + D.CLOSE_BLOCK,
                 )
                 bad = ((n > (seq * D.CHECK_MAX_KEPT_FRACTION).to(n.dtype)) & mask).sum()
                 if int(bad):
@@ -908,15 +897,17 @@ class VestigeKVMLABackend(AttentionBackend):
         # Every request passes through extend before decode, so decode can
         # assume the slot state exists (slot reuse re-extends).
         lid = layer.layer_id
+        # Registered here, not at graph capture: an eager decode step (CUDA
+        # graph off) collects calibration and recalls only for these layers.
+        self._mla_lids.add(lid)
         fm = self.base.forward_metadata
         r2t = self.req_to_token_pool.req_to_token
         if lid not in self._kept_buf:
             max_reqs = r2t.shape[0]
             cap = self.base.max_context_len
-            dt = fm.kv_indices.dtype if fm is not None else torch.int64
             dev = r2t.device
-            self._ensure_kept_stacks(max_reqs, cap, dt, dev)
-            self._alloc_recall_bufs(lid, max_reqs, dt, dev)
+            self._ensure_kept_stacks(max_reqs, cap, dev)
+            self._alloc_recall_bufs(lid, max_reqs, dev)
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)
         kbuf = kbuf.reshape(-1, kbuf.shape[-1])
         slots = forward_batch.req_pool_indices.tolist()
@@ -939,7 +930,7 @@ class VestigeKVMLABackend(AttentionBackend):
             # decode-time close past it closes the whole prefix in one pass.
             closed0 = (
                 (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
-                if seq_len >= _activation_min_tokens()
+                if seq_len >= self.config.activation_min_tokens
                 else 0
             )
             self._close_state[(slot, lid)] = {
@@ -954,11 +945,6 @@ class VestigeKVMLABackend(AttentionBackend):
             # by one per step keeps it >= the true max; a new request can only
             # raise it here, where n is already known on the host.
             self._kmax[lid] = max(self._kmax.get(lid, 0), n)
-            # Slot reuse: drop the bs>1 tier-2 index state built for the slot's
-            # previous occupant; the first decode step rebuilds it for this
-            # request. Stale state made bs>1 decode attend the prior request's
-            # row set (profiler: VESTIGE attn == FULL attn at bs=16).
-            self._tier2.pop((slot, lid), None)
             # Build the recall index HERE, at prefill, alongside the kept table:
             # RecallTier.build costs ~85 ms at S=65k (fp32 prefix gather, SVD,
             # chunked full-cache calibration). Deferring it to decode billed
@@ -982,6 +968,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._invalidate_scan()
             if lid in self._fetch_len:
                 self._fetch_len[lid][slot] = 0
+                self._fetch_ovf[lid][slot] = 0
             # Deliberately NOT built here: under chunked prefill seq_lens is the
             # running total, not the request length, so "is this the last chunk?"
             # is not decidable from the ForwardBatch (measured: the obvious
@@ -990,24 +977,26 @@ class VestigeKVMLABackend(AttentionBackend):
             # prefill-phase work by semantics, so serving reports must bill it to
             # TTFT, not to steady-state decode throughput.
 
-    def _ensure_kept_stacks(self, max_reqs, cap, dt, dev):
+    def _ensure_kept_stacks(self, max_reqs, cap, dev):
         # Stacked kept tables ([L, R1, CAP] etc.) with the per-lid dict
         # entries as views (the _qbuf_stack pattern): eager call sites keep
-        # their dict interface, while the in-graph CSR pack addresses every
-        # layer from two kernels (see vestigekv/pack_csr.py).
+        # their dict interface, while the graph-replayed CSR pack addresses
+        # every layer from two kernels (see vestigekv/pack_csr.py).
         if getattr(self, "_kept_stack", None) is not None:
             return
         n = len(self._local_mla_lids)
         li_map = {L: i for i, L in enumerate(self._local_mla_lids)}
-        self._kept_stack = torch.zeros(n, max_reqs + 1, cap, dtype=dt, device=dev)
+        self._kept_stack = torch.zeros(
+            n, max_reqs + 1, cap, dtype=D.INDEX_DTYPE, device=dev
+        )
         self._kept_len_stack = torch.zeros(
-            n, max_reqs + 1, dtype=torch.int64, device=dev
+            n, max_reqs + 1, dtype=D.INDEX_DTYPE, device=dev
         )
         for lid, i in li_map.items():
             self._kept_buf[lid] = self._kept_stack[i]
             self._kept_len[lid] = self._kept_len_stack[i]
 
-    def _alloc_recall_bufs(self, lid, max_reqs, idx_dtype, dev):
+    def _alloc_recall_bufs(self, lid, max_reqs, dev):
         if lid in self._qbuf:
             return
         # One stacked allocation per buffer kind, with the per-layer dict
@@ -1036,15 +1025,20 @@ class VestigeKVMLABackend(AttentionBackend):
                 device=dev,
             )
             self._fetch_stack = torch.zeros(
-                n, max_reqs, self._fetch_w, dtype=idx_dtype, device=dev
+                n, max_reqs, self._fetch_w, dtype=D.INDEX_DTYPE, device=dev
             )
             self._fetch_len_stack = torch.zeros(
-                n, max_reqs, dtype=torch.int64, device=dev
+                n, max_reqs, dtype=D.INDEX_DTYPE, device=dev
             )
+            self._fetch_ovf_stack = torch.zeros(
+                n, max_reqs, dtype=torch.int32, device=dev
+            )
+            self._ovf_count_stack = torch.zeros(n, dtype=torch.int32, device=dev)
         li = self._li_map[lid]
         self._qbuf[lid] = self._qbuf_stack[li]
         self._fetch_buf[lid] = self._fetch_stack[li]
         self._fetch_len[lid] = self._fetch_len_stack[li]
+        self._fetch_ovf[lid] = self._fetch_ovf_stack[li]
 
     def _full_arm(self) -> bool:
         # Benchmark-only A/B switch (SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG names a
@@ -1062,7 +1056,7 @@ class VestigeKVMLABackend(AttentionBackend):
             # FULL arm, or the in-graph pack was disabled (capacity defect):
             # dense is the only safe row set when nothing will recall.
             return row_slots
-        if seq_len < _activation_min_tokens():
+        if seq_len < self.config.activation_min_tokens:
             # Below the activation threshold the recall pipeline's fixed
             # per-step cost outweighs anything tier 1 could save: keep every
             # row (dense-equivalent attention), build no index, close nothing.
@@ -1137,20 +1131,20 @@ class VestigeKVMLABackend(AttentionBackend):
             bs = forward_batch.seq_lens.shape[0]
             bufs = self._graph_bufs[lid]
             indptr, indices = bufs["indptr"][: bs + 1], bufs["indices"]
-        elif (
-            lid in self._graph_bufs
-            and forward_batch.seq_lens.shape[0] + 1
-            <= self._graph_bufs[lid]["indptr"].shape[0]
-        ):
-            bs = forward_batch.seq_lens.shape[0]
-            bufs = self._graph_bufs[lid]
-            indptr, indices = bufs["indptr"][: bs + 1], bufs["indices"]
         else:
-            # Also the fallback for eager decode batches larger than the
-            # captured sizes: the graph indptr is only graph_max_bs + 1 rows,
-            # so slicing it for a bigger batch would silently truncate and
-            # trip the base kernel's q/kv_indptr shape assertion.
-            indptr, indices = self._compressed_indices(layer, forward_batch)
+            # Eager step: the metadata hook packed this step's CSR into the
+            # same buffers the graphs read. Sized for the whole request
+            # table, so a batch they cannot hold is a broken step, not a case
+            # to serve some other way (a short indptr slice would silently
+            # truncate and trip the base kernel's q/kv_indptr assertion).
+            bs = forward_batch.seq_lens.shape[0]
+            bufs = self._graph_bufs.get(lid)
+            if bufs is None or bs + 1 > bufs["indptr"].shape[0]:
+                raise RuntimeError(
+                    f"vestigekv: layer {lid} has no packed CSR for a decode batch "
+                    f"of {bs}; the step's metadata hook did not run"
+                )
+            indptr, indices = bufs["indptr"][: bs + 1], bufs["indices"]
         saved = (fm.kv_indptr, fm.kv_indices)
         fm.kv_indptr, fm.kv_indices = indptr, indices
         try:
@@ -1162,39 +1156,47 @@ class VestigeKVMLABackend(AttentionBackend):
 
     # ---- VestigeKV core: tier-1 sidecar-residual eviction over the latent pool ----
 
+    def _ensure_graph_bufs(self):
+        # Per-layer CSR buffers every decode step packs into: the captured
+        # graphs bake these addresses and eager steps write the same ones.
+        # Stacked across layers (views per lid) so the Triton pack addresses
+        # them from one launch. Sized for the whole request table: lanes are
+        # bounded by max_reqs, rows by the KV pool (a lane attends at most its
+        # own tokens, fenced or not) plus one row per padded lane. +1: the
+        # eager torch pack scatters masked-out entries into a trash slot at
+        # the end (see _refresh_graph_bufs); the Triton pack masks.
+        if self._graph_bufs:
+            return
+        fm = self.base.forward_metadata
+        r2t = self.req_to_token_pool.req_to_token
+        max_reqs, max_ctx = r2t.shape[0], self.base.max_context_len
+        self._ensure_kept_stacks(max_reqs, max_ctx, r2t.device)
+        nl = len(self._local_mla_lids)
+        rows = max_reqs * max_ctx
+        pool_tokens = getattr(self.token_to_kv_pool, "size", None)
+        if isinstance(pool_tokens, int) and pool_tokens > 0:
+            rows = min(rows, pool_tokens + max_reqs)
+        self._gb_indptr_stack = fm.kv_indptr.new_zeros(nl, max_reqs + 1)
+        self._gb_indices_stack = torch.zeros(
+            nl, rows + 1, dtype=D.INDEX_DTYPE, device=r2t.device
+        )
+        for lid in self._local_mla_lids:
+            self._alloc_recall_bufs(lid, max_reqs, r2t.device)
+            li = self._li_map[lid]
+            self._graph_bufs[lid] = {
+                "indptr": self._gb_indptr_stack[li],
+                "indices": self._gb_indices_stack[li],
+            }
+
     def _prefill_graph_bufs_for_capture(self, forward_batch):
-        # All layers get a buffer (only the MLA layers' entries are used); the
-        # dummy batch's base metadata is copied in so capture records sane
-        # contents at these fixed addresses.
+        # The dummy batch's base metadata is copied in so capture records sane
+        # contents at the fixed addresses.
         fm = self.base.forward_metadata
         bs = forward_batch.seq_lens.shape[0]
         n = int(fm.kv_indptr[bs])
-        r2t = self.req_to_token_pool.req_to_token
+        self._ensure_graph_bufs()
         for lid in self._local_mla_lids:
-            if lid not in self._kept_buf:
-                cap_row = self.base.max_context_len
-                self._ensure_kept_stacks(
-                    r2t.shape[0], cap_row, fm.kv_indices.dtype, r2t.device
-                )
-            self._alloc_recall_bufs(lid, r2t.shape[0], fm.kv_indices.dtype, r2t.device)
-            bufs = self._graph_bufs.get(lid)
-            if bufs is None:
-                # Stacked across layers (views per lid): the in-graph CSR pack
-                # addresses all layers from one kernel launch. +1: the legacy
-                # torch pack scatters masked-out entries into a trash slot at
-                # the end (see _refresh_graph_bufs); the Triton pack masks.
-                if getattr(self, "_gb_indices_stack", None) is None:
-                    nl = len(self._local_mla_lids)
-                    mb1 = max(self._graph_max_bs, 1) + 1
-                    cap = max(self._graph_max_bs, 1) * self.base.max_context_len + 1
-                    self._gb_indptr_stack = fm.kv_indptr.new_zeros(nl, mb1)
-                    self._gb_indices_stack = fm.kv_indices.new_zeros(nl, cap)
-                li_ = self._li_map[lid]
-                bufs = {
-                    "indptr": self._gb_indptr_stack[li_],
-                    "indices": self._gb_indices_stack[li_],
-                }
-                self._graph_bufs[lid] = bufs
+            bufs = self._graph_bufs[lid]
             bufs["indptr"][: bs + 1].copy_(fm.kv_indptr[: bs + 1])
             bufs["indptr"][bs + 1 :].fill_(fm.kv_indptr[bs])
             if n > 0:
@@ -1227,11 +1229,7 @@ class VestigeKVMLABackend(AttentionBackend):
 
         dev = self._qbuf_stack.device
         maxbs = max(self._graph_max_bs, 1)
-        if self._stage_slots is None or self._stage_slots.shape[0] < maxbs:
-            self._stage_slots = torch.full(
-                (maxbs,), self._trash_slot, dtype=torch.int64, device=dev
-            )
-            self._stage_loc = torch.zeros(maxbs, dtype=torch.int64, device=dev)
+        self._ensure_stage(maxbs, dev)
         max_ctx = self.base.max_context_len
         # Kept rows are bounded by tier-1's keep rate plus the un-closed tail
         # (blocks close every CLOSE_BLOCK); the slack absorbs close latency.
@@ -1287,6 +1285,8 @@ class VestigeKVMLABackend(AttentionBackend):
             self._qbuf_stack,
             self._fetch_stack,
             self._fetch_len_stack,
+            self._fetch_ovf_stack,
+            self._ovf_count_stack,
             self._trash_slot,
             arena=arena,
             pool_bases=pool_bases,
@@ -1309,9 +1309,15 @@ class VestigeKVMLABackend(AttentionBackend):
         # Runs inside run_once during capture, so the whole recall step --
         # scan + fetch + the all-layer CSR pack -- replays as nodes of the
         # ONE decode graph launch. No host code runs here at replay time.
+        self._ingraph_pack.run(p_live=len(self._local_mla_lids) * bs)
+        self._pack_all_layers(bs)
+
+    def _pack_all_layers(self, bs):
+        # The one CSR pack both captured paths replay (in-graph and the scan
+        # graph): reads the staged lanes, writes every layer's graph buffers.
         from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
 
-        self._ingraph_pack.run(p_live=len(self._local_mla_lids) * bs)
+        fence = self.config.overflow_fallback
         pack_csr_all_layers(
             self._stage_slots[:bs],
             self._stage_loc[:bs],
@@ -1321,20 +1327,48 @@ class VestigeKVMLABackend(AttentionBackend):
             self._fetch_stack,
             self._gb_indices_stack,
             self._gb_indptr_stack,
+            seq=self._stage_seq[:bs] if fence else None,
+            fetch_ovf=self._fetch_ovf_stack if fence else None,
+            req_to_token=self.req_to_token_pool.req_to_token if fence else None,
         )
 
-    def _ingraph_host_step(self, forward_batch, reqs):
-        bs = forward_batch.seq_lens.shape[0]
+    def _ensure_stage(self, n, dev):
+        # Fixed-address per-lane inputs of the packed step (pool slot, this
+        # step's row, seq_len): the captured kernels bake these addresses.
+        n = max(n, self._graph_max_bs, 1)
+        if self._stage_slots is not None and self._stage_slots.shape[0] >= n:
+            return
+        self._stage_slots = torch.full(
+            (n,), self._trash_slot, dtype=torch.int64, device=dev
+        )
+        self._stage_loc = torch.zeros(n, dtype=torch.int64, device=dev)
+        self._stage_seq = torch.zeros(n, dtype=torch.int64, device=dev)
+
+    def _stage_step(self, forward_batch, bs):
+        # Copy this step's lanes into the staged buffers; padded lanes point
+        # at the trash slot so the always-running kernels write where nothing
+        # reads. seq_len is only consumed by the fence.
         real = forward_batch.out_cache_loc.shape[0]
+        fence = self.config.overflow_fallback
         self._stage_slots[:real].copy_(
-            forward_batch.req_pool_indices[:real].to(torch.int64), non_blocking=True
+            forward_batch.req_pool_indices[:real], non_blocking=True
         )
-        self._stage_loc[:real].copy_(
-            forward_batch.out_cache_loc.to(torch.int64), non_blocking=True
-        )
+        self._stage_loc[:real].copy_(forward_batch.out_cache_loc, non_blocking=True)
+        if fence:
+            self._stage_seq[:real].copy_(forward_batch.seq_lens[:real], non_blocking=True)
         if real < bs:
             self._stage_slots[real:bs].fill_(self._trash_slot)
             self._stage_loc[real:bs].zero_()
+            if fence:
+                self._stage_seq[real:bs].zero_()
+            # The pack appends the padded lanes' rows to the trash slot's kept
+            # table; emptied before every pack so a padded lane packs exactly
+            # one row, which is what the CSR buffers are sized for.
+            self._kept_len_stack[:, self._trash_slot] = 0
+
+    def _ingraph_host_step(self, forward_batch, reqs):
+        real = forward_batch.out_cache_loc.shape[0]
+        self._stage_step(forward_batch, forward_batch.seq_lens.shape[0])
         if self._full_arm():
             if not self._ingraph_full_armed:
                 # FULL arm: kept_buf already holds every row (_arm_aware_kept),
@@ -1342,6 +1376,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 # spliced next to its dense copy would be attended twice.
                 self._ingraph_pack.update([], [])
                 self._fetch_len_stack.zero_()
+                self._fetch_ovf_stack.zero_()
                 self._ingraph_full_armed = True
         elif (
             self._pack_epoch != self._pack_epoch_synced or self._ingraph_full_armed
@@ -1383,12 +1418,6 @@ class VestigeKVMLABackend(AttentionBackend):
                 # over one per-request cache the pack reads through. There is
                 # nothing left here to release.
             self._pack_epoch_synced = self._pack_epoch
-        # The captured pack appends one row per padded lane per layer to the
-        # trash slot's kept table; reset it before it can reach capacity
-        # (growth <= layers per step, capacity is max_context_len).
-        self._ingraph_steps += 1
-        if self._ingraph_steps % 1024 == 0:
-            self._kept_len_stack[:, self._trash_slot] = 0
 
     def _ingraph_disable(self, forward_batch, reqs):
         # A tier outgrew the capacity pack -- impossible under the sizing
@@ -1404,6 +1433,7 @@ class VestigeKVMLABackend(AttentionBackend):
         self._ingraph_dead = True
         self._ingraph_pack.update([], [])
         self._fetch_len_stack.zero_()
+        self._fetch_ovf_stack.zero_()
         r2t = self.req_to_token_pool.req_to_token
         lens = self._seq_lens_host(forward_batch)
         real = forward_batch.out_cache_loc.shape[0]
@@ -1439,8 +1469,13 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._qbuf[lid][slot],
                 self._fetch_buf[lid],
                 self._fetch_len[lid],
+                self._fetch_ovf[lid],
                 slot,
             )
+        slots = forward_batch.req_pool_indices[:real].to(torch.int64)
+        self._ovf_count_stack[self._li_map[lid]] += (
+            self._fetch_ovf[lid].gather(0, slots).sum(dtype=torch.int32)
+        )
 
     def _seq_lens_host(self, forward_batch):
         """Host-side seq_lens without a device readback. The scheduler ships
@@ -1483,7 +1518,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 # commutes with closure order, so the resulting kept set is
                 # identical to having compressed from the start.
                 while (
-                    seq_len >= _activation_min_tokens()
+                    seq_len >= self.config.activation_min_tokens
                     and seq_len - cl["closed"] >= D.CLOSE_BLOCK
                 ):
                     self._close_one_block(slot, lid, cl, seq_len)
@@ -1562,7 +1597,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 if st is None or st.get("qcal") is None:
                     continue
                 prefix_len = int(self._seq_lens_host(forward_batch)[i]) - 1
-                if prefix_len + 1 < _activation_min_tokens():
+                if prefix_len + 1 < self.config.activation_min_tokens:
                     # Below the activation threshold there is no archive and
                     # no index to calibrate (the request runs dense). Keep it
                     # marked pending so the provisional build fires on the
@@ -1676,7 +1711,7 @@ class VestigeKVMLABackend(AttentionBackend):
                     q_pos = torch.tensor(
                         job["qpos"], device=kbuf.device, dtype=torch.long
                     )
-                    tier = RecallTier(r=self.index_rank, topj=self.topj)
+                    tier = RecallTier(r=self.index_rank)
                     stats = tier.build(
                         kbuf,
                         job["row_slots"],
@@ -1846,7 +1881,7 @@ class VestigeKVMLABackend(AttentionBackend):
         else:
             q_cal = torch.stack(st["qcal"]).float()  # [n_cal, H, 576]
             q_pos = torch.tensor(st["qpos"], device=row_slots.device, dtype=torch.long)
-        tier = RecallTier(r=self.index_rank, topj=self.topj)
+        tier = RecallTier(r=self.index_rank)
         stats = tier.build(
             kbuf,
             row_slots,
@@ -1892,7 +1927,40 @@ class VestigeKVMLABackend(AttentionBackend):
         loc = forward_batch.out_cache_loc
         real_bs = loc.shape[0]
         slots = forward_batch.req_pool_indices[:real_bs].to(torch.int64)
-        self._pack_csr(lid, slots, loc, real_bs, bs, self._kmax_step(lid))
+        self._pack_csr(
+            lid,
+            slots,
+            loc,
+            real_bs,
+            bs,
+            self._kmax_step(lid),
+            dense=self._dense_rows(lid, forward_batch, slots, loc, reqs),
+        )
+
+    def _dense_rows(self, lid, forward_batch, slots, loc, reqs):
+        # Eager-step lanes packed as their full row set (req_to_token[slot,
+        # :seq], this step's slot at seq - 1): a slot with no compressed state
+        # for this layer always (a warmup/dummy batch, or a slot that never
+        # extended through this backend -- the base backend attends the same
+        # rows), and an overflowed lane when the fallback is on. None when no
+        # lane can need it. The row gather is bounded by the batch's longest
+        # request and shared by every layer of the step.
+        real = slots.shape[0]
+        unseen = [self._close_state.get((reqs[i], lid)) is None for i in range(real)]
+        fence = self.config.overflow_fallback and lid in self._fetch_ovf
+        if not fence and not any(unseen):
+            return None
+        fenced = torch.tensor(unseen, dtype=torch.bool, device=slots.device)
+        if fence:
+            fenced |= self._fetch_ovf[lid].gather(0, slots) != 0
+        seq = forward_batch.seq_lens[:real].to(torch.int64)
+        cache = self._dense_cache
+        if cache is None or cache[0] is not forward_batch:
+            seqmax = int(self._seq_lens_host(forward_batch)[:real].max())
+            rows = self.req_to_token_pool.req_to_token[slots, :seqmax].to(torch.int64)
+            rows.scatter_(1, (seq - 1)[:, None], loc[:, None].to(torch.int64))
+            cache = self._dense_cache = (forward_batch, rows)
+        return cache[1], seq, fenced
 
     def _kmax_step(self, lid):
         # Bound used by this step's pack, advanced by one because the step
@@ -1902,11 +1970,14 @@ class VestigeKVMLABackend(AttentionBackend):
         self._kmax[lid] = kmax
         return kmax
 
-    def _pack_csr(self, lid, slots, loc, real_bs, bs, kmax):
-        # bs > 1 graph replay: append this step's slot to each request's kept
-        # table, then repack the CSR into the fixed-address buffers the captured
-        # graph reads. Vectorized (~12 tensor ops per layer); the previous
-        # per-request python loop cost ~4 ms/step at bs=16.
+    def _pack_csr(self, lid, slots, loc, real_bs, bs, kmax, dense=None):
+        # Eager step: append this step's slot to each request's kept table,
+        # then repack the CSR into the fixed-address buffers the decode graph
+        # reads. Vectorized (~12 tensor ops per layer); the previous
+        # per-request python loop cost ~4 ms/step at bs=16. `dense` (rows
+        # [real_bs, seqmax], seq [real_bs], fenced [real_bs]) is the overflow
+        # fence: a fenced lane packs its full row set in place of kept +
+        # fetched; the append stands either way.
         # seq_lens is padded to the captured graph bs; out_cache_loc carries only
         # the real (unpadded) requests -- see build_replay_fb_view. Padded CSR
         # slots get one reserved pad row (slot 0); their output is discarded.
@@ -1943,7 +2014,12 @@ class VestigeKVMLABackend(AttentionBackend):
             f_lens = torch.zeros_like(lens)
             fw = 0
             fetch_flat = None
-        lens_tot = lens + f_lens
+        lens_tot = (lens + f_lens).to(torch.int64)
+        packed = True  # lanes packing kept + fetched (all of them, unfenced)
+        if dense is not None:
+            d_rows, d_len, fenced = dense
+            lens_tot = torch.where(fenced, d_len, lens_tot)
+            packed = ~fenced[:, None]
         starts = torch.zeros_like(lens_tot)
         starts[1:] = lens_tot.cumsum(0)[:-1]
         total = lens_tot.sum()
@@ -1956,7 +2032,9 @@ class VestigeKVMLABackend(AttentionBackend):
             .view(real_bs, kmax)
         )
         dst = torch.where(
-            col[None, :] < lens[:, None], starts[:, None] + col[None, :], trash
+            (col[None, :] < lens[:, None]) & packed,
+            starts[:, None] + col[None, :],
+            trash,
         )
         if fw:
             fcol = torch.arange(fw, device=dev)
@@ -1964,12 +2042,21 @@ class VestigeKVMLABackend(AttentionBackend):
                 0, (slots[:, None] * fw + fcol[None, :]).reshape(-1)
             ).view(real_bs, fw)
             dst_f = torch.where(
-                fcol[None, :] < f_lens[:, None],
+                (fcol[None, :] < f_lens[:, None]) & packed,
                 starts[:, None] + lens[:, None] + fcol[None, :],
                 trash,
             )
             src = torch.cat([src.reshape(-1), src_f.reshape(-1)])
             dst = torch.cat([dst.reshape(-1), dst_f.reshape(-1)])
+        if dense is not None:
+            dcol = torch.arange(d_rows.shape[1], device=dev)
+            dst_d = torch.where(
+                (dcol[None, :] < d_len[:, None]) & fenced[:, None],
+                starts[:, None] + dcol[None, :],
+                trash,
+            )
+            src = torch.cat([src.reshape(-1), d_rows.reshape(-1).to(src.dtype)])
+            dst = torch.cat([dst.reshape(-1), dst_d.reshape(-1)])
         bufs["indices"].scatter_(0, dst.reshape(-1), src.reshape(-1))
         n_pad = bs - real_bs
         if n_pad > 0:
@@ -1983,70 +2070,3 @@ class VestigeKVMLABackend(AttentionBackend):
             indptr[real_bs + 1 :] = total + torch.arange(1, n_pad + 1, device=dev)
         bufs["indptr"][: bs + 1].copy_(indptr)
         bufs["indptr"][bs + 1 :] = total + n_pad
-
-    def _compressed_indices(self, layer, forward_batch):
-        # Incremental per-(req, layer) index buffer: [kept..., tail...] built once
-        # (one-time sync), then each step appends this step's slot from
-        # out_cache_loc (no GPU->CPU sync). bs=1 returns a zero-copy narrow.
-        lid = layer.layer_id
-        fm = self.base.forward_metadata
-        bs = forward_batch.seq_lens.shape[0]
-        parts, lens = [], []
-        for i in range(bs):
-            req = int(forward_batch.req_pool_indices[i])
-            st = self._tier2.get((req, lid))
-            if st is None:
-                st = self._build_index_buffer(req, lid, forward_batch, i, fm)
-            buf, n = st["buf"], st["n"]
-            if n >= buf.numel():
-                buf = torch.cat([buf, buf.new_zeros(buf.numel())])
-                st["buf"] = buf
-            buf[n] = forward_batch.out_cache_loc[i]
-            st["n"] = n = n + 1
-            parts.append(buf[:n])
-            lens.append(n)
-        if bs == 1:
-            kv_indptr = fm.kv_indptr.new_zeros(2)
-            kv_indptr[1] = lens[0]
-            return kv_indptr, parts[0]
-        kv_indices = torch.cat(parts)
-        kv_indptr = fm.kv_indptr.new_zeros(bs + 1)
-        kv_indptr[1:] = torch.as_tensor(lens, device=kv_indptr.device).cumsum(0)
-        return kv_indptr, kv_indices
-
-    def _build_index_buffer(self, req, lid, forward_batch, i, fm):
-        # One-time per (req, layer). Source the kept set from the prefill-built
-        # kept_buf/kept_len tables (single source of truth; pure GPU copy) --
-        # recomputing sigma here put 7 x bs rFFTs over the whole prefix into the
-        # FIRST decode step, which at bs=16/S=64k ate the entire speedup.
-        if lid in self._kept_buf and int(self._kept_len[lid][req]) > 0:
-            n_kept = int(self._kept_len[lid][req])
-            head = self._kept_buf[lid][req, :n_kept].to(fm.kv_indices.dtype)
-        else:
-            # Fallback (slot never extended through this backend): compute once.
-            kbuf = self.token_to_kv_pool.get_key_buffer(lid)
-            kbuf = kbuf.reshape(-1, kbuf.shape[-1])
-            r2t = self.req_to_token_pool.req_to_token
-            seq_len = int(forward_batch.seq_lens[i])
-            kept_st = self._build_kept(
-                req, lid, seq_len, kbuf, r2t, kbuf.shape[-1] - 64
-            )
-            head = torch.cat(
-                [kept_st["kept"], r2t[req, kept_st["prefix_len"] : seq_len]]
-            ).to(fm.kv_indices.dtype)
-        buf = head.new_zeros(head.numel() + _TAIL_CAPACITY)
-        buf[: head.numel()] = head
-        st = {"buf": buf, "n": head.numel() - 1}  # -1: current step re-appends its slot
-        self._tier2[(req, lid)] = st
-        return st
-
-    def _build_kept(self, req, lid, seq_len, kbuf, r2t, v_dim):
-        # keep the m=round(rho*seq_len) most anomalous rows by sidecar-residual
-        # sigma, plus sinks and a recent window; the decode tail is appended at
-        # query time so it is always attended. Same arm-aware selector as the
-        # bs==1 path, so the FULL benchmark arm is honored here too.
-        slots = r2t[req, :seq_len]
-        kept = self._arm_aware_kept(slots, kbuf, seq_len, v_dim)
-        st = {"kept": kept, "prefix_len": seq_len}
-        self._tier2[(req, lid)] = st
-        return st
