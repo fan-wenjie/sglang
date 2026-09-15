@@ -56,12 +56,18 @@ def select_kept(
 
 
 def blockwise_sigma_from_pool(
-    kbuf: torch.Tensor, slots: torch.Tensor, block: int = D.CLOSE_BLOCK
+    kbuf: torch.Tensor,
+    slots: torch.Tensor,
+    block: int = D.CLOSE_BLOCK,
+    *,
+    offset: int = D.KV_LORA_RANK,
+    dim: int = D.SIDECAR_DIM,
+    scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """blockwise_sigma without the caller's [T, ROW] gather: the fused kernel
-    addresses the 64-dim branch inside the pool row directly. Bit-identical
-    to blockwise_sigma(kbuf[slots][:, KV_LORA_RANK:], block) (asserted in the
-    registered test); falls back to that path off-CUDA."""
+    addresses the `dim`-wide branch at column `offset` of the pool row
+    directly. Bit-identical to blockwise_sigma(kbuf[slots][:, offset:offset+dim],
+    block) (asserted in the registered test); falls back to that path off-CUDA."""
     n_blocks = slots.shape[0] // block
     if n_blocks == 0:
         return kbuf.new_zeros(0, dtype=torch.float32)
@@ -70,9 +76,14 @@ def blockwise_sigma_from_pool(
             sigma_fused_from_pool,
         )
 
-        sig, _ = sigma_fused_from_pool(kbuf, slots, block)
+        sig, _ = sigma_fused_from_pool(
+            kbuf, slots, block, offset=offset, dim=dim, scale=scale
+        )
         return sig
-    return blockwise_sigma(kbuf[slots][:, D.KV_LORA_RANK :], block)
+    rows = kbuf[slots][:, offset : offset + dim]
+    if scale is not None:
+        rows = rows.float() * scale[slots][:, None]
+    return blockwise_sigma(rows, block)
 
 
 def blockwise_sigma(side: torch.Tensor, block: int = D.CLOSE_BLOCK) -> torch.Tensor:

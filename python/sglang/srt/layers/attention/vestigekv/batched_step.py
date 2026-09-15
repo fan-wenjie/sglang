@@ -27,6 +27,7 @@ from sglang.srt.layers.attention.vestigekv.fused_prologue import (
     compact_fired,
     fused_prologue_split,
 )
+from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR, Geometry
 
 
 @triton.jit
@@ -86,16 +87,17 @@ def _scan_batched_kernel(
     # arena base and the offset-table pointer; the offset VALUES live in
     # device memory and are refreshed by update(), exactly like a_len.
     abase = tl.load(a_off_ptr + p).to(tl.int64)
-    d = tl.arange(0, DD)
     r = tl.arange(0, R)
     h = tl.arange(0, H)
     # pair-invariant operands load once per program, not per sub-block
-    qs = tl.load(qside_t_ptr + p * DD * H + d[:, None] * H + h[None, :])
+    if DD > 0:
+        d = tl.arange(0, DD)
+        qs = tl.load(qside_t_ptr + p * DD * H + d[:, None] * H + h[None, :])
     qk = tl.load(qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :])
     cc = tl.load(cc_ptr + p)
     qr = tl.load(qres_ptr + p * H + h)
     m1 = tl.load(max1g_ptr + p * H + h)
-    if SIDE_POOL:
+    if SIDE_POOL and DD > 0:
         kbase = tl.load(kbase_ptr + p).to(tl.pointer_type(tl.bfloat16))
     if CSK_TIER:
         # The sketch projections live in the tier's closed-prefix cache, and
@@ -112,7 +114,7 @@ def _scan_batched_kernel(
             strides=[R, 1],
             block_shape=[1, R],
         )
-    if SIDE_POOL == 2:
+    if SIDE_POOL == 2 and DD > 0:
         sdesc = tl.make_tensor_descriptor(
             kbase,
             shape=[POOL_ROWS, ROW],
@@ -127,28 +129,29 @@ def _scan_batched_kernel(
             offs = base + kb * BLOCK_A + tl.arange(0, BLOCK_A)
             m = offs < al
             # quantized storage, fp32 ieee arithmetic (see scan_kernel)
-            if SIDE_POOL:
-                # The sidecar is the un-roped tail of an archived pool row and arch
-                # already holds that row's id, so the packed table duplicates it --
-                # 40 MiB of the pack's 84 at 64k bs1. Reading it back through the id
-                # is a data-dependent access, which the pipeliner will not stage
-                # (see fused_prologue._pool_read_mode); the TMA form is the one that
-                # keeps it asynchronous.
-                sl = tl.load(arch_ptr + abase + offs, mask=m, other=0)
-            if SIDE_POOL == 2:
-                s = sdesc.gather(sl, KV_OFF)
-            elif SIDE_POOL == 1:
-                s = tl.load(
-                    kbase + sl.to(tl.int64)[:, None] * ROW + (KV_OFF + d)[None, :],
-                    mask=m[:, None],
-                    other=0.0,
-                )
-            else:
-                s = tl.load(
-                    side_ptr + (abase + offs[:, None]) * DD + d[None, :],
-                    mask=m[:, None],
-                    other=0.0,
-                )
+            if DD > 0:
+                if SIDE_POOL:
+                    # The sidecar is the un-roped tail of an archived pool row and
+                    # arch already holds that row's id, so the packed table
+                    # duplicates it -- 40 MiB of the pack's 84 at 64k bs1. Reading
+                    # it back through the id is a data-dependent access, which the
+                    # pipeliner will not stage (see fused_prologue._pool_read_mode);
+                    # the TMA form is the one that keeps it asynchronous.
+                    sl = tl.load(arch_ptr + abase + offs, mask=m, other=0)
+                if SIDE_POOL == 2:
+                    s = sdesc.gather(sl, KV_OFF)
+                elif SIDE_POOL == 1:
+                    s = tl.load(
+                        kbase + sl.to(tl.int64)[:, None] * ROW + (KV_OFF + d)[None, :],
+                        mask=m[:, None],
+                        other=0.0,
+                    )
+                else:
+                    s = tl.load(
+                        side_ptr + (abase + offs[:, None]) * DD + d[None, :],
+                        mask=m[:, None],
+                        other=0.0,
+                    )
             if CSK_TIER:
                 ai = tl.load(aidx_ptr + abase + offs, mask=m, other=0)
             if CSK_TIER == 2:
@@ -169,7 +172,10 @@ def _scan_batched_kernel(
             # ieee, not tf32: the fast path disagreed with the eager fire set on
             # 6 rows in 58900, a silent change to which rows the model attends.
             # native-dtype tensor-core dots, fp32 accumulation (scan_kernel.py)
-            acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
+            if DD > 0:
+                acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
+            else:
+                acc = tl.dot(c, qk).to(tl.float32)
             score = acc * sc + cc * rh[:, None] * qr[None, :]
             fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
             tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
@@ -205,6 +211,7 @@ class BatchedScanPack:
         # recall outputs; ovf_count [n_li] is its running overflow tally.
         dev = tiers[0].arch.device
         self.q_heads = q_heads
+        self.geom = g = tiers[0].geom
         self._pad_slot = None  # legacy packs are always fully occupied
         P = len(tiers)
         # Floor to 1: an all-empty-kept capture (every pair's tier-1 kept the
@@ -215,7 +222,7 @@ class BatchedScanPack:
         NKm = max(1, int(max(t.kept_rows.shape[0] for t in tiers) * self.HEADROOM))
         Am = max(1, int(max(t.arch.shape[0] for t in tiers) * self.HEADROOM))
         r = tiers[0].r
-        self.kr = torch.zeros(P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
+        self.kr = torch.zeros(P, NKm, g.latent_dim, device=dev, dtype=torch.bfloat16)
         self.nkm = NKm
         self.kslot = self.kbase = self._pool_bases = None
         self.pool_row = self._pool_rows = self.pool_mode = None
@@ -225,14 +232,14 @@ class BatchedScanPack:
         self.rank = r
         self._csk_rows = 0
         self._csk_refs = []
-        self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
+        self.v = torch.zeros(P, r, g.kv_lora_rank, device=dev)
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
         # is what the pool can hold rather than max_bs x max_context.
         arena = P * Am  # eager path: one contiguous slab, offsets are p*Am
         self.am_grid = Am
         self.arena = arena
-        self.side = torch.zeros(arena, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+        self.side = torch.zeros(arena, g.side_dim, device=dev, dtype=torch.bfloat16)
         self.csk = torch.zeros(arena, r, device=dev, dtype=torch.float16)
         self.rho = torch.zeros(arena, device=dev)
         self.a_off = torch.arange(P, dtype=torch.int64, device=dev) * Am
@@ -258,9 +265,7 @@ class BatchedScanPack:
         # fixed-address fused-prologue outputs (graph reads/writes in place)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
-        self.qside_t = torch.zeros(
-            P, D.SIDECAR_DIM, H, device=dev, dtype=torch.bfloat16
-        )
+        self.qside_t = torch.zeros(P, g.side_dim, H, device=dev, dtype=torch.bfloat16)
         self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=torch.float16)
         self.qres = torch.zeros(P, H, device=dev)
         self.thr_flat = torch.zeros(P, device=dev)
@@ -297,6 +302,7 @@ class BatchedScanPack:
         csk_from_tier=False,
         margin=0.0,
         thr_lse=False,
+        geom: Geometry = KIMI_LINEAR,
     ):
         """An empty pack sized for the worst case, for the in-graph scan.
 
@@ -311,6 +317,7 @@ class BatchedScanPack:
         self.margin = margin
         self.thr_lse = thr_lse
         self.q_heads = q_heads
+        self.geom = g = geom
         self._pad_slot = pad_slot
         # Kept rows: either a snapshot this pack owns, or -- when the caller
         # hands over the pool's per-layer base pointers -- 4 bytes of row id
@@ -319,9 +326,7 @@ class BatchedScanPack:
         # of it duplicated a pool row that can no longer change.
         self.nkm = NKm
         if pool_bases is None:
-            self.kr = torch.zeros(
-                P, NKm, D.LATENT_DIM, device=dev, dtype=torch.bfloat16
-            )
+            self.kr = torch.zeros(P, NKm, g.latent_dim, device=dev, dtype=torch.bfloat16)
             self.kslot = self.kbase = self._pool_bases = None
             self.pool_row = self._pool_rows = self.pool_mode = None
         else:
@@ -332,7 +337,7 @@ class BatchedScanPack:
             # The row stride is the POOL's, not this module's: taking it from
             # the buffer the caller actually hands over is what keeps a pool
             # layout change from silently addressing the wrong rows.
-            self.pool_row = D.LATENT_DIM if pool_row is None else pool_row
+            self.pool_row = g.latent_dim if pool_row is None else pool_row
             self._pool_rows = pool_rows
             # None = pick per device (TMA gather when it runs here);
             # set explicitly only to pin one path, as the tests do.
@@ -345,7 +350,7 @@ class BatchedScanPack:
             )
 
             self.side_mode = _pool_read_mode(dev) if side_from_pool else 0
-        self.v = torch.zeros(P, r, D.KV_LORA_RANK, device=dev)
+        self.v = torch.zeros(P, r, g.kv_lora_rank, device=dev)
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
         # is what the pool can hold rather than max_bs x max_context.
@@ -363,7 +368,7 @@ class BatchedScanPack:
         self.side = (
             None
             if side_from_pool
-            else torch.zeros(arena, D.SIDECAR_DIM, device=dev, dtype=torch.bfloat16)
+            else torch.zeros(arena, g.side_dim, device=dev, dtype=torch.bfloat16)
         )
         # The sketch projections are a selection over the tier's closed-prefix
         # cache; carrying a compacted copy here is the same numbers twice.
@@ -397,7 +402,7 @@ class BatchedScanPack:
         self._nk_col = torch.arange(NKm, device=dev)
         # all pairs empty -> every kept column masked True from step one
         self.nk_mask = torch.ones(P, 1, NKm, dtype=torch.bool, device=dev)
-        self.scale = D.ATTN_SCALE
+        self.scale = g.attn_scale
         self.inf = torch.tensor(float("inf"), device=dev)
         self.li = torch.zeros(P, dtype=torch.int64, device=dev)
         self.slot = torch.full((P,), pad_slot, dtype=torch.int64, device=dev)
@@ -405,9 +410,7 @@ class BatchedScanPack:
         self.hit = torch.zeros(arena, dtype=torch.int8, device=dev)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
-        self.qside_t = torch.zeros(
-            P, D.SIDECAR_DIM, H, device=dev, dtype=torch.bfloat16
-        )
+        self.qside_t = torch.zeros(P, g.side_dim, H, device=dev, dtype=torch.bfloat16)
         self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=torch.float16)
         self.qres = torch.zeros(P, H, device=dev)
         self.thr_flat = torch.zeros(P, device=dev)
@@ -438,7 +441,7 @@ class BatchedScanPack:
             n_ok
             and max(t.kept_rows.shape[0] for t in tiers) <= self.nkm
             and sum(t.arch.shape[0] for t in tiers) <= self.arena
-            and all(t.r == self.rank for t in tiers)
+            and all(t.r == self.rank and t.geom == self.geom for t in tiers)
         )
 
     def update(self, pairs, tiers):
@@ -546,7 +549,7 @@ class BatchedScanPack:
             self.nk_len[i] = nk
             self.thr[i, 0] = t.thr_g
             self.thr_flat[i] = t.thr_g
-            self.cc[i] = t.zp * t.scale / (D.KV_LORA_RANK - t.r) ** 0.5
+            self.cc[i] = t.zp * t.scale / (self.geom.kv_lora_rank - t.r) ** 0.5
         if self.csk is None:
             # Hold the caches alive: cbase is a raw address, and a tier going
             # out of scope would free the memory the graph still points at.
@@ -621,6 +624,7 @@ class BatchedScanPack:
             pool_rows=self._pool_rows,
             mode=self.pool_mode,
             a_len=self.a_len,
+            kv=self.geom.kv_lora_rank,
         )
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
         # Grid covers the LARGEST per-pair archive, not the arena: programs
@@ -655,13 +659,13 @@ class BatchedScanPack:
             Am,
             sc,
             H=self.q_heads,
-            DD=D.SIDECAR_DIM,
+            DD=self.geom.side_dim,
             R=self.v.shape[1],
             SIDE_POOL=0 if self.side is not None else self.side_mode,
             CSK_TIER=0 if self.csk is not None else self.csk_mode,
             CSK_ROWS=self._csk_rows or 1,
             ROW=self.pool_row or 0,
-            KV_OFF=D.KV_LORA_RANK,
+            KV_OFF=self.geom.kv_lora_rank,
             POOL_ROWS=self._pool_rows or 1,
             BLOCK_A=D.SCAN_BLOCK_A,
             MULTI=16,  # 16 x BLOCK_A(64) = one 1024-row compact bucket

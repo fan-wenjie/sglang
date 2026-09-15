@@ -610,6 +610,13 @@ class Envs:
     # bit-identical -- this selects instructions, never numerics.
     SGLANG_VESTIGEKV_POOL_READ = EnvInt(None)
 
+    # VestigeKV side-pool storage (rope-less MLA only): the salience keys are
+    # stored bf16 by default (bit-exact); True stores fp8 e4m3 with one fp32
+    # scale per token, halving the pool. Sigma then reads the dequantized
+    # key, so this changes numerics (ranking fidelity), never the per-token
+    # contract.
+    SGLANG_VESTIGEKV_USE_FP8_SIDE_POOL = EnvBool(False)
+
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch

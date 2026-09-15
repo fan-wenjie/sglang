@@ -29,13 +29,15 @@ def _cnt(lens):
     return torch.zeros(lens.shape[0], dtype=torch.int32, device=lens.device)
 
 
-def _mk_tier(nk, a, seed, zp, thr_g):
+def _mk_tier(nk, a, seed, zp, thr_g, geom=None):
+    from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR
     from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
 
+    geom = KIMI_LINEAR if geom is None else geom
     g = torch.Generator(device="cuda").manual_seed(seed)
     rnd = lambda *s: torch.randn(*s, device="cuda", generator=g)  # noqa: E731
-    t = RecallTier(r=R)
-    t.r, t.scale, t.zp, t.thr_g, t.built = R, 192**-0.5, zp, thr_g, True
+    t = RecallTier(r=R, geom=geom)
+    t.r, t.scale, t.zp, t.thr_g, t.built = R, geom.attn_scale, zp, thr_g, True
     # storage contract mirrors RecallTier.build: side bf16, csk fp16,
     # kept_rows bf16, rho fp32 -- a fabricated fp32 tier would make the two
     # paths disagree for test-artifact reasons, not algorithmic ones
@@ -43,9 +45,9 @@ def _mk_tier(nk, a, seed, zp, thr_g):
     # the index is not a tier any more (lengths are read off the index, so
     # asking one cannot gather a row table).
     t.kept_slots = torch.arange(nk, dtype=torch.int32, device="cuda")
-    t.kept_rows = rnd(nk, 576).to(torch.bfloat16)
-    t.V = rnd(R, 512)
-    t.side = rnd(a, 64).to(torch.bfloat16)
+    t.kept_rows = rnd(nk, geom.latent_dim).to(torch.bfloat16)
+    t.V = rnd(R, geom.kv_lora_rank)
+    t.side = rnd(a, geom.side_dim).to(torch.bfloat16)
     t.csk = rnd(a, R).to(torch.float16)
     t.rho = torch.rand(a, device="cuda", generator=g)
     t.arch = torch.randperm(500000, device="cuda")[:a] + 1  # never row 0
@@ -282,6 +284,47 @@ class TestKeptSetParityWithReference(CustomTestCase):
             got = be._arm_aware_kept(row_slots, kbuf, seq, 512)
         self.assertEqual(got.shape[0], seq)
 
+
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_rope_less_pairs_bit_identical(self):
+        # side_dim == 0: the batched scan and prologue take their DD == 0
+        # branches and must still reproduce the per-pair fetch sets exactly.
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
+        from sglang.srt.layers.attention.vestigekv.geometry import Geometry
+
+        geom = Geometry(
+            kv_lora_rank=512, side_dim=0, qk_head_dim=256, sigma_dim=128, sigma_in_row=False
+        )
+        torch.manual_seed(0)
+        L, max_reqs = 2, 6
+        shapes = [(800, 15000), (600, 9000)]
+        tiers = {}
+        for li in range(L):
+            for slot in (1, 4):
+                nk, a = shapes[li]
+                tiers[(li, slot)] = _mk_tier(
+                    nk + slot, a + 50 * slot, seed=li * 10 + slot, zp=float(li + 1),
+                    thr_g=-float("inf"), geom=geom,
+                )
+        qbuf = torch.randn(L, max_reqs, H, geom.latent_dim, device="cuda")
+        fetch = torch.zeros(L, max_reqs, W, dtype=torch.int64, device="cuda")
+        flen = torch.zeros(L, max_reqs, dtype=torch.int64, device="cuda")
+        ref_rows, ref_n = {}, {}
+        out = torch.zeros(max_reqs, W, dtype=torch.int64, device="cuda")
+        ol = torch.zeros(max_reqs, dtype=torch.int64, device="cuda")
+        for (li, slot), t in tiers.items():
+            t.query_fixed(qbuf[li, slot], out, ol, slot)
+            ref_n[(li, slot)] = int(ol[slot])
+            ref_rows[(li, slot)] = out[slot, : int(ol[slot])].clone()
+        pairs = list(tiers.keys())
+        pack = BatchedScanPack(pairs, [tiers[p] for p in pairs], qbuf, fetch, flen, H)
+        pack.run()
+        torch.cuda.synchronize()
+        for li, slot in pairs:
+            n = int(flen[li, slot])
+            self.assertEqual(n, ref_n[(li, slot)], f"pair {(li, slot)}")
+            self.assertTrue(torch.equal(fetch[li, slot, :n], ref_rows[(li, slot)]))
 
 if __name__ == "__main__":
     unittest.main()

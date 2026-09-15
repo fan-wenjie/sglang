@@ -43,11 +43,11 @@ def _reference(q, kr, v, nk_len, thr, sc):
     return max1g, qside_t, qsk_t, qres
 
 
-def _case(P=4, NKm=512, seed=0, empty=()):
+def _case(P=4, NKm=512, seed=0, empty=(), width=576):
     torch.manual_seed(seed)
     dev = "cuda"
-    q = torch.randn(P, H, 576, device=dev)
-    kr = torch.randn(P, NKm, 576, device=dev, dtype=torch.bfloat16)
+    q = torch.randn(P, H, width, device=dev)
+    kr = torch.randn(P, NKm, width, device=dev, dtype=torch.bfloat16)
     v = torch.stack(
         [
             torch.linalg.qr(torch.randn(KV, R, device=dev))[0].T.contiguous()
@@ -99,6 +99,27 @@ class TestFusedPrologue(CustomTestCase):
             bool(torch.isfinite(g1[1]).any() | (g1[1] == float("inf")).any())
         )
 
+
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_rope_less_rows_match_reference(self):
+        # width == KV: no sidecar columns, so the kernel's D-loop and the
+        # transposed sidecar output must both handle DD == 0.
+        from sglang.srt.layers.attention.vestigekv.fused_prologue import fused_prologue
+
+        q, kr, v, nk_len, thr = _case(P=5, NKm=640, seed=3, width=KV)
+        got = fused_prologue(q, kr, v, nk_len, thr, 1 / 16.0, kv=KV)
+        ref = _reference(q, kr, v, nk_len, thr, 1 / 16.0)
+        g1, gs, gk, gr = got
+        r1, rs, rk, rr = ref
+        self.assertEqual(tuple(gs.shape), (5, 0, H))
+        self.assertTrue(torch.equal(gs, rs))
+        self.assertTrue(torch.allclose(gk.float(), rk.float(), atol=2e-3, rtol=1e-3))
+        self.assertTrue(torch.allclose(gr, rr, atol=1e-3, rtol=1e-3))
+        both_finite = torch.isfinite(g1) & torch.isfinite(r1)
+        self.assertTrue(
+            torch.allclose(g1[both_finite], r1[both_finite], atol=1e-4, rtol=1e-4)
+        )
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)

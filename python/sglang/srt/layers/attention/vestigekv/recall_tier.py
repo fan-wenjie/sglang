@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
+from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR, Geometry
 from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
 
 
@@ -31,13 +32,15 @@ class RecallTier:
         self,
         r: int = D.INDEX_RANK,
         recall_target: float = D.RECALL_TARGET,
-        scale: float = D.ATTN_SCALE,
+        scale: float | None = None,
         margin: float = 0.0,
         threshold: str = "max",
+        geom: Geometry = KIMI_LINEAR,
     ):
         self.r = r
         self.recall_target = recall_target
-        self.scale = scale
+        self.geom = geom
+        self.scale = geom.attn_scale if scale is None else scale
         self.margin = margin  # scan threshold = base - margin (see VestigeKVConfig)
         self.threshold = threshold  # base: "max" kept score or "lse" of kept scores
         self.built = False
@@ -147,7 +150,10 @@ class RecallTier:
                 "tier has neither a materialised sidecar nor a pool to read it "
                 "from; build()/refresh_membership() must record kbuf"
             )
-        self._side_mat = self._kbuf[self.arch][:, D.KV_LORA_RANK :].contiguous()
+        g = self.geom
+        self._side_mat = self._kbuf[self.arch][
+            :, g.kv_lora_rank : g.kv_lora_rank + g.side_dim
+        ].contiguous()
         return self._side_mat
 
     @side.setter
@@ -172,8 +178,8 @@ class RecallTier:
         operands_from: RecallTier | None = None,
         diag: bool = False,
     ) -> dict:
-        """rows: [T,576] pool rows (fp32). keep: [T] bool tier-1 mask.
-        q_cal: [n,H,576] expanded calibration queries; q_pos: [n] positions.
+        """rows: [T,latent_dim] pool rows (fp32). keep: [T] bool tier-1 mask.
+        q_cal: [n,H,latent_dim] expanded calibration queries; q_pos: [n] positions.
         Returns stats. All thresholds derive from the prefix itself.
 
         operands_from: a previous tier for the SAME (slot, layer) whose
@@ -194,9 +200,9 @@ class RecallTier:
         self.keep = keep
         arch_idx = (~keep).nonzero().flatten()
         self._arch_idx = arch_idx
-        qe = q_cal.reshape(-1, D.LATENT_DIM).float()  # [n*H, 576]
+        qe = q_cal.reshape(-1, self.geom.latent_dim).float()  # [n*H, 576]
 
-        qcal_c = qe[:, : D.KV_LORA_RANK] - qe[:, : D.KV_LORA_RANK].mean(0, keepdim=True)
+        qcal_c = qe[:, : self.geom.kv_lora_rank] - qe[:, : self.geom.kv_lora_rank].mean(0, keepdim=True)
         # Top-r right singular vectors via the covariance eigendecomposition:
         # V(SVD) == eigenvectors of C^T C, and only r=64 of 512 are used, so the
         # full Jacobi SVD computes 448 vectors that are thrown away. Measured on
@@ -216,7 +222,7 @@ class RecallTier:
             # construction, allocation-only, no factorization. The calibrated
             # build (async, off the token path) still fits the real PCA basis
             # and caches it, so every subsequent provisional build reuses that.
-            V = torch.zeros(self.r, D.KV_LORA_RANK, device=dev, dtype=qe.dtype)
+            V = torch.zeros(self.r, self.geom.kv_lora_rank, device=dev, dtype=qe.dtype)
             V[torch.arange(self.r, device=dev), torch.arange(self.r, device=dev)] = 1.0
         else:
             # Fitted on THIS request's calibration queries, every calibrated
@@ -294,7 +300,7 @@ class RecallTier:
                 # gated by fire-set stability + retrieval. Per row, so the
                 # values on the archived subset do not depend on the row set.
                 self._csk_all, self._rho_all, _side = build_operands_fused(
-                    kbuf, row_slots, V
+                    kbuf, row_slots, V, kv=self.geom.kv_lora_rank, side_dim=self.geom.side_dim
                 )
                 del _side
             else:
@@ -312,7 +318,7 @@ class RecallTier:
                 for a0 in range(0, T, D.BUILD_ROW_CHUNK):
                     a1 = min(a0 + D.BUILD_ROW_CHUNK, T)
                     blk = kbuf[row_slots[a0:a1]].float()
-                    content = blk[:, : D.KV_LORA_RANK]
+                    content = blk[:, : self.geom.kv_lora_rank]
                     c = content @ V.T
                     torch._assert_async(
                         (c.abs().amax() < 6e4).to(torch.bool)
@@ -444,8 +450,8 @@ class RecallTier:
             self.zp = D.Z_MAX
         else:
             qh = qe[has_arch]
-            qskh = qh[:, : D.KV_LORA_RANK] @ V.T
-            qresh = (qh[:, : D.KV_LORA_RANK] - qskh @ V).norm(dim=-1)
+            qskh = qh[:, : self.geom.kv_lora_rank] @ V.T
+            qresh = (qh[:, : self.geom.kv_lora_rank] - qskh @ V).norm(dim=-1)
             pa = torch.searchsorted(self._arch_idx.to(torch.int64), atgt[has_arch])
             # Gather the target rows out of the caches directly. Going through
             # self.side / self.csk / self.rho would materialise the WHOLE
@@ -456,7 +462,7 @@ class RecallTier:
             pa64 = pa.to(torch.int64)
             arch_rows = self.arch.to(torch.int64).index_select(0, pa64)
             tgt_side = self._kbuf.index_select(0, arch_rows)[
-                :, D.KV_LORA_RANK : D.LATENT_DIM
+                :, self.geom.kv_lora_rank : self.geom.latent_dim
             ]  # [n, side_dim]
             src = self._arch_idx.to(torch.int64).index_select(0, pa64)
             tgt_csk = self._csk_all.index_select(0, src)  # [n, r]
@@ -465,11 +471,11 @@ class RecallTier:
             # rounded to the storage dtypes before the (exact-in-fp32)
             # products, so zp is calibrated on exactly what the kernel scores.
             idxs_t = (
-                qh[:, D.KV_LORA_RANK :].to(torch.bfloat16).float() * tgt_side.float()
+                qh[:, self.geom.kv_lora_rank :].to(torch.bfloat16).float() * tgt_side.float()
             ).sum(-1) + (qskh.half().float() * tgt_csk.float()).sum(-1)
             idxs_t = idxs_t * sc_
             cert_t = (
-                qresh * tgt_rho * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
+                qresh * tgt_rho * sc_ / (self.geom.kv_lora_rank - self.r) ** 0.5
             ).clamp_min(D.ENTROPY_EPS)
             z_req = (abest_val[has_arch] - idxs_t) / cert_t
             k = D.conformal_k(n_cal_q, self.recall_target)
@@ -578,20 +584,20 @@ class RecallTier:
             p1 = torch.softmax(skept, -1)
             ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
             gate = ent > self.thr_g
-        qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
-        qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
+        qsk = qe[:, : self.geom.kv_lora_rank] @ self.V.T
+        qres = (qe[:, : self.geom.kv_lora_rank] - qsk @ self.V).norm(dim=-1)
         if self._qside_t is None:
             H = qe.shape[0]
             # Storage dtypes, matching the kernel's native-dtype dots: bf16 for
             # the sidecar branch (exact -- qbuf is bf16), fp16 for the sketch
             # projection (rounded here AND at calibration, so zp covers it).
-            self._qside_t = qe.new_empty(D.SIDECAR_DIM, H, dtype=torch.bfloat16)
+            self._qside_t = qe.new_empty(self.geom.side_dim, H, dtype=torch.bfloat16)
             self._qsk_t = qe.new_empty(self.r, H, dtype=torch.float16)
             self._hit_buf = torch.empty(
                 self.side.shape[0], dtype=torch.int32, device=qe.device
             )
             self._inf = qe.new_full((), float("inf"))
-        self._qside_t.copy_(qe[:, D.KV_LORA_RANK :].T)
+        self._qside_t.copy_(qe[:, self.geom.kv_lora_rank :].T)
         self._qsk_t.copy_(qsk.T)
         # Fold the gate into the threshold: a closed head can never fire, so
         # +inf makes it lose every comparison and the kernel needs no second
@@ -654,14 +660,14 @@ class RecallTier:
             gate = ent > self.thr_g  # [H]
             if not bool(gate.any()):
                 return self.arch[:0]
-        qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
-        qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
+        qsk = qe[:, : self.geom.kv_lora_rank] @ self.V.T
+        qres = (qe[:, : self.geom.kv_lora_rank] - qsk @ self.V).norm(dim=-1)
         idxs = (
-            (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16) @ self.side.T).float()
+            (qe[:, self.geom.kv_lora_rank :].to(torch.bfloat16) @ self.side.T).float()
             + (qsk.half() @ self.csk.T).float()
         ) * sc_
         cert = (
-            (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
+            (qres[:, None] * self.rho[None, :]) * sc_ / (self.geom.kv_lora_rank - self.r) ** 0.5
         )
         score = idxs + self.zp * cert
         fire = (score > (max1 - self.margin)[:, None]) & gate[:, None]
@@ -679,8 +685,8 @@ class RecallTier:
             self._csk_all = torch.zeros(0, self.r, device=dev, dtype=torch.float16)
             self._rho_all = torch.zeros(0, device=dev)
         Cf = new_rows.float()
-        csk = Cf[:, : D.KV_LORA_RANK] @ self.V.T
-        rho = (Cf[:, : D.KV_LORA_RANK] - csk @ self.V).norm(dim=-1)
+        csk = Cf[:, : self.geom.kv_lora_rank] @ self.V.T
+        rho = (Cf[:, : self.geom.kv_lora_rank] - csk @ self.V).norm(dim=-1)
         # No _side_all. The sidecar is the pool row's own tail at KV_LORA_RANK
         # and _pos_all already names every closed row, so carrying a [closed,64]
         # bf16 copy alongside is storing what the pool still holds -- 8 MiB per

@@ -538,6 +538,106 @@ class TestStatsTelemetry(CustomTestCase):
         self.assertEqual(be._stats["fetched"], 0)
 
 
+class TestSaliencePool(CustomTestCase):
+    """Rope-less geometry: tier-1 sigma comes from the per-layer side pool the
+    model fills through write_salience, never from the latent row."""
+
+    N = D.CLOSE_BLOCK + 64
+
+    def _mk(self):
+        from sglang.srt.layers.attention.vestigekv.geometry import Geometry
+
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.geom = Geometry(
+            kv_lora_rank=512, side_dim=0, qk_head_dim=256, sigma_dim=128, sigma_in_row=False
+        )
+        be._side_fp8 = False
+        be._side_pool = {LID: torch.zeros(self.N, 128, dtype=torch.bfloat16)}
+        be._side_scale = {}
+        return be
+
+    def test_keys_land_at_their_cache_rows(self):
+        be = self._mk()
+        loc = torch.tensor([5, 900, 17])
+        key = torch.randn(3, 128)
+        be.write_salience(layer_id=LID, loc=loc, key=key)
+        pool = be._side_pool[LID]
+        self.assertTrue(torch.equal(pool[loc], key.to(torch.bfloat16)))
+        rest = torch.ones(self.N, dtype=torch.bool)
+        rest[loc] = False
+        self.assertEqual(float(pool[rest].abs().sum()), 0.0)
+
+    def test_row_count_mismatch_is_refused(self):
+        be = self._mk()
+        with self.assertRaises(ValueError):
+            be.write_salience(layer_id=LID, loc=torch.tensor([1, 2]), key=torch.randn(3, 128))
+
+    def test_sigma_reads_the_side_pool_not_the_latent(self):
+        from sglang.srt.layers.attention.vestigekv.eviction import blockwise_sigma
+
+        be = self._mk()
+        g = torch.Generator().manual_seed(0)
+        slots = torch.randperm(self.N, generator=g)[: D.CLOSE_BLOCK]
+        be._side_pool[LID][slots] = torch.randn(D.CLOSE_BLOCK, 128, generator=g).to(
+            torch.bfloat16
+        )
+        a = be._block_sigma(torch.randn(self.N, 512, generator=g), slots, lid=LID)
+        b = be._block_sigma(torch.randn(self.N, 512, generator=g), slots, lid=LID)
+        self.assertTrue(torch.equal(a, b))
+        self.assertTrue(
+            torch.equal(a, blockwise_sigma(be._side_pool[LID][slots], D.CLOSE_BLOCK))
+        )
+
+
+
+class TestFp8SidePool(CustomTestCase):
+    """The fp8 side pool changes bytes, not the contract: keys round-trip to
+    fp8 e4m3 * per-token scale, and sigma equals sigma over the dequantized
+    keys -- the same rows the bf16 path would score, at fp8 fidelity."""
+
+    N = D.CLOSE_BLOCK + 64
+
+    def _mk(self):
+        from sglang.srt.layers.attention.vestigekv.geometry import Geometry
+
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.geom = Geometry(
+            kv_lora_rank=512, side_dim=0, qk_head_dim=256, sigma_dim=128, sigma_in_row=False
+        )
+        be._side_fp8 = True
+        be._side_pool = {LID: torch.zeros(self.N, 128, dtype=torch.float8_e4m3fn)}
+        be._side_scale = {LID: torch.zeros(self.N, dtype=torch.float32)}
+        return be
+
+    def test_keys_round_trip_within_fp8_precision(self):
+        from sglang.srt.layers.attention.vestigekv.salience import dequantize_salience
+
+        be = self._mk()
+        loc = torch.tensor([3, 700, 4000])
+        key = torch.randn(3, 128) * torch.tensor([[0.1], [1.0], [40.0]])
+        be.write_salience(layer_id=LID, loc=loc, key=key)
+        scale = be._side_scale[LID][loc]
+        back = dequantize_salience(be._side_pool[LID][loc], scale)
+        # DSA index-cache alignment: ue8m0 scales are exact powers of two
+        self.assertTrue(torch.equal(scale, torch.exp2(torch.log2(scale).round())))
+        # e4m3: 3 mantissa bits (rel 2^-4) down to the subnormal step (2^-9 * scale)
+        tol = key.abs() * 2**-4 + scale[:, None] * 2**-9
+        self.assertTrue(bool(((back - key).abs() <= tol).all()))
+
+    def test_sigma_equals_sigma_over_the_dequantized_keys(self):
+        from sglang.srt.layers.attention.vestigekv.eviction import blockwise_sigma
+        from sglang.srt.layers.attention.vestigekv.salience import dequantize_salience
+
+        be = self._mk()
+        g = torch.Generator().manual_seed(1)
+        slots = torch.randperm(self.N, generator=g)[: D.CLOSE_BLOCK]
+        be.write_salience(
+            layer_id=LID, loc=slots, key=torch.randn(D.CLOSE_BLOCK, 128, generator=g)
+        )
+        got = be._block_sigma(torch.randn(self.N, 512, generator=g), slots, lid=LID)
+        rows = dequantize_salience(be._side_pool[LID][slots], be._side_scale[LID][slots])
+        self.assertTrue(torch.equal(got, blockwise_sigma(rows, D.CLOSE_BLOCK)))
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -41,16 +41,19 @@ def _vestige_scan_kernel(
 ):
     offs = tl.program_id(0) * BLOCK_A + tl.arange(0, BLOCK_A)
     m = offs < A
-    d = tl.arange(0, D)
     r = tl.arange(0, R)
     h = tl.arange(0, H)
     # The two per-row loads that dominate the scan's traffic. Everything after
     # this stays in registers, across every head.
-    s = tl.load(side_ptr + offs[:, None] * D + d[None, :], mask=m[:, None], other=0.0)
     c = tl.load(csk_ptr + offs[:, None] * R + r[None, :], mask=m[:, None], other=0.0)
     rh = tl.load(rho_ptr + offs, mask=m, other=0.0)
-    qs = tl.load(qside_t_ptr + d[:, None] * H + h[None, :])
     qk = tl.load(qsk_t_ptr + r[:, None] * H + h[None, :])
+    if D > 0:
+        d = tl.arange(0, D)
+        s = tl.load(
+            side_ptr + offs[:, None] * D + d[None, :], mask=m[:, None], other=0.0
+        )
+        qs = tl.load(qside_t_ptr + d[:, None] * H + h[None, :])
     # Native-dtype tensor-core dots with fp32 accumulation. Every bf16/fp16
     # product is EXACT in the fp32 accumulator (8/11-bit mantissas square
     # under 24), so no tf32-style silent truncation exists here; the query
@@ -58,7 +61,10 @@ def _vestige_scan_kernel(
     # conformal zp is calibrated on this exact scoring path (quantize-then-
     # calibrate). The previous convert-to-fp32 ieee form ran the dot on CUDA
     # cores and was 6.6x slower (538 vs 3601 GB/s effective, measured).
-    acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
+    if D > 0:
+        acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
+    else:
+        acc = tl.dot(c, qk).to(tl.float32)
     score = acc * sc + cc * rh[:, None] * tl.load(qres_ptr + h)[None, :]
     fired = tl.max((score > tl.load(max1g_ptr + h)[None, :]).to(tl.int32), 1)
     tl.store(hit_ptr + offs, fired, mask=m)

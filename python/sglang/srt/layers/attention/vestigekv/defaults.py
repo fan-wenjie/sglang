@@ -17,7 +17,9 @@ import math
 
 import torch
 
-# ---- model geometry (Kimi Linear MLA; the only architecture in scope) ----
+# ---- model geometry: Kimi Linear MLA values, the defaults of geometry.Geometry ----
+# The live values come from Geometry.from_hf_config; these stay as the
+# validated reference (and the defaults every kernel entry point falls back to).
 
 KV_LORA_RANK = 512
 """Content half of an MLA latent row; also the value vector."""

@@ -127,5 +127,71 @@ class TestOperandFused(CustomTestCase):
         self.assertTrue(bool(((csk_r.float() - csk_f.float()).abs() <= 2 * ulp).all()))
 
 
+
+
+class TestGeometryVariants(CustomTestCase):
+    def test_sigma_from_a_side_pool_matches_the_gather(self):
+        # A [rows, 128] side pool: the branch is the whole row (offset 0).
+        from sglang.srt.layers.attention.vestigekv.sigma_fused import (
+            sigma_fused,
+            sigma_fused_from_pool,
+        )
+
+        torch.manual_seed(4)
+        pool = torch.randn(30000, 128, device="cuda").to(torch.bfloat16)
+        blk, nb = 4096, 3
+        slots = torch.randperm(30000, device="cuda")[: blk * nb].to(torch.int64)
+        s_gather, h_gather = sigma_fused(pool[slots].reshape(nb, blk, 128))
+        s_pool, h_pool = sigma_fused_from_pool(pool, slots, blk, offset=0, dim=128)
+        self.assertTrue(torch.equal(s_gather.reshape(-1), s_pool))
+        self.assertTrue(torch.equal(h_gather, h_pool))
+
+    def test_operands_without_a_sidecar_keep_the_content_terms(self):
+        from sglang.srt.layers.attention.vestigekv.operand_fused import (
+            build_operands_fused,
+        )
+
+        torch.manual_seed(5)
+        pool = torch.randn(20000, 512, device="cuda").to(torch.bfloat16)
+        arch = torch.randperm(20000, device="cuda")[:5000].to(torch.int64)
+        V = torch.linalg.qr(torch.randn(512, 64, device="cuda")).Q.T.contiguous()
+        csk, rho, side = build_operands_fused(pool, arch, V, kv=512, side_dim=0)
+        self.assertEqual(tuple(side.shape), (5000, 0))
+        blk = pool[arch].float()
+        c = blk @ V.T
+        self.assertLess(
+            float(((blk - c @ V).norm(dim=-1) - rho).abs().max()), 1e-3
+        )
+        ulp = torch.finfo(torch.float16).eps * c.abs().clamp_min(1.0)
+        self.assertTrue(bool(((c.half().float() - csk.float()).abs() <= 2 * ulp).all()))
+
+
+
+class TestFp8SidePoolKernel(CustomTestCase):
+    def test_scaled_fp8_pool_matches_the_dequantized_gather(self):
+        # HAS_SCALE path: fp8 row * fp32 scale inside the kernel must equal
+        # feeding the dequantized fp32 rows to the unscaled kernel, bit for bit.
+        from sglang.srt.layers.attention.vestigekv.salience import (
+            dequantize_salience,
+            quantize_salience,
+        )
+        from sglang.srt.layers.attention.vestigekv.sigma_fused import (
+            sigma_fused,
+            sigma_fused_from_pool,
+        )
+
+        torch.manual_seed(6)
+        keys = torch.randn(30000, 128, device="cuda") * torch.rand(30000, 1, device="cuda") * 8
+        pool, scale = quantize_salience(keys)
+        blk, nb = 4096, 3
+        slots = torch.randperm(30000, device="cuda")[: blk * nb].to(torch.int64)
+        rows = dequantize_salience(pool[slots], scale[slots])
+        s_ref, h_ref = sigma_fused(rows.reshape(nb, blk, 128))
+        s_pool, h_pool = sigma_fused_from_pool(
+            pool, slots, blk, offset=0, dim=128, scale=scale
+        )
+        self.assertTrue(torch.equal(s_ref.reshape(-1), s_pool))
+        self.assertTrue(torch.equal(h_ref, h_pool))
+
 if __name__ == "__main__":
     unittest.main(verbosity=3)

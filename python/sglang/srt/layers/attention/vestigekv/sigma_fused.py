@@ -52,19 +52,21 @@ def _basis(T: int, kappa: int, dev) -> torch.Tensor:
 
 @triton.jit
 def _sigma_fused_kernel(
-    r_ptr,  # FROM_POOL=0: [N,T,64] gathered sidecars. =1: [pool,ROW] pool
+    r_ptr,  # FROM_POOL=0: [N,T,DD] gathered sidecars. =1: [pool,ROW] pool
     slots_ptr,  # FROM_POOL=1: [N*T] int64 pool row indices (else unused)
+    scale_ptr,  # HAS_SCALE=1: [pool] fp32 per-row dequant scale (else unused)
     c_ptr,  # [T, 32] fp32 basis
     sig_ptr,  # [N, T] fp32 out
     hist_ptr,  # [N_BINS] int32 SHARED (atomic across instances)
     T,
     NB: tl.constexpr,
     BT: tl.constexpr,
-    DD: tl.constexpr,  # 64
+    DD: tl.constexpr,  # branch width
     KB: tl.constexpr,  # 32
     FROM_POOL: tl.constexpr,
-    ROW: tl.constexpr,  # pool row width (576)
-    KV_OFF: tl.constexpr,  # branch offset inside the row (512)
+    ROW: tl.constexpr,  # pool row width
+    KV_OFF: tl.constexpr,  # branch offset inside the row
+    HAS_SCALE: tl.constexpr,  # rows are fp8 with a per-row scale
 ):
     inst = tl.program_id(0)
     sig_ptr = sig_ptr + inst.to(tl.int64) * T
@@ -87,6 +89,8 @@ def _sigma_fused_kernel(
                 mask=m[:, None],
                 other=0.0,
             ).to(tl.float32)
+            if HAS_SCALE:
+                r = r * tl.load(scale_ptr + sl, mask=m, other=0.0)[:, None]
         else:
             r = tl.load(
                 r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
@@ -113,6 +117,8 @@ def _sigma_fused_kernel(
                 mask=m[:, None],
                 other=0.0,
             ).to(tl.float32)
+            if HAS_SCALE:
+                r = r * tl.load(scale_ptr + sl, mask=m, other=0.0)[:, None]
         else:
             r = tl.load(
                 r_ptr + t[:, None] * DD + tl.arange(0, DD)[None, :],
@@ -138,13 +144,19 @@ def sigma_fused_from_pool(
     slots: torch.Tensor,
     block: int,
     kappa: int = D.LOWPASS_KAPPA,
+    *,
+    offset: int = D.KV_LORA_RANK,
+    dim: int = D.SIDECAR_DIM,
+    scale: torch.Tensor | None = None,
 ):
     """sigma for the blocks of `slots`, read STRAIGHT from the pool.
 
     kbuf: [pool, ROW] bf16 rows; slots: [n_blocks*block] int64 pool indices.
     Identical arithmetic to sigma_fused(); the only difference is that the
-    64-dim branch slice is addressed inside the kernel instead of being
-    gathered into a [T, ROW] intermediate and then sliced by the caller.
+    `dim`-wide branch at column `offset` is addressed inside the kernel
+    instead of being gathered into a [T, ROW] intermediate and then sliced.
+    `scale` [pool] fp32 marks an fp8 pool: each row is dequantized as
+    row.float() * scale[row] before the projection.
     """
     n = slots.numel() // block
     dev = kbuf.device
@@ -157,17 +169,19 @@ def sigma_fused_from_pool(
     _sigma_fused_kernel[(n,)](
         kbuf,
         slots,
+        kbuf if scale is None else scale,
         C,
         sig,
         hist,
         block,
         NB=N_BINS,
         BT=64,
-        DD=D.SIDECAR_DIM,
+        DD=dim,
         KB=_KB_PAD,
         FROM_POOL=1,
         ROW=kbuf.shape[-1],
-        KV_OFF=D.KV_LORA_RANK,
+        KV_OFF=offset,
+        HAS_SCALE=scale is not None,
         num_warps=4,
         num_stages=1,
     )
@@ -191,6 +205,7 @@ def sigma_fused(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA):
     _sigma_fused_kernel[(N,)](
         side,
         side,
+        side,
         C,
         sig,
         hist,
@@ -202,6 +217,7 @@ def sigma_fused(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA):
         FROM_POOL=0,
         ROW=DD,
         KV_OFF=0,
+        HAS_SCALE=False,
         num_warps=4,
         num_stages=1,
     )
