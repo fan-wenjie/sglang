@@ -107,6 +107,7 @@ class VestigeKVMLABackend(AttentionBackend):
         recall_capacity=4096,
         overflow_fallback=True,
         activation_min_tokens=0,
+        index_rank=64,
     )
 
     def __init__(
@@ -116,10 +117,10 @@ class VestigeKVMLABackend(AttentionBackend):
         *,
         config: VestigeKVConfig,
         rho: float = D.RHO,
-        index_rank: int = D.INDEX_RANK,
     ):
         self.base = base
         self.config = config
+        index_rank = config.index_rank
         self.attn_backend_list = [base]  # let generic snapshot/restore reach the child
         # Capability flags are class attributes, not methods, so delegation has
         # to be explicit: inheriting the AttentionBackend defaults instead of
