@@ -193,8 +193,12 @@ class BatchedScanPack:
     # async.
     HEADROOM = 1.05
 
-    def __init__(self, pairs, tiers, qbuf, fetch_buf, fetch_len, q_heads):
+    def __init__(
+        self, pairs, tiers, qbuf, fetch_buf, fetch_len, fetch_ovf, ovf_count, q_heads
+    ):
         # pairs: list of (lid, slot); tiers: matching RecallTier list.
+        # fetch_buf/fetch_len/fetch_ovf are the backend's stacked fixed-address
+        # recall outputs; ovf_count [n_li] is its running overflow tally.
         dev = tiers[0].arch.device
         self.q_heads = q_heads
         self._pad_slot = None  # legacy packs are always fully occupied
@@ -242,7 +246,6 @@ class BatchedScanPack:
         self.inf = torch.tensor(float("inf"), device=dev)
         self.li = torch.zeros(P, dtype=torch.int64, device=dev)
         self.slot = torch.zeros(P, dtype=torch.int64, device=dev)
-        W = fetch_buf.shape[-1]
         # zeros, not empty: the kernel never stores to the padded region
         # (masked by a_len), so anything there at init is there forever --
         # torch.empty garbage would read as fired rows of ARCH padding.
@@ -264,8 +267,8 @@ class BatchedScanPack:
         self.c_counts = torch.zeros(P, NB, dtype=torch.int32, device=dev)
         self.c_offsets = torch.zeros(P, NB, dtype=torch.int32, device=dev)
         self.c_total = torch.zeros(P, dtype=torch.int32, device=dev)
-        self.scratch = torch.zeros(P, W + 1, dtype=torch.int64, device=dev)
         self.qbuf, self.fetch_buf, self.fetch_len = qbuf, fetch_buf, fetch_len
+        self.fetch_ovf, self.ovf_count = fetch_ovf, ovf_count
         self.update(pairs, tiers)
 
     @classmethod
@@ -279,6 +282,8 @@ class BatchedScanPack:
         qbuf,
         fetch_buf,
         fetch_len,
+        fetch_ovf,
+        ovf_count,
         pad_slot,
         arena=None,
         pool_bases=None,
@@ -388,7 +393,6 @@ class BatchedScanPack:
         self.inf = torch.tensor(float("inf"), device=dev)
         self.li = torch.zeros(P, dtype=torch.int64, device=dev)
         self.slot = torch.full((P,), pad_slot, dtype=torch.int64, device=dev)
-        W = fetch_buf.shape[-1]
         # int8: a 0/1 fired flag; the compaction reads it as a predicate.
         self.hit = torch.zeros(arena, dtype=torch.int8, device=dev)
         H = q_heads
@@ -406,8 +410,8 @@ class BatchedScanPack:
         self.c_counts = torch.zeros(P, NB, dtype=torch.int32, device=dev)
         self.c_offsets = torch.zeros(P, NB, dtype=torch.int32, device=dev)
         self.c_total = torch.zeros(P, dtype=torch.int32, device=dev)
-        self.scratch = torch.zeros(P, W + 1, dtype=torch.int64, device=dev)
         self.qbuf, self.fetch_buf, self.fetch_len = qbuf, fetch_buf, fetch_len
+        self.fetch_ovf, self.ovf_count = fetch_ovf, ovf_count
         self.pairs = []
         self.tier_ids = ()
         return self
@@ -664,6 +668,8 @@ class BatchedScanPack:
             self.slot,
             self.fetch_buf,
             self.fetch_len,
+            self.fetch_ovf,
+            self.ovf_count,
             (self.c_counts, self.c_offsets, self.c_total),
             self.am_grid,
         )

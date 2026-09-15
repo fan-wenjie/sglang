@@ -5,9 +5,11 @@ between two runs, and cannot be found by someone asking "what did this run
 actually do?". Anything here that changes what is compared between two runs
 belongs in a run record, not only in this file.
 
-Runtime knobs (the fetch cap, the calibration-query count, the debug hooks) are
-env vars registered in `sglang.srt.environ`; this module holds the values that
-are NOT knobs -- the ones a deployment does not get to vary.
+Deployment knobs (recall capacity, overflow fallback, activation threshold,
+side-pool dtype) are `--vestigekv-*` server flags read through
+`vestigekv.config.VestigeKVConfig`; expert and debug switches are env vars in
+`sglang.srt.environ`. This module holds the values that are NOT knobs -- the
+ones a deployment does not get to vary.
 """
 
 import contextlib
@@ -98,10 +100,11 @@ BUILD_KEY_CHUNK = 16384
 """Key-axis chunk for the calibration argmax. Chunked because the full
 [n*H, T] score matrix OOMs at S=512k."""
 
-FETCH_WIDTH_UNCAPPED = 4096
-"""Fetch buffer width when no cap is set. Not a cap: it is a fixed-address
-buffer size above the worst fire ever observed (3983); overflow is truncated
-and must be counted, never silently dropped."""
+INDEX_DTYPE = torch.int32
+"""Element type of every VestigeKV-owned row-index table (kept, fetch, the
+packed CSR) and their lengths. Pool row ids and context lengths are far below
+2^31, and the base backend's decode kernel takes the CSR at any integer
+width; int32 halves the tables and the pack's traffic."""
 
 # ---- tier-2 scan capture (CUDA graph) ----
 
@@ -130,14 +133,6 @@ is unaffected."""
 SCAN_CAPTURE_AFTER = 8
 """Decode steps one scan shape must hold before it is captured, so a short
 generation does not pay for a graph it replays a handful of times."""
-
-SCAN_KMAX_HEADROOM = CLOSE_BLOCK
-"""Extra kept-table columns baked into a capture. kept_len grows by one per
-decode step until the next block close resets it, so a capture only ever needs
-to survive one close interval: headroom = CLOSE_BLOCK ends the forced
-recapture-every-512-steps regime (measured: 8 recaptures per 4096-step request
-at 256k, ~45 ms each). The cost is a wider baked gather in the in-graph pack,
-which the lens mask renders harmless."""
 
 # ---- fused scan kernel ----
 
