@@ -943,6 +943,69 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         self.assertEqual(called, [])
         self.assertGreater(be._pack_epoch, epoch0)
 
+    def test_install_writes_the_calibration_snapshot_when_dump_dir_is_set(self):
+        # SGLANG_DEBUG_VESTIGEKV_DUMP_DIR contract: the installed build's exact
+        # inputs land in one file, rows gathered in the row_slots order, so the
+        # offline certificate study (mexp/glm53/cert_offline.py) can refit them.
+        import os
+        import tempfile
+
+        from sglang.srt.environ import envs
+
+        be = self._backend()
+        kbuf = torch.randn(300, 576)
+        be.token_to_kv_pool = SimpleNamespace(get_key_buffer=lambda lid: kbuf)
+        be.index_rank = 64
+        st = be._recall[(0, LID)]
+        row_slots = torch.tensor([5, 9, 2, 100, 7], dtype=torch.int32)
+        job = {
+            "slot": 0,
+            "lid": LID,
+            "st": st,
+            "seq_len": 5,
+            "qcal": [torch.randn(2, 576) for _ in range(3)],
+            "qpos": [2, 3, 4],
+            "row_slots": row_slots,
+            "kept": torch.tensor([9, 100], dtype=torch.int32),
+            "done": SimpleNamespace(is_set=lambda: True),
+            "tier": SimpleNamespace(V=torch.eye(64, 512), scale=0.125),
+            "stats": {"need_more_hard": False, "n_hard": 99},
+            "error": None,
+        }
+        be._build_jobs = [job]
+        with tempfile.TemporaryDirectory() as d, envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.override(d):
+            self.assertTrue(be._install_finished_builds())
+            (name,) = os.listdir(d)
+            snap = torch.load(os.path.join(d, name))
+        self.assertEqual(name, f"cal_slot0_lid{LID}_seq5.pt")
+        self.assertTrue(torch.equal(snap["rows"], kbuf[row_slots.long()]))
+        self.assertEqual(snap["qcal"].shape, (3, 2, 576))
+        self.assertEqual(snap["qpos"].tolist(), [2, 3, 4])
+        self.assertEqual(snap["kept"].tolist(), [9, 100])
+        self.assertEqual(snap["index_rank"], 64)
+        self.assertEqual(snap["geom"]["kv_lora_rank"], 512)
+
+    def test_memory_trace_snapshots_every_fifth_request(self):
+        # SGLANG_DEBUG_VESTIGEKV_MEM_DIR contract: one VKMEM line per request
+        # and a snapshot file at requests 5, 10, ...; a dump on every request
+        # would be 100+ MB each and a dump on none leaves nothing to diff.
+        import os
+        import tempfile
+
+        dumped = []
+        be = self._backend()
+        with (
+            tempfile.TemporaryDirectory() as d,
+            patch.object(torch.cuda, "memory_allocated", lambda: 0),
+            patch.object(torch.cuda, "memory_reserved", lambda: 0),
+            patch.object(torch.cuda.memory, "_dump_snapshot", lambda p: dumped.append(p)),
+        ):
+            be._mem_dir = d
+            be._trace_request_memory(3)
+            be._trace_request_memory(4)
+            self.assertEqual(be._mem_reqs, 7)
+            self.assertEqual(dumped, [os.path.join(d, "mem_req5.pickle")])
+
     def test_reachable_hard_rate_jumps_the_window_predictively(self):
         # window 8, n_hard=6 -> needed = ceil(18*8/6)=24 -> next pow2 = 32,
         # in ONE jump instead of 8->16->32
