@@ -510,7 +510,20 @@ class RecallTier:
         fire = ((idxs + zp * cert) > max1[:, None]).sum(-1)
         fire0 = (idxs > max1[:, None]).sum(-1)  # sketch term alone
         q = lambda t, p: float(t.float().quantile(p))
+        # Would a position-pooled (4 rows) certificate be usable? Group bound:
+        # q_sk . mean(c) + |q_sk| max|c_i - mean(c)| + zp cert(max rho); a
+        # fired group fetches its 4 rows.
+        A4 = (A // 4) * 4
+        cg = self.csk[:A4].float().view(-1, 4, self.r)
+        cbar = cg.mean(1)
+        delta = (cg - cbar[:, None, :]).norm(dim=-1).max(1).values
+        rho_g = self.rho[:A4].view(-1, 4).max(1).values
+        bound_g = (qsk @ cbar.T) * sc_ + (qsk.norm(dim=-1)[:, None] * delta[None, :]) * sc_
+        bound_g = bound_g + (qres[:, None] * rho_g[None, :]) * sc_ * zp / (D.KV_LORA_RANK - self.r) ** 0.5
+        gfire = (bound_g > max1[:, None]).sum(-1) * 4
         return {
+            "gfire_p50": q(gfire, 0.5), "gfire_p90": q(gfire, 0.9),
+            "delta_over_c_p50": q(delta / cbar.norm(dim=-1).clamp_min(1e-6), 0.5),
             "A": A,
             "need_p50": q(need, 0.5), "need_p90": q(need, 0.9), "need_max": int(need.max()),
             "fire_p50": q(fire, 0.5), "fire_p90": q(fire, 0.9),

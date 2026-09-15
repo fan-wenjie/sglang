@@ -93,7 +93,8 @@ def build_operands_fused(kbuf: torch.Tensor, arch_slots: torch.Tensor, V: torch.
     amax = torch.zeros(1, dtype=torch.float32, device=dev)
     if A == 0:
         return csk, rho, side
-    grid = (triton.cdiv(A, 64),)
+    ba = D.a_block_for_rank(r)
+    grid = (triton.cdiv(A, ba),)
     _operand_fused_kernel[grid](
         kbuf,
         arch_slots,
@@ -103,8 +104,8 @@ def build_operands_fused(kbuf: torch.Tensor, arch_slots: torch.Tensor, V: torch.
         side,
         amax,
         A,
-        BA=64,
-        BD=64,
+        BA=ba,
+        BD=D.d_block_for_rank(r),
         R=r,
         KV=D.KV_LORA_RANK,
         SD=D.SIDECAR_DIM,
