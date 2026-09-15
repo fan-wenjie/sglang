@@ -972,17 +972,55 @@ class TestTierTwoIsNeverOff(CustomTestCase):
             "error": None,
         }
         be._build_jobs = [job]
-        with tempfile.TemporaryDirectory() as d, envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.override(d):
+        with (
+            tempfile.TemporaryDirectory() as d,
+            envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.override(d),
+            patch(f"{VestigeKVMLABackend.__module__}.get_parallel", lambda: SimpleNamespace(tp_rank=0)),
+        ):
             self.assertTrue(be._install_finished_builds())
             (name,) = os.listdir(d)
             snap = torch.load(os.path.join(d, name))
-        self.assertEqual(name, f"cal_slot0_lid{LID}_seq5.pt")
+        self.assertEqual(name, f"cal_tp0_slot0_lid{LID}_seq5.pt")
         self.assertTrue(torch.equal(snap["rows"], kbuf[row_slots.long()]))
         self.assertEqual(snap["qcal"].shape, (3, 2, 576))
         self.assertEqual(snap["qpos"].tolist(), [2, 3, 4])
         self.assertEqual(snap["kept"].tolist(), [9, 100])
         self.assertEqual(snap["index_rank"], 64)
         self.assertEqual(snap["geom"]["kv_lora_rank"], 512)
+
+    def test_replaced_slot_state_and_its_job_are_freed_without_the_cyclic_gc(self):
+        # A request that ends before its calibrated build installs must not
+        # leave its state dict and job (which reference each other) to the
+        # cyclic GC: the job holds the built tier, ~100 MB per request at 64k.
+        import gc
+        import weakref
+
+        be = self._backend()
+        b, e = self._stubs(be)
+        with b, e:
+            for step in range(D.N_CAL_START):
+                be._collect_calibration(self._fb(seq=101 + step), [0])
+        old_st = be._recall[(0, LID)]
+        job = be.enqueued[0]
+        self.assertIs(old_st["job"], job)
+        self._finish(job)
+        # dicts take no weakref: watch the tiers they hold (the provisional
+        # one in the state, the calibrated one in the job)
+        class Tier:
+            built_at, proxy, V = 0, False, "V"
+
+        old_st["tier"], job["tier"] = Tier(), Tier()
+        ref_prov, ref_cal = weakref.ref(old_st["tier"]), weakref.ref(job["tier"])
+        gc.disable()
+        try:
+            be._reset_slot_state(slot=0, lid=LID)  # the next request's prefill
+            be._install_finished_builds()  # drops the stale job
+            del old_st, job
+            self.assertIsNone(ref_prov())
+            self.assertIsNone(ref_cal())
+        finally:
+            gc.enable()
+        self.assertEqual(be._build_jobs, [])
 
     def test_memory_trace_snapshots_every_fifth_request(self):
         # SGLANG_DEBUG_VESTIGEKV_MEM_DIR contract: one VKMEM line per request
@@ -998,12 +1036,13 @@ class TestTierTwoIsNeverOff(CustomTestCase):
             patch.object(torch.cuda, "memory_allocated", lambda: 0),
             patch.object(torch.cuda, "memory_reserved", lambda: 0),
             patch.object(torch.cuda.memory, "_dump_snapshot", lambda p: dumped.append(p)),
+            patch(f"{VestigeKVMLABackend.__module__}.get_parallel", lambda: SimpleNamespace(tp_rank=0)),
         ):
             be._mem_dir = d
             be._trace_request_memory(3)
             be._trace_request_memory(4)
             self.assertEqual(be._mem_reqs, 7)
-            self.assertEqual(dumped, [os.path.join(d, "mem_req5.pickle")])
+            self.assertEqual(dumped, [os.path.join(d, "mem_tp0_req5.pickle")])
 
     def test_reachable_hard_rate_jumps_the_window_predictively(self):
         # window 8, n_hard=6 -> needed = ceil(18*8/6)=24 -> next pow2 = 32,
