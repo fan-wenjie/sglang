@@ -19,12 +19,22 @@ register_cuda_ci(est_time=60, suite="base-b-test-1-gpu-small")
 H, R, W = 32, 64, 512
 
 
+def _ovf(lens):
+    """Overflow-flag buffer matching a fetch_len buffer (any shape)."""
+    return torch.zeros_like(lens, dtype=torch.int32)
+
+
+def _cnt(lens):
+    """Per-layer overflow counter for a [n_li, ...] fetch_len buffer."""
+    return torch.zeros(lens.shape[0], dtype=torch.int32, device=lens.device)
+
+
 def _mk_tier(nk, a, seed, zp, thr_g):
     from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
 
     g = torch.Generator(device="cuda").manual_seed(seed)
     rnd = lambda *s: torch.randn(*s, device="cuda", generator=g)  # noqa: E731
-    t = RecallTier(r=R, topj=-1)
+    t = RecallTier(r=R)
     t.r, t.scale, t.zp, t.thr_g, t.built = R, 192**-0.5, zp, thr_g, True
     # storage contract mirrors RecallTier.build: side bf16, csk fp16,
     # kept_rows bf16, rho fp32 -- a fabricated fp32 tier would make the two
@@ -73,12 +83,12 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         out = torch.zeros(max_reqs, W, dtype=torch.int64, device="cuda")
         ol = torch.zeros(max_reqs, dtype=torch.int64, device="cuda")
         for (li, slot), t in tiers.items():
-            t.query_fixed(qbuf[li, slot], out, ol, slot)
+            t.query_fixed(qbuf[li, slot], out, ol, _ovf(ol), slot)
             ref_n[(li, slot)] = int(ol[slot])
             ref_rows[(li, slot)] = out[slot, : int(ol[slot])].clone()
 
         pairs = list(tiers.keys())
-        pack = BatchedScanPack(pairs, [tiers[p] for p in pairs], qbuf, fetch, flen, H)
+        pack = BatchedScanPack(pairs, [tiers[p] for p in pairs], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H)
         pack.run()
         torch.cuda.synchronize()
         for li, slot in pairs:
@@ -101,7 +111,7 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         qbuf = torch.randn(1, 4, H, 576, device="cuda")
         fetch = torch.zeros(1, 4, W, dtype=torch.int64, device="cuda")
         flen = torch.zeros(1, 4, dtype=torch.int64, device="cuda")
-        pack = BatchedScanPack([(0, 0), (0, 1)], [small, wide], qbuf, fetch, flen, H)
+        pack = BatchedScanPack([(0, 0), (0, 1)], [small, wide], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H)
         pack.run()
         torch.cuda.synchronize()
         n_small = int(flen[0, 0])
@@ -121,7 +131,7 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         qbuf = torch.randn(1, 2, H, 576, device="cuda")
         fetch = torch.zeros(1, 2, W, dtype=torch.int64, device="cuda")
         flen = torch.zeros(1, 2, dtype=torch.int64, device="cuda")
-        pack = BatchedScanPack([(0, 0), (0, 1)], [t_neg, t_pad], qbuf, fetch, flen, H)
+        pack = BatchedScanPack([(0, 0), (0, 1)], [t_neg, t_pad], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H)
         pack.run()
         torch.cuda.synchronize()
         self.assertGreater(int(flen[0, 0]), 0, "pad row won the max: nothing fired")
@@ -141,12 +151,12 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         # founding request (larger), then a SMALLER successor reusing the pack
         old = [_mk_tier(900, 20000, seed=11, zp=2.0, thr_g=-float("inf"))]
         new = [_mk_tier(700, 15000, seed=12, zp=1.0, thr_g=-float("inf"))]
-        pack = BatchedScanPack([(0, 2)], old, qbuf, f1, l1, H)
+        pack = BatchedScanPack([(0, 2)], old, qbuf, f1, l1, _ovf(l1), _cnt(l1), H)
         pack.run()  # founding contents exercised (also seeds any stale state)
         self.assertTrue(pack.fits([(0, 2)], new))
         pack.update([(0, 2)], new)
         pack.run()
-        fresh = BatchedScanPack([(0, 2)], new, qbuf, f2, l2, H)
+        fresh = BatchedScanPack([(0, 2)], new, qbuf, f2, l2, _ovf(l2), _cnt(l2), H)
         fresh.run()
         torch.cuda.synchronize()
         n_u, n_f = int(l1[0, 2]), int(l2[0, 2])
@@ -164,7 +174,7 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         ln = torch.zeros(1, 4, dtype=torch.int64, device="cuda")
         small = [_mk_tier(100, 5000, seed=21, zp=2.0, thr_g=-float("inf"))]
         big = [_mk_tier(100, 9000, seed=22, zp=2.0, thr_g=-float("inf"))]
-        pack = BatchedScanPack([(0, 0)], small, qbuf, f, ln, H)
+        pack = BatchedScanPack([(0, 0)], small, qbuf, f, ln, _ovf(ln), _cnt(ln), H)
         self.assertFalse(pack.fits([(0, 0)], big))  # 9000 > 5000*1.05
 
 
@@ -179,14 +189,12 @@ class TestKeptSetParityWithReference(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_prefill_selection_matches_reference_policy(self):
         from sglang.srt.layers.attention.vestigekv import defaults as D
-        from sglang.srt.environ import envs
-
-        # Activation threshold is a config knob (environ), not a defaults
-        # constant; tests run against its default value.
-        ACT_MIN = envs.SGLANG_VESTIGEKV_ACTIVATION_MIN_TOKENS.get()
         from sglang.srt.layers.attention.vestigekv_mla_backend import (
             VestigeKVMLABackend,
         )
+
+        # Activation threshold is a server flag; tests run against its default.
+        ACT_MIN = VestigeKVMLABackend.config.activation_min_tokens
 
         torch.manual_seed(3)
         # Past the activation threshold so compression is on; below it the
@@ -281,7 +289,7 @@ class TestBatchedEmptyKept(CustomTestCase):
         qbuf = torch.randn(2, 2, H, D.LATENT_DIM, device=dev)
         fetch_buf = torch.zeros(2, 2, A + 8, dtype=torch.int64, device=dev)
         fetch_len = torch.zeros(2, 2, dtype=torch.int64, device=dev)
-        pack = BatchedScanPack(pairs, tiers, qbuf, fetch_buf, fetch_len, H)
+        pack = BatchedScanPack(pairs, tiers, qbuf, fetch_buf, fetch_len, _ovf(fetch_len), _cnt(fetch_len), H)
         pack.run()  # must not raise (was: zero-width kr -> max(-1) crash)
         # empty kept => whole archive eligible; both pairs fire > 0 rows
         self.assertGreater(int(fetch_len.sum()), 0)
@@ -326,13 +334,13 @@ class TestArchiveArenaAddressing(CustomTestCase):
         out = torch.zeros(max_reqs, W, dtype=torch.int64, device="cuda")
         ol = torch.zeros(max_reqs, dtype=torch.int64, device="cuda")
         for (li, slot), t in zip(pairs, tiers):
-            t.query_fixed(qbuf[li, slot], out, ol, slot)
+            t.query_fixed(qbuf[li, slot], out, ol, _ovf(ol), slot)
             ref_n.append(int(ol[slot]))
             ref_rows.append(out[slot, : int(ol[slot])].clone())
 
         # arena = the exact sum, i.e. the tightest the pool bound can ever be
         pack = BatchedScanPack.at_capacity(
-            P, 900, Am, R, H, qbuf, f, ln, 0, arena=sum(lens)
+            P, 900, Am, R, H, qbuf, f, ln, _ovf(ln), _cnt(ln), 0, arena=sum(lens)
         )
         self.assertTrue(pack.fits(pairs, tiers))
         pack.update(pairs, tiers)
@@ -358,7 +366,7 @@ class TestArchiveArenaAddressing(CustomTestCase):
         f = torch.zeros(2, 2, W, dtype=torch.int64, device="cuda")
         ln = torch.zeros(2, 2, dtype=torch.int64, device="cuda")
         pack = BatchedScanPack.at_capacity(
-            P, 900, Am, R, H, qbuf, f, ln, 0, arena=sum(lens) - 1
+            P, 900, Am, R, H, qbuf, f, ln, _ovf(ln), _cnt(ln), 0, arena=sum(lens) - 1
         )
         pairs = [(li, s) for li in range(2) for s in range(2)]
         tiers = [
@@ -416,7 +424,7 @@ class TestKeptRowsFromPool(CustomTestCase):
         keep[kbuf[slots].float().norm(dim=-1).topk(nkeep).indices] = True
         qcal = torch.randn(32, H, 576, device="cuda", generator=g)
         qpos = torch.randint(0, n_tok, (32,), device="cuda", generator=g)
-        t = RecallTier(r=R, topj=-1)
+        t = RecallTier(r=R)
         t.build(kbuf, slots, keep, qcal, qpos)
         return t
 
@@ -450,6 +458,8 @@ class TestKeptRowsFromPool(CustomTestCase):
             qbuf,
             f,
             ln,
+            _ovf(ln),
+            _cnt(ln),
             0,
             arena=sum(arch_lens),
             pool_bases=pool_bases,
@@ -516,7 +526,7 @@ class TestKeptRowsFromPool(CustomTestCase):
         ol = torch.zeros(qbuf.shape[1], dtype=torch.int64, device="cuda")
         ref = []
         for (li, slot), t in zip(pairs, tiers):
-            t.query_fixed(qbuf[li, slot], out, ol, slot)
+            t.query_fixed(qbuf[li, slot], out, ol, _ovf(ol), slot)
             ref.append(set(out[slot, : int(ol[slot])].tolist()))
 
         f, ln = self._run(
@@ -614,7 +624,7 @@ class TestProjectionsFromTierCache(CustomTestCase):
                 keep[kb[slots].float().norm(dim=-1).topk(nkeep).indices] = True
                 qcal = torch.randn(32, H, 576, device="cuda", generator=gg)
                 qpos = torch.randint(0, n_toks[p], (32,), device="cuda", generator=gg)
-                t = RecallTier(r=R, topj=-1)
+                t = RecallTier(r=R)
                 t.build(kb, slots, keep, qcal, qpos)
                 pairs.append((li, slot))
                 tiers.append(t)
@@ -639,6 +649,8 @@ class TestProjectionsFromTierCache(CustomTestCase):
             qbuf,
             f,
             ln,
+            _ovf(ln),
+            _cnt(ln),
             0,
             arena=sum(arch_lens) + slack,
             pool_bases=[b.data_ptr() for b in bufs],
@@ -711,3 +723,46 @@ class TestProjectionsFromTierCache(CustomTestCase):
             int(before[0]), int(pack.cbase[0]), "cbase kept a stale address"
         )
         self.assertEqual(int(pack.cbase[0]), t0._csk_all.data_ptr())
+
+class TestRecallOverflowFlag(CustomTestCase):
+    """A pair firing more rows than the fetch buffer holds must keep the first
+    W rows, raise its overflow flag and count once per step in its layer's
+    counter; a pair that fits must leave the flag clear. Without the flag the
+    pack's fence has nothing to read and an overflow is a silent truncation.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_flag_and_counter_follow_the_fire_size(self):
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
+
+        torch.manual_seed(5)
+        # thr_g=-inf opens every gate and zp=8 inflates every certificate:
+        # the 300-row archive fires whole, past a 64-row fetch buffer; the
+        # 16-row archive cannot overflow it.
+        big = _mk_tier(40, 300, seed=51, zp=8.0, thr_g=-float("inf"))
+        small = _mk_tier(40, 16, seed=52, zp=8.0, thr_g=-float("inf"))
+        qbuf = torch.randn(2, 3, H, 576, device="cuda")
+        fetch = torch.zeros(2, 3, 64, dtype=torch.int32, device="cuda")
+        flen = torch.zeros(2, 3, dtype=torch.int32, device="cuda")
+        fovf, fcnt = _ovf(flen), _cnt(flen)
+        pairs = [(1, 2), (0, 1)]
+        pack = BatchedScanPack(pairs, [big, small], qbuf, fetch, flen, fovf, fcnt, H)
+        pack.run()
+        pack.run()
+        torch.cuda.synchronize()
+        # per-pair reference: the eager form's count and flag
+        out = torch.zeros(3, 64, dtype=torch.int32, device="cuda")
+        ol = torch.zeros(3, dtype=torch.int32, device="cuda")
+        oo = _ovf(ol)
+        big.query_fixed(qbuf[1, 2], out, ol, oo, 2)
+        small.query_fixed(qbuf[0, 1], out, ol, oo, 1)
+        self.assertEqual(int(oo[2]), 1)
+        self.assertEqual(int(oo[1]), 0)
+        self.assertEqual(int(flen[1, 2]), 64)
+        self.assertEqual(int(fovf[1, 2]), 1)
+        self.assertTrue(torch.equal(fetch[1, 2], out[2]))
+        self.assertEqual(int(fovf[0, 1]), 0)
+        self.assertEqual(int(flen[0, 1]), int(ol[1]))
+        self.assertEqual(fcnt.tolist(), [0, 2], "one overflow per run, layer 1")
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

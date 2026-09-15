@@ -588,22 +588,6 @@ class Envs:
     SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN = EnvBool(True)
 
     SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG = EnvStr(None)
-    # VestigeKV recall calibration: number of decode steps whose queries
-    # feed RecallTier.build before the tier activates for a request.
-    # VestigeKV per-head recall fetch cap (topj). Default -1 = uncapped: fetch
-    # the full fired recall set. Set > 0 explicitly (16 recommended) for the
-    # bounded-fetch guarantee; deliberate opt-in so the operator states the
-    # fetch bound they are accepting.
-    SGLANG_VESTIGEKV_TOPJ = EnvInt(-1)
-
-    # VestigeKV activation threshold: below this many tokens a request is
-    # served dense (nothing closed/archived/recalled). The default 32768 is
-    # the engineering optimum on the reference stack (recall pipeline fixed
-    # cost outweighs tier-1 savings below ~32k). 0 disables the fallback:
-    # every request compresses from token 0 -- the configuration all
-    # published experiments run under, so the quality/performance numbers
-    # measure the compressed path at every length.
-    SGLANG_VESTIGEKV_ACTIVATION_MIN_TOKENS = EnvInt(32768)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
     # rows the KV pool already holds. Unset picks the fastest form that runs on
@@ -1944,6 +1928,16 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
         note="The unified radix tree is the default tree cache now; unset this "
         "env. The field is still defined for legacy call sites."
+    ),
+    "SGLANG_VESTIGEKV_TOPJ": _DeprecatedEnv(
+        note="The per-head fetch cap is gone: the recall fetch is a fixed "
+        "capacity, set with '--vestigekv-recall-capacity', and an overflow "
+        "falls back to dense attention unless "
+        "'--disable-vestigekv-recall-overflow-fallback' is given."
+    ),
+    "SGLANG_VESTIGEKV_ACTIVATION_MIN_TOKENS": _DeprecatedEnv(
+        note="Please use '--vestigekv-activation-min-tokens' instead "
+        "(its default is 0: every request compresses)."
     ),
 }
 

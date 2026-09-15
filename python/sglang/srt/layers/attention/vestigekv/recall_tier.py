@@ -30,20 +30,10 @@ class RecallTier:
     def __init__(
         self,
         r: int = D.INDEX_RANK,
-        topj: int = -1,
         recall_target: float = D.RECALL_TARGET,
         scale: float = D.ATTN_SCALE,
     ):
-        # topj: per-head fetch cap. DEFAULT -1 = uncapped (fetch the full fired
-        # set; the fool-proof default does the WHOLE thing, never a fraction
-        # nobody typed). Set topj > 0 explicitly to enable the bounded-fetch
-        # guarantee (fetch <= topj*num_heads rows/step/layer); recommended cap
-        # is 16. Measured (PREREG33/34): the cap is nearly free at
-        # batch=1/<=32k and changes generation not at all (bit-identical text),
-        # trading a sub-0.001-bpb likelihood sliver for the worst-case bound
-        # (uncapped fire max 3983 rows vs capped 296).
         self.r = r
-        self.topj = topj
         self.recall_target = recall_target
         self.scale = scale
         self.built = False
@@ -480,13 +470,20 @@ class RecallTier:
     @torch.inference_mode()
     @ieee_fp32
     def query_fixed(
-        self, qe: torch.Tensor, out: torch.Tensor, out_len: torch.Tensor, slot: int
+        self,
+        qe: torch.Tensor,
+        out: torch.Tensor,
+        out_len: torch.Tensor,
+        out_ovf: torch.Tensor,
+        slot: int,
     ) -> None:
         """Device-only variant of query(): writes the fired pool rows into
-        out[slot, :W] and their count into out_len[slot] with NO host sync
-        (no .numel(), no bool() early-exit). Serving decode uses this; query()
-        stays as the reference/equivalence-tested form. Overflow past W is
-        truncated -- W is sized above the observed worst fire."""
+        out[slot, :W], their count (at most W) into out_len[slot] and whether
+        the fire exceeded W into out_ovf[slot], with NO host sync (no
+        .numel(), no bool() early-exit). Serving decode uses this; query()
+        stays as the reference/equivalence-tested form. An overflow keeps the
+        first W rows in position order; the flag is what the pack's fence
+        reads."""
         sc_ = self.scale
         qe = qe.float()
         H = qe.shape[0]
@@ -519,50 +516,29 @@ class RecallTier:
             self._inf = qe.new_full((), float("inf"))
         self._qside_t.copy_(qe[:, D.KV_LORA_RANK :].T)
         self._qsk_t.copy_(qsk.T)
-        if self.topj is not None and self.topj > 0:
-            # Capped fetch needs the per-head ranking, so it keeps the eager
-            # form: the fused kernel reduces over heads and never materializes
-            # the score matrix the top-j selection ranks. The cap is explicit
-            # opt-in; the default (uncapped) path is the fused one.
-            idxs = (
-                (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16) @ self.side.T).float()
-                + (qsk.half() @ self.csk.T).float()
-            ) * sc_
-            cert = (
-                (qres[:, None] * self.rho[None, :])
-                * sc_
-                / (D.KV_LORA_RANK - self.r) ** 0.5
+        # Fold the gate into the threshold: a closed head can never fire, so
+        # +inf makes it lose every comparison and the kernel needs no second
+        # predicate. Scores stay in registers -- see scan_kernel for why
+        # that, not arithmetic, is what the scan costs.
+        max1g = torch.where(gate, max1, self._inf)
+        hit = (
+            vestige_scan(
+                self._qside_t,
+                self._qsk_t,
+                qres,
+                max1g,
+                self.side,
+                self.csk,
+                self.rho,
+                sc_,
+                self.zp * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5,
+                out=self._hit_buf,
             )
-            score = idxs + self.zp * cert
-            fire = (score > max1[:, None]) & gate[:, None]
-            topj = score.topk(min(self.topj, score.shape[1]), dim=-1).indices
-            fetch = torch.zeros_like(fire)
-            fetch.scatter_(1, topj, True)
-            fetch &= fire
-            hit = fetch.any(0)  # [A] bool, stays on device
-        else:
-            # Fold the gate into the threshold: a closed head can never fire, so
-            # +inf makes it lose every comparison and the kernel needs no second
-            # predicate. Scores stay in registers -- see scan_kernel for why
-            # that, not arithmetic, is what the scan costs.
-            max1g = torch.where(gate, max1, self._inf)
-            hit = (
-                vestige_scan(
-                    self._qside_t,
-                    self._qsk_t,
-                    qres,
-                    max1g,
-                    self.side,
-                    self.csk,
-                    self.rho,
-                    sc_,
-                    self.zp * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5,
-                    out=self._hit_buf,
-                )
-                != 0
-            )
+            != 0
+        )
         W = out.shape[1]
-        n = hit.sum().clamp(max=W)  # [] int64 on device
+        total = hit.sum()  # [] int64 on device
+        n = total.clamp(max=W)
         # Rank the hit rows by position and keep the first W. Everything here is
         # static-shape on purpose: boolean-mask indexing (`pos[sel]`) is a
         # masked_select, whose output size is only known on the device, so eager
@@ -580,6 +556,7 @@ class RecallTier:
         scratch.scatter_(0, dst, self.arch.to(out.dtype))
         out[slot].copy_(scratch[:W])
         out_len[slot] = n
+        out_ovf[slot] = total > W
 
     @torch.inference_mode()
     @ieee_fp32
@@ -611,14 +588,7 @@ class RecallTier:
         )
         score = idxs + self.zp * cert
         fire = (score > max1[:, None]) & gate[:, None]
-        if self.topj is not None and self.topj > 0:
-            topj = score.topk(min(self.topj, score.shape[1]), dim=-1).indices
-            fetch = torch.zeros_like(fire)
-            fetch.scatter_(1, topj, True)
-            fetch &= fire
-        else:  # topj <= 0 (-1): uncapped, full fired set
-            fetch = fire
-        return self.arch[fetch.any(0)]
+        return self.arch[fire.any(0)]
 
     @ieee_fp32
     @torch.inference_mode()

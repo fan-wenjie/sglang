@@ -309,6 +309,30 @@ class ExecKernel(msgspec.Struct):
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
 
+    # -------------------------------------------------------------------------
+    # VestigeKV (--attention-backend vestigekv_mla)
+    # -------------------------------------------------------------------------
+    vestigekv_recall_capacity: A[
+        int,
+        "VestigeKV: rows the tier-2 recall may fetch per layer, request and decode "
+        "step. A fixed buffer width (CUDA graphs bake it), not a per-head cap; a "
+        "step that fires more rows than this overflows. Default 4096 sits above "
+        "the largest fire observed on the reference stack.",
+    ] = 4096
+    disable_vestigekv_recall_overflow_fallback: A[
+        bool,
+        "VestigeKV: on a recall overflow, attend the truncated fetch instead of "
+        "falling back to the request's full row set (dense MLA) for that step. "
+        "Trades the no-under-recall guarantee for a bounded per-step cost; the "
+        "overflow count is reported in the VestigeKV stats.",
+    ] = False
+    vestigekv_activation_min_tokens: A[
+        int,
+        "VestigeKV: requests shorter than this many tokens are served dense "
+        "(nothing closed, archived or recalled). 0 compresses every request from "
+        "its first token.",
+    ] = 0
+
 
 class ExecMamba(msgspec.Struct):
     """Namespace ``exec.mamba``."""

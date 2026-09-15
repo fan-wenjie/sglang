@@ -580,6 +580,8 @@ def _compact_write_kernel(
     arch_ptr,
     out_ptr,
     out_len_ptr,
+    out_ovf_ptr,  # [n_li, NSLOT] int32: 1 where the fire exceeded W this step
+    ovf_count_ptr,  # [n_li] int32: running overflow count per layer
     li_ptr,
     slot_ptr,
     total_ptr,
@@ -601,6 +603,9 @@ def _compact_write_kernel(
         # write cannot ride on bucket 0 existing in the (capped) grid.
         t = tl.load(total_ptr + p)
         tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
+        tl.store(out_ovf_ptr + li * NSLOT + slot, (t > W).to(tl.int32))
+        if t > W:
+            tl.atomic_add(ovf_count_ptr + li, 1)
     alen = tl.load(a_len_ptr + p)
     live = tl.minimum(nb, (alen + BLOCK_A - 1) // BLOCK_A)
     trips = (tl.maximum(live - pid, 0) + G - 1) // G
@@ -626,16 +631,21 @@ def compact_fired(
     slot,
     fetch_buf,
     fetch_len,
+    fetch_ovf,
+    ovf_count,
     scratch,
     am_grid,
     p_live=None,
 ):
     """Deterministic fired-row compaction. scratch: (counts, offsets, total)
-    int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W] int64-compatible.
+    int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W]; fetch_len/fetch_ovf
+    [n_li, n_slot]; ovf_count [n_li].
 
     am_grid is the largest archive a SINGLE pair can hold -- the bucket grid
     and the counts table are sized by it, not by the shared arena (which only
     bounds the sum). Rows are addressed as a_off[p] + i, masked by a_len[p].
+    A pair firing more than W rows keeps the first W in position order,
+    raises its fetch_ovf flag and counts once in ovf_count[li].
     """
     Am = am_grid
     P = p_live if p_live is not None else a_len.shape[0]
@@ -658,6 +668,8 @@ def compact_fired(
         arch,
         fetch_buf,
         fetch_len,
+        fetch_ovf,
+        ovf_count,
         li,
         slot,
         total,

@@ -27,7 +27,7 @@ def _mk_tier(nk, a, seed, zp, thr_g):
 
     g = torch.Generator(device="cuda").manual_seed(seed)
     rnd = lambda *s: torch.randn(*s, device="cuda", generator=g)  # noqa: E731
-    t = RecallTier(r=R, topj=-1)
+    t = RecallTier(r=R)
     t.r, t.scale, t.zp, t.thr_g, t.built = R, 192**-0.5, zp, thr_g, True
     t.kept_rows = rnd(nk, 576).to(torch.bfloat16)
     t.V = rnd(R, 512)
@@ -65,7 +65,17 @@ def _capacity_pack(qbuf, fetch, flen, P=None):
     from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
 
     return BatchedScanPack.at_capacity(
-        P or (L * MAX_REQS), 2048, 32768, R, H, qbuf, fetch, flen, TRASH
+        P or (L * MAX_REQS),
+        2048,
+        32768,
+        R,
+        H,
+        qbuf,
+        fetch,
+        flen,
+        torch.zeros_like(flen, dtype=torch.int32),
+        torch.zeros(flen.shape[0], dtype=torch.int32, device=flen.device),
+        TRASH,
     )
 
 
@@ -79,7 +89,16 @@ class TestCapacityPack(CustomTestCase):
         tl = [tiers[p] for p in pairs]
 
         ref_fetch, ref_flen = fetch.clone(), flen.clone()
-        legacy = BatchedScanPack(pairs, tl, qbuf, ref_fetch, ref_flen, H)
+        legacy = BatchedScanPack(
+            pairs,
+            tl,
+            qbuf,
+            ref_fetch,
+            ref_flen,
+            torch.zeros_like(ref_flen, dtype=torch.int32),
+            torch.zeros(ref_flen.shape[0], dtype=torch.int32, device="cuda"),
+            H,
+        )
         legacy.run()
 
         cap = _capacity_pack(qbuf, fetch, flen)
@@ -140,7 +159,16 @@ class TestCapacityPack(CustomTestCase):
         pairs = sorted(tiers.keys())
         tl = [tiers[p] for p in pairs]
         ref_fetch, ref_flen = fetch.clone(), flen.clone()
-        legacy = BatchedScanPack(pairs, tl, qbuf, ref_fetch, ref_flen, H)
+        legacy = BatchedScanPack(
+            pairs,
+            tl,
+            qbuf,
+            ref_fetch,
+            ref_flen,
+            torch.zeros_like(ref_flen, dtype=torch.int32),
+            torch.zeros(ref_flen.shape[0], dtype=torch.int32, device="cuda"),
+            H,
+        )
         legacy.run()
 
         cap.update(pairs, tl)
@@ -170,7 +198,16 @@ class TestCapacityPack(CustomTestCase):
         }
         tl2 = [tiers2[p] for p in pairs]
         ref_fetch.zero_(), ref_flen.zero_()
-        legacy2 = BatchedScanPack(pairs, tl2, qbuf, ref_fetch, ref_flen, H)
+        legacy2 = BatchedScanPack(
+            pairs,
+            tl2,
+            qbuf,
+            ref_fetch,
+            ref_flen,
+            torch.zeros_like(ref_flen, dtype=torch.int32),
+            torch.zeros(ref_flen.shape[0], dtype=torch.int32, device="cuda"),
+            H,
+        )
         legacy2.run()
         cap.update(pairs, tl2)
         g.replay()

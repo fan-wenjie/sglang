@@ -35,7 +35,7 @@ def _mk(n_tok, seed):
     keep[kbuf[slots].float().norm(dim=-1).topk(nkeep).indices] = True
     qcal = torch.randn(32, H, 576, device="cuda", generator=g)
     qpos = torch.randint(0, n_tok, (32,), device="cuda", generator=g)
-    t = RecallTier(r=R, topj=-1)
+    t = RecallTier(r=R)
     t.build(kbuf, slots, keep, qcal, qpos)
     # build now returns pool row ids directly; no remap
     return t, kbuf, slots, keep, D
@@ -171,7 +171,8 @@ class TestLazyKeptRows(CustomTestCase):
         t.drop_kept_rows()
         out = torch.zeros(2, 512, dtype=torch.int64, device="cuda")
         ol = torch.zeros(2, dtype=torch.int64, device="cuda")
-        t.query_fixed(torch.randn(H, 576, device="cuda"), out, ol, 0)
+        oo = torch.zeros(2, dtype=torch.int32, device="cuda")
+        t.query_fixed(torch.randn(H, 576, device="cuda"), out, ol, oo, 0)
         self.assertIsNotNone(t.kept_slots)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
