@@ -143,6 +143,25 @@ registers on SM120."""
 SCAN_NUM_WARPS = 4
 
 
+def d_block_for_rank(r: int, base: int = 64) -> int:
+    """K-chunk of the content dimension in the kernels that hold a [rank, chunk]
+    slice of the sketch basis on chip. The tiles were tuned at rank 64; a
+    larger rank keeps the on-chip footprint by shrinking the chunk in
+    proportion (never below the 16-wide tensor-core minimum), so rank 64 is
+    untouched and ranks 128/256 fit the shared-memory limit."""
+    return max(16, base * D_BLOCK_RANK_BASE // r)
+
+
+def a_block_for_rank(r: int) -> int:
+    """Rows per program in the operand build, which holds a [rows, rank] fp32
+    sketch tile on chip: 64 rows up to rank 128; rank 256 at 64 rows needs
+    102400 B of shared memory against the 101376 B SM120 limit, so 32."""
+    return 64 if r <= 2 * D_BLOCK_RANK_BASE else 32
+
+
+D_BLOCK_RANK_BASE = INDEX_RANK
+
+
 # ---- row invariant (SGLANG_DEBUG_VESTIGEKV_ROWS) ----
 
 CHECK_MIN_SEQ_BLOCKS = 4

@@ -332,6 +332,12 @@ class ExecKernel(msgspec.Struct):
         "(nothing closed, archived or recalled). 0 compresses every request from "
         "its first token.",
     ] = 0
+    vestigekv_index_rank: A[
+        int,
+        "VestigeKV: rank of the tier-2 recall sketch (rows of the per-layer basis). "
+        "Higher ranks certify more of the latent row and fire fewer rows per scan, at "
+        "2 bytes per rank per archived row per layer of scan traffic and memory.",
+    ] = 64
 
 
 class ExecMamba(msgspec.Struct):

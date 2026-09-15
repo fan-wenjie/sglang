@@ -147,7 +147,7 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None):
         KV=D.KV_LORA_RANK,
         DD=D.SIDECAR_DIM,
         BLOCK_NK=64,
-        BLOCK_D=64,
+        BLOCK_D=D.d_block_for_rank(R),
         num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
@@ -519,7 +519,7 @@ def fused_prologue_split(
         ROW=ROW,
         POOL_ROWS=pool_rows or 1,
         BLOCK_NK=_TILE[from_pool][0],
-        BLOCK_D=_TILE[from_pool][1],
+        BLOCK_D=D.d_block_for_rank(R, _TILE[from_pool][1]),
         num_warps=_TILE[from_pool][2],
         num_stages=_TILE[from_pool][3],
     )
@@ -544,7 +544,7 @@ def fused_prologue_split(
         R=R,
         KV=D.KV_LORA_RANK,
         DD=D.SIDECAR_DIM,
-        BLOCK_D=64,
+        BLOCK_D=D.d_block_for_rank(R),
         num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
