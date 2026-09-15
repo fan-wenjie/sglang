@@ -199,12 +199,6 @@ class RecallTier:
         # the real shape (512x512): 17.4 ms -> 4.3 ms, subspace alignment 1.0000
         # (torch.svd_lowrank was faster still but only 0.87-aligned: rejected).
         if v_init is not None:
-            # A sketch basis carried over from this layer's previous calibrated
-            # build. The certificate is a Cauchy-Schwarz bound on the truncation
-            # error and stays sound for ANY orthonormal basis, so reusing one is
-            # a cost saving, not an approximation -- and a basis fitted on real
-            # queries beats a PCA of cache-row proxies, which is all the
-            # provisional build could compute for itself.
             V = v_init
         elif conservative:
             # The PROVISIONAL build must never block the first decode step on a
@@ -221,6 +215,11 @@ class RecallTier:
             V = torch.zeros(self.r, D.KV_LORA_RANK, device=dev, dtype=qe.dtype)
             V[torch.arange(self.r, device=dev), torch.arange(self.r, device=dev)] = 1.0
         else:
+            # Fitted on THIS request's calibration queries, every calibrated
+            # build. The certificate is sound for any orthonormal basis, but
+            # its tightness is not: a basis carried over from another request
+            # left GLM queries with 2x the residual norm of their own PCA and
+            # the certificate fired the whole archive (fallback 0.6-0.8).
             evals, evecs = torch.linalg.eigh(qcal_c.T @ qcal_c)
             V = evecs[:, -self.r :].T.flip(0)  # descending singular value order
         self.V = V

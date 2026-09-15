@@ -838,7 +838,6 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         be._capture_asap = False
         be._needs_recapture = False
         be._build_jobs = []
-        be._vcache = {}
         be.built = []
         be.enqueued = []
         return be
