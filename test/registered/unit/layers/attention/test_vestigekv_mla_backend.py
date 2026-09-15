@@ -383,6 +383,43 @@ class TestOverflowFence(CustomTestCase):
         )
 
 
+class TestStatsTelemetry(CustomTestCase):
+    """VKSTATS reports the fetched-row distribution and the fallback rate
+    from a device histogram; the percentile is the nearest-rank one over bin
+    counts, and one scan of an overflowed lane lands in the capacity bin."""
+
+    def test_hist_percentiles_are_nearest_rank(self):
+        from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
+
+        # values: 1 x3, 3 x2, 4 x5 (total 10) -> ranks 5, 9, 10
+        self.assertEqual(hist_percentiles([0, 3, 0, 2, 5], (0.5, 0.9, 0.99)), [3, 4, 4])
+        self.assertEqual(hist_percentiles([], (0.5,)), [0])
+        self.assertEqual(hist_percentiles([7], (0.5, 1.0)), [0, 0])
+
+    def test_account_step_bins_last_steps_fetch_counts(self):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._fetch_w = 8
+        be._mla_lids = {LID}
+        be._qbuf = {LID: None}
+        be._fetch_len = {LID: torch.tensor([3, 8, 0, 5], dtype=torch.int32)}
+        be._kept_len = {LID: torch.tensor([10, 20, 30, 40], dtype=torch.int32)}
+        be._stats = dict.fromkeys(("steps", "scan_calls", "fetched", "kept", "seq"), 0)
+        be._stats["steps"] = 1  # off the dump cadence
+        be._fetch_hist = None
+        fb = SimpleNamespace(
+            out_cache_loc=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([100, 200], dtype=torch.int64),
+        )
+        be._stat_acc = None
+        be._account_step(fb)
+        self.assertEqual(be._fetch_hist.tolist(), [0, 0, 0, 0, 0, 1, 0, 0, 1])
+        self.assertEqual(be._stats["scan_calls"], 2)
+        # the sums stay on the device until the dump reads them back
+        self.assertEqual(be._stat_acc.tolist(), [13, 60, 300])
+        self.assertEqual(be._stats["fetched"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
