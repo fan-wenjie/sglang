@@ -361,6 +361,11 @@ class RecallTier:
         nq = qe.shape[0]
         best_val = torch.full((nq,), torch.finfo(torch.float32).min, device=dev)
         tgt = torch.zeros(nq, dtype=torch.long, device=dev)
+        # Best ARCHIVED row per query (true score, causal): the certificate is
+        # calibrated on it for every query, not only for the queries whose
+        # global argmax is archived -- see the zp block below.
+        abest_val = torch.full((nq,), torch.finfo(torch.float32).min, device=dev)
+        atgt = torch.zeros(nq, dtype=torch.long, device=dev)
         KB = D.BUILD_KEY_CHUNK
         if diag:
             # Debug telemetry: how many ARCHIVED rows each calibration query
@@ -386,6 +391,11 @@ class RecallTier:
             take = bval > best_val
             best_val = torch.where(take, bval, best_val)
             tgt = torch.where(take, bidx + k0, tgt)
+            blk.masked_fill_(keep[k0:k1][None, :], torch.finfo(torch.float32).min)
+            abval, abidx = blk.max(-1)
+            atake = abval > abest_val
+            abest_val = torch.where(atake, abval, abest_val)
+            atgt = torch.where(atake, abidx + k0, atgt)
             del blk
         del best_val
         hard = ~keep[tgt]
@@ -407,28 +417,33 @@ class RecallTier:
             thr_g = float("-inf")
         self.thr_g = thr_g
 
-        # zp in closed form: for hard sample q the archived target wins iff
-        # idxs_t + z*cert_t > max1, i.e. z > z_q := (max1 - idxs_t)/cert_t.
-        # Over n exchangeable hard samples the k-th order statistic of z_q at
-        # k = ceil((n+1)*scan_target) is the conformal quantile: it carries the
-        # distribution-free marginal guarantee P(recovered) >= scan_target.
-        # This replaces the former 11-rung ladder search exactly (the ladder
-        # was a discretization of this quantile) and needs no fallback rung.
-        # Positional, not pool ids: tgt is an index into the closed prefix
-        # and _arch_idx is the archive's positions in it, ascending.
-        pos_in_arch = torch.searchsorted(self._arch_idx.to(torch.int64), tgt)
-        self.need_more_hard = n_hard < D.min_hard(self.recall_target)
-        if n_hard == 0 or self.need_more_hard:
+        # zp in closed form. Requirement per calibration query q: the certified
+        # score of its best ARCHIVED row t must reach that row's true score,
+        # idxs_t + z*cert_t >= true_t, i.e. z >= z_q := (true_t - idxs_t)/cert_t;
+        # then whenever an archived row truly beats the kept set, its certified
+        # score does too and the scan fires it. Over the n exchangeable queries
+        # the k-th order statistic of z_q at k = ceil((n+1)*scan_target) is the
+        # conformal quantile (distribution-free marginal guarantee). Every
+        # query contributes, not only the "hard" ones whose global argmax is
+        # archived: on a model whose kept set is good those are too few to
+        # calibrate on and the certificate collapsed to the Z_MAX clamp,
+        # firing the whole archive.
+        # Positional, not pool ids: atgt indexes the closed prefix and
+        # _arch_idx is the archive's positions in it, ascending.
+        has_arch = abest_val > torch.finfo(torch.float32).min
+        n_cal_q = int(has_arch.sum())
+        self.need_more_hard = n_cal_q < D.min_hard(self.recall_target)
+        if self.need_more_hard:
             # Not enough evidence for the guarantee yet: serve with the safety
             # clamp (over-fetches, never under-recalls) and tell the caller to
             # keep collecting.
             self.zp = D.Z_MAX
         else:
-            qh = qe[hard]
+            qh = qe[has_arch]
             qskh = qh[:, : D.KV_LORA_RANK] @ V.T
             qresh = (qh[:, : D.KV_LORA_RANK] - qskh @ V).norm(dim=-1)
-            pa = pos_in_arch[hard]
-            # Gather the n_hard rows out of the caches directly. Going through
+            pa = torch.searchsorted(self._arch_idx.to(torch.int64), atgt[has_arch])
+            # Gather the target rows out of the caches directly. Going through
             # self.side / self.csk / self.rho would materialise the WHOLE
             # archive's selection to read a few dozen rows of it, and those
             # three views are the entire difference between the steady-state
@@ -437,11 +452,11 @@ class RecallTier:
             pa64 = pa.to(torch.int64)
             arch_rows = self.arch.to(torch.int64).index_select(0, pa64)
             tgt_side = self._kbuf.index_select(0, arch_rows)[
-                :, D.KV_LORA_RANK :
-            ]  # [n_hard, 64]
+                :, D.KV_LORA_RANK : D.LATENT_DIM
+            ]  # [n, side_dim]
             src = self._arch_idx.to(torch.int64).index_select(0, pa64)
-            tgt_csk = self._csk_all.index_select(0, src)  # [n_hard, r]
-            tgt_rho = self._rho_all.index_select(0, src)  # [n_hard]
+            tgt_csk = self._csk_all.index_select(0, src)  # [n, r]
+            tgt_rho = self._rho_all.index_select(0, src)  # [n]
             # Same rounding as the serve-time scoring path: query operands
             # rounded to the storage dtypes before the (exact-in-fp32)
             # products, so zp is calibrated on exactly what the kernel scores.
@@ -452,8 +467,8 @@ class RecallTier:
             cert_t = (
                 qresh * tgt_rho * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
             ).clamp_min(D.ENTROPY_EPS)
-            z_req = (max1[hard] - idxs_t) / cert_t
-            k = D.conformal_k(n_hard, self.recall_target)
+            z_req = (abest_val[has_arch] - idxs_t) / cert_t
+            k = D.conformal_k(n_cal_q, self.recall_target)
             self.zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
         zp = self.zp
         # Per-row projection caches over ALL closed rows (kept and archived
@@ -486,12 +501,12 @@ class RecallTier:
         truly needs (true score above its best kept row); medians and maxima
         over the queries, plus the certificate's own two terms."""
         A = self.arch.shape[0]
-        qsk = qe[:, : self.geom.kv_lora_rank] @ self.V.T
-        qres = (qe[:, : self.geom.kv_lora_rank] - qsk @ self.V).norm(dim=-1)
+        qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
+        qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
         idxs = (qsk.half().float() @ self.csk.float().T) * sc_
-        if self.geom.side_dim:
-            idxs = idxs + (qe[:, self.geom.kv_lora_rank :].to(torch.bfloat16).float() @ self.side.float().T) * sc_
-        cert = (qres[:, None] * self.rho[None, :]) * sc_ / (self.geom.kv_lora_rank - self.r) ** 0.5
+        if D.SIDECAR_DIM:
+            idxs = idxs + (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16).float() @ self.side.float().T) * sc_
+        cert = (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
         fire = ((idxs + zp * cert) > max1[:, None]).sum(-1)
         fire0 = (idxs > max1[:, None]).sum(-1)  # sketch term alone
         q = lambda t, p: float(t.float().quantile(p))
