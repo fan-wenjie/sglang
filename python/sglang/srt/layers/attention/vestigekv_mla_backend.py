@@ -99,6 +99,12 @@ class VestigeKVMLABackend(AttentionBackend):
     _cap_lru_hit = 0
     _scan_cache = None  # OrderedDict[key -> {graph, pack}], LRU cap 2
     _dense_cache = None  # (forward_batch, dense rows) of the eager step's fence
+    _dbg_prev_lanes: list = []  # ROWS check: (slot, seq) per lane of the last decode step
+    _dbg_prev_tail = None  # TAIL check: (slots, seqs) device tensors of the last decode step
+    _dbg_tail_bad = None  # TAIL check: per-layer mismatch counters (+ lanes checked)
+    _dbg_tail_steps = 0
+    _mem_dir = None  # SGLANG_DEBUG_VESTIGEKV_MEM_DIR; class default for __new__ fakes
+    _mem_reqs = 0
     _fetch_hist = None
     _stat_acc = None
     # The flag defaults, for __new__-constructed fakes; a registered test pins
@@ -202,6 +208,10 @@ class VestigeKVMLABackend(AttentionBackend):
         self._stats = dict.fromkeys(
             ("steps", "scan_calls", "fetched", "kept", "seq", "replays"), 0
         )
+        self._mem_dir = envs.SGLANG_DEBUG_VESTIGEKV_MEM_DIR.get()
+        self._mem_reqs = 0  # requests seen at their first prefill chunk (mem trace)
+        if self._mem_dir is not None:
+            torch.cuda.memory._record_memory_history(max_entries=200000)
         self._fetch_hist = None  # stats only: [W + 1] int64 device histogram
         self._stat_acc = None  # stats only: [fetched, kept, seq] int64 device sums
         self._scan_graph = None
@@ -810,7 +820,46 @@ class VestigeKVMLABackend(AttentionBackend):
             return 0
         return int(self._ovf_count_stack.sum())
 
+    def _check_packed_rows(self, forward_batch):
+        # SGLANG_DEBUG_VESTIGEKV_ROWS=1: the rows the previous decode step packed
+        # for a lane must all belong to that lane's request (r2t[slot, :seq]);
+        # a foreign row means the CSR, kept table or fetch carried another
+        # request's pool rows. Checked one step late, on lanes whose slot did
+        # not change in between. Syncs; debug only.
+        real = forward_batch.out_cache_loc.shape[0]
+        slots = forward_batch.req_pool_indices[:real].tolist()
+        seqs = forward_batch.seq_lens[:real].tolist()
+        prev = self._dbg_prev_lanes
+        self._dbg_prev_lanes = list(zip(slots, seqs))
+        if not prev or not self._graph_bufs:
+            return
+        r2t = self.req_to_token_pool.req_to_token
+        for i, (slot, seq) in enumerate(zip(slots, seqs)):
+            # same request continuing in this lane: same slot, one token longer
+            # (a warmup/dummy step or a new request in a reused slot is skipped)
+            if i >= len(prev) or prev[i][0] != slot or int(prev[i][1]) + 1 != int(seq):
+                continue
+            valid = r2t[slot, : int(seq)].to(torch.int64)
+            for lid in self._local_mla_lids:
+                bufs = self._graph_bufs.get(lid)
+                if bufs is None:
+                    continue
+                a, b = int(bufs["indptr"][i]), int(bufs["indptr"][i + 1])
+                rows = bufs["indices"][a:b].to(torch.int64)
+                foreign = ~torch.isin(rows, valid)
+                nf = int(foreign.sum())
+                if nf:
+                    raise AssertionError(
+                        f"VESTIGE CHECK: layer {lid} lane {i} slot {slot} seq {seq}: "
+                        f"{nf} of {b - a} packed rows are not this request's "
+                        f"(first: {rows[foreign][:8].tolist()}); kept_len="
+                        f"{int(self._kept_len[lid][slot])} fetch_len="
+                        f"{int(self._fetch_len[lid][slot]) if lid in self._fetch_len else -1} "
+                        f"ovf={int(self._fetch_ovf[lid][slot]) if lid in self._fetch_ovf else -1}"
+                    )
+
     def _check_row_invariant(self, forward_batch):
+        self._check_packed_rows(forward_batch)
         # SGLANG_DEBUG_VESTIGEKV_ROWS=1: per-step loud assertion that the attended row
         # set is the intended one. Catches the silent wrong-row-set class (stale
         # slot state, never-built tables, chunk-local seq_len) that unit tests
@@ -953,7 +1002,10 @@ class VestigeKVMLABackend(AttentionBackend):
             if forward_batch.seq_lens_cpu is not None
             else forward_batch.seq_lens.tolist()
         )
-        for slot, seq_len in zip(slots, lens):
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if self._mem_dir is not None and lid == min(self._mla_lids):
+            self._trace_request_memory(sum(int(p) == 0 for p in prefix_lens))
+        for i, (slot, seq_len) in enumerate(zip(slots, lens)):
             seq_len = int(seq_len)
             row_slots = r2t[slot, :seq_len]
             kept = self._arm_aware_kept(row_slots, kbuf, seq_len, layer.v_head_dim)
@@ -1403,8 +1455,44 @@ class VestigeKVMLABackend(AttentionBackend):
             # one row, which is what the CSR buffers are sized for.
             self._kept_len_stack[:, self._trash_slot] = 0
 
+    def _check_tail_append(self, forward_batch, reqs):
+        # SGLANG_DEBUG_VESTIGEKV_TAIL=1: for every lane continuing its request
+        # (same slot, seq one longer than last step), the row the previous
+        # step appended (kept_buf[slot, kept_len - 1]) must be that request's
+        # previous token row, req_to_token[slot, seq - 2]. Accumulated on the
+        # device; read back and logged every 200 steps so the step timing the
+        # race depends on is preserved.
+        real = forward_batch.out_cache_loc.shape[0]
+        slots = forward_batch.req_pool_indices[:real].to(torch.int64)
+        seqs = forward_batch.seq_lens[:real].to(torch.int64)
+        prev = self._dbg_prev_tail
+        self._dbg_prev_tail = (slots.clone(), seqs.clone())
+        if self._dbg_tail_bad is None:
+            self._dbg_tail_bad = torch.zeros(
+                len(self._local_mla_lids) + 1, dtype=torch.int64, device=slots.device
+            )
+        if prev is None or prev[0].shape[0] != real:
+            return
+        cont = (prev[0] == slots) & (prev[1] + 1 == seqs)
+        r2t = self.req_to_token_pool.req_to_token
+        expect = r2t[slots, (seqs - 2).clamp_min(0)].to(torch.int64)
+        for lid in self._local_mla_lids:
+            if lid not in self._kept_buf:
+                continue
+            n = self._kept_len[lid][slots].to(torch.int64)
+            got = self._kept_buf[lid][slots, (n - 1).clamp_min(0)].to(torch.int64)
+            bad = cont & (n > 0) & (got != expect)
+            self._dbg_tail_bad[self._li_map[lid]] += bad.sum()
+        self._dbg_tail_bad[-1] += cont.sum()
+        self._dbg_tail_steps += 1
+        if self._dbg_tail_steps % 200 == 0:
+            v = self._dbg_tail_bad.tolist()
+            logger.info("VKTAIL steps=%d checked=%d bad_per_layer=%s", self._dbg_tail_steps, v[-1], v[:-1])
+
     def _ingraph_host_step(self, forward_batch, reqs):
         real = forward_batch.out_cache_loc.shape[0]
+        if envs.SGLANG_DEBUG_VESTIGEKV_TAIL.get():
+            self._check_tail_append(forward_batch, reqs)
         self._stage_step(forward_batch, forward_batch.seq_lens.shape[0])
         if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
             self._stats["steps"] += 1
@@ -1847,6 +1935,8 @@ class VestigeKVMLABackend(AttentionBackend):
                 # below -- one capture for all layers instead of one each
                 # (5 extra ~100 ms captures per request at 256k).
                 st["tier"], st["built_at"] = job["tier"], job["seq_len"]
+                if envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.get() is not None:
+                    self._dump_calibration(job=job, slot=slot, lid=lid, stats=stats)
                 # The reuse guard compares against this; an async build
                 # that did not record it would let a later rebuild at a
                 # different prefix adopt a cache that does not cover it.
@@ -1855,6 +1945,55 @@ class VestigeKVMLABackend(AttentionBackend):
                 installed = True
         self._build_jobs = remaining
         return installed
+
+    def _trace_request_memory(self, new_requests):
+        # Allocator bookkeeping only (no device sync): what the caching
+        # allocator holds when a request starts, and a full snapshot every
+        # fifth request so two of them can be diffed by allocation stack.
+        for _ in range(new_requests):
+            self._mem_reqs += 1
+            alloc = torch.cuda.memory_allocated() / 2**30
+            reserved = torch.cuda.memory_reserved() / 2**30
+            logger.info(
+                "VKMEM req=%d alloc=%.3fGB reserved=%.3fGB", self._mem_reqs, alloc, reserved
+            )
+            if self._mem_reqs % 5 == 0:
+                os.makedirs(self._mem_dir, exist_ok=True)
+                torch.cuda.memory._dump_snapshot(
+                    os.path.join(self._mem_dir, f"mem_req{self._mem_reqs}.pickle")
+                )
+
+    def _dump_calibration(self, *, job, slot, lid, stats):
+        # One file per install: <dir>/cal_slot<slot>_lid<lid>_seq<seq>.pt with the
+        # exact build inputs (rows in pool dtype, queries as collected) plus the
+        # fitted basis, so an offline study can refit any basis or rank.
+        out_dir = envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.get()
+        os.makedirs(out_dir, exist_ok=True)
+        kbuf = self.token_to_kv_pool.get_key_buffer(lid)
+        kbuf = kbuf.reshape(-1, kbuf.shape[-1])
+        tier = job["tier"]
+        torch.save(
+            {
+                "slot": slot,
+                "lid": lid,
+                "seq_len": job["seq_len"],
+                "rows": kbuf.index_select(0, job["row_slots"].to(torch.int64)).cpu(),
+                "row_slots": job["row_slots"].cpu(),
+                "kept": job["kept"].cpu(),
+                "qcal": torch.stack(job["qcal"]).cpu(),
+                "qpos": torch.tensor(job["qpos"], dtype=torch.long),
+                "V": tier.V.cpu(),
+                "scale": tier.scale,
+                "index_rank": self.index_rank,
+                "geom": {
+                    "kv_lora_rank": D.KV_LORA_RANK,
+                    "side_dim": D.SIDECAR_DIM,
+                    "latent_dim": D.LATENT_DIM,
+                },
+                "stats": stats,
+            },
+            os.path.join(out_dir, f"cal_slot{slot}_lid{lid}_seq{job['seq_len']}.pt"),
+        )
 
     def _reusable_operands(self, slot, lid, st, seq_len):
         """The previous tier for this (slot, layer), IF its scan operands are
