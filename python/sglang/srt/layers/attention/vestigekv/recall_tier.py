@@ -166,6 +166,7 @@ class RecallTier:
         conservative: bool = False,
         v_init: torch.Tensor | None = None,
         operands_from: RecallTier | None = None,
+        diag: bool = False,
     ) -> dict:
         """rows: [T,576] pool rows (fp32). keep: [T] bool tier-1 mask.
         q_cal: [n,H,576] expanded calibration queries; q_pos: [n] positions.
@@ -361,6 +362,12 @@ class RecallTier:
         best_val = torch.full((nq,), torch.finfo(torch.float32).min, device=dev)
         tgt = torch.zeros(nq, dtype=torch.long, device=dev)
         KB = D.BUILD_KEY_CHUNK
+        if diag:
+            # Debug telemetry: how many ARCHIVED rows each calibration query
+            # truly prefers to its best kept row (the recall need), against
+            # what the certificate fires below.
+            max1_d = (qe.to(torch.bfloat16) @ self.kept_rows.T).float().mul_(sc_).max(-1).values
+            need = torch.zeros(nq, dtype=torch.int64, device=dev)
         for k0 in range(0, T, KB):
             k1 = min(k0 + KB, T)
             # In place throughout: `* sc_` and `masked_fill` each copied the
@@ -372,6 +379,9 @@ class RecallTier:
             blk.mul_(sc_)
             colk = torch.arange(k0, k1, device=dev)[None, :]
             blk.masked_fill_(colk > qpos_r[:, None], torch.finfo(torch.float32).min)
+            if diag:
+                arch_col = (~keep[k0:k1])[None, :]
+                need += ((blk > max1_d[:, None]) & arch_col).sum(-1)
             bval, bidx = blk.max(-1)
             take = bval > best_val
             best_val = torch.where(take, bval, best_val)
@@ -459,12 +469,40 @@ class RecallTier:
         # honest. _arch_idx indexes the archive INTO that prefix; `arch`
         # carries the pool row ids the scan and the fetch output use.
         self.built = True
-        return {
+        stats = {
             "zp": zp,
             "gate_off": thr_g == float("-inf"),
             "n_hard": n_hard,
             "need_more_hard": self.need_more_hard,
             "arch": int(arch_idx.numel()),
+        }
+        if diag:
+            stats.update(self._diag_fire(qe, max1, zp, sc_, need))
+        return stats
+
+    def _diag_fire(self, qe, max1, zp, sc_, need):
+        """Debug telemetry for one calibrated build: per calibration query, the
+        rows the certificate fires at the fitted zp against the rows the query
+        truly needs (true score above its best kept row); medians and maxima
+        over the queries, plus the certificate's own two terms."""
+        A = self.arch.shape[0]
+        qsk = qe[:, : self.geom.kv_lora_rank] @ self.V.T
+        qres = (qe[:, : self.geom.kv_lora_rank] - qsk @ self.V).norm(dim=-1)
+        idxs = (qsk.half().float() @ self.csk.float().T) * sc_
+        if self.geom.side_dim:
+            idxs = idxs + (qe[:, self.geom.kv_lora_rank :].to(torch.bfloat16).float() @ self.side.float().T) * sc_
+        cert = (qres[:, None] * self.rho[None, :]) * sc_ / (self.geom.kv_lora_rank - self.r) ** 0.5
+        fire = ((idxs + zp * cert) > max1[:, None]).sum(-1)
+        fire0 = (idxs > max1[:, None]).sum(-1)  # sketch term alone
+        q = lambda t, p: float(t.float().quantile(p))
+        return {
+            "A": A,
+            "need_p50": q(need, 0.5), "need_p90": q(need, 0.9), "need_max": int(need.max()),
+            "fire_p50": q(fire, 0.5), "fire_p90": q(fire, 0.9),
+            "fire_sketch_only_p50": q(fire0, 0.5),
+            "max1_p50": q(max1, 0.5),
+            "cert_p50": q(cert.median(dim=-1).values * zp, 0.5),
+            "rho_p50": q(self.rho, 0.5), "qres_p50": q(qres, 0.5),
         }
 
     @torch.inference_mode()
