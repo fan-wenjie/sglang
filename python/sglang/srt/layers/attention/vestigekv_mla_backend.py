@@ -50,6 +50,7 @@ from sglang.srt.layers.attention.vestigekv.eviction import (
 )
 from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
@@ -1045,13 +1046,7 @@ class VestigeKVMLABackend(AttentionBackend):
             # chunk costs 9x for a 9-chunk prefill; deferring to the first decode
             # step bills the SVD to decode (trace: aten::linalg_svd 83 ms inside
             # the decode window). Both were measured and rejected.
-            self._recall[(slot, lid)] = {
-                "tier": None,
-                "built_at": 0,
-                "qcal": [],
-                "qpos": [],
-                "target": D.N_CAL_START,
-            }
+            self._reset_slot_state(slot=slot, lid=lid)
             self._collecting = True
             self._invalidate_scan()
             if lid in self._fetch_len:
@@ -1064,6 +1059,26 @@ class VestigeKVMLABackend(AttentionBackend):
             # built once on the first decode step for this slot; that is
             # prefill-phase work by semantics, so serving reports must bill it to
             # TTFT, not to steady-state decode throughput.
+
+    def _reset_slot_state(self, *, slot, lid):
+        # The state dict and its in-flight build job reference each other
+        # (st["job"] / job["st"]); a request that ends before its calibrated
+        # build installs leaves that cycle to the cyclic GC, which under a
+        # serving process ran late enough to hold ~100 MB of tier caches per
+        # request until the box OOMed. Unlink here, at the replacement.
+        old = self._recall.get((slot, lid))
+        if old is not None:
+            job = old.pop("job", None)
+            if job is not None:
+                job["st"] = None
+            old["tier"] = None
+        self._recall[(slot, lid)] = {
+            "tier": None,
+            "built_at": 0,
+            "qcal": [],
+            "qpos": [],
+            "target": D.N_CAL_START,
+        }
 
     def _ensure_kept_stacks(self, max_reqs, cap, dev):
         # Stacked kept tables ([L, R1, CAP] etc.) with the per-lid dict
@@ -1879,6 +1894,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 # replaces the state dict, so an identity mismatch means this
                 # tier belongs to the slot's PREVIOUS occupant. Installing it
                 # would hand the new request the old request's archive.
+                job.clear()  # the worker is done with it: release its tier now
                 continue
             st.pop("job", None)
             if job["error"] is not None:
@@ -1955,7 +1971,9 @@ class VestigeKVMLABackend(AttentionBackend):
             if self._mem_reqs % 5 == 0:
                 os.makedirs(self._mem_dir, exist_ok=True)
                 torch.cuda.memory._dump_snapshot(
-                    os.path.join(self._mem_dir, f"mem_req{self._mem_reqs}.pickle")
+                    os.path.join(
+                        self._mem_dir, f"mem_tp{get_parallel().tp_rank}_req{self._mem_reqs}.pickle"
+                    )
                 )
 
     def _dump_calibration(self, *, job, slot, lid, stats):
@@ -1987,7 +2005,9 @@ class VestigeKVMLABackend(AttentionBackend):
                 },
                 "stats": stats,
             },
-            os.path.join(out_dir, f"cal_slot{slot}_lid{lid}_seq{job['seq_len']}.pt"),
+            os.path.join(
+                out_dir, f"cal_tp{get_parallel().tp_rank}_slot{slot}_lid{lid}_seq{job['seq_len']}.pt"
+            ),
         )
 
     def _reusable_operands(self, slot, lid, st, seq_len):
