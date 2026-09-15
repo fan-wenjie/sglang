@@ -163,7 +163,7 @@ def _naive_build(kbuf, row_slots, keep, q_cal, q_pos, r, recall_target, scale):
     }
 
 
-def _naive_query(tier, qe, topj):
+def _naive_query(tier, qe):
     """The decision math, re-typed straight-line, reading the tier's own
     operands (V / kept rows / side / csk / rho / arch / zp / thr_g) so the
     comparison isolates the decision logic from the operand build."""
@@ -189,14 +189,7 @@ def _naive_query(tier, qe, topj):
     cert = (qres[:, None] * tier.rho[None, :]) * sc_ / (KV - tier.r) ** 0.5
     score = idxs + tier.zp * cert
     fire = (score > max1[:, None]) & gate[:, None]
-    if topj is not None and topj > 0:
-        tj = score.topk(min(topj, score.shape[1]), dim=-1).indices
-        fetch = torch.zeros_like(fire)
-        fetch.scatter_(1, tj, True)
-        fetch &= fire
-    else:
-        fetch = fire
-    return tier.arch[fetch.any(0)]
+    return tier.arch[fire.any(0)]
 
 
 # --------------------------------------------------------------------------
@@ -208,7 +201,7 @@ def _dev():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _fixture(dev, topj):
+def _fixture(dev):
     torch.manual_seed(1)
     T, H, n = 4096, 8, 64
     kbuf = torch.randn(T, D.LATENT_DIM, device=dev).bfloat16()
@@ -218,7 +211,7 @@ def _fixture(dev, topj):
     keep[: D.SINKS] = True
     q_cal = torch.randn(n, H, D.LATENT_DIM, device=dev).bfloat16()
     q_pos = torch.randint(T // 2, T, (n,), device=dev)
-    tier = RecallTier(r=64, topj=topj)
+    tier = RecallTier(r=64)
     stats = tier.build(kbuf, row_slots, keep, q_cal, q_pos)
     naive = _naive_build(
         kbuf, row_slots, keep, q_cal, q_pos, 64, D.RECALL_TARGET, D.ATTN_SCALE
@@ -298,7 +291,7 @@ def test_recall_build_equiv(dev=None):
     dev = dev or _dev()
     if dev.type != "cuda":
         return  # the fused operand build is the interesting path; CPU-only skip
-    tier, stats, naive = _fixture(dev, topj=-1)
+    tier, stats, naive = _fixture(dev)
 
     assert torch.equal(tier.V, naive["V"]), "sketch basis drifted (same eigh call)"
     assert stats["arch"] == int(naive["arch"].numel()), "archive size differs"
@@ -323,40 +316,41 @@ def test_recall_query_equiv(dev=None):
     dev = dev or _dev()
     if dev.type != "cuda":
         return
-    for topj in (-1, 16):  # uncapped fused scan, and the capped eager form
-        tier, _stats, _naive = _fixture(dev, topj=topj)
-        # W must cover the worst fire: query_fixed truncates at W while the
-        # eager forms return the full fired set. FETCH_WIDTH_UNCAPPED (4096)
-        # is sized above the observed worst fire; the fixture's archive is
-        # ~3968 rows and CAN fire nearly whole under the Z_MAX safety clamp.
-        W = D.FETCH_WIDTH_UNCAPPED
-        out = torch.zeros(1, W, dtype=torch.int64, device=dev)
-        out_len = torch.zeros(1, dtype=torch.int64, device=dev)
-        torch.manual_seed(2)
-        mism_eager = 0
-        worst_fixed = 0.0
-        for _ in range(16):
-            qe = torch.randn(8, D.LATENT_DIM, device=dev).bfloat16()
-            f_naive = _naive_query(tier, qe.clone(), topj).sort().values
-            f_eager = tier.query(qe.clone()).sort().values
-            tier.query_fixed(qe.clone(), out, out_len, 0)
-            f_fixed = out[0, : int(out_len[0])].sort().values.to(f_naive.dtype)
-            if not torch.equal(f_naive, f_eager):
-                mism_eager += 1
-            # query_fixed's fused scan sits ~1 ulp off the eager formulation
-            # at the fire boundary (DEFECTS.md; the registered bar is 1% of
-            # the fired set, twice the observed worst 0.48%).
-            sym = len(set(f_naive.tolist()) ^ set(f_fixed.tolist()))
-            worst_fixed = max(worst_fixed, sym / max(1, f_naive.numel()))
-        assert mism_eager == 0, f"topj={topj}: {mism_eager}/16 eager mismatches"
-        assert worst_fixed <= 0.01, (
-            f"topj={topj}: query_fixed worst fire-set disagreement "
-            f"{100 * worst_fixed:.2f}% over 16 steps"
-        )
-        print(
-            f"PASS recall query equiv (topj={topj}): eager 16/16 bitwise; "
-            f"query_fixed worst fire-set gap {100 * worst_fixed:.3f}% (bar 1%)"
-        )
+    tier, _stats, _naive = _fixture(dev)
+    # W must cover the worst fire: query_fixed keeps the first W fired
+    # rows while the eager forms return the full fired set. 4096 (the
+    # --vestigekv-recall-capacity default) sits above the observed worst
+    # fire; the fixture's archive is ~3968 rows and CAN fire nearly
+    # whole under the Z_MAX safety clamp.
+    W = 4096
+    out = torch.zeros(1, W, dtype=torch.int64, device=dev)
+    out_len = torch.zeros(1, dtype=torch.int64, device=dev)
+    out_ovf = torch.zeros(1, dtype=torch.int32, device=dev)
+    torch.manual_seed(2)
+    mism_eager = 0
+    worst_fixed = 0.0
+    for _ in range(16):
+        qe = torch.randn(8, D.LATENT_DIM, device=dev).bfloat16()
+        f_naive = _naive_query(tier, qe.clone()).sort().values
+        f_eager = tier.query(qe.clone()).sort().values
+        tier.query_fixed(qe.clone(), out, out_len, out_ovf, 0)
+        f_fixed = out[0, : int(out_len[0])].sort().values.to(f_naive.dtype)
+        if not torch.equal(f_naive, f_eager):
+            mism_eager += 1
+        # query_fixed's fused scan sits ~1 ulp off the eager formulation
+        # at the fire boundary (DEFECTS.md; the registered bar is 1% of
+        # the fired set, twice the observed worst 0.48%).
+        sym = len(set(f_naive.tolist()) ^ set(f_fixed.tolist()))
+        worst_fixed = max(worst_fixed, sym / max(1, f_naive.numel()))
+    assert mism_eager == 0, f"{mism_eager}/16 eager mismatches"
+    assert worst_fixed <= 0.01, (
+        f"query_fixed worst fire-set disagreement "
+        f"{100 * worst_fixed:.2f}% over 16 steps"
+    )
+    print(
+        f"PASS recall query equiv: eager 16/16 bitwise; "
+        f"query_fixed worst fire-set gap {100 * worst_fixed:.3f}% (bar 1%)"
+    )
 
 
 def main():
