@@ -176,7 +176,6 @@ class VestigeKVMLABackend(AttentionBackend):
         self._kept_buf: dict = {}  # lid -> [max_reqs, cap] fm.kv_indices dtype
         self._kept_len: dict = {}
         self._kmax: dict = {}  # lid -> host-side upper bound on kept_len
-        self._vcache: dict = {}  # lid -> last calibrated sketch basis
         self._close_state: dict = {}  # (slot, lid) -> {closed, sigma}
         import queue as _q
 
@@ -1805,7 +1804,6 @@ class VestigeKVMLABackend(AttentionBackend):
             "st": st,  # identity token: a re-prefill REPLACES the state dict
             "qcal": list(st["qcal"]),
             "qpos": list(st["qpos"]),
-            "v_init": self._vcache.get(lid),
             "operands_from": self._reusable_operands(slot, lid, st, seq_len),
             "ready": torch.cuda.Event(),
             "done": threading.Event(),
@@ -1847,7 +1845,6 @@ class VestigeKVMLABackend(AttentionBackend):
                         q_cal.contiguous(),
                         q_pos,
                         conservative=False,
-                        v_init=job["v_init"],
                         operands_from=job["operands_from"],
                         diag=envs.SGLANG_DEBUG_VESTIGEKV_STATS.get(),
                     )
@@ -1896,8 +1893,6 @@ class VestigeKVMLABackend(AttentionBackend):
                 st["qcal"] = st["qpos"] = None
                 continue
             stats = job["stats"]
-            if lid not in self._vcache:
-                self._vcache[lid] = job["tier"].V
             if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
                 import logging
 
@@ -2071,16 +2066,7 @@ class VestigeKVMLABackend(AttentionBackend):
             conservative=proxy,
             operands_from=self._reusable_operands(slot, lid, st, seq_len),
             diag=envs.SGLANG_DEBUG_VESTIGEKV_STATS.get(),
-            # Every build after a layer's first calibrated one reuses that
-            # basis. The certificate is a Cauchy-Schwarz bound on the sketch
-            # truncation error and is sound for ANY orthonormal basis -- a
-            # stale basis can only loosen rho (fire slightly more), never miss
-            # -- while the eigendecomposition it replaces was ~3 ms per layer
-            # per request, the largest single item left in the build.
-            v_init=self._vcache.get(lid),
         )
-        if not proxy and lid not in self._vcache:
-            self._vcache[lid] = tier.V
         if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
             import logging
 
