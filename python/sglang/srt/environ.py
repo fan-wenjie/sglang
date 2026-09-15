@@ -577,8 +577,22 @@ class Envs:
     # baseline). Unset (default) disables arm switching entirely -- no
     # file stat on any path in production.
     SGLANG_DEBUG_VESTIGEKV_ROWS = EnvBool(False)
+    # Device-side check that the previous decode step appended the request's
+    # own previous row to its kept table (no per-step sync: a counter of
+    # mismatches per layer, read back every 200 steps and logged as VKTAIL).
+    SGLANG_DEBUG_VESTIGEKV_TAIL = EnvBool(False)
 
     SGLANG_DEBUG_VESTIGEKV_STATS = EnvBool(False)
+    # Directory for one calibration snapshot per (request slot, layer): the
+    # closed-prefix content rows, the tier-1 keep set and the calibration
+    # queries the calibrated index was fitted on, written at its install.
+    # Offline certificate studies read these (mexp/glm53/cert_offline.py).
+    SGLANG_DEBUG_VESTIGEKV_DUMP_DIR = EnvStr(None)
+    # Directory for allocator snapshots: records allocation stacks from
+    # startup, logs VKMEM (allocated / reserved) at every new request's first
+    # prefill chunk and writes torch.cuda.memory._dump_snapshot every fifth
+    # request, to find what grows across requests without the stats syncs.
+    SGLANG_DEBUG_VESTIGEKV_MEM_DIR = EnvStr(None)
 
     # Capture the tier-2 recall scan + CSR pack INSIDE the decode model graph
     # (via init_forward_metadata_in_graph) instead of replaying a second scan
