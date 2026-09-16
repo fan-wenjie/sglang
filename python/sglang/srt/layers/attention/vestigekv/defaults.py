@@ -98,10 +98,14 @@ PREFILL_CAL_STRIDE = 512
 query is kept every this many prompt positions, plus each chunk's last
 position; the newest N_CAL_MAX of them calibrate the index before decode."""
 
-PREFILL_BUILD_EVERY = 16384
-"""Prompt tokens between two prefill-time calibrated builds of a request (the
-last chunk is not identifiable under chunked prefill, so builds are paced by
-the prefix instead; decode-time closes backfill what the last build missed)."""
+PREFILL_BUILD_MIN = 4096
+"""Prefill-time calibrated builds of a request run at prompt lengths 4096,
+8192, 16384, ... (the first closed block, then at every doubling of the prefix
+built last): every prompt with an archive gets a build before its first decode
+step, the last build lies within a factor of two of the prompt's end, and a 1M
+prompt pays eight builds. The last chunk is not identifiable under chunked
+prefill, so builds are paced by the prefix; decode-time closes backfill what
+the last build missed."""
 
 
 ENTROPY_EPS = 1e-12
