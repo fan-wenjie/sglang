@@ -33,6 +33,10 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # kept scores (a dropped row's weight <= e^-margin of the whole kept mass:
     # self-adapting to how peaked the kept distribution is).
     recall_threshold: str
+    # Calibrate the recall index on absorbed prompt queries during prefill
+    # (paced every PREFILL_BUILD_EVERY tokens) so the first decode steps are
+    # served by a calibrated index instead of the provisional one.
+    prefill_calibration: bool
 
     @classmethod
     def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
@@ -44,6 +48,7 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             index_rank=kernel.vestigekv_index_rank,
             recall_margin=kernel.vestigekv_recall_margin,
             recall_threshold=kernel.vestigekv_recall_threshold,
+            prefill_calibration=kernel.enable_vestigekv_prefill_calibration,
         )
         cfg.validate()
         return cfg
@@ -77,5 +82,6 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"overflow_fallback={self.overflow_fallback} "
             f"activation_min_tokens={self.activation_min_tokens} "
             f"index_rank={self.index_rank} recall_margin={self.recall_margin} "
-            f"recall_threshold={self.recall_threshold}"
+            f"recall_threshold={self.recall_threshold} "
+            f"prefill_calibration={self.prefill_calibration}"
         )

@@ -356,6 +356,14 @@ class ExecKernel(msgspec.Struct):
             choices=["max", "lse"],
         ),
     ] = "max"
+    enable_vestigekv_prefill_calibration: A[
+        bool,
+        "VestigeKV: calibrate the recall index during prefill on absorbed prompt "
+        "queries (one every 512 positions plus each chunk's last, paced every 16k "
+        "prompt tokens), so decode starts on a calibrated index instead of the "
+        "provisional one that fires most of a large archive. Decode queries still "
+        "refine it.",
+    ] = False
 
 
 class ExecMamba(msgspec.Struct):
