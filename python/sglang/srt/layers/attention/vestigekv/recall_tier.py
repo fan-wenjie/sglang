@@ -33,11 +33,13 @@ class RecallTier:
         recall_target: float = D.RECALL_TARGET,
         scale: float = D.ATTN_SCALE,
         margin: float = 0.0,
+        threshold: str = "max",
     ):
         self.r = r
         self.recall_target = recall_target
         self.scale = scale
-        self.margin = margin  # scan threshold = kept max - margin (see VestigeKVConfig)
+        self.margin = margin  # scan threshold = base - margin (see VestigeKVConfig)
+        self.threshold = threshold  # base: "max" kept score or "lse" of kept scores
         self.built = False
         # live-archive projection caches: None until the first decode-time
         # close backfills them (extend_closed); _pos_all doubles as the fill
@@ -404,7 +406,7 @@ class RecallTier:
         skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
         p1 = torch.softmax(skept, -1)
         ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
-        max1 = skept.max(-1).values
+        max1 = self._thr_base(skept, skept.max(-1).values)
         del skept, p1
 
         n_hard = int(hard.sum())
@@ -496,6 +498,13 @@ class RecallTier:
             stats.update(self._diag_fire(qe, max1, zp, sc_, need))
         return stats
 
+    def _thr_base(self, skept, max1):
+        # The score the margin is taken from: the best kept row, or the kept
+        # set's log-sum-exp (>= max1; equal when one row holds the mass).
+        if self.threshold == "lse":
+            return torch.logsumexp(skept, -1)
+        return max1
+
     def _diag_fire(self, qe, max1, zp, sc_, need):
         """Debug telemetry for one calibrated build: per calibration query, the
         rows the certificate fires at the fitted zp against the rows the query
@@ -564,7 +573,7 @@ class RecallTier:
             gate = qe.new_ones(H, dtype=torch.bool)
         else:
             skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
-            max1 = skept.max(-1).values
+            max1 = self._thr_base(skept, skept.max(-1).values)
             p1 = torch.softmax(skept, -1)
             ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
             gate = ent > self.thr_g
@@ -638,7 +647,7 @@ class RecallTier:
             gate = qe.new_ones(H, dtype=torch.bool)
         else:
             skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
-            max1 = skept.max(-1).values  # [H]
+            max1 = self._thr_base(skept, skept.max(-1).values)  # [H]
             p1 = torch.softmax(skept, -1)
             ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
             gate = ent > self.thr_g  # [H]

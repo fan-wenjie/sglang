@@ -48,6 +48,7 @@ def _fused_prologue_kernel(
     DD: tl.constexpr,  # 64 sidecar dims
     BLOCK_NK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    THR_LSE: tl.constexpr = False,  # margin from the kept log-sum-exp, not the max
 ):
     p = tl.program_id(0)
     h = tl.arange(0, H)
@@ -100,6 +101,8 @@ def _fused_prologue_kernel(
     ent = lse - x_sum / tl.where(nonempty, e_sum, 1.0)
     gate = (ent > thr) | (~nonempty)
     max1 = tl.where(nonempty, e_max, -float("inf"))
+    if THR_LSE:
+        max1 = tl.where(nonempty, lse, -float("inf"))
     max1g = tl.where(gate, max1 - margin, float("inf"))
     tl.store(max1g_ptr + p * H + h, max1g)
     tl.store(qres_ptr + p * H + h, qres)
@@ -117,7 +120,7 @@ def _fused_prologue_kernel(
     )
 
 
-def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0):
+def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0, thr_lse=False):
     """q [P,H,576] fp32, kr [P,NKm,576] bf16, v [P,R,512] fp32.
     Returns (max1g [P,H] fp32, qside_t [P,64,H] bf16, qsk_t [P,R,H] fp16,
     qres [P,H] fp32); pass `out` to reuse fixed-address buffers (capture)."""
@@ -150,6 +153,7 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0):
         DD=D.SIDECAR_DIM,
         BLOCK_NK=64,
         BLOCK_D=D.d_block_for_rank(R),
+        THR_LSE=bool(thr_lse),
         num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
@@ -297,6 +301,7 @@ def _prologue_merge_kernel(
     KV: tl.constexpr,
     DD: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    THR_LSE: tl.constexpr = False,  # margin from the kept log-sum-exp, not the max
 ):
     p = tl.program_id(0)
     if tl.load(a_len_ptr + p) == 0:
@@ -349,6 +354,8 @@ def _prologue_merge_kernel(
     ent = lse - gt / tl.where(nonempty, gs, 1.0)
     gate = (ent > thr) | (~nonempty)
     max1 = tl.where(nonempty, gm, -float("inf"))
+    if THR_LSE:
+        max1 = tl.where(nonempty, lse, -float("inf"))
     tl.store(max1g_ptr + p * H + h, tl.where(gate, max1 - margin, float("inf")))
 
 
@@ -464,6 +471,7 @@ def fused_prologue_split(
     pool_rows=None,
     mode=None,
     margin=0.0,
+    thr_lse=False,
 ):
     """Split-NK prologue reading queries in place from the stacked qbuf.
 
@@ -550,6 +558,7 @@ def fused_prologue_split(
         KV=D.KV_LORA_RANK,
         DD=D.SIDECAR_DIM,
         BLOCK_D=D.d_block_for_rank(R),
+        THR_LSE=bool(thr_lse),
         num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres

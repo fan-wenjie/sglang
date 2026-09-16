@@ -70,22 +70,27 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         out = torch.zeros(max_reqs, W, dtype=torch.int64, device="cuda")
         ol = torch.zeros(max_reqs, dtype=torch.int64, device="cuda")
         n_by_margin = {}
-        for margin in (0.0, 2.0):
+        for mode, margin in (("max", 0.0), ("max", 2.0), ("lse", 0.0), ("lse", 2.0)):
             ref = {}
             for (li, slot), t in base.items():
-                t.margin = margin
+                t.margin, t.threshold = margin, mode
                 t.query_fixed(qbuf[li, slot], out, ol, _ovf(ol), slot)
                 ref[(li, slot)] = out[slot, : int(ol[slot])].clone()
             fetch = torch.zeros(L, max_reqs, W, dtype=torch.int64, device="cuda")
             flen = torch.zeros(L, max_reqs, dtype=torch.int64, device="cuda")
-            pack = BatchedScanPack(pairs, [base[p] for p in pairs], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H, margin=margin)
+            pack = BatchedScanPack(
+                pairs, [base[p] for p in pairs], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H,
+                margin=margin, thr_lse=(mode == "lse"),
+            )
             pack.run()
             torch.cuda.synchronize()
             for (li, slot), rows in ref.items():
                 n = int(flen[li, slot])
                 self.assertEqual(sorted(fetch[li, slot, :n].tolist()), sorted(rows.tolist()))
-            n_by_margin[margin] = sum(int(flen[li, slot]) for (li, slot) in pairs)
-        self.assertGreaterEqual(n_by_margin[2.0], n_by_margin[0.0])
+            n_by_margin[(mode, margin)] = sum(int(flen[li, slot]) for (li, slot) in pairs)
+        self.assertGreaterEqual(n_by_margin[("max", 2.0)], n_by_margin[("max", 0.0)])
+        # the kept log-sum-exp is >= the kept max: the lse base fires no more than max
+        self.assertLessEqual(n_by_margin[("lse", 0.0)], n_by_margin[("max", 0.0)])
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_heterogeneous_pairs_bit_identical(self):
