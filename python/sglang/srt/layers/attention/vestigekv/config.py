@@ -45,6 +45,9 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # Size the decode kernel's KV split count from the attended rows rather than
     # the request's length (changes the accumulation grouping, not the row set).
     attended_splits: bool
+    # Read a lane's rows from the tiers (kept table + fetch buffer, or the page
+    # table when fenced) instead of from a CSR packed for the step.
+    tier_decode: bool
 
     @classmethod
     def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
@@ -59,6 +62,7 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             prefill_calibration=kernel.enable_vestigekv_prefill_calibration,
             rebuild_overflow_fraction=kernel.vestigekv_rebuild_overflow_fraction,
             attended_splits=kernel.enable_vestigekv_attended_splits,
+            tier_decode=kernel.enable_vestigekv_tier_decode,
         )
         cfg.validate()
         return cfg
@@ -100,5 +104,6 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"recall_threshold={self.recall_threshold} "
             f"prefill_calibration={self.prefill_calibration} "
             f"rebuild_overflow_fraction={self.rebuild_overflow_fraction} "
-            f"attended_splits={self.attended_splits}"
+            f"attended_splits={self.attended_splits} "
+            f"tier_decode={self.tier_decode}"
         )
