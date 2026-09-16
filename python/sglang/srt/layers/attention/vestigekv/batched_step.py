@@ -196,8 +196,10 @@ class BatchedScanPack:
     def __init__(
         self, pairs, tiers, qbuf, fetch_buf, fetch_len, fetch_ovf, ovf_count, q_heads,
         margin=0.0,
+        thr_lse=False,
     ):
-        self.margin = margin  # scan threshold = kept max - margin, every pair
+        self.margin = margin  # scan threshold = base - margin, every pair
+        self.thr_lse = thr_lse  # base = kept log-sum-exp instead of the kept max
         # pairs: list of (lid, slot); tiers: matching RecallTier list.
         # fetch_buf/fetch_len/fetch_ovf are the backend's stacked fixed-address
         # recall outputs; ovf_count [n_li] is its running overflow tally.
@@ -294,6 +296,7 @@ class BatchedScanPack:
         side_from_pool=False,
         csk_from_tier=False,
         margin=0.0,
+        thr_lse=False,
     ):
         """An empty pack sized for the worst case, for the in-graph scan.
 
@@ -306,6 +309,7 @@ class BatchedScanPack:
         self = cls.__new__(cls)
         dev = qbuf.device
         self.margin = margin
+        self.thr_lse = thr_lse
         self.q_heads = q_heads
         self._pad_slot = pad_slot
         # Kept rows: either a snapshot this pack owns, or -- when the caller
@@ -608,6 +612,7 @@ class BatchedScanPack:
             sc,
             out=(self.max1g, self.qside_t, self.qsk_t, self.qres),
             margin=self.margin,
+            thr_lse=self.thr_lse,
             partials=(self.pm, self.ps, self.pt),
             kslot=self.kslot,
             kbase=self.kbase,

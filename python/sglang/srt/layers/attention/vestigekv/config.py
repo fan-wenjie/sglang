@@ -8,6 +8,8 @@ configuration is logged as one line.
 
 import msgspec
 
+RECALL_THRESHOLDS = ("max", "lse")
+
 
 class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # Fixed width of the per-(layer, request, step) recall fetch buffer, in
@@ -26,6 +28,11 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # delta bounds the softmax weight of a dropped row at e^-delta of the
     # kept max (ln K covers K-way near ties, e.g. multi-key needles).
     recall_margin: float
+    # What the margin is taken from: "max" = the best kept-row score (a dropped
+    # row's weight <= e^-margin of the max row); "lse" = the log-sum-exp of the
+    # kept scores (a dropped row's weight <= e^-margin of the whole kept mass:
+    # self-adapting to how peaked the kept distribution is).
+    recall_threshold: str
 
     @classmethod
     def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
@@ -36,6 +43,7 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             activation_min_tokens=kernel.vestigekv_activation_min_tokens,
             index_rank=kernel.vestigekv_index_rank,
             recall_margin=kernel.vestigekv_recall_margin,
+            recall_threshold=kernel.vestigekv_recall_threshold,
         )
         cfg.validate()
         return cfg
@@ -54,6 +62,11 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError(
                 f"--vestigekv-recall-margin must be >= 0, got {self.recall_margin}"
             )
+        if self.recall_threshold not in RECALL_THRESHOLDS:
+            raise ValueError(
+                f"--vestigekv-recall-threshold must be one of {RECALL_THRESHOLDS}, "
+                f"got {self.recall_threshold!r}"
+            )
         if self.index_rank < 8 or self.index_rank % 8:
             raise ValueError(
                 f"--vestigekv-index-rank must be a positive multiple of 8, got {self.index_rank}"
@@ -63,5 +76,6 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"recall_capacity={self.recall_capacity} "
             f"overflow_fallback={self.overflow_fallback} "
             f"activation_min_tokens={self.activation_min_tokens} "
-            f"index_rank={self.index_rank} recall_margin={self.recall_margin}"
+            f"index_rank={self.index_rank} recall_margin={self.recall_margin} "
+            f"recall_threshold={self.recall_threshold}"
         )

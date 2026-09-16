@@ -116,6 +116,7 @@ class VestigeKVMLABackend(AttentionBackend):
         activation_min_tokens=0,
         index_rank=64,
         recall_margin=0.0,
+        recall_threshold="max",
     )
 
     def __init__(
@@ -548,6 +549,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._ovf_count_stack,
             self._q_heads,
             margin=self.config.recall_margin,
+            thr_lse=self.config.recall_threshold == "lse",
         )
         torch.cuda.synchronize()
         self._stats["_ph_pack"] = _t.perf_counter() - _p0
@@ -1412,6 +1414,7 @@ class VestigeKVMLABackend(AttentionBackend):
             # block close, which update() handles by refreshing the address.
             csk_from_tier=True,
             margin=self.config.recall_margin,
+            thr_lse=self.config.recall_threshold == "lse",
         )
 
     def _ingraph_device_step(self, bs):
@@ -1858,7 +1861,11 @@ class VestigeKVMLABackend(AttentionBackend):
                     q_pos = torch.tensor(
                         job["qpos"], device=kbuf.device, dtype=torch.long
                     )
-                    tier = RecallTier(r=self.index_rank, margin=self.config.recall_margin)
+                    tier = RecallTier(
+            r=self.index_rank,
+            margin=self.config.recall_margin,
+            threshold=self.config.recall_threshold,
+        )
                     stats = tier.build(
                         kbuf,
                         job["row_slots"],
@@ -2082,7 +2089,11 @@ class VestigeKVMLABackend(AttentionBackend):
         else:
             q_cal = torch.stack(st["qcal"]).float()  # [n_cal, H, 576]
             q_pos = torch.tensor(st["qpos"], device=row_slots.device, dtype=torch.long)
-        tier = RecallTier(r=self.index_rank, margin=self.config.recall_margin)
+        tier = RecallTier(
+            r=self.index_rank,
+            margin=self.config.recall_margin,
+            threshold=self.config.recall_threshold,
+        )
         stats = tier.build(
             kbuf,
             row_slots,
