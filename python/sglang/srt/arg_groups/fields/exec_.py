@@ -366,6 +366,16 @@ class ExecKernel(msgspec.Struct):
         "then serves that step from the full row set. 0 disables the trigger; "
         "0.05 is the measured-regime starting point.",
     ] = 0.0
+    enable_vestigekv_attended_splits: A[
+        bool,
+        "VestigeKV: size the decode kernel's KV split count from the attended row "
+        "count (kept plus the recall capacity) instead of the request's full "
+        "length. The split count is otherwise chosen for a 256k row range while "
+        "the kernel reads about 8k rows, which both starves each split of work "
+        "and makes the combine stage cost more than the read. Changes the "
+        "floating-point accumulation grouping, so outputs stop being bitwise "
+        "identical to the dense arm at the same context; row sets are unaffected.",
+    ] = False
 
 
 class ExecMamba(msgspec.Struct):

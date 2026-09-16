@@ -463,6 +463,31 @@ class TestOverflowRearm(CustomTestCase):
         self.assertIsNone(be._recall[(0, 10)]["qcal"])
 
 
+class TestSplitLens(CustomTestCase):
+    """The split count is a performance knob over the row range the decode
+    kernel reads; the base sizes it from the request's length, which at long
+    context is 30x the attended rows."""
+
+    def _backend(self, enabled, kmax=None):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.config = msgspec.structs.replace(
+            FLAG_DEFAULT_CONFIG, attended_splits=enabled, recall_capacity=4096
+        )
+        be._kmax = {} if kmax is None else kmax
+        return be
+
+    def test_the_bound_is_kept_plus_the_recall_capacity(self):
+        lens = torch.tensor([262144, 1000], dtype=torch.int64)
+        got = self._backend(True, {3: 8192, 7: 4096})._split_lens(lens)
+        self.assertEqual(got.tolist(), [8192 + 4096, 1000])
+
+    def test_off_and_before_any_close_the_request_length_is_used(self):
+        lens = torch.tensor([262144], dtype=torch.int64)
+        self.assertEqual(self._backend(False, {3: 8192})._split_lens(lens).tolist(), [262144])
+        # no layer has closed a block yet: there is no attended bound to clamp to
+        self.assertEqual(self._backend(True)._split_lens(lens).tolist(), [262144])
+
+
 class TestConfig(CustomTestCase):
     def test_fake_default_matches_the_flag_defaults(self):
         # The __new__ fakes read the class-level config; if a flag default
