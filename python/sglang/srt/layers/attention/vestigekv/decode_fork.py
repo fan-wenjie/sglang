@@ -94,6 +94,7 @@ def _vk_fwd_grouped_kernel_stage1(
     VK_FW: tl.constexpr,
     VK_R2T: tl.constexpr,
     ROW_SRC: tl.constexpr,
+    FENCE: tl.constexpr = True,
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
@@ -136,7 +137,9 @@ def _vk_fwd_grouped_kernel_stage1(
         cur_batch_kv_start_idx = 0
         vk_slot = tl.load(vk_slots + cur_batch).to(tl.int64)
         vk_nk = tl.load(vk_kept_len + vk_slot).to(tl.int64)
-        vk_fenced = tl.load(vk_fetch_ovf + vk_slot) != 0
+        vk_fenced = False
+        if FENCE:
+            vk_fenced = tl.load(vk_fetch_ovf + vk_slot) != 0
         vk_seq = tl.load(vk_seq + cur_batch).to(tl.int64)
         cur_batch_seq_len = tl.where(
             vk_fenced, vk_seq, vk_nk + tl.load(vk_fetch_len + vk_slot).to(tl.int64)
@@ -355,7 +358,11 @@ class VestigeKVRows(msgspec.Struct):
     """Where a lane's attended rows are, for the forked stage 1: the kept table
     and the fetch buffer of ONE layer, plus the page table a fenced lane uses.
     `tiers` False falls back to upstream's CSR reading, so the same launcher
-    serves both and the comparison is like for like."""
+    serves both and the comparison is like for like. `fence` False is
+    --disable-vestigekv-recall-overflow-fallback: the compaction raises
+    fetch_ovf whenever a scan overflowed, regardless of that flag, so the
+    kernel must be told not to act on it or the tier path would attend the
+    full row set where the CSR path truncates."""
 
     slots: torch.Tensor
     kept_buf: torch.Tensor
@@ -367,6 +374,7 @@ class VestigeKVRows(msgspec.Struct):
     seq: torch.Tensor
     loc: torch.Tensor
     tiers: bool = True
+    fence: bool = True
 
 
 def decode_grouped_att_m_fwd(
@@ -503,6 +511,7 @@ def decode_grouped_att_m_fwd(
         VK_FW=vk.fetch_buf.shape[1],
         VK_R2T=vk.r2t.shape[1],
         ROW_SRC=SRC_TIERS if vk.tiers else SRC_CSR,
+        FENCE=vk.fence,
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         IS_GFX1250=_is_gfx1250,

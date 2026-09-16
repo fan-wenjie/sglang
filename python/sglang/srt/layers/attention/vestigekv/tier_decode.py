@@ -72,4 +72,8 @@ def rows_for_layer(backend, lid, slots, seq, loc) -> VestigeKVRows:
         r2t=backend.req_to_token_pool.req_to_token,
         seq=seq,
         loc=loc,
+        # The compaction raises fetch_ovf on any overflow, so the config is what
+        # says whether to act on it; without this the tier path would attend the
+        # full row set where the CSR path truncates.
+        fence=backend.config.overflow_fallback,
     )
