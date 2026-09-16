@@ -1140,7 +1140,7 @@ class VestigeKVMLABackend(AttentionBackend):
         st = self._recall.get((slot, lid))
         if pc is None or st is None or "job" in st or st.get("qcal") is None:
             return
-        if len(pc["q"]) < D.N_CAL_START or seq_len - pc["built_at"] < D.PREFILL_BUILD_EVERY:
+        if len(pc["q"]) < D.N_CAL_START or seq_len < max(D.PREFILL_BUILD_MIN, 2 * pc["built_at"]):
             return
         pc["built_at"] = seq_len
         st["job"] = self._enqueue_build(slot, lid, seq_len, st)
