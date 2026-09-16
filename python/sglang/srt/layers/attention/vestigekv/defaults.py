@@ -93,6 +93,17 @@ still not producing MIN_HARD hard samples by here is genuinely easy (the kept
 tier dominates); the index then serves with zp clamped to Z_MAX, which errs
 toward over-fetching, never under-recall."""
 
+PREFILL_CAL_STRIDE = 512
+"""Prefill calibration (--enable-vestigekv-prefill-calibration): one absorbed
+query is kept every this many prompt positions, plus each chunk's last
+position; the newest N_CAL_MAX of them calibrate the index before decode."""
+
+PREFILL_BUILD_EVERY = 16384
+"""Prompt tokens between two prefill-time calibrated builds of a request (the
+last chunk is not identifiable under chunked prefill, so builds are paced by
+the prefix instead; decode-time closes backfill what the last build missed)."""
+
+
 ENTROPY_EPS = 1e-12
 """Clamp inside log for the entropy gate."""
 

@@ -292,6 +292,84 @@ class TestRowInvariantCheck(CustomTestCase):
 
 
 
+class TestPrefillCalibration(CustomTestCase):
+    """--enable-vestigekv-prefill-calibration: absorbed prompt queries are
+    collected at a stride during extend, a paced side-stream build is enqueued
+    from them, and a build that finished during prefill installs before the
+    first decode step could build the provisional index."""
+
+    def _backend(self, enabled=True):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.config = msgspec.structs.replace(FLAG_DEFAULT_CONFIG, prefill_calibration=enabled)
+        be._pcal = {}
+        be._recall = {}
+        return be
+
+    def _fb(self, slots, lens, prefix):
+        return SimpleNamespace(
+            req_pool_indices=torch.tensor(slots),
+            extend_seq_lens_cpu=list(lens),
+            extend_prefix_lens_cpu=list(prefix),
+            positions=torch.cat([torch.arange(p, p + n) for p, n in zip(prefix, lens)]),
+        )
+
+    def test_queries_are_absorbed_at_the_stride_and_at_each_chunk_end(self):
+        torch.manual_seed(0)
+        H, nope, rope, kv = 2, 8, 4, 16
+        w_kc = torch.randn(H, nope, kv)
+        be = self._backend()
+        n = 3 * D.PREFILL_CAL_STRIDE + 7  # three stride hits plus the chunk's last row
+        q = torch.randn(n, H, nope + rope)
+        be.write_prefill_queries(layer_id=LID, forward_batch=self._fb([5], [n], [0]), q=q, positions=None, w_kc=w_kc)
+        pc = be._pcal[(5, LID)]
+        want_pos = [D.PREFILL_CAL_STRIDE - 1, 2 * D.PREFILL_CAL_STRIDE - 1, 3 * D.PREFILL_CAL_STRIDE - 1, n - 1]
+        self.assertEqual(pc["pos"], want_pos)
+        for qe, pos in zip(pc["q"], want_pos):
+            ref = torch.cat([torch.einsum("hd,hdk->hk", q[pos, :, :nope], w_kc), q[pos, :, nope:]], -1)
+            self.assertTrue(torch.allclose(qe, ref, atol=1e-5))
+        # second chunk continues the same request; a new request (prefix 0) starts over
+        be.write_prefill_queries(layer_id=LID, forward_batch=self._fb([5], [10], [n]), q=torch.randn(10, H, nope + rope), positions=None, w_kc=w_kc)
+        self.assertEqual(be._pcal[(5, LID)]["pos"][-1], n + 9)
+        self.assertEqual(len(be._pcal[(5, LID)]["q"]), 5)
+        be.write_prefill_queries(layer_id=LID, forward_batch=self._fb([5], [10], [0]), q=torch.randn(10, H, nope + rope), positions=None, w_kc=w_kc)
+        self.assertEqual(be._pcal[(5, LID)]["pos"], [9])
+
+    def test_collection_keeps_the_newest_queries_and_is_off_by_default(self):
+        H, nope, rope, kv = 1, 4, 2, 8
+        w_kc = torch.randn(H, nope, kv)
+        be = self._backend()
+        n = (D.N_CAL_MAX + 5) * D.PREFILL_CAL_STRIDE
+        be.write_prefill_queries(layer_id=LID, forward_batch=self._fb([0], [n], [0]), q=torch.randn(n, H, nope + rope), positions=None, w_kc=w_kc)
+        self.assertEqual(len(be._pcal[(0, LID)]["q"]), D.N_CAL_MAX)
+        self.assertEqual(be._pcal[(0, LID)]["pos"][-1], n - 1)
+        off = self._backend(enabled=False)
+        off.write_prefill_queries(layer_id=LID, forward_batch=self._fb([0], [n], [0]), q=torch.randn(n, H, nope + rope), positions=None, w_kc=w_kc)
+        self.assertEqual(off._pcal, {})
+
+    def test_prefill_build_is_paced_and_needs_an_archive(self):
+        be = self._backend()
+        st = {"tier": None, "built_at": 0, "qcal": [], "qpos": [], "target": D.N_CAL_START}
+        be._recall[(0, LID)] = st
+        be._pcal[(0, LID)] = {"q": [torch.zeros(1, 1)] * D.N_CAL_START, "pos": list(range(D.N_CAL_START)), "built_at": 0}
+        calls = []
+        with patch.object(VestigeKVMLABackend, "_enqueue_build", lambda _s, slot, lid, seq_len, st: calls.append(seq_len) or {"done": None}):
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_EVERY, closed=0)  # no archive
+            self.assertEqual(calls, [])
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_EVERY, closed=D.CLOSE_BLOCK)
+            self.assertEqual(calls, [D.PREFILL_BUILD_EVERY])
+            self.assertIn("job", st)
+            st.pop("job")
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_EVERY + 100, closed=D.CLOSE_BLOCK)
+            self.assertEqual(calls, [D.PREFILL_BUILD_EVERY])  # not yet 16k further
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=2 * D.PREFILL_BUILD_EVERY, closed=D.CLOSE_BLOCK)
+            self.assertEqual(calls, [D.PREFILL_BUILD_EVERY, 2 * D.PREFILL_BUILD_EVERY])
+        # the build's inputs put the prompt queries before the decode ones
+        st["qcal"], st["qpos"] = [torch.ones(1, 1)], [99]
+        q, pos = be._calibration_inputs(0, LID, st)
+        self.assertEqual(pos, list(range(D.N_CAL_START)) + [99])
+        self.assertEqual(len(q), D.N_CAL_START + 1)
+
+
 class TestPackedCsrDtype(CustomTestCase):
     def test_csr_keeps_the_base_index_dtype(self):
         # The base decode kernel multiplies row id by row stride in the CSR's
@@ -927,6 +1005,25 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         self.assertEqual(be.built, [])
         self.assertEqual(be._recall[(0, LID)]["qcal"], [])
         self.assertTrue(be._collecting)
+
+    def test_a_build_finished_during_prefill_installs_before_the_provisional_index(self):
+        # With prefill calibration the calibrated job can be done before the
+        # first decode step; installing it first skips the provisional build.
+        be = self._backend()
+        st = be._recall[(0, LID)]
+        job = {
+            "slot": 0, "lid": LID, "st": st, "seq_len": 100, "qcal": [None] * 8,
+            "done": SimpleNamespace(is_set=lambda: True), "error": None,
+            "tier": SimpleNamespace(built_at=100, proxy=False, V="V"),
+            "stats": {"need_more_hard": False, "n_hard": 99},
+        }
+        st["job"] = job
+        be._build_jobs = [job]
+        b, e = self._stubs(be)
+        with b, e:
+            be._collect_calibration(self._fb(), [0])
+        self.assertEqual(be.built, [])  # no provisional build
+        self.assertIs(st["tier"], job["tier"])
 
     def test_provisional_index_is_built_synchronously_on_step_one(self):
         be = self._backend()

@@ -69,6 +69,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def vestigekv_backend_of(backend):
+    """The VestigeKV backend serving full-attention layers, or None. Hybrid
+    models hand the model a HybridLinearAttnBackend whose full-attention half
+    is the one VestigeKV wraps."""
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    if isinstance(backend, HybridLinearAttnBackend):
+        backend = backend.full_attn_backend
+    return backend if isinstance(backend, VestigeKVMLABackend) else None
+
+
 class VestigeKVMLABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.
 
@@ -101,6 +114,7 @@ class VestigeKVMLABackend(AttentionBackend):
     _scan_cache = None  # OrderedDict[key -> {graph, pack}], LRU cap 2
     _dense_cache = None  # (forward_batch, dense rows) of the eager step's fence
     _dbg_prev_lanes: list = []  # ROWS check: (slot, seq) per lane of the last decode step
+    _pcal: dict = {}  # (slot, lid) -> {"q": [[H, 576]...], "pos": [...], "built_at": int}
     _dbg_prev_tail = None  # TAIL check: (slots, seqs) device tensors of the last decode step
     _dbg_tail_bad = None  # TAIL check: per-layer mismatch counters (+ lanes checked)
     _dbg_tail_steps = 0
@@ -117,6 +131,7 @@ class VestigeKVMLABackend(AttentionBackend):
         index_rank=64,
         recall_margin=0.0,
         recall_threshold="max",
+        prefill_calibration=False,
     )
 
     def __init__(
@@ -210,6 +225,7 @@ class VestigeKVMLABackend(AttentionBackend):
         self._stats = dict.fromkeys(
             ("steps", "scan_calls", "fetched", "kept", "seq", "replays"), 0
         )
+        self._pcal: dict = {}  # prefill calibration queries per (slot, lid)
         self._mem_dir = envs.SGLANG_DEBUG_VESTIGEKV_MEM_DIR.get()
         self._mem_reqs = 0  # requests seen at their first prefill chunk (mem trace)
         if self._mem_dir is not None:
@@ -1050,12 +1066,16 @@ class VestigeKVMLABackend(AttentionBackend):
             # chunk costs 9x for a 9-chunk prefill; deferring to the first decode
             # step bills the SVD to decode (trace: aten::linalg_svd 83 ms inside
             # the decode window). Both were measured and rejected.
-            self._reset_slot_state(slot=slot, lid=lid)
+            if int(prefix_lens[i]) == 0:
+                # A new request in this slot; later chunks keep the state so a
+                # prefill-time build (and the queries it was fitted on) survive.
+                self._reset_slot_state(slot=slot, lid=lid)
             self._collecting = True
             self._invalidate_scan()
             if lid in self._fetch_len:
                 self._fetch_len[lid][slot] = 0
                 self._fetch_ovf[lid][slot] = 0
+            self._maybe_prefill_build(slot=slot, lid=lid, seq_len=seq_len, closed=closed0)
             # Deliberately NOT built here: under chunked prefill seq_lens is the
             # running total, not the request length, so "is this the last chunk?"
             # is not decidable from the ForwardBatch (measured: the obvious
@@ -1063,6 +1083,67 @@ class VestigeKVMLABackend(AttentionBackend):
             # built once on the first decode step for this slot; that is
             # prefill-phase work by semantics, so serving reports must bill it to
             # TTFT, not to steady-state decode throughput.
+
+    def write_prefill_queries(self, *, layer_id, forward_batch, q, positions, w_kc):
+        """Keep absorbed prompt queries for prefill-time calibration.
+
+        q [tokens, H, nope + rope] with the rope part already rotated; w_kc
+        [H, nope, kv_lora_rank] absorbs the nope part into the latent space
+        (what the decode path hands the backend). One query every
+        D.PREFILL_CAL_STRIDE absolute positions plus each chunk's last one,
+        the newest D.N_CAL_MAX kept per (slot, layer).
+        """
+        if not self.config.prefill_calibration or w_kc is None:
+            return
+        if w_kc.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            return  # a quantized absorbed weight needs its own dequant path
+        slots = forward_batch.req_pool_indices.tolist()
+        lens = forward_batch.extend_seq_lens_cpu
+        prefix = forward_batch.extend_prefix_lens_cpu
+        nope = w_kc.shape[1]
+        start = 0
+        for slot, n, p0 in zip(slots, lens, prefix):
+            n, p0 = int(n), int(p0)
+            key = (slot, layer_id)
+            if p0 == 0 or key not in self._pcal:
+                self._pcal[key] = {"q": [], "pos": [], "built_at": 0}
+            pos = torch.arange(p0, p0 + n)
+            pick = ((pos + 1) % D.PREFILL_CAL_STRIDE == 0).nonzero().flatten().tolist()
+            if not pick or pick[-1] != n - 1:
+                pick.append(n - 1)
+            rows = q[start : start + n][pick]  # [m, H, nope + rope]
+            q_nope = rows[..., :nope].to(w_kc.dtype)
+            absorbed = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
+            qe = torch.cat([absorbed, rows[..., nope:].to(absorbed.dtype)], dim=-1).float()
+            pc = self._pcal[key]
+            for j, m in enumerate(pick):
+                pc["q"].append(qe[j].clone())
+                pc["pos"].append(p0 + m)
+            if len(pc["q"]) > D.N_CAL_MAX:
+                pc["q"] = pc["q"][-D.N_CAL_MAX :]
+                pc["pos"] = pc["pos"][-D.N_CAL_MAX :]
+            start += n
+
+    def _calibration_inputs(self, slot, lid, st):
+        # Prefill queries first (older positions), then the decode ones.
+        pc = self._pcal.get((slot, lid), {"q": [], "pos": []})
+        return list(pc["q"]) + list(st["qcal"]), list(pc["pos"]) + list(st["qpos"])
+
+    def _maybe_prefill_build(self, *, slot, lid, seq_len, closed):
+        # Prefill-time calibrated build, paced by the prefix (the last chunk is
+        # not identifiable under chunked prefill); needs an archive to index and
+        # enough absorbed prompt queries. The build runs on the side stream and
+        # installs at the first decode prologue, ahead of the provisional index.
+        if not self.config.prefill_calibration or closed <= 0:
+            return
+        pc = self._pcal.get((slot, lid))
+        st = self._recall.get((slot, lid))
+        if pc is None or st is None or "job" in st or st.get("qcal") is None:
+            return
+        if len(pc["q"]) < D.N_CAL_START or seq_len - pc["built_at"] < D.PREFILL_BUILD_EVERY:
+            return
+        pc["built_at"] = seq_len
+        st["job"] = self._enqueue_build(slot, lid, seq_len, st)
 
     def _reset_slot_state(self, *, slot, lid):
         # The state dict and its in-flight build job reference each other
@@ -1739,6 +1820,10 @@ class VestigeKVMLABackend(AttentionBackend):
         """
         real = forward_batch.out_cache_loc.shape[0]
         pending = False
+        # A build finished during prefill installs here, ahead of the loop, so
+        # its request never gets the provisional index.
+        if self._install_finished_builds():
+            self._needs_recapture = True
         for lid in self._mla_lids:
             if lid not in self._qbuf:
                 continue
@@ -1826,8 +1911,8 @@ class VestigeKVMLABackend(AttentionBackend):
             "row_slots": r2t[slot, :seq_len].to(torch.int64).clone(),
             "kept": self._kept_buf[lid][slot, :n_kept].to(torch.int64).clone(),
             "st": st,  # identity token: a re-prefill REPLACES the state dict
-            "qcal": list(st["qcal"]),
-            "qpos": list(st["qpos"]),
+            "qcal": self._calibration_inputs(slot, lid, st)[0],
+            "qpos": self._calibration_inputs(slot, lid, st)[1],
             "operands_from": self._reusable_operands(slot, lid, st, seq_len),
             "ready": torch.cuda.Event(),
             "done": threading.Event(),

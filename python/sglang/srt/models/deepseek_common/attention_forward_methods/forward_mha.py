@@ -29,6 +29,23 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.utils import BumpAllocator, next_power_of_2
 
+
+def _vestigekv_prefill_queries(layer, q, forward_batch):
+    # VestigeKV prefill calibration: hand the rotated extend queries and the
+    # absorbed key weight to the backend (a no-op for every other backend).
+    from sglang.srt.layers.attention.vestigekv_mla_backend import vestigekv_backend_of
+
+    backend = vestigekv_backend_of(get_attn_backend())
+    if backend is None:
+        return
+    backend.write_prefill_queries(
+        layer_id=layer.layer_id,
+        forward_batch=forward_batch,
+        q=q,
+        positions=forward_batch.positions,
+        w_kc=layer.w_kc,
+    )
+
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -247,6 +264,7 @@ class DeepseekMHAForwardMixin:
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
+        _vestigekv_prefill_queries(self, q, forward_batch)
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
         if (
