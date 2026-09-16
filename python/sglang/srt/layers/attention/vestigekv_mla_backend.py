@@ -133,6 +133,7 @@ class VestigeKVMLABackend(AttentionBackend):
         recall_threshold="max",
         prefill_calibration=False,
         rebuild_overflow_fraction=0.0,
+        attended_splits=False,
     )
 
     def __init__(
@@ -355,7 +356,9 @@ class VestigeKVMLABackend(AttentionBackend):
             seq_lens = forward_batch.seq_lens[:bs]
             kv_indptr = fa.kv_indptr[: bs + 1]
             kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
-            fa.get_num_kv_splits(fa.cuda_graph_num_kv_splits[:bs], seq_lens)
+            fa.get_num_kv_splits(
+                fa.cuda_graph_num_kv_splits[:bs], self._split_lens(seq_lens)
+            )
             fa._fill_cuda_graph_write_locs(forward_batch, bs)
         except AttributeError:
             return False
@@ -2295,6 +2298,23 @@ class VestigeKVMLABackend(AttentionBackend):
             rows.scatter_(1, (seq - 1)[:, None], loc[:, None].to(torch.int64))
             cache = self._dense_cache = (forward_batch, rows)
         return cache[1], seq, fenced
+
+    def _split_lens(self, seq_lens):
+        """What the base sizes its KV split count from.
+
+        The split count divides the row range the decode kernel reads, and the
+        base sizes it from the request's length: at 256k that range is 262144
+        rows while the kernel reads the ~8k attended ones, so each split gets a
+        hundred-odd rows (too few to saturate anything) and the combine stage
+        pays for partials nobody needed -- measured at 256k, the combine costs
+        more than the read. Clamping to the attended bound is a performance
+        knob only: any count is correct, and the row set does not move. It does
+        change the accumulation grouping, hence the flag.
+        """
+        if not self.config.attended_splits or not self._kmax:
+            return seq_lens
+        attended = max(self._kmax.values()) + self.config.recall_capacity
+        return seq_lens.clamp(max=attended)
 
     def _kmax_step(self, lid):
         # Bound used by this step's pack, advanced by one because the step

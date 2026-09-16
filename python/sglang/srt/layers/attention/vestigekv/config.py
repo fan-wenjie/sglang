@@ -42,6 +42,9 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # of the steps since that layer's last close (0 disables): the fit is
     # otherwise made once, early, and serves the whole request.
     rebuild_overflow_fraction: float
+    # Size the decode kernel's KV split count from the attended rows rather than
+    # the request's length (changes the accumulation grouping, not the row set).
+    attended_splits: bool
 
     @classmethod
     def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
@@ -55,6 +58,7 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             recall_threshold=kernel.vestigekv_recall_threshold,
             prefill_calibration=kernel.enable_vestigekv_prefill_calibration,
             rebuild_overflow_fraction=kernel.vestigekv_rebuild_overflow_fraction,
+            attended_splits=kernel.enable_vestigekv_attended_splits,
         )
         cfg.validate()
         return cfg
@@ -95,5 +99,6 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"index_rank={self.index_rank} recall_margin={self.recall_margin} "
             f"recall_threshold={self.recall_threshold} "
             f"prefill_calibration={self.prefill_calibration} "
-            f"rebuild_overflow_fraction={self.rebuild_overflow_fraction}"
+            f"rebuild_overflow_fraction={self.rebuild_overflow_fraction} "
+            f"attended_splits={self.attended_splits}"
         )
