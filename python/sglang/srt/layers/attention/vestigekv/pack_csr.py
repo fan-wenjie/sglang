@@ -33,6 +33,7 @@ it on shared inputs.
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
 
@@ -111,6 +112,7 @@ def _pack_csr_gather_kernel(
     R2T,
     BLOCK: tl.constexpr,
     FENCE: tl.constexpr,
+    FENCE_BODY: tl.constexpr,  # 0 stubs the dense branch; see SGLANG_DEBUG_VESTIGEKV_FENCE_STUB
 ):
     li = tl.program_id(0)
     lane = tl.program_id(1)
@@ -128,7 +130,7 @@ def _pack_csr_gather_kernel(
     fenced = False
     if FENCE:
         fenced = tl.load(fetch_ovf_ptr + li * R1 + slot) != 0
-    if fenced:
+    if fenced and FENCE_BODY:
         seq = tl.load(seq_ptr + lane).to(tl.int64)
         loc = tl.load(loc_ptr + lane)
         for i in range(g, tl.cdiv(seq, BLOCK), G):
@@ -141,7 +143,7 @@ def _pack_csr_gather_kernel(
                 dense.to(indices_ptr.dtype.element_ty),
                 mask=m,
             )
-    else:
+    if (not fenced) or (not FENCE_BODY):
         f_len = tl.load(fetch_len_ptr + li * R1 + slot).to(tl.int64)
         lens_tot = n + f_len
         for i in range(g, tl.cdiv(lens_tot, BLOCK), G):
@@ -230,4 +232,5 @@ def pack_csr_all_layers(
         req_to_token.shape[1] if fence else 0,
         BLOCK=512,
         FENCE=fence,
+        FENCE_BODY=not envs.SGLANG_DEBUG_VESTIGEKV_FENCE_STUB.get(),
     )

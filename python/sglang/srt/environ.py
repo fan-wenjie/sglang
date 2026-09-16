@@ -592,6 +592,12 @@ class Envs:
     # that no deployment config surface offers the trade, because there is
     # no trade -- setting it leaves an incomplete algorithm.
     SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK = EnvBool(False)
+    # Timing probe, never a serving mode: compiles the CSR gather's fenced
+    # branch as a no-op while every other part of the fence stays armed, so the
+    # cost of the branch merely EXISTING (it is sized into the kernel's register
+    # and shared-memory budget) separates from the cost of it running. A fenced
+    # lane then attends nothing, so the output is wrong on the steps that fence.
+    SGLANG_DEBUG_VESTIGEKV_FENCE_STUB = EnvBool(False)
     # Directory for one calibration snapshot per (request slot, layer): the
     # closed-prefix content rows, the tier-1 keep set and the calibration
     # queries the calibrated index was fitted on, written at its install.
