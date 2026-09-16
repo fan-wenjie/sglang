@@ -353,16 +353,24 @@ class TestPrefillCalibration(CustomTestCase):
         be._pcal[(0, LID)] = {"q": [torch.zeros(1, 1)] * D.N_CAL_START, "pos": list(range(D.N_CAL_START)), "built_at": 0}
         calls = []
         with patch.object(VestigeKVMLABackend, "_enqueue_build", lambda _s, slot, lid, seq_len, st: calls.append(seq_len) or {"done": None}):
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_EVERY, closed=0)  # no archive
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN, closed=0)  # no archive
             self.assertEqual(calls, [])
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_EVERY, closed=D.CLOSE_BLOCK)
-            self.assertEqual(calls, [D.PREFILL_BUILD_EVERY])
+            # Regression: builds were paced every 16k prompt tokens, so 4k-16k
+            # prompts (RULER's short cells) started decode on the provisional
+            # index; the first closed block must already get a build.
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK)
+            self.assertEqual(calls, [D.PREFILL_BUILD_MIN])
             self.assertIn("job", st)
             st.pop("job")
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_EVERY + 100, closed=D.CLOSE_BLOCK)
-            self.assertEqual(calls, [D.PREFILL_BUILD_EVERY])  # not yet 16k further
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=2 * D.PREFILL_BUILD_EVERY, closed=D.CLOSE_BLOCK)
-            self.assertEqual(calls, [D.PREFILL_BUILD_EVERY, 2 * D.PREFILL_BUILD_EVERY])
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN + 100, closed=D.CLOSE_BLOCK)
+            self.assertEqual(calls, [D.PREFILL_BUILD_MIN])  # next build at the doubling
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=2 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK)
+            self.assertEqual(calls, [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN])
+            st.pop("job")
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=3 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK)
+            self.assertEqual(calls, [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN])  # 12k < 2 x 8k
+            be._maybe_prefill_build(slot=0, lid=LID, seq_len=4 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK)
+            self.assertEqual(calls, [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN, 4 * D.PREFILL_BUILD_MIN])
         # the build's inputs put the prompt queries before the decode ones
         st["qcal"], st["qpos"] = [torch.ones(1, 1)], [99]
         q, pos = be._calibration_inputs(0, LID, st)

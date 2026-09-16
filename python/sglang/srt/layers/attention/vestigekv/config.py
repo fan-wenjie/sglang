@@ -34,8 +34,8 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # self-adapting to how peaked the kept distribution is).
     recall_threshold: str
     # Calibrate the recall index on absorbed prompt queries during prefill
-    # (paced every PREFILL_BUILD_EVERY tokens) so the first decode steps are
-    # served by a calibrated index instead of the provisional one.
+    # (at PREFILL_BUILD_MIN tokens, then at every doubling) so the first decode
+    # steps are served by a calibrated index instead of the provisional one.
     prefill_calibration: bool
 
     @classmethod
