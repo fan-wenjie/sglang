@@ -33,6 +33,8 @@ it on shared inputs.
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.vestigekv import defaults as D
+
 
 @triton.jit
 def _pack_csr_prep_kernel(
@@ -112,6 +114,11 @@ def _pack_csr_gather_kernel(
 ):
     li = tl.program_id(0)
     lane = tl.program_id(1)
+    # Tile workers of this lane: the loops below grid-stride, so the launch
+    # covers the worst case (a fenced lane's whole row set) without one
+    # program per tile (defaults.PACK_GRID_CAP).
+    g = tl.program_id(2)
+    G = tl.num_programs(2)
     slot = tl.load(slots_ptr + lane).to(tl.int64)
     start = tl.load(indptr_ptr + li * MAXBS1 + lane).to(tl.int64)
     n = tl.load(kept_len_ptr + li * R1 + slot).to(tl.int64)
@@ -124,7 +131,7 @@ def _pack_csr_gather_kernel(
     if fenced:
         seq = tl.load(seq_ptr + lane).to(tl.int64)
         loc = tl.load(loc_ptr + lane)
-        for i in range(tl.cdiv(seq, BLOCK)):
+        for i in range(g, tl.cdiv(seq, BLOCK), G):
             j = i * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
             m = j < seq
             dense = tl.load(r2t_ptr + slot * R2T + j, mask=m, other=0)
@@ -137,7 +144,7 @@ def _pack_csr_gather_kernel(
     else:
         f_len = tl.load(fetch_len_ptr + li * R1 + slot).to(tl.int64)
         lens_tot = n + f_len
-        for i in range(tl.cdiv(lens_tot, BLOCK)):
+        for i in range(g, tl.cdiv(lens_tot, BLOCK), G):
             j = i * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
             m = j < lens_tot
             kept = tl.load(
@@ -200,7 +207,10 @@ def pack_csr_all_layers(
         indptr.shape[1],
         FENCE=fence,
     )
-    _pack_csr_gather_kernel[(L, bs)](
+    # Worst case a single lane packs: the whole row set when the fence can
+    # fire, the kept table plus the fetch buffer otherwise.
+    max_rows = req_to_token.shape[1] if fence else CAP + fetch_buf.shape[2]
+    _pack_csr_gather_kernel[(L, bs, min(triton.cdiv(max_rows, 512), D.PACK_GRID_CAP))](
         slots,
         loc,
         seq,
