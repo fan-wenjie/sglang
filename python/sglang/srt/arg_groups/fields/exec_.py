@@ -346,6 +346,16 @@ class ExecKernel(msgspec.Struct):
         "K-way near ties (the softmax weight of a dropped row is bounded by e^-margin "
         "of the kept max). More rows fetched per step as it grows.",
     ] = 0.0
+    vestigekv_recall_threshold: A[
+        str,
+        Arg(
+            help="VestigeKV: what --vestigekv-recall-margin is subtracted from. max: the "
+            "best kept-row score (a dropped row holds at most e^-margin of the max "
+            "row's weight). lse: the log-sum-exp of the kept scores (at most e^-margin "
+            "of the whole kept mass; fires less where the kept distribution is diffuse).",
+            choices=["max", "lse"],
+        ),
+    ] = "max"
 
 
 class ExecMamba(msgspec.Struct):
