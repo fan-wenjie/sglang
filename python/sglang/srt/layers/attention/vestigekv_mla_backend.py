@@ -115,6 +115,7 @@ class VestigeKVMLABackend(AttentionBackend):
         overflow_fallback=True,
         activation_min_tokens=0,
         index_rank=64,
+        recall_margin=0.0,
     )
 
     def __init__(
@@ -546,6 +547,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._fetch_ovf_stack,
             self._ovf_count_stack,
             self._q_heads,
+            margin=self.config.recall_margin,
         )
         torch.cuda.synchronize()
         self._stats["_ph_pack"] = _t.perf_counter() - _p0
@@ -1409,6 +1411,7 @@ class VestigeKVMLABackend(AttentionBackend):
             # numbers. Unlike the pool, that cache is reallocated at every
             # block close, which update() handles by refreshing the address.
             csk_from_tier=True,
+            margin=self.config.recall_margin,
         )
 
     def _ingraph_device_step(self, bs):
@@ -1855,7 +1858,7 @@ class VestigeKVMLABackend(AttentionBackend):
                     q_pos = torch.tensor(
                         job["qpos"], device=kbuf.device, dtype=torch.long
                     )
-                    tier = RecallTier(r=self.index_rank)
+                    tier = RecallTier(r=self.index_rank, margin=self.config.recall_margin)
                     stats = tier.build(
                         kbuf,
                         job["row_slots"],
@@ -2079,7 +2082,7 @@ class VestigeKVMLABackend(AttentionBackend):
         else:
             q_cal = torch.stack(st["qcal"]).float()  # [n_cal, H, 576]
             q_pos = torch.tensor(st["qpos"], device=row_slots.device, dtype=torch.long)
-        tier = RecallTier(r=self.index_rank)
+        tier = RecallTier(r=self.index_rank, margin=self.config.recall_margin)
         stats = tier.build(
             kbuf,
             row_slots,

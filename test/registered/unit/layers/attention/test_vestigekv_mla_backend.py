@@ -346,6 +346,7 @@ class TestConfig(CustomTestCase):
             {"recall_capacity": 0},
             {"activation_min_tokens": -1},
             {"index_rank": 60},
+            {"recall_margin": -0.5},
         ):
             with self.assertRaises(ValueError, msg=str(bad)):
                 msgspec.structs.replace(base, **bad).validate()
