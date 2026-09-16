@@ -101,10 +101,13 @@ BUILD_KEY_CHUNK = 16384
 [n*H, T] score matrix OOMs at S=512k."""
 
 INDEX_DTYPE = torch.int32
-"""Element type of every VestigeKV-owned row-index table (kept, fetch, the
-packed CSR) and their lengths. Pool row ids and context lengths are far below
-2^31, and the base backend's decode kernel takes the CSR at any integer
-width; int32 halves the tables and the pack's traffic."""
+"""Element type of the VestigeKV-owned row-index tables (kept, fetch) and their
+lengths: pool row ids are far below 2^31 and every VestigeKV kernel widens a
+row id to int64 before multiplying it by a row stride. The packed CSR handed
+to the base backend is NOT this type: the base decode kernel multiplies the
+row id by the row stride in the CSR's own dtype, which overflows int32 once
+the pool exceeds 2^31 / row elements (Kimi Linear: 5.1M rows x 576 = 2.9e9),
+so that buffer keeps the base metadata's kv_indices dtype (int64)."""
 
 # ---- tier-2 scan capture (CUDA graph) ----
 

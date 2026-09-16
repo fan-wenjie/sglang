@@ -148,6 +148,32 @@ class TestPackCsrParity(CustomTestCase):
             self._check(seed, lanes, fence=False)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_wide_row_ids_land_exactly_in_an_int64_csr(self):
+        # The CSR the base decode kernel reads is int64: it multiplies the row
+        # id by the row stride in the CSR's dtype, and int32 overflowed on a
+        # 5.1M-row pool (Kimi Linear, 576 elements per row) -- garbage rows
+        # for every request whose ids sat past 2^31 / 576. The int32 kept and
+        # fetch tables must widen on the store, value for value.
+        from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
+
+        kept_buf, kept_len, fetch_len, fetch_buf, _, indptr = _mk_state(11)
+        g = torch.Generator(device="cuda").manual_seed(11)
+        kept_buf = torch.randint(4_000_000, 5_100_000, kept_buf.shape, dtype=torch.int32, device="cuda", generator=g)
+        fetch_buf = torch.randint(4_000_000, 5_100_000, fetch_buf.shape, dtype=torch.int32, device="cuda", generator=g)
+        indices = torch.zeros(L, MAXBS * CAP + 1, dtype=torch.int64, device="cuda")
+        lanes = [2, 5, 0, TRASH]
+        slots = torch.tensor(lanes, dtype=torch.int64, device="cuda")
+        loc = torch.randint(4_000_000, 5_100_000, (len(lanes),), dtype=torch.int64, device="cuda", generator=g)
+        pack_csr_all_layers(slots, loc, kept_buf, kept_len, fetch_len, fetch_buf, indices, indptr)
+        for i in range(L):
+            for lane, slot in enumerate(lanes):
+                lo, hi = int(indptr[i, lane]), int(indptr[i, lane + 1])
+                n = int(kept_len[i, slot])  # post-append
+                want = kept_buf[i, slot, :n].tolist() + fetch_buf[i, slot, : int(fetch_len[i, slot])].tolist()
+                self.assertEqual(indices[i, lo:hi].tolist(), want)
+                self.assertEqual(int(indices[i, lo + n - 1]), int(loc[lane]))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_fence_matches_torch_chain(self):
         for seed, lanes in ((2, [2, 5, 0, TRASH]), (3, [1, 3, 6, 7])):
             self._check(seed, lanes, fence=True)

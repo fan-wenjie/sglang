@@ -292,6 +292,35 @@ class TestRowInvariantCheck(CustomTestCase):
 
 
 
+class TestPackedCsrDtype(CustomTestCase):
+    def test_csr_keeps_the_base_index_dtype(self):
+        # The base decode kernel multiplies row id by row stride in the CSR's
+        # dtype; an int32 CSR overflowed on a 5.1M-row pool (Kimi Linear) and
+        # served garbage rows. VestigeKV's own tables stay int32.
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.base = SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                kv_indptr=torch.zeros(5, dtype=torch.int32),
+                kv_indices=torch.zeros(8, dtype=torch.int64),
+            ),
+            max_context_len=64,
+        )
+        be.req_to_token_pool = SimpleNamespace(req_to_token=torch.zeros(3, 64, dtype=torch.int32))
+        be.token_to_kv_pool = SimpleNamespace(size=5_095_798)
+        be._local_mla_lids = [LID]
+        be._li_map = {LID: 0}
+        be._kept_buf, be._kept_len, be._qbuf = {}, {}, {}
+        be._fetch_buf, be._fetch_len, be._fetch_ovf, be._graph_bufs = {}, {}, {}, {}
+        be._q_heads, be._q_dim, be._fetch_w = 2, 576, 16
+        be._qbuf_stack = be._fetch_stack = be._fetch_len_stack = None
+        be._fetch_ovf_stack = be._ovf_count_stack = None
+        be._trash_slot = 3
+        be._ensure_graph_bufs()
+        self.assertEqual(be._graph_bufs[LID]["indices"].dtype, torch.int64)
+        self.assertEqual(be._kept_buf[LID].dtype, D.INDEX_DTYPE)
+        self.assertEqual(be._fetch_buf[LID].dtype, D.INDEX_DTYPE)
+
+
 class TestConfig(CustomTestCase):
     def test_fake_default_matches_the_flag_defaults(self):
         # The __new__ fakes read the class-level config; if a flag default

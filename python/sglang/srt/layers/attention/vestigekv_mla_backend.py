@@ -1280,8 +1280,11 @@ class VestigeKVMLABackend(AttentionBackend):
         if isinstance(pool_tokens, int) and pool_tokens > 0:
             rows = min(rows, pool_tokens + max_reqs)
         self._gb_indptr_stack = fm.kv_indptr.new_zeros(nl, max_reqs + 1)
+        # The base decode kernel does row_id * row_stride in this dtype: int32
+        # overflows past 2^31 / 576 rows (a 5.1M-row Kimi pool), so the CSR keeps
+        # the base's index type; VestigeKV's own tables stay D.INDEX_DTYPE.
         self._gb_indices_stack = torch.zeros(
-            nl, rows + 1, dtype=D.INDEX_DTYPE, device=r2t.device
+            nl, rows + 1, dtype=fm.kv_indices.dtype, device=r2t.device
         )
         for lid in self._local_mla_lids:
             self._alloc_recall_bufs(lid, max_reqs, r2t.device)
@@ -2244,7 +2247,9 @@ class VestigeKVMLABackend(AttentionBackend):
             )
             src = torch.cat([src.reshape(-1), d_rows.reshape(-1).to(src.dtype)])
             dst = torch.cat([dst.reshape(-1), dst_d.reshape(-1)])
-        bufs["indices"].scatter_(0, dst.reshape(-1), src.reshape(-1))
+        bufs["indices"].scatter_(
+            0, dst.reshape(-1), src.reshape(-1).to(bufs["indices"].dtype)
+        )
         n_pad = bs - real_bs
         if n_pad > 0:
             pad_dst = total + torch.arange(n_pad, device=dev)

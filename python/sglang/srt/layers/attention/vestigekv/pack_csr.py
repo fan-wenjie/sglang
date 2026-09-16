@@ -129,7 +129,11 @@ def _pack_csr_gather_kernel(
             m = j < seq
             dense = tl.load(r2t_ptr + slot * R2T + j, mask=m, other=0)
             dense = tl.where(j == seq - 1, loc.to(dense.dtype), dense)
-            tl.store(indices_ptr + li * CAPI + start + j, dense, mask=m)
+            tl.store(
+                indices_ptr + li * CAPI + start + j,
+                dense.to(indices_ptr.dtype.element_ty),
+                mask=m,
+            )
     else:
         f_len = tl.load(fetch_len_ptr + li * R1 + slot).to(tl.int64)
         lens_tot = n + f_len
@@ -146,7 +150,7 @@ def _pack_csr_gather_kernel(
             )
             tl.store(
                 indices_ptr + li * CAPI + start + j,
-                tl.where(j < n, kept, fired),
+                tl.where(j < n, kept, fired).to(indices_ptr.dtype.element_ty),
                 mask=m,
             )
 
