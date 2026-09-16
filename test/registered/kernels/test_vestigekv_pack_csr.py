@@ -174,6 +174,52 @@ class TestPackCsrParity(CustomTestCase):
                 self.assertEqual(int(indices[i, lo + n - 1]), int(loc[lane]))
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_row_sets_wider_than_the_grid_are_packed_whole(self):
+        # The gather grid-strides its tiles (defaults.PACK_GRID_CAP programs per
+        # lane), so a lane whose row set needs more tiles than the grid has
+        # programs is only complete if every program keeps looping. The sizes
+        # above are all under one tile, so they cannot see a stride that starts
+        # at the wrong tile or steps by the wrong amount -- both branches here
+        # need 40+ tiles against a 32-program grid.
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
+
+        nl, r1, cap, fw, maxbs = 2, 3, 20480, 1024, 2
+        self.assertGreater((cap + fw + 511) // 512, D.PACK_GRID_CAP)
+        g = torch.Generator(device="cuda").manual_seed(23)
+        ints = lambda *shape: torch.randint(1, 5_000_000, shape, dtype=torch.int32, device="cuda", generator=g)
+        kept_buf, fetch_buf = ints(nl, r1, cap), ints(nl, r1, fw)
+        kept_len = torch.full((nl, r1), cap - 2, dtype=torch.int32, device="cuda")
+        fetch_len = torch.full((nl, r1), fw, dtype=torch.int32, device="cuda")
+        indices = torch.zeros(nl, maxbs * (cap + fw) + 1, dtype=torch.int64, device="cuda")
+        indptr = torch.zeros(nl, maxbs + 1, dtype=torch.int32, device="cuda")
+        lanes = [0, 1]
+        slots = torch.tensor(lanes, dtype=torch.int64, device="cuda")
+        loc = ints(len(lanes)).to(torch.int64)
+        seq = torch.full((len(lanes),), cap, dtype=torch.int64, device="cuda")
+        r2t = ints(r1, cap)
+        fetch_ovf = torch.zeros(nl, r1, dtype=torch.int32, device="cuda")
+        fetch_ovf[:, 0] = 1  # lane 0 fenced (dense row set), lane 1 kept+fetched
+
+        kb, fb = kept_buf.clone(), fetch_buf.clone()
+        pack_csr_all_layers(
+            slots, loc, kept_buf, kept_len, fetch_len, fetch_buf, indices, indptr,
+            seq=seq, fetch_ovf=fetch_ovf, req_to_token=r2t,
+        )
+        torch.cuda.synchronize()
+        for i in range(nl):
+            for lane, slot in enumerate(lanes):
+                lo, hi = int(indptr[i, lane]), int(indptr[i, lane + 1])
+                if int(fetch_ovf[i, slot]):
+                    want = r2t[slot, : cap - 1].to(torch.int64).tolist() + [int(loc[lane])]
+                else:
+                    n = cap - 1  # the append took the free cell
+                    want = kb[i, slot, : n - 1].to(torch.int64).tolist() + [int(loc[lane])]
+                    want += fb[i, slot, :fw].to(torch.int64).tolist()
+                self.assertEqual(hi - lo, len(want), f"layer {i} lane {lane} length")
+                self.assertEqual(indices[i, lo:hi].tolist(), want, f"layer {i} lane {lane}")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_fence_matches_torch_chain(self):
         for seed, lanes in ((2, [2, 5, 0, TRASH]), (3, [1, 3, 6, 7])):
             self._check(seed, lanes, fence=True)
