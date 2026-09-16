@@ -21,6 +21,11 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     activation_min_tokens: int
     # Rank of the tier-2 recall sketch.
     index_rank: int
+    # Recall margin in scaled-logit units: an archived row fires when its
+    # certified score exceeds the kept max minus this. 0 is exact max-recall;
+    # delta bounds the softmax weight of a dropped row at e^-delta of the
+    # kept max (ln K covers K-way near ties, e.g. multi-key needles).
+    recall_margin: float
 
     @classmethod
     def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
@@ -30,6 +35,7 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             overflow_fallback=not kernel.disable_vestigekv_recall_overflow_fallback,
             activation_min_tokens=kernel.vestigekv_activation_min_tokens,
             index_rank=kernel.vestigekv_index_rank,
+            recall_margin=kernel.vestigekv_recall_margin,
         )
         cfg.validate()
         return cfg
@@ -44,6 +50,10 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
                 "--vestigekv-activation-min-tokens must be >= 0, got "
                 f"{self.activation_min_tokens}"
             )
+        if self.recall_margin < 0:
+            raise ValueError(
+                f"--vestigekv-recall-margin must be >= 0, got {self.recall_margin}"
+            )
         if self.index_rank < 8 or self.index_rank % 8:
             raise ValueError(
                 f"--vestigekv-index-rank must be a positive multiple of 8, got {self.index_rank}"
@@ -53,5 +63,5 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"recall_capacity={self.recall_capacity} "
             f"overflow_fallback={self.overflow_fallback} "
             f"activation_min_tokens={self.activation_min_tokens} "
-            f"index_rank={self.index_rank}"
+            f"index_rank={self.index_rank} recall_margin={self.recall_margin}"
         )

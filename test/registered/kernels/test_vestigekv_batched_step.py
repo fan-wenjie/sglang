@@ -55,6 +55,38 @@ def _mk_tier(nk, a, seed, zp, thr_g):
 
 
 class TestBatchedStepMatchesPerPair(CustomTestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "batched pack is device-only")
+    def test_recall_margin_matches_the_per_pair_reference(self):
+        # --vestigekv-recall-margin lowers every pair's scan threshold by the
+        # same amount in the fused prologue and in query_fixed; the fetched
+        # sets must agree, and a positive margin must fetch at least as much.
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
+
+        torch.manual_seed(3)
+        L, max_reqs = 2, 6
+        pairs = [(0, 1), (1, 4)]
+        base = {p: _mk_tier(800, 12000, seed=7 + p[1], zp=1.0, thr_g=-float("inf")) for p in pairs}
+        qbuf = torch.randn(L, max_reqs, H, 576, device="cuda")
+        out = torch.zeros(max_reqs, W, dtype=torch.int64, device="cuda")
+        ol = torch.zeros(max_reqs, dtype=torch.int64, device="cuda")
+        n_by_margin = {}
+        for margin in (0.0, 2.0):
+            ref = {}
+            for (li, slot), t in base.items():
+                t.margin = margin
+                t.query_fixed(qbuf[li, slot], out, ol, _ovf(ol), slot)
+                ref[(li, slot)] = out[slot, : int(ol[slot])].clone()
+            fetch = torch.zeros(L, max_reqs, W, dtype=torch.int64, device="cuda")
+            flen = torch.zeros(L, max_reqs, dtype=torch.int64, device="cuda")
+            pack = BatchedScanPack(pairs, [base[p] for p in pairs], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H, margin=margin)
+            pack.run()
+            torch.cuda.synchronize()
+            for (li, slot), rows in ref.items():
+                n = int(flen[li, slot])
+                self.assertEqual(sorted(fetch[li, slot, :n].tolist()), sorted(rows.tolist()))
+            n_by_margin[margin] = sum(int(flen[li, slot]) for (li, slot) in pairs)
+        self.assertGreaterEqual(n_by_margin[2.0], n_by_margin[0.0])
+
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_heterogeneous_pairs_bit_identical(self):
         from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
