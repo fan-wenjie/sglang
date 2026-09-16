@@ -32,10 +32,12 @@ class RecallTier:
         r: int = D.INDEX_RANK,
         recall_target: float = D.RECALL_TARGET,
         scale: float = D.ATTN_SCALE,
+        margin: float = 0.0,
     ):
         self.r = r
         self.recall_target = recall_target
         self.scale = scale
+        self.margin = margin  # scan threshold = kept max - margin (see VestigeKVConfig)
         self.built = False
         # live-archive projection caches: None until the first decode-time
         # close backfills them (extend_closed); _pos_all doubles as the fill
@@ -506,8 +508,8 @@ class RecallTier:
         if D.SIDECAR_DIM:
             idxs = idxs + (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16).float() @ self.side.float().T) * sc_
         cert = (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
-        fire = ((idxs + zp * cert) > max1[:, None]).sum(-1)
-        fire0 = (idxs > max1[:, None]).sum(-1)  # sketch term alone
+        fire = ((idxs + zp * cert) > (max1 - self.margin)[:, None]).sum(-1)
+        fire0 = (idxs > (max1 - self.margin)[:, None]).sum(-1)  # sketch term alone
         q = lambda t, p: float(t.float().quantile(p))
         # Would a position-pooled (4 rows) certificate be usable? Group bound:
         # q_sk . mean(c) + |q_sk| max|c_i - mean(c)| + zp cert(max rho); a
@@ -519,7 +521,7 @@ class RecallTier:
         rho_g = self.rho[:A4].view(-1, 4).max(1).values
         bound_g = (qsk @ cbar.T) * sc_ + (qsk.norm(dim=-1)[:, None] * delta[None, :]) * sc_
         bound_g = bound_g + (qres[:, None] * rho_g[None, :]) * sc_ * zp / (D.KV_LORA_RANK - self.r) ** 0.5
-        gfire = (bound_g > max1[:, None]).sum(-1) * 4
+        gfire = (bound_g > (max1 - self.margin)[:, None]).sum(-1) * 4
         return {
             "gfire_p50": q(gfire, 0.5), "gfire_p90": q(gfire, 0.9),
             "delta_over_c_p50": q(delta / cbar.norm(dim=-1).clamp_min(1e-6), 0.5),
@@ -585,7 +587,7 @@ class RecallTier:
         # +inf makes it lose every comparison and the kernel needs no second
         # predicate. Scores stay in registers -- see scan_kernel for why
         # that, not arithmetic, is what the scan costs.
-        max1g = torch.where(gate, max1, self._inf)
+        max1g = torch.where(gate, max1 - self.margin, self._inf)
         hit = (
             vestige_scan(
                 self._qside_t,
@@ -652,7 +654,7 @@ class RecallTier:
             (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
         )
         score = idxs + self.zp * cert
-        fire = (score > max1[:, None]) & gate[:, None]
+        fire = (score > (max1 - self.margin)[:, None]) & gate[:, None]
         return self.arch[fire.any(0)]
 
     @ieee_fp32

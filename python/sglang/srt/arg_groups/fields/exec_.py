@@ -338,6 +338,14 @@ class ExecKernel(msgspec.Struct):
         "Higher ranks certify more of the latent row and fire fewer rows per scan, at "
         "2 bytes per rank per archived row per layer of scan traffic and memory.",
     ] = 64
+    vestigekv_recall_margin: A[
+        float,
+        "VestigeKV: recall margin in scaled-logit units. An archived row is fetched "
+        "when its certified score exceeds the request's best kept-row score minus this "
+        "margin; 0 recalls only rows that could beat the kept max, ln(K) also keeps "
+        "K-way near ties (the softmax weight of a dropped row is bounded by e^-margin "
+        "of the kept max). More rows fetched per step as it grows.",
+    ] = 0.0
 
 
 class ExecMamba(msgspec.Struct):

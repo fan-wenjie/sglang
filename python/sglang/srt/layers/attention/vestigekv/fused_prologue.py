@@ -40,6 +40,7 @@ def _fused_prologue_kernel(
     qsk_t_ptr,  # [P, R, H] fp16 out
     qres_ptr,  # [P, H] fp32 out
     sc,  # attention scale
+    margin,  # recall margin subtracted from the kept max (fp32 scalar)
     NKm,
     H: tl.constexpr,
     R: tl.constexpr,
@@ -99,7 +100,7 @@ def _fused_prologue_kernel(
     ent = lse - x_sum / tl.where(nonempty, e_sum, 1.0)
     gate = (ent > thr) | (~nonempty)
     max1 = tl.where(nonempty, e_max, -float("inf"))
-    max1g = tl.where(gate, max1, float("inf"))
+    max1g = tl.where(gate, max1 - margin, float("inf"))
     tl.store(max1g_ptr + p * H + h, max1g)
     tl.store(qres_ptr + p * H + h, qres)
 
@@ -116,7 +117,7 @@ def _fused_prologue_kernel(
     )
 
 
-def fused_prologue(q, kr, v, nk_len, thr, sc, out=None):
+def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0):
     """q [P,H,576] fp32, kr [P,NKm,576] bf16, v [P,R,512] fp32.
     Returns (max1g [P,H] fp32, qside_t [P,64,H] bf16, qsk_t [P,R,H] fp16,
     qres [P,H] fp32); pass `out` to reuse fixed-address buffers (capture)."""
@@ -141,6 +142,7 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None):
         qsk_t,
         qres,
         sc,
+        float(margin),
         NKm,
         H=H,
         R=R,
@@ -284,6 +286,7 @@ def _prologue_merge_kernel(
     li_ptr,  # and the scan (its only consumer) runs strictly after.
     slot_ptr,
     RR,
+    margin,  # recall margin subtracted from the kept max (fp32 scalar)
     v_ptr,
     qside_t_ptr,
     qsk_t_ptr,
@@ -346,7 +349,7 @@ def _prologue_merge_kernel(
     ent = lse - gt / tl.where(nonempty, gs, 1.0)
     gate = (ent > thr) | (~nonempty)
     max1 = tl.where(nonempty, gm, -float("inf"))
-    tl.store(max1g_ptr + p * H + h, tl.where(gate, max1, float("inf")))
+    tl.store(max1g_ptr + p * H + h, tl.where(gate, max1 - margin, float("inf")))
 
 
 _NSPLIT = 32
@@ -460,6 +463,7 @@ def fused_prologue_split(
     row=None,
     pool_rows=None,
     mode=None,
+    margin=0.0,
 ):
     """Split-NK prologue reading queries in place from the stacked qbuf.
 
@@ -535,6 +539,7 @@ def fused_prologue_split(
         li,
         slot,
         RR,
+        float(margin),
         v,
         qside_t,
         qsk_t,
