@@ -132,6 +132,7 @@ class VestigeKVMLABackend(AttentionBackend):
         recall_margin=0.0,
         recall_threshold="max",
         prefill_calibration=False,
+        rebuild_overflow_fraction=0.0,
     )
 
     def __init__(
@@ -203,6 +204,7 @@ class VestigeKVMLABackend(AttentionBackend):
         self._build_stream = None
         self._qbuf_stack = self._fetch_stack = self._fetch_len_stack = None
         self._fetch_ovf_stack = self._ovf_count_stack = None
+        self._ovf_at_close: dict = {}  # lid -> its overflow tally at its last close
         self._li_map: dict = {}
         # ---- recall tier (REQUIRED component; no production off-switch) ----
         # Expanded-query dims from the model config (q_nope@W_kc | q_rope).
@@ -1736,6 +1738,7 @@ class VestigeKVMLABackend(AttentionBackend):
         """
         real = forward_batch.out_cache_loc.shape[0]
         seq_lens = self._seq_lens_host(forward_batch)
+        closed = []
         for i in range(real):
             slot = reqs[i]
             seq_len = int(seq_lens[i])
@@ -1754,6 +1757,48 @@ class VestigeKVMLABackend(AttentionBackend):
                     and seq_len - cl["closed"] >= D.CLOSE_BLOCK
                 ):
                     self._close_one_block(slot, lid, cl, seq_len)
+                    closed.append((slot, lid))
+        if closed:
+            self._rearm_overflowing_indices(closed)
+
+    def _rearm_overflowing_indices(self, closed):
+        """Re-open calibration for a layer whose scan keeps overflowing.
+
+        A calibrated index is fitted once, early (the collection loop stops as
+        soon as every layer has settled), and then serves the rest of the
+        request: a fit made at 8k context over-fires at 256k, the scan
+        overflows the capacity and every overflowing lane is served from the
+        full row set that step. The compaction already tallies overflows per
+        layer in-graph, so the signal is free; this reads it at the close that
+        just happened (one sync per CLOSE_BLOCK decoded tokens) and hands the
+        layer back to the existing side-stream build, which refits basis and z
+        at the current context while the installed tier keeps serving.
+
+        The tally is per layer, summed over lanes, so one hot lane re-arms the
+        layer for every lane that closed with it: over-triggering costs a
+        build, under-triggering costs a dense step every step.
+        """
+        if self.config.rebuild_overflow_fraction <= 0 or self._ovf_count_stack is None:
+            return
+        tally = self._ovf_count_stack.tolist()
+        budget = D.CLOSE_BLOCK * self.config.rebuild_overflow_fraction
+        hot = set()
+        for lid in {l for _, l in closed}:
+            li = self._li_map.get(lid)
+            if li is None:
+                continue
+            grew = tally[li] - self._ovf_at_close.get(lid, 0)
+            self._ovf_at_close[lid] = tally[li]
+            if grew >= budget:
+                hot.add(lid)
+        for slot, lid in closed:
+            st = self._recall.get((slot, lid))
+            if lid not in hot or st is None or st["tier"] is None or "job" in st:
+                continue
+            # tier is not None, so the collection loop takes the calibrated
+            # branch: no provisional index, no gap in service.
+            st["qcal"], st["qpos"], st["target"] = [], [], D.N_CAL_START
+            self._collecting = True
 
     def _close_one_block(self, slot, lid, cl, seq_len):
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)
