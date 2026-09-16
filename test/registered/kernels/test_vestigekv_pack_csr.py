@@ -224,6 +224,29 @@ class TestPackCsrParity(CustomTestCase):
         for seed, lanes in ((2, [2, 5, 0, TRASH]), (3, [1, 3, 6, 7])):
             self._check(seed, lanes, fence=True)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_gather_off_keeps_the_counts_and_the_append(self):
+        # The tier-decode router reads rows from the tiers, so the pack runs
+        # its prep launch alone. Everything the router still depends on -- the
+        # per-lane counts stage 2 reduces over, and the append of this step's
+        # row into the kept table -- must come out identical, and the row array
+        # must be left alone rather than half-written.
+        from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
+
+        lanes = [2, 5, 0, TRASH]
+        slots = torch.tensor(lanes, dtype=torch.int64, device="cuda")
+        loc = torch.arange(1, len(lanes) + 1, dtype=torch.int64, device="cuda")
+        full = _mk_state(4)
+        only = tuple(t.clone() for t in full)
+        pack_csr_all_layers(slots, loc, *full[:4], full[4], full[5])
+        only[4].fill_(-7)  # a value the gather would overwrite
+        pack_csr_all_layers(slots, loc, *only[:4], only[4], only[5], gather=False)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(only[5], full[5]), "indptr must not change")
+        self.assertTrue(torch.equal(only[1], full[1]), "kept_len must not change")
+        self.assertTrue(torch.equal(only[0], full[0]), "kept_buf must not change")
+        self.assertTrue((only[4] == -7).all(), "indices must be left untouched")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

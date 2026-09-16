@@ -177,6 +177,7 @@ def pack_csr_all_layers(
     seq=None,
     fetch_ovf=None,
     req_to_token=None,
+    gather=True,
 ):
     """Two launches for every layer's CSR. Stacked tensors: kept_buf
     [L, R1, CAP], kept_len/fetch_len [L, R1], fetch_buf [L, R1, FW],
@@ -184,7 +185,13 @@ def pack_csr_all_layers(
 
     Passing `seq` [bs], `fetch_ovf` [L, R1] and `req_to_token` [reqs, ctx]
     together arms the overflow fence (see the module docstring); all three
-    or none."""
+    or none.
+
+    `gather=False` runs the prep launch alone, leaving `indices` untouched:
+    the tier-decode router reads a lane's rows from the tiers themselves, so
+    only the per-lane counts in `indptr` are still consumed (stage 2 sizes its
+    reduction from them). Copying the rows into one array is what arming the
+    fence costs, and this is the switch that stops paying it."""
     fence = seq is not None
     if fence != (fetch_ovf is not None) or fence != (req_to_token is not None):
         raise ValueError("the fence needs seq, fetch_ovf and req_to_token together")
@@ -209,6 +216,8 @@ def pack_csr_all_layers(
         indptr.shape[1],
         FENCE=fence,
     )
+    if not gather:
+        return
     # Worst case a single lane packs: the whole row set when the fence can
     # fire, the kept table plus the fetch buffer otherwise.
     max_rows = req_to_token.shape[1] if fence else CAP + fetch_buf.shape[2]

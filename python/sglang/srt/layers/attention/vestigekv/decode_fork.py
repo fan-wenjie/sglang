@@ -26,14 +26,22 @@ import triton.language as tl
 # The launcher below is upstream's too, so it keeps using upstream's block
 # buckets, head tiling and platform flags rather than copies of them.
 from sglang.kernels.ops.attention.decode_attention import (
+    _extract_kv_strides,
+    _GROUPED_BLOCK_H,
     _grouped_head_tiles,
     _is_hip,
+    _MIN_BLOCK_KV,
+    _MLA_BLOCK_N,
     _MLA_BUCKET_BATCH_FREE,
+    _is_gfx1250,
     _mla_bucket,
+    unpack_aux_tensors,
 )
 
-SRC_CSR = 0  # upstream behaviour: one index array, segments given by kv_indptr
-SRC_TIERS = 1  # kept table then fetch buffer, or the page table when fenced
+# tl.constexpr, not plain ints: a @triton.jit body may only read globals that
+# are declared as such.
+SRC_CSR = tl.constexpr(0)  # upstream behaviour: one index array, bounds from kv_indptr
+SRC_TIERS = tl.constexpr(1)  # kept table then fetch buffer, or the page table when fenced
 
 
 @triton.jit
