@@ -407,6 +407,62 @@ class TestPackedCsrDtype(CustomTestCase):
         self.assertEqual(be._fetch_buf[LID].dtype, D.INDEX_DTYPE)
 
 
+class TestOverflowRearm(CustomTestCase):
+    """A calibrated index is fitted once and then serves the whole request, so a
+    fit made at short context over-fires at long context and every overflowing
+    lane is served from the full row set. The per-layer overflow tally re-opens
+    calibration for such a layer at its next block close."""
+
+    def _backend(self, fraction=0.05, tally=(0, 0)):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.config = msgspec.structs.replace(
+            FLAG_DEFAULT_CONFIG, rebuild_overflow_fraction=fraction
+        )
+        be._ovf_count_stack = torch.tensor(tally, dtype=torch.int32)
+        be._li_map = {10: 0, 11: 1}
+        be._ovf_at_close = {}
+        be._collecting = False
+        be._recall = {
+            (0, lid): {"tier": object(), "qcal": None, "qpos": None, "target": 99}
+            for lid in (10, 11)
+        }
+        return be
+
+    def test_only_the_overflowing_layer_reopens_calibration(self):
+        hot = int(D.CLOSE_BLOCK * 0.05) + 1
+        be = self._backend(tally=(hot, 0))
+        be._rearm_overflowing_indices([(0, 10), (0, 11)])
+        self.assertEqual(be._recall[(0, 10)]["qcal"], [])
+        self.assertEqual(be._recall[(0, 10)]["target"], D.N_CAL_START)
+        self.assertIsNone(be._recall[(0, 11)]["qcal"])
+        self.assertTrue(be._collecting)
+
+    def test_the_tally_is_read_as_growth_since_the_last_close(self):
+        # The counter is cumulative over the request: comparing it against zero
+        # instead of against its value at the previous close re-arms every layer
+        # at every close for the rest of the request, one build per 4096 tokens.
+        hot = int(D.CLOSE_BLOCK * 0.05) + 1
+        be = self._backend(tally=(hot, 0))
+        be._rearm_overflowing_indices([(0, 10)])
+        be._recall[(0, 10)]["qcal"] = None  # as an install would leave it
+        be._collecting = False
+        be._rearm_overflowing_indices([(0, 10)])  # same tally: no new overflow
+        self.assertIsNone(be._recall[(0, 10)]["qcal"])
+        self.assertFalse(be._collecting)
+
+    def test_a_build_in_flight_is_not_disturbed(self):
+        hot = int(D.CLOSE_BLOCK * 0.05) + 1
+        be = self._backend(tally=(hot, 0))
+        be._recall[(0, 10)]["job"] = {"seq_len": 1}
+        be._rearm_overflowing_indices([(0, 10)])
+        self.assertIsNone(be._recall[(0, 10)]["qcal"])
+
+    def test_zero_fraction_is_off(self):
+        be = self._backend(fraction=0.0, tally=(D.CLOSE_BLOCK, 0))
+        be._rearm_overflowing_indices([(0, 10)])
+        self.assertIsNone(be._recall[(0, 10)]["qcal"])
+
+
 class TestConfig(CustomTestCase):
     def test_fake_default_matches_the_flag_defaults(self):
         # The __new__ fakes read the class-level config; if a flag default
@@ -444,6 +500,8 @@ class TestConfig(CustomTestCase):
             {"index_rank": 60},
             {"recall_margin": -0.5},
             {"recall_threshold": "mean"},
+            {"rebuild_overflow_fraction": -0.1},
+            {"rebuild_overflow_fraction": 1.5},
         ):
             with self.assertRaises(ValueError, msg=str(bad)):
                 msgspec.structs.replace(base, **bad).validate()

@@ -352,11 +352,20 @@ class ExecKernel(msgspec.Struct):
     enable_vestigekv_prefill_calibration: A[
         bool,
         "VestigeKV: calibrate the recall index during prefill on absorbed prompt "
-        "queries (one every 512 positions plus each chunk's last, paced every 16k "
-        "prompt tokens), so decode starts on a calibrated index instead of the "
-        "provisional one that fires most of a large archive. Decode queries still "
-        "refine it.",
+        "queries (one every 512 positions plus each chunk's last, built at the "
+        "first closed block and then at every doubling of the prompt), so decode "
+        "starts on a calibrated index instead of the provisional one that fires "
+        "most of a large archive. Decode queries still refine it.",
     ] = False
+    vestigekv_rebuild_overflow_fraction: A[
+        float,
+        "VestigeKV: refit a layer's recall index when its scan overflowed the "
+        "capacity on more than this fraction of the steps since that layer's last "
+        "block close. The index is otherwise fitted once, early in the request, "
+        "and a fit made at 8k context over-fires at 256k: every overflowing lane "
+        "then serves that step from the full row set. 0 disables the trigger; "
+        "0.05 is the measured-regime starting point.",
+    ] = 0.0
 
 
 class ExecMamba(msgspec.Struct):

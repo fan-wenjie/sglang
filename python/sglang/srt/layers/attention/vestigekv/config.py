@@ -38,6 +38,10 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # (at PREFILL_BUILD_MIN tokens, then at every doubling) so the first decode
     # steps are served by a calibrated index instead of the provisional one.
     prefill_calibration: bool
+    # Refit a layer's index when its scan overflowed on more than this fraction
+    # of the steps since that layer's last close (0 disables): the fit is
+    # otherwise made once, early, and serves the whole request.
+    rebuild_overflow_fraction: float
 
     @classmethod
     def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
@@ -50,11 +54,17 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             recall_margin=kernel.vestigekv_recall_margin,
             recall_threshold=kernel.vestigekv_recall_threshold,
             prefill_calibration=kernel.enable_vestigekv_prefill_calibration,
+            rebuild_overflow_fraction=kernel.vestigekv_rebuild_overflow_fraction,
         )
         cfg.validate()
         return cfg
 
     def validate(self) -> None:
+        if not 0.0 <= self.rebuild_overflow_fraction <= 1.0:
+            raise ValueError(
+                "--vestigekv-rebuild-overflow-fraction must be in [0, 1], got "
+                f"{self.rebuild_overflow_fraction}"
+            )
         if self.recall_capacity < 1:
             raise ValueError(
                 f"--vestigekv-recall-capacity must be >= 1, got {self.recall_capacity}"
@@ -84,5 +94,6 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"activation_min_tokens={self.activation_min_tokens} "
             f"index_rank={self.index_rank} recall_margin={self.recall_margin} "
             f"recall_threshold={self.recall_threshold} "
-            f"prefill_calibration={self.prefill_calibration}"
+            f"prefill_calibration={self.prefill_calibration} "
+            f"rebuild_overflow_fraction={self.rebuild_overflow_fraction}"
         )
