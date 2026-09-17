@@ -40,9 +40,6 @@ def _rows(gen):
         r2t=r2t,
         seq=torch.tensor([777], dtype=torch.int64, device="cuda"),
         loc=torch.tensor([POOL - 1], dtype=torch.int64, device="cuda"),
-        # affine is a per-slot run-time flag; the cases set it directly
-        affine_ok=torch.zeros(R1, dtype=torch.int32, device="cuda"),
-        affine_base=torch.zeros(R1, dtype=torch.int64, device="cuda"),
     )
 
 
@@ -57,10 +54,7 @@ def _run(q, kb, vb, indptr, indices, vk, tiers, fence=True, affine=False):
     splits = torch.full((bs,), SPLITS, dtype=torch.int32, device="cuda")
     decode_grouped_att_m_fwd(
         q, kb, vb, out, lse, indptr, indices,
-        msgspec.structs.replace(
-            vk, tiers=tiers, fence=fence,
-            affine_ok=torch.full_like(vk.affine_ok, int(affine)),
-        ),
+        msgspec.structs.replace(vk, tiers=tiers, fence=fence, affine=affine),
         splits, SPLITS, 1.0 / (LK**0.5), 0.0, has_mla=True,
     )
     return out, lse
@@ -113,7 +107,6 @@ class TestDecodeForkRowSource(CustomTestCase):
         base = 7
         vk.r2t[slot, :n] = base + torch.arange(n, dtype=torch.int32, device="cuda")
         vk.loc.fill_(base + n - 1)  # the affine arm has no last-row fixup
-        vk.affine_base.fill_(base)
         indices = vk.r2t[slot, :n].to(torch.int64)
         indptr = torch.tensor([0, n], dtype=torch.int32, device="cuda")
         a_out, a_lse = _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=True)
