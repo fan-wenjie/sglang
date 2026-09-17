@@ -45,6 +45,8 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # Size the decode kernel's KV split count from the attended rows rather than
     # the request's length (changes the accumulation grouping, not the row set).
     attended_splits: bool
+    # Extra margin per nat of kept-distribution flatness (0 = threshold unchanged).
+    entropy_margin_gain: float
     # Read a lane's rows from the tiers (kept table + fetch buffer, or the page
     # table when fenced) instead of from a CSR packed for the step.
 
@@ -61,11 +63,17 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             prefill_calibration=kernel.enable_vestigekv_prefill_calibration,
             rebuild_overflow_fraction=kernel.vestigekv_rebuild_overflow_fraction,
             attended_splits=kernel.enable_vestigekv_attended_splits,
+            entropy_margin_gain=kernel.vestigekv_entropy_margin_gain,
         )
         cfg.validate()
         return cfg
 
     def validate(self) -> None:
+        if self.entropy_margin_gain < 0:
+            raise ValueError(
+                "--vestigekv-entropy-margin-gain must be >= 0, got "
+                f"{self.entropy_margin_gain}"
+            )
         if not 0.0 <= self.rebuild_overflow_fraction <= 1.0:
             raise ValueError(
                 "--vestigekv-rebuild-overflow-fraction must be in [0, 1], got "
@@ -102,5 +110,6 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"recall_threshold={self.recall_threshold} "
             f"prefill_calibration={self.prefill_calibration} "
             f"rebuild_overflow_fraction={self.rebuild_overflow_fraction} "
-            f"attended_splits={self.attended_splits}"
+            f"attended_splits={self.attended_splits} "
+            f"entropy_margin_gain={self.entropy_margin_gain}"
         )
