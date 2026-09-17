@@ -21,7 +21,7 @@ import logging
 import msgspec
 import torch
 
-_BLEND_SEEN = [False]
+_BLEND_SEEN = [0]
 
 from sglang.kernels.ops.attention.decode_attention import _decode_softmax_reducev_fwd
 from sglang.srt.layers.attention.vestigekv.decode_fork import (
@@ -95,12 +95,12 @@ def _blend_omitted_mass(o, attn_lse, num_kv_splits, logm_buf, mu_buf, slots):
     entries of each row are written, so the unwritten tail is masked out rather
     than folded into the merge.
     """
-    if not _BLEND_SEEN[0]:
+    if _BLEND_SEEN[0] == 0:
         # An arm that silently does not run reads exactly like an arm that
         # ran and changed nothing -- which is how two different compensators
         # once returned bit-identical answers over 650 questions. This line is
         # the difference between a null result and a void one.
-        _BLEND_SEEN[0] = True
+        _BLEND_SEEN[0] = 1
         logging.getLogger(__name__).info(
             "VKBLEND active: omitted-mass blend is in the decode path"
         )
@@ -119,6 +119,19 @@ def _blend_omitted_mass(o, attn_lse, num_kv_splits, logm_buf, mu_buf, slots):
         attn_lse[:n].float().masked_fill(~live, float("-inf")), dim=-1
     )  # [n, H]
     sigma = torch.sigmoid(lse - logm)[..., None]  # [n, H, 1]
+    if _BLEND_SEEN[0] == 1:
+        # One reading of sigma, which separates the two ways this arm can be
+        # wrong. Offline says the attended set holds ~57% of the mass, so a
+        # correct implementation sits near 0.5-0.6. A sigma near 0 means logM
+        # is being compared against an lse on a different scale and the output
+        # is being swamped by the centroid -- an implementation fault, not a
+        # verdict on the idea.
+        _BLEND_SEEN[0] = 2
+        f = sigma.flatten().float()
+        logging.getLogger(__name__).info(
+            "VKBLEND sigma: min %.4f p50 %.4f max %.4f over %d (q, head)",
+            float(f.min()), float(f.median()), float(f.max()), f.numel(),
+        )
     view = o.view(-1, H, o.shape[-1])[:n]
     view.copy_(view.float() * sigma + mu.float() * (1.0 - sigma))
 
