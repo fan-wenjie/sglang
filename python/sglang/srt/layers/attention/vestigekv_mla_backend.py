@@ -36,6 +36,7 @@ safety width.
 from __future__ import annotations
 
 import logging
+import json
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -129,6 +130,8 @@ class VestigeKVMLABackend(AttentionBackend):
     # Class-level so a backend built with __new__ (the unit tests) reads the
     # arm as off rather than raising on a missing attribute.
     _omit_blend = False
+    _stepdump = False
+    _stepdump_rows: list = []
     _logm_stack = _archmu_stack = None
     _blend_logged = False
     _affine_base = None  # [max_reqs] int64
@@ -259,6 +262,8 @@ class VestigeKVMLABackend(AttentionBackend):
         # [max_reqs, H] log of the softmax mass the scan skipped and
         # [max_reqs, kv] the archive mean it is carried at.
         self._omit_blend = envs.SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND.get()
+        self._stepdump = envs.SGLANG_DEBUG_VESTIGEKV_STEPDUMP.get()
+        self._stepdump_rows: list = []
         self._logm: dict = {}
         self._archmu: dict = {}
         self._logm_stack = self._archmu_stack = None
@@ -340,6 +345,8 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._last_step_tok = tok
                 st["steps"] += 1
                 self._account_step(forward_batch, reqs)
+        if self._stepdump:
+            self._dump_step_attribution(forward_batch, reqs)
         if self._omit_blend:
             # Hung off the prologue, not off _recall_step: with the in-graph
             # scan on (the default) the decode path is
@@ -975,6 +982,66 @@ class VestigeKVMLABackend(AttentionBackend):
                     dim=1,
                 ),
             )
+
+    def _dump_step_attribution(self, forward_batch, reqs):
+        """One record per (step, layer, lane): where the mass went, against dense.
+
+        The blind spot this exists to close: every offline study in this line
+        runs on CALIBRATED tiers sampled at the eight decode steps right after
+        the build, while 81% of RULER's scans run on a PROVISIONAL tier at
+        ANSWER positions. So "the certificate misses nothing" and "coverage
+        rises with k" describe the 19% of steps RULER barely enters. This
+        records the other 81%, on the steps that actually produce the answer.
+
+        Debug only and far slower than serving: step_attribution computes the
+        dense attention over the whole closed prefix, which is the work the
+        method exists to avoid.
+        """
+        real = forward_batch.out_cache_loc.shape[0]
+        if not real:
+            return
+        seq = self._seq_lens_host(forward_batch)[:real].tolist()
+        step = self._stats.get("steps", 0)
+        for lid in self._local_mla_lids:
+            qb = self._qbuf.get(lid)
+            if qb is None:
+                continue
+            for i in range(real):
+                slot = reqs[i]
+                st = self._recall.get((slot, lid))
+                tier = None if st is None else st["tier"]
+                if tier is None:
+                    continue
+                rec = tier.step_attribution(qb[slot])
+                if not rec:
+                    continue
+                rec.update(
+                    step=step, lid=lid, slot=int(slot), seq=int(seq[i]),
+                    # the state the blind spot is about
+                    provisional=bool(getattr(tier, "need_more_hard", True)),
+                    zp=float(tier.zp), built_at=int(st.get("built_at", 0)),
+                )
+                self._stepdump_rows.append(rec)
+        if len(self._stepdump_rows) >= 200:
+            self._flush_step_attribution()
+
+    def _flush_step_attribution(self):
+        out_dir = envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.get() or "/tmp"
+        os.makedirs(out_dir, exist_ok=True)
+        tag = os.environ.get("VK_JOB", "step")
+        path = os.path.join(out_dir, f"stepattr_{tag}_tp{self._tp_rank()}.jsonl")
+        with open(path, "a") as f:
+            for r in self._stepdump_rows:
+                f.write(json.dumps(r) + "\n")
+        self._stepdump_rows = []
+
+    def _tp_rank(self):
+        try:
+            from sglang.srt.distributed import get_parallel
+
+            return int(get_parallel().tp_rank)
+        except Exception:
+            return 0
 
     def _probe_page_table(self, slots, seq_lens):
         """How affine is a request's page table?
