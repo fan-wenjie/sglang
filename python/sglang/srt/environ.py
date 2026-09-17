@@ -599,6 +599,13 @@ class Envs:
     # lane then attends nothing, so the output is wrong on the steps that fence.
     SGLANG_DEBUG_VESTIGEKV_FENCE_STUB = EnvBool(False)
     SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE = EnvBool(False)
+    # Research arm: compensate the softmax denominator for the rows the scan
+    # never attends. VestigeKV attends ~6% of rows and captures ~57% of the
+    # dense softmax mass, so every retained weight is inflated ~2.9x. This
+    # estimates the omitted mass from the certified upper bound the scan
+    # already computes and blends the attention output toward the archive's
+    # mean value by that weight. Changes the output; off by default.
+    SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND = EnvBool(False)
     # Directory for one calibration snapshot per (request slot, layer): the
     # closed-prefix content rows, the tier-1 keep set and the calibration
     # queries the calibrated index was fitted on, written at its install.
