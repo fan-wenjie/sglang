@@ -243,8 +243,11 @@ class VestigeKVMLABackend(AttentionBackend):
         self._fetch_ovf: dict = {}  # lid -> [max_reqs] int32 overflow flag
         self._recall: dict = {}  # (slot, lid) -> {"tier", "built_at"}
         self._stats = dict.fromkeys(
-            ("steps", "scan_calls", "fetched", "kept", "seq", "replays"), 0
+            ("steps", "scan_calls", "fetched", "kept", "seq", "replays",
+             "prologue_calls"), 0
         )
+        # The dedup token for "steps": see _decode_prologue.
+        self._last_step_tok = None
         self._pcal: dict = {}  # prefill calibration queries per (slot, lid)
         self._mem_dir = envs.SGLANG_DEBUG_VESTIGEKV_MEM_DIR.get()
         self._mem_reqs = 0  # requests seen at their first prefill chunk (mem trace)
@@ -301,8 +304,28 @@ class VestigeKVMLABackend(AttentionBackend):
         # left an eager run with no VKSTATS at all, which is how a
         # --disable-cuda-graph measurement came back empty.
         if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
-            self._stats["steps"] += 1
-            self._account_step(forward_batch, reqs)
+            # This function runs once per decode step but is CALLED more than
+            # once: init_forward_metadata reaches it through _eager_decode_step
+            # and the graph runner's load_batch reaches it again through
+            # init_forward_metadata_out_graph. Counting on entry -- which is
+            # what moving the accounting here first did -- multiplied steps and
+            # scan_calls by that multiplicity and so DIVIDED the reported
+            # fallback rate by it (RULER 64k read 0.118 where the once-per-step
+            # count reads 0.360). Dedup on a token that changes exactly when
+            # the step does: every request in a decode batch grows by one
+            # token, so the host-side seq_lens sum is strictly monotonic within
+            # a fixed batch, and the size distinguishes a recomposed one. The
+            # raw entry count is kept as prologue_calls so the multiplicity is
+            # a measured number rather than an inference.
+            st = self._stats
+            st["prologue_calls"] += 1
+            real = forward_batch.out_cache_loc.shape[0]
+            tok = (real, int(self._seq_lens_host(forward_batch)[:real].sum())
+                   if real else 0)
+            if tok != self._last_step_tok:
+                self._last_step_tok = tok
+                st["steps"] += 1
+                self._account_step(forward_batch, reqs)
         self._maybe_close_blocks(forward_batch, reqs)
         # Collecting a calibration query is five 74 KB clones; it does not
         # need the eager scan path, and tying it to that path cost 16 eager
@@ -956,7 +979,7 @@ class VestigeKVMLABackend(AttentionBackend):
         if self._stat_acc is not None:  # the only readback of the per-scan sums
             st["fetched"], st["kept"], st["seq"] = self._stat_acc.tolist()
         logging.getLogger(__name__).info(
-            "VKSTATS steps=%d layers=%d replay=%.0f%% build=%.1fms x%d cap=%.1fms x%d "
+            "VKSTATS steps=%d calls/step=%.2f layers=%d replay=%.0f%% build=%.1fms x%d cap=%.1fms x%d "
             "caps[key=%d fits=%d] overflow=%d fetch[p50=%d p90=%d p99=%d] fallback=%.5f "
             "mem[alloc=%.2fGB reserved=%.2fGB] "
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
@@ -964,6 +987,7 @@ class VestigeKVMLABackend(AttentionBackend):
             "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
             "attended_frac=%.4f pagetable_affine=%s idx(scans/fetch/ovf)[%s]",
             st["steps"],
+            st["prologue_calls"] / n,
             len(self._mla_lids),
             100.0 * st["replays"] / n,
             1e3 * st["t_build"],
