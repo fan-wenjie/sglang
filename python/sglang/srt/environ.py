@@ -612,7 +612,7 @@ class Envs:
     # softmax mass the attended set holds and whether dense's argmax row is in
     # it. Computes the dense attention the method exists to avoid, so it is
     # far slower than serving; debug only.
-    SGLANG_DEBUG_VESTIGEKV_STEPDUMP = EnvBool(False)
+    SGLANG_DEBUG_VESTIGEKV_STEPDUMP = EnvStr(None)
 
     # Control for the multi-key fence: fence a random fraction of lanes at the
     # same cost instead of choosing them by fired-row count. If the gain
