@@ -294,6 +294,13 @@ class VestigeKVMLABackend(AttentionBackend):
         if envs.SGLANG_DEBUG_VESTIGEKV_ROWS.get():
             self._check_row_invariant(forward_batch)
         reqs, key = self._step_slots(forward_batch)
+        # Counted here because this is the one function every decode step runs
+        # "however the step is launched": hanging it off the in-graph host step
+        # left an eager run with no VKSTATS at all, which is how a
+        # --disable-cuda-graph measurement came back empty.
+        if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
+            self._stats["steps"] += 1
+            self._account_step(forward_batch)
         self._maybe_close_blocks(forward_batch, reqs)
         # Collecting a calibration query is five 74 KB clones; it does not
         # need the eager scan path, and tying it to that path cost 16 eager
@@ -787,7 +794,6 @@ class VestigeKVMLABackend(AttentionBackend):
         import time as _t
 
         st = self._stats
-        st["steps"] += 1
         # Must take the SAME branch production takes: measuring _recall_step
         # directly would price the eager path on a step that actually replays a
         # captured graph, i.e. instrument a path the server no longer runs.
@@ -821,7 +827,6 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._refresh_graph_bufs(lid, forward_batch, reqs)
             torch.cuda.synchronize()
             st["t_pack"] += _t.perf_counter() - t1
-        self._account_step(forward_batch)
 
     def _account_step(self, forward_batch):
         # SGLANG_DEBUG_VESTIGEKV_STATS=1 bookkeeping for one decode step, on
@@ -1729,9 +1734,6 @@ class VestigeKVMLABackend(AttentionBackend):
         if envs.SGLANG_DEBUG_VESTIGEKV_TAIL.get():
             self._check_tail_append(forward_batch, reqs)
         self._stage_step(forward_batch, forward_batch.seq_lens.shape[0])
-        if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
-            self._stats["steps"] += 1
-            self._account_step(forward_batch)
         if self._full_arm():
             if not self._ingraph_full_armed:
                 # FULL arm: kept_buf already holds every row (_arm_aware_kept),
