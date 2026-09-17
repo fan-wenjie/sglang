@@ -133,6 +133,8 @@ def _vk_fwd_grouped_kernel_stage1(
         vk_slot = 0
         vk_nk = 0
         vk_fenced = False
+        vk_loc = 0
+        vk_last = 0
     else:
         cur_batch_kv_start_idx = 0
         vk_slot = tl.load(vk_slots + cur_batch).to(tl.int64)
@@ -144,6 +146,10 @@ def _vk_fwd_grouped_kernel_stage1(
         cur_batch_seq_len = tl.where(
             vk_fenced, vk_seq, vk_nk + tl.load(vk_fetch_len + vk_slot).to(tl.int64)
         )
+        # loop invariants of the fenced arm: loading them per iteration made the
+        # allocator carry the whole branch across the loop (255 regs, 40B spill).
+        vk_loc = tl.load(vk_loc_ptr + cur_batch)
+        vk_last = cur_batch_seq_len - 1
     # runtime, not constexpr: it only feeds the kv_len_per_split arithmetic below, so
     # a constexpr buys nothing and costs one stage-1 variant per cuda-graph ladder
     # rung (stage-2 does need it at compile time). Any count covers any length since
@@ -210,27 +216,31 @@ def _vk_fwd_grouped_kernel_stage1(
                     mask=offs_n < split_kv_end,
                     other=0,
                 )
-            elif vk_fenced:
-                # the step's own row is in the pool but not yet in the page table
-                loc = tl.load(vk_loc_ptr + cur_batch)
-                rid = tl.load(
-                    vk_r2t + vk_slot * VK_R2T + offs_n, mask=offs_n < split_kv_end, other=0
-                )
-                kv_loc = tl.where(offs_n == cur_batch_seq_len - 1, loc.to(rid.dtype), rid).to(
-                    tl.int64
-                )
             else:
+                # One straight-line row read for both arms. Written as a branch,
+                # the fenced and unfenced definitions of kv_loc each carried their
+                # own downstream address tensor through the loop and the allocator
+                # spilled (255 regs, 40B stack, against 200 and none unfenced);
+                # selecting the value instead of the path keeps one definition.
+                # The masked-off load of the arm that does not apply is predicated
+                # away, and vk_last/vk_loc are loop invariants hoisted above.
+                live = offs_n < split_kv_end
                 kept = tl.load(
                     vk_kept_buf + vk_slot * VK_CAP + offs_n,
-                    mask=(offs_n < split_kv_end) & (offs_n < vk_nk),
+                    mask=live & (offs_n < vk_nk) & (not vk_fenced),
                     other=0,
                 )
                 fired = tl.load(
                     vk_fetch_buf + vk_slot * VK_FW + (offs_n - vk_nk),
-                    mask=(offs_n < split_kv_end) & (offs_n >= vk_nk),
+                    mask=live & (offs_n >= vk_nk) & (not vk_fenced),
                     other=0,
                 )
-                kv_loc = tl.where(offs_n < vk_nk, kept, fired).to(tl.int64)
+                rid = tl.load(
+                    vk_r2t + vk_slot * VK_R2T + offs_n, mask=live & vk_fenced, other=0
+                )
+                tier = tl.where(offs_n < vk_nk, kept, fired)
+                fenced_row = tl.where(offs_n == vk_last, vk_loc.to(rid.dtype), rid)
+                kv_loc = tl.where(vk_fenced, fenced_row, tier).to(tl.int64)
             # Page-aware KV address math (see _fwd_kernel_stage1).
             if PAGE_SIZE == 1:
                 offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
