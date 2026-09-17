@@ -100,6 +100,44 @@ class TestFusedPrologue(CustomTestCase):
         )
 
 
+class TestEntropyMargin(CustomTestCase):
+    """The margin may grow with how flat the kept distribution is.
+
+    A query with no dominant kept row is the one whose kept maximum says least,
+    and it is the one that needs several archived rows rather than one, so
+    --vestigekv-entropy-margin-gain lowers its threshold and leaves a confident
+    query's alone. Gain 0 must reproduce the old threshold exactly, including
+    on an empty kept set where lse and the maximum are both -inf and their
+    difference is a NaN that multiplying by zero does not clear.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_gain_zero_is_the_old_threshold_and_gain_lowers_it(self):
+        from sglang.srt.layers.attention.vestigekv.fused_prologue import fused_prologue
+
+        q, kr, v, nk_len, thr = _case(P=3, NKm=256, seed=5)
+        base, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, 1 / 24.0)
+        same, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, 1 / 24.0, ent_gain=0.0)
+        lower, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, 1 / 24.0, ent_gain=0.5)
+        self.assertTrue(torch.equal(base, same), "gain 0 must change nothing")
+        fin = torch.isfinite(base) & torch.isfinite(lower)
+        self.assertTrue(bool(fin.any()), "no open gate to compare")
+        self.assertTrue(bool((lower[fin] <= base[fin] + 1e-6).all()),
+                        "a positive gain may only lower the threshold")
+        self.assertTrue(bool((lower[fin] < base[fin] - 1e-6).any()),
+                        "a positive gain must lower some threshold")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_empty_kept_stays_minus_inf_under_a_gain(self):
+        from sglang.srt.layers.attention.vestigekv.fused_prologue import fused_prologue
+
+        q, kr, v, nk_len, thr = _case(P=3, NKm=256, seed=2, empty=(0, 2))
+        g, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, 1 / 24.0, ent_gain=0.5)
+        for p in (0, 2):
+            self.assertTrue(bool((g[p] == -float("inf")).all()),
+                            f"empty kept pair {p} produced {g[p][:4]}")
+
+
 class TestSpreadTruncation(CustomTestCase):
     """An overflowing pair keeps the same number of rows, spread not prefixed.
 

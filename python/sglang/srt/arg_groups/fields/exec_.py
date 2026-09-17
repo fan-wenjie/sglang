@@ -366,6 +366,17 @@ class ExecKernel(msgspec.Struct):
         "then serves that step from the full row set. 0 disables the trigger; "
         "0.05 is the measured-regime starting point.",
     ] = 0.0
+    vestigekv_entropy_margin_gain: A[
+        float,
+        "VestigeKV: extra recall margin per nat of kept-distribution flatness, "
+        "measured as the log-sum-exp of the kept scores minus their maximum. It "
+        "is 0 when one kept row holds the attention mass and grows when none "
+        "does, which is the query whose kept maximum says least and which needs "
+        "several archived rows rather than one. 0 leaves the threshold exactly "
+        "as it is, and natural text with a confident match pays nothing either "
+        "way. Raises the fired-row count and so the fallback rate; accuracy is "
+        "what it is measured on.",
+    ] = 0.0
     enable_vestigekv_attended_splits: A[
         bool,
         "VestigeKV: size the decode kernel's KV split count from the attended row "

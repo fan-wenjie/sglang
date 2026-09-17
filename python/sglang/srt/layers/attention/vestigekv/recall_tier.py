@@ -34,12 +34,17 @@ class RecallTier:
         scale: float = D.ATTN_SCALE,
         margin: float = 0.0,
         threshold: str = "max",
+        ent_gain: float = 0.0,
     ):
         self.r = r
         self.recall_target = recall_target
         self.scale = scale
         self.margin = margin  # scan threshold = base - margin (see VestigeKVConfig)
         self.threshold = threshold  # base: "max" kept score or "lse" of kept scores
+        # Extra margin per nat of kept-distribution flatness. The fused
+        # prologue applies it inside the kernel; these reference forms have to
+        # apply the same one or the equivalence tests compare two thresholds.
+        self.ent_gain = ent_gain
         self.built = False
         # live-archive projection caches: None until the first decode-time
         # close backfills them (extend_closed); _pos_all doubles as the fill
@@ -499,6 +504,19 @@ class RecallTier:
             stats.update(self._diag_fire(qe, max1, zp, sc_, need))
         return stats
 
+    def _ent_margin(self, skept):
+        """How flat the kept distribution is, in nats: log-sum-exp of the kept
+        scores less their maximum. 0 when one kept row holds the attention
+        mass, log(n) when none does. Scaled by ent_gain it widens the scan's
+        threshold exactly where the maximum says least about the query; the
+        kernel computes the same quantity as `lse - e_max`.
+        """
+        if self.ent_gain == 0.0 or skept is None:
+            return 0.0
+        return self.ent_gain * (
+            torch.logsumexp(skept, -1) - skept.max(-1).values
+        )
+
     def _thr_base(self, skept, max1):
         # The score the margin is taken from: the best kept row, or the kept
         # set's log-sum-exp (>= max1; equal when one row holds the mass).
@@ -572,9 +590,11 @@ class RecallTier:
             # the +inf-open form keeps serving correct while it is investigated.
             max1 = qe.new_full((H,), float("-inf"))
             gate = qe.new_ones(H, dtype=torch.bool)
+            emarg = 0.0
         else:
             skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
             max1 = self._thr_base(skept, skept.max(-1).values)
+            emarg = self._ent_margin(skept)
             p1 = torch.softmax(skept, -1)
             ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
             gate = ent > self.thr_g
@@ -597,7 +617,7 @@ class RecallTier:
         # +inf makes it lose every comparison and the kernel needs no second
         # predicate. Scores stay in registers -- see scan_kernel for why
         # that, not arithmetic, is what the scan costs.
-        max1g = torch.where(gate, max1 - self.margin, self._inf)
+        max1g = torch.where(gate, max1 - self.margin - emarg, self._inf)
         hit = (
             vestige_scan(
                 self._qside_t,
@@ -646,9 +666,11 @@ class RecallTier:
             H = qe.shape[0]
             max1 = qe.new_full((H,), float("-inf"))  # no baseline: all eligible
             gate = qe.new_ones(H, dtype=torch.bool)
+            emarg = 0.0
         else:
             skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
             max1 = self._thr_base(skept, skept.max(-1).values)  # [H]
+            emarg = self._ent_margin(skept)
             p1 = torch.softmax(skept, -1)
             ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
             gate = ent > self.thr_g  # [H]
@@ -664,7 +686,7 @@ class RecallTier:
             (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
         )
         score = idxs + self.zp * cert
-        fire = (score > (max1 - self.margin)[:, None]) & gate[:, None]
+        fire = (score > (max1 - self.margin - emarg)[:, None]) & gate[:, None]
         return self.arch[fire.any(0)]
 
     @ieee_fp32

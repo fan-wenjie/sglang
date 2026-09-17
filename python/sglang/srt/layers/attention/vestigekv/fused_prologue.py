@@ -41,6 +41,7 @@ def _fused_prologue_kernel(
     qres_ptr,  # [P, H] fp32 out
     sc,  # attention scale
     margin,  # recall margin subtracted from the kept max (fp32 scalar)
+    ent_gain,  # extra margin per nat of kept-distribution flatness
     NKm,
     H: tl.constexpr,
     R: tl.constexpr,
@@ -103,7 +104,15 @@ def _fused_prologue_kernel(
     max1 = tl.where(nonempty, e_max, -float("inf"))
     if THR_LSE:
         max1 = tl.where(nonempty, lse, -float("inf"))
-    max1g = tl.where(gate, max1 - margin, float("inf"))
+    # lse - max is how flat the kept distribution is: 0 when one row holds the
+    # mass, log(n) when none does. A query with no dominant kept row is one
+    # whose max1 says little, and it is the one that needs several archived
+    # rows rather than one, so the margin grows with it. Both terms are already
+    # in registers; ent_gain 0 leaves the threshold exactly as it was.
+    # guarded: an empty kept set leaves lse and e_max both -inf, and their
+    # difference is NaN, which 0 * NaN does not clear
+    flat = tl.where(nonempty, lse - e_max, 0.0)
+    max1g = tl.where(gate, max1 - margin - ent_gain * flat, float("inf"))
     tl.store(max1g_ptr + p * H + h, max1g)
     tl.store(qres_ptr + p * H + h, qres)
 
@@ -120,7 +129,8 @@ def _fused_prologue_kernel(
     )
 
 
-def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0, thr_lse=False):
+def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0, thr_lse=False,
+                   ent_gain=0.0):
     """q [P,H,576] fp32, kr [P,NKm,576] bf16, v [P,R,512] fp32.
     Returns (max1g [P,H] fp32, qside_t [P,64,H] bf16, qsk_t [P,R,H] fp16,
     qres [P,H] fp32); pass `out` to reuse fixed-address buffers (capture)."""
@@ -146,6 +156,7 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0, thr_lse=Fals
         qres,
         sc,
         float(margin),
+        float(ent_gain),
         NKm,
         H=H,
         R=R,
@@ -291,6 +302,7 @@ def _prologue_merge_kernel(
     slot_ptr,
     RR,
     margin,  # recall margin subtracted from the kept max (fp32 scalar)
+    ent_gain,  # extra margin per nat of kept-distribution flatness
     v_ptr,
     qside_t_ptr,
     qsk_t_ptr,
@@ -356,7 +368,15 @@ def _prologue_merge_kernel(
     max1 = tl.where(nonempty, gm, -float("inf"))
     if THR_LSE:
         max1 = tl.where(nonempty, lse, -float("inf"))
-    tl.store(max1g_ptr + p * H + h, tl.where(gate, max1 - margin, float("inf")))
+    # same entropy-scaled margin as the single-pass form above
+    tl.store(
+        max1g_ptr + p * H + h,
+        tl.where(
+            gate,
+            max1 - margin - ent_gain * tl.where(nonempty, lse - gm, 0.0),
+            float("inf"),
+        ),
+    )
 
 
 _NSPLIT = 32
@@ -471,6 +491,7 @@ def fused_prologue_split(
     pool_rows=None,
     mode=None,
     margin=0.0,
+    ent_gain=0.0,
     thr_lse=False,
 ):
     """Split-NK prologue reading queries in place from the stacked qbuf.
@@ -548,6 +569,7 @@ def fused_prologue_split(
         slot,
         RR,
         float(margin),
+        float(ent_gain),
         v,
         qside_t,
         qsk_t,
