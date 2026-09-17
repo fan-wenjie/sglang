@@ -625,6 +625,7 @@ def _compact_write_kernel(
     a_off_ptr,  # [P] int64 arena offset per pair
     Am,
     W,
+    FENCE,
     NSLOT,
     BLOCK_A: tl.constexpr,
     SPREAD: tl.constexpr,
@@ -648,8 +649,14 @@ def _compact_write_kernel(
             tl.store(out_len_ptr + li * NSLOT + slot, (t + st_ - 1) // st_)
         else:
             tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
-        tl.store(out_ovf_ptr + li * NSLOT + slot, (t > W).to(tl.int32))
-        if t > W:
+        # The flag and the buffer cap are separate thresholds. FENCE is the
+        # buffer cap by default; a multi-key fence lowers it so a lane that
+        # fires more than a handful of archived rows -- the cheap signal that
+        # this step needs SEVERAL of them, measured monotonic in the number of
+        # rows that beat max1 -- attends its full row set instead of ranking.
+        # Raising the flag early is safe: a fenced lane never reads the buffer.
+        tl.store(out_ovf_ptr + li * NSLOT + slot, (t > FENCE).to(tl.int32))
+        if t > FENCE:
             tl.atomic_add(ovf_count_ptr + li, 1)
     alen = tl.load(a_len_ptr + p)
     live = tl.minimum(nb, (alen + BLOCK_A - 1) // BLOCK_A)
@@ -688,6 +695,7 @@ def compact_fired(
     scratch,
     am_grid,
     p_live=None,
+    fence_rows=0,
 ):
     """Deterministic fired-row compaction. scratch: (counts, offsets, total)
     int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W]; fetch_len/fetch_ovf
@@ -732,6 +740,10 @@ def compact_fired(
         a_off,
         Am,
         W,
+        # The multi-key fence: a lane firing more than this many archived rows
+        # attends its full row set. 0 keeps the historical behaviour, where the
+        # only fence is the buffer overflowing.
+        min(W, fence_rows) if fence_rows > 0 else W,
         fetch_buf.shape[1],
         BLOCK_A=BLOCK_A,
         SPREAD=envs.SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE.get(),
