@@ -50,5 +50,24 @@ class TestBlend(unittest.TestCase):
         # only split 0 counts: lse = 0, logM = 0 -> sigma = 0.5
         torch.testing.assert_close(o, torch.full((1, 1, 2), 0.5))
 
+    def test_the_batch_is_the_slot_slice_not_the_buffer_length(self):
+        """The graph's lse buffer is sized for the LARGEST captured batch.
+
+        A smaller capture leaves its tail unwritten, so taking the batch from
+        attn_lse.shape[0] mixes a bs-4 buffer with a bs-2 step -- which is
+        exactly how this arm aborted cuda-graph capture with "size of tensor a
+        (4) must match tensor b (2)". The installed slot slice is the batch.
+        """
+        o = torch.ones(4, 1, 2)  # buffer for 4, step of 2
+        lse = torch.zeros(4, 1, 1)
+        nsp = torch.tensor([1, 1, 1, 1], dtype=torch.int32)
+        slots = torch.tensor([0, 1])
+        logm = torch.zeros(4, 1)  # logM = lse = 0 -> sigma = 0.5
+        mub = torch.zeros(4, 1, 2)
+        _blend_omitted_mass(o, lse, nsp, logm, mub, slots)
+        torch.testing.assert_close(o[:2], torch.full((2, 1, 2), 0.5))
+        torch.testing.assert_close(o[2:], torch.ones(2, 1, 2))  # tail untouched
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

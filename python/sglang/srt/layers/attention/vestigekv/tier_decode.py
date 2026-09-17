@@ -104,18 +104,22 @@ def _blend_omitted_mass(o, attn_lse, num_kv_splits, logm_buf, mu_buf, slots):
         logging.getLogger(__name__).info(
             "VKBLEND active: omitted-mass blend is in the decode path"
         )
-    bs, H = attn_lse.shape[0], attn_lse.shape[1]
+    # The batch is the INSTALLED slot slice, never attn_lse.shape[0]: the
+    # graph's logits and lse are preallocated at the largest captured batch and
+    # a smaller capture leaves the tail unwritten, so reading the buffer's
+    # first dimension as the batch mixes a bs-4 buffer with a bs-2 step.
+    n, H = slots.shape[0], attn_lse.shape[1]
     # Gathered here, not by the caller: under graph capture the gather has to
     # be an op reading the step's fixed slot buffer, not a host-side index.
-    logm = logm_buf.index_select(0, slots[:bs])  # [bs, H]
-    mu = mu_buf.index_select(0, slots[:bs])  # [bs, H, Lv]
+    logm = logm_buf.index_select(0, slots)  # [n, H]
+    mu = mu_buf.index_select(0, slots)  # [n, H, Lv]
     idx = torch.arange(attn_lse.shape[-1], device=attn_lse.device)
-    live = idx[None, None, :] < num_kv_splits[:, None, None]
+    live = idx[None, None, :] < num_kv_splits[:n, None, None]
     lse = torch.logsumexp(
-        attn_lse.float().masked_fill(~live, float("-inf")), dim=-1
-    )  # [bs, H]
-    sigma = torch.sigmoid(lse - logm)[..., None]  # [bs, H, 1]
-    view = o.view(bs, H, -1)
+        attn_lse[:n].float().masked_fill(~live, float("-inf")), dim=-1
+    )  # [n, H]
+    sigma = torch.sigmoid(lse - logm)[..., None]  # [n, H, 1]
+    view = o.view(-1, H, o.shape[-1])[:n]
     view.copy_(view.float() * sigma + mu.float() * (1.0 - sigma))
 
 
