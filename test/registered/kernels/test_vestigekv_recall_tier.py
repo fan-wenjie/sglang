@@ -241,3 +241,81 @@ class TestClosedPrefixWatermark(CustomTestCase):
         )
         self.assertTrue(torch.equal(t.rho, t._rho_all.index_select(0, arch_idx)))
         self.assertTrue(torch.equal(t.arch, slots[arch_idx]), "arch must be pool ids")
+
+
+class TestOmittedMass(CustomTestCase):
+    """The omitted-mass arm's logM must live on the decode kernel's scale.
+
+    The blend is sigmoid(lse - logM), where lse is the kernel's absolute
+    logsumexp over the attended rows. If logM is off by a constant -- a
+    different softmax scale, a missing shift, a bound summed in the wrong
+    space -- sigma collapses toward 0, the output is replaced by the archive
+    centroid, and every task degrades at once. That is what the arm did on its
+    first working run, and it needed no GPU run to see: this recomputes logM
+    independently from the tier's own stored operands.
+    """
+
+    def _q(self, seed):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        return torch.randn(H, 576, device="cuda", generator=g)
+
+    def _parts(self, t, q, D):
+        sc = t.scale
+        qe = q.float()
+        skept = (qe.to(torch.bfloat16) @ t.kept_rows.T).float() * sc
+        max1 = t._thr_base(skept, skept.max(-1).values)
+        qsk = qe[:, : D.KV_LORA_RANK] @ t.V.T
+        qres = (qe[:, : D.KV_LORA_RANK] - qsk @ t.V).norm(dim=-1)
+        idxs = ((qe[:, D.KV_LORA_RANK :].to(torch.bfloat16) @ t.side.T).float()
+                + (qsk.half() @ t.csk.T).float()) * sc
+        cert = (qres[:, None] * t.rho[None, :]) * sc / (D.KV_LORA_RANK - t.r) ** 0.5
+        score = idxs + t.zp * cert
+        p1 = torch.softmax(skept, -1)
+        ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
+        fire = (score > (max1 - t.margin - t._ent_margin(skept))[:, None]) & (
+            ent > t.thr_g)[:, None]
+        return skept, max1, score, ~fire.any(0)
+
+    def test_log_mass_matches_an_independent_sum_over_the_omitted_rows(self):
+        t, kbuf, slots, keep, D = _mk(4096, 11)
+        q = self._q(5)
+        logm, mu = t.omitted_mass_and_mean(q)
+        skept, max1, score, om = self._parts(t, q, D)
+        torch.testing.assert_close(
+            logm, torch.logsumexp(score[:, om], dim=-1), rtol=2e-3, atol=2e-3)
+        # The centroid is the MASS-WEIGHTED one: a synthetic row is an exact
+        # online-softmax step only if it carries the weighted centroid
+        # (offline 0.195 output error against 0.367 for the plain mean).
+        w = (score[:, om] - max1[:, None]).exp()
+        vals = kbuf.index_select(0, t.arch.to(torch.int64))[
+            :, : D.KV_LORA_RANK].float()
+        want_mu = (w @ vals[om]) / w.sum(-1, keepdim=True)
+        torch.testing.assert_close(mu, want_mu, rtol=5e-3, atol=5e-3)
+
+    def test_sigma_is_a_blend_not_a_replacement(self):
+        """logM must be COMPARABLE to the attended lse, not dwarf it.
+
+        Offline the attended set holds about 57% of the dense softmax mass, so
+        sigma belongs near 0.5. A sigma at 0.01 means the output is 99%
+        archive centroid, which is a scale fault however plausible the
+        arithmetic looks in isolation. Reported with both sides so a failure
+        says WHICH term is wrong.
+        """
+        t, kbuf, slots, keep, D = _mk(4096, 12)
+        q = self._q(6)
+        logm, _ = t.omitted_mass_and_mean(q)
+        skept, max1, score, om = self._parts(t, q, D)
+        fired = score[:, ~om]
+        lse_att = torch.logsumexp(torch.cat([skept, fired], dim=-1), dim=-1)
+        sigma = torch.sigmoid(lse_att - logm)
+        arch_true = (q.float() @ kbuf.index_select(
+            0, t.arch.to(torch.int64)).float().T) * t.scale
+        self.assertGreater(
+            float(sigma.median()), 0.02,
+            f"sigma p50 {float(sigma.median()):.5f}: the blend REPLACES the "
+            f"output instead of correcting it. logM p50 "
+            f"{float(logm.median()):.2f}, attended lse p50 "
+            f"{float(lse_att.median()):.2f}, true archive lse p50 "
+            f"{float(torch.logsumexp(arch_true, -1).median()):.2f}, "
+            f"omitted rows {int(om.sum())} of {int(om.numel())}",
+        )
