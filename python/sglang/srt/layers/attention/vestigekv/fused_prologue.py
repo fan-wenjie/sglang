@@ -605,6 +605,7 @@ def _compact_write_kernel(
     W,
     NSLOT,
     BLOCK_A: tl.constexpr,
+    SPREAD: tl.constexpr,
 ):
     p = tl.program_id(1)
     pid = tl.program_id(0)
@@ -616,7 +617,15 @@ def _compact_write_kernel(
         # fetch_len is consumed every step, even by an empty pair, so its
         # write cannot ride on bucket 0 existing in the (capped) grid.
         t = tl.load(total_ptr + p)
-        tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
+        if SPREAD:
+            # An overflowing pair keeps W rows SPREAD over the archive instead
+            # of its first W. Same count, different positions: the falsifiable
+            # half of "multi-key fails because the keys are spread through the
+            # document and a positional prefix cuts the later ones".
+            st_ = tl.maximum((t + W - 1) // W, 1)
+            tl.store(out_len_ptr + li * NSLOT + slot, (t + st_ - 1) // st_)
+        else:
+            tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
         tl.store(out_ovf_ptr + li * NSLOT + slot, (t > W).to(tl.int32))
         if t > W:
             tl.atomic_add(ovf_count_ptr + li, 1)
@@ -632,8 +641,15 @@ def _compact_write_kernel(
         base = tl.load(offsets_ptr + p * nb + b)
         pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
         arch = tl.load(arch_ptr + abase + offs, mask=m, other=0)
-        ok = h & (pos < W)
-        tl.store(out_ptr + li * NSLOT * W + slot * W + pos, arch, mask=ok)
+        if SPREAD:
+            t_all = tl.load(total_ptr + p)
+            st2 = tl.maximum((t_all + W - 1) // W, 1)
+            dst = pos // st2
+            ok = h & (pos % st2 == 0) & (dst < W)
+            tl.store(out_ptr + li * NSLOT * W + slot * W + dst, arch, mask=ok)
+        else:
+            ok = h & (pos < W)
+            tl.store(out_ptr + li * NSLOT * W + slot * W + pos, arch, mask=ok)
 
 
 def compact_fired(
@@ -660,6 +676,9 @@ def compact_fired(
     bounds the sum). Rows are addressed as a_off[p] + i, masked by a_len[p].
     A pair firing more than W rows keeps the first W in position order,
     raises its fetch_ovf flag and counts once in ovf_count[li].
+    SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE keeps them spread over the archive
+    instead, at the same count: an experiment on whether the positional prefix
+    is what costs the multi-key tasks when the fallback is off.
     """
     Am = am_grid
     P = p_live if p_live is not None else a_len.shape[0]
@@ -693,4 +712,5 @@ def compact_fired(
         W,
         fetch_buf.shape[1],
         BLOCK_A=BLOCK_A,
+        SPREAD=envs.SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE.get(),
     )

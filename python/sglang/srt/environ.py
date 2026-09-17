@@ -598,6 +598,7 @@ class Envs:
     # and shared-memory budget) separates from the cost of it running. A fenced
     # lane then attends nothing, so the output is wrong on the steps that fence.
     SGLANG_DEBUG_VESTIGEKV_FENCE_STUB = EnvBool(False)
+    SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE = EnvBool(False)
     # Directory for one calibration snapshot per (request slot, layer): the
     # closed-prefix content rows, the tier-1 keep set and the calibration
     # queries the calibrated index was fitted on, written at its install.
