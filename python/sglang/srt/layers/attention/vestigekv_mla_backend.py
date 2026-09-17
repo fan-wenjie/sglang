@@ -264,6 +264,9 @@ class VestigeKVMLABackend(AttentionBackend):
         # [max_reqs, H] log of the softmax mass the scan skipped and
         # [max_reqs, kv] the archive mean it is carried at.
         self._omit_blend = envs.SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND.get()
+        # Its OWN directory: sharing SGLANG_DEBUG_VESTIGEKV_DUMP_DIR also turns
+        # on the calibration dump, which wrote 9.9 GB of 72 MB snapshots beside
+        # 1.1 MB of records and took the disk to 92%.
         self._stepdump = envs.SGLANG_DEBUG_VESTIGEKV_STEPDUMP.get()
         # Control for the fence: fence a random fraction of lanes at the same
         # cost, so the gain can be attributed to the SELECTION or to the mere
@@ -1038,7 +1041,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._flush_step_attribution()
 
     def _flush_step_attribution(self):
-        out_dir = envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.get() or "/tmp"
+        out_dir = self._stepdump
         os.makedirs(out_dir, exist_ok=True)
         tag = os.environ.get("VK_JOB", "step")
         path = os.path.join(out_dir, f"stepattr_{tag}_tp{self._tp_rank()}.jsonl")

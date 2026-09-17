@@ -706,8 +706,24 @@ class RecallTier:
         )
         pr = w / Z[:, None]
         ent = -(pr * pr.clamp_min(1e-30).log()).sum(-1)
+        # WHY a missed row was missed: where the true argmax ranks under the
+        # certified score the scan actually orders by, and how far its
+        # certified score fell short of the kept maximum. A row ranked 3rd but
+        # below threshold is a threshold problem; one ranked 40000th is an
+        # ordering problem, and they have different fixes.
         top1 = allsc.argmax(-1)
+        cert_sc = idxs + self.zp * cert
+        a_top1 = (top1 - skept.shape[1]).clamp_min(0)
+        arch_is_top = top1 >= skept.shape[1]
+        rank = (cert_sc > cert_sc.gather(1, a_top1[:, None])).sum(1)
+        marg = cert_sc.gather(1, a_top1[:, None]).squeeze(1) - max1
+        sel = arch_is_top & (~fired.gather(0, a_top1.clamp_max(fired.numel() - 1)))
         return {
+            "top1_rank_p50": float(rank[sel].median()) if bool(sel.any()) else -1.0,
+            "top1_margin_p50": float(marg[sel].median()) if bool(sel.any()) else 0.0,
+            "qperp_rel": float(
+                (qres / qe[:, :kv].norm(dim=-1)).median()
+            ),
             "coverage": float(((w * att).sum(-1) / Z).median()),
             "coverage_min": float(((w * att).sum(-1) / Z).min()),
             "top1_attended": float(att.gather(1, top1[:, None]).float().mean()),
