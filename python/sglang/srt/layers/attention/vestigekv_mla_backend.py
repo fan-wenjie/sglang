@@ -123,6 +123,8 @@ class VestigeKVMLABackend(AttentionBackend):
     _mem_reqs = 0
     _fetch_hist = None
     _stat_acc = None
+    _affine_ok = None  # [max_reqs] int32, see _verify_affine
+    _affine_base = None  # [max_reqs] int64
     _pt_acc = None  # (consecutive pairs, pairs) of the page table; see _probe_page_table
     _router = None  # TierDecodeRouter when config.tier_decode, else the CSR path
     # The flag defaults, for __new__-constructed fakes; a registered test pins
@@ -137,8 +139,6 @@ class VestigeKVMLABackend(AttentionBackend):
         prefill_calibration=False,
         rebuild_overflow_fraction=0.0,
         attended_splits=False,
-        tier_decode=False,
-        affine_page_table=False,
     )
 
     def __init__(
@@ -175,13 +175,10 @@ class VestigeKVMLABackend(AttentionBackend):
         # whole redirection is this assignment and nothing upstream is edited;
         # a layer with no entry in `rows` falls through to the base's own
         # function, which is how eager steps keep the CSR path.
-        if config.tier_decode:
-            from sglang.srt.layers.attention.vestigekv.tier_decode import (
-                TierDecodeRouter,
-            )
+        from sglang.srt.layers.attention.vestigekv.tier_decode import TierDecodeRouter
 
-            self._router = TierDecodeRouter(inner=base.decode_attention_fwd)
-            base.decode_attention_fwd = self._router
+        self._router = TierDecodeRouter(inner=base.decode_attention_fwd)
+        base.decode_attention_fwd = self._router
         # Pool handles shared with the base (the latent rows VestigeKV compresses).
         self.token_to_kv_pool = base.token_to_kv_pool
         self.req_to_token_pool = base.req_to_token_pool
@@ -400,7 +397,38 @@ class VestigeKVMLABackend(AttentionBackend):
         reqs = forward_batch.req_pool_indices.tolist()
         key = self._scan_key(forward_batch, reqs)
         self._step_cache = (sig, reqs, key)
+        self._verify_affine(forward_batch)
         return reqs, key
+
+    def _verify_affine(self, forward_batch):
+        """Re-establish the affine flag for the lanes of a changed batch.
+
+        A fenced lane may read its rows as base + offset instead of loading
+        them, which is only the same row set when the page table is one
+        contiguous run. This is the O(seq) half of knowing that: it runs when
+        the batch composition changes, which is when a request joins. The
+        per-step half is one comparison in the pack's prep kernel, so a table
+        that stops being contiguous clears the flag on the step it happens.
+        """
+        if self._affine_ok is None:
+            return
+        real = forward_batch.out_cache_loc.shape[0]
+        if real == 0:
+            return
+        slots = forward_batch.req_pool_indices[:real].to(torch.int64)
+        seq = forward_batch.seq_lens[:real].to(torch.int64)
+        n = int(self._seq_lens_host(forward_batch)[:real].max())
+        if n < 1:
+            return
+        rows = self.req_to_token_pool.req_to_token[slots, :n].to(torch.int64)
+        # rows[:, i] == rows[:, 0] + i for every i the request actually holds.
+        # The step's own row is not in the table yet, so the last cell is the
+        # prep kernel's to check.
+        col = torch.arange(n, device=rows.device)
+        live = col[None, :] < (seq[:, None] - 1)
+        ok = ((rows == rows[:, :1] + col[None, :]) | ~live).all(dim=1)
+        self._affine_ok[slots] = ok.to(torch.int32)
+        self._affine_base[slots] = rows[:, 0]
 
     # ---- tier-2 scan capture: 215 launches/step -> 1 ----
 
@@ -1269,6 +1297,12 @@ class VestigeKVMLABackend(AttentionBackend):
                 n, max_reqs, dtype=torch.int32, device=dev
             )
             self._ovf_count_stack = torch.zeros(n, dtype=torch.int32, device=dev)
+            # Per pool slot, not per layer: whether this request's page table is
+            # one contiguous run, and where it starts. Maintained incrementally
+            # (see _verify_affine and the pack's prep kernel) so a fenced lane
+            # can compute its row ids instead of loading them.
+            self._affine_ok = torch.zeros(max_reqs, dtype=torch.int32, device=dev)
+            self._affine_base = torch.zeros(max_reqs, dtype=torch.int64, device=dev)
         li = self._li_map[lid]
         self._qbuf[lid] = self._qbuf_stack[li]
         self._fetch_buf[lid] = self._fetch_stack[li]
@@ -1591,8 +1625,14 @@ class VestigeKVMLABackend(AttentionBackend):
             seq=self._stage_seq[:bs] if fence else None,
             fetch_ovf=self._fetch_ovf_stack if fence else None,
             req_to_token=self.req_to_token_pool.req_to_token if fence else None,
+            affine_ok=self._affine_ok if fence else None,
+            affine_base=self._affine_base if fence else None,
             # The router reads the rows from the tiers, so only the prep
             # launch's per-lane counts are still consumed.
+            # The router reads rows from the tiers, so nothing consumes the
+            # index array any more: only the prep launch's per-lane counts are,
+            # by stage 2. It is never None; the argument stays because the
+            # eager path and the registered tests still build a CSR.
             gather=self._router is None,
         )
 

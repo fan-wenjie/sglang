@@ -40,6 +40,9 @@ def _rows(gen):
         r2t=r2t,
         seq=torch.tensor([777], dtype=torch.int64, device="cuda"),
         loc=torch.tensor([POOL - 1], dtype=torch.int64, device="cuda"),
+        # affine is a per-slot run-time flag; the cases set it directly
+        affine_ok=torch.zeros(R1, dtype=torch.int32, device="cuda"),
+        affine_base=torch.zeros(R1, dtype=torch.int64, device="cuda"),
     )
 
 
@@ -54,7 +57,10 @@ def _run(q, kb, vb, indptr, indices, vk, tiers, fence=True, affine=False):
     splits = torch.full((bs,), SPLITS, dtype=torch.int32, device="cuda")
     decode_grouped_att_m_fwd(
         q, kb, vb, out, lse, indptr, indices,
-        msgspec.structs.replace(vk, tiers=tiers, fence=fence, affine=affine),
+        msgspec.structs.replace(
+            vk, tiers=tiers, fence=fence,
+            affine_ok=torch.full_like(vk.affine_ok, int(affine)),
+        ),
         splits, SPLITS, 1.0 / (LK**0.5), 0.0, has_mla=True,
     )
     return out, lse
@@ -107,6 +113,7 @@ class TestDecodeForkRowSource(CustomTestCase):
         base = 7
         vk.r2t[slot, :n] = base + torch.arange(n, dtype=torch.int32, device="cuda")
         vk.loc.fill_(base + n - 1)  # the affine arm has no last-row fixup
+        vk.affine_base.fill_(base)
         indices = vk.r2t[slot, :n].to(torch.int64)
         indptr = torch.tensor([0, n], dtype=torch.int32, device="cuda")
         a_out, a_lse = _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=True)
@@ -138,14 +145,19 @@ class TestDecodeForkRowSource(CustomTestCase):
 
 
 class TestDecodeForkRegisters(CustomTestCase):
-    """The fence must not cost registers on the steps that do not fence.
+    """No build may spill, and none may sit at the register ceiling.
 
-    FENCE is a constexpr, so a build with it in pays whatever it costs on every
-    step. Written as a branch inside the row loop it reached the 255-register
-    ceiling and spilled 40 bytes to local memory, against 200 and no spill
-    without it, and that spill was paid by the 99.7% of scans that never fence.
-    Selecting the row value instead of branching on the row source keeps one
-    definition of the downstream address tensor and one allocation.
+    Register allocation is a property of the build, so whatever a variant costs
+    is paid on every step -- including the 99.7% of scans that never fence.
+    Written as a branch inside the row loop the fenced arm reached the
+    255-register ceiling and spilled 40 bytes to local memory; selecting the
+    row value instead of branching on the row source brought it back to 200 and
+    none.
+
+    The fenced build now also carries the affine arm, which is deliberately a
+    second loop, so it legitimately uses more registers than the unfenced one.
+    What must not happen is a spill, or an allocation at the 255 ceiling, which
+    is where the allocator is starved and the next edit spills.
     """
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
@@ -176,10 +188,9 @@ class TestDecodeForkRegisters(CustomTestCase):
                                  capture_output=True, text=True).stdout
             use[fence] = {k: int(v) for k, v in
                           (m.split(":") for m in re.findall(r"(?:REG|STACK):\d+", out))}
-        self.assertEqual(use[True].get("STACK", 0), 0,
-                         f"the fenced build spills: {use[True]}")
-        self.assertLessEqual(use[True]["REG"], use[False]["REG"],
-                             f"the fence costs registers: {use}")
+        for fence, u in use.items():
+            self.assertEqual(u.get("STACK", 0), 0, f"fence={fence} spills: {u}")
+            self.assertLess(u["REG"], 255, f"fence={fence} is at the ceiling: {u}")
 
 
 if __name__ == "__main__":
