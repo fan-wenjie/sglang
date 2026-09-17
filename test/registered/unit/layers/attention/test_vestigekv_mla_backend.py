@@ -711,6 +711,38 @@ class TestStatsTelemetry(CustomTestCase):
             be._decode_prologue(fb)
         self.assertEqual(called, [2])  # the arm's per-step work actually ran
 
+    def test_the_step_attribution_dump_runs_off_the_prologue_too(self):
+        """The attribution dump exists to record the PROVISIONAL regime.
+
+        It must therefore run on the path the in-graph scan actually takes,
+        which is the prologue; hung off _recall_step it would record nothing,
+        exactly as the omitted-mass fill did for three runs.
+        """
+        from sglang.srt.environ import envs
+
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._stats = dict.fromkeys(
+            ("steps", "scan_calls", "fetched", "kept", "seq", "replays",
+             "prologue_calls"), 0)
+        be._last_step_tok = None
+        be._collecting = False
+        be._omit_blend = False
+        be._stepdump = True
+        seen = []
+        be._step_slots = lambda fb: ([1], "k")
+        be._account_step = lambda fb, reqs: None
+        be._maybe_close_blocks = lambda fb, reqs: None
+        be._dump_step_attribution = lambda fb, reqs: seen.append(reqs)
+        fb = SimpleNamespace(
+            out_cache_loc=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([100, 100], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([100, 100], dtype=torch.int64),
+        )
+        with envs.SGLANG_DEBUG_VESTIGEKV_STATS.override(False):
+            be._decode_prologue(fb)
+        self.assertEqual(seen, [[1]])
+
     def test_index_state_buckets_by_the_index_that_served_the_scan(self):
         """A scan is attributed to the state of the index that served it.
 
