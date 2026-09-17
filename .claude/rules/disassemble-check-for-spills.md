@@ -58,3 +58,32 @@ qualify, because both arms stay live across the whole loop.
 
 `test_vestigekv_decode_fork.py::TestDecodeForkRegisters` pins this: it fails if
 the fenced build spills or uses more registers than the unfenced one.
+
+## When the two paths must be separate code
+
+Selecting the value works when both arms do the same kind of work and only the
+operand differs. It does **not** work when the point of one arm is to *remove*
+an instruction: an affine row address (`base + offs_n`, no id load) lets the
+pipeliner emit `cp.async`, and a predicated-off indirect load still blocks
+that, so writing both and selecting gives up the whole gain.
+
+Where an arm exists to delete work, the arms have to be separate code, and the
+branch has to sit **outside** the loop -- one complete loop per arm, shared
+values defined and initialized above the branch. Inside the loop both arms'
+address tensors stay live and the allocator spills, which is the failure this
+rule exists for. The cost is a second copy of the loop body in the SASS, so
+check the instruction count as well as the spill.
+
+Two checks, not one, when an arm is supposed to be cheaper:
+
+1. `STACK: 0` and no `LDL`/`STL`, as above.
+2. The cheaper arm actually got what it was written for -- e.g. `LDGSTS` or a
+   TMA instruction in its SASS. An arm that duplicates the loop and does not
+   show the instruction it was written to enable has cost code size and bought
+   nothing.
+
+And measure the precondition before writing either: the VestigeKV page table's
+affinity is a run-time property of the allocator, reported as
+`pagetable_affine` in the stats line (`_probe_page_table`). An affine arm is
+all-or-nothing per lane, so a ratio short of 1 means the arm cannot be taken
+and the code should not be written.
