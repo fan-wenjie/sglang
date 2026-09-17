@@ -623,12 +623,49 @@ class TestStatsTelemetry(CustomTestCase):
             seq_lens=torch.tensor([100, 200], dtype=torch.int64),
         )
         be._stat_acc = None
-        be._account_step(fb)
+        be._fetch_ovf = {}
+        be._idx_state = None
+        be._account_step(fb, fb.req_pool_indices.tolist())
         self.assertEqual(be._fetch_hist.tolist(), [0, 0, 0, 0, 0, 1, 0, 0, 1])
         self.assertEqual(be._stats["scan_calls"], 2)
         # the sums stay on the device until the dump reads them back
         self.assertEqual(be._stat_acc.tolist(), [13, 60, 300])
         self.assertEqual(be._stats["fetched"], 0)
+
+    def test_index_state_buckets_by_the_index_that_served_the_scan(self):
+        """A scan is attributed to the state of the index that served it.
+
+        Three lanes, one in each state: a tier still calibrating (z at Z_MAX),
+        one fitted and not outgrown, and one fitted at 50 tokens now serving
+        200 -- past INDEX_STALE_FACTOR. Each contributes its own scan, its
+        fired-row count and its overflow flag to its own row, so a run can say
+        which state the misses are under rather than only how many there were.
+        """
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._mla_lids = {LID}
+        be._qbuf = {LID: None}
+        be._fetch_len = {LID: torch.tensor([3, 8, 0, 5], dtype=torch.int32)}
+        be._fetch_ovf = {LID: torch.tensor([0, 1, 0, 0], dtype=torch.int32)}
+        be._idx_state = None
+        be._recall = {
+            (1, LID): {"tier": SimpleNamespace(need_more_hard=True), "built_at": 0},
+            (2, LID): {"tier": SimpleNamespace(need_more_hard=False), "built_at": 50},
+            (3, LID): {"tier": SimpleNamespace(need_more_hard=False), "built_at": 50},
+        }
+        fb = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 2, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([100, 60, 200], dtype=torch.int64),
+        )
+        reqs = fb.req_pool_indices.tolist()
+        slots = fb.req_pool_indices.to(torch.int64)
+        be._account_index_state(fb, reqs, slots, 3)
+        # rows: provisional, fresh, stale; columns: scans, fired rows, overflows
+        self.assertEqual(be._idx_state.tolist(), [[1, 8, 1], [1, 0, 0], [1, 5, 0]])
+        # an unbuilt tier is provisional, not a crash: the second pass adds
+        # that lane's own scan to the bucket alongside the still-calibrating one
+        be._recall[(2, LID)]["tier"] = None
+        be._account_index_state(fb, reqs, slots, 3)
+        self.assertEqual(be._idx_state.tolist(), [[3, 16, 2], [1, 0, 0], [2, 10, 0]])
 
 
 if __name__ == "__main__":
