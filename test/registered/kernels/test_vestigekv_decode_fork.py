@@ -7,6 +7,7 @@ same schedule, so the outputs must agree bit for bit -- if they do not, the
 fork changed something it was not supposed to.
 """
 
+import re
 import unittest
 
 import torch
@@ -110,6 +111,51 @@ class TestDecodeForkRowSource(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(a_out, b_out), "att_out differs with the fence off")
         self.assertTrue(torch.equal(a_lse, b_lse), "att_lse differs with the fence off")
+
+
+class TestDecodeForkRegisters(CustomTestCase):
+    """The fence must not cost registers on the steps that do not fence.
+
+    FENCE is a constexpr, so a build with it in pays whatever it costs on every
+    step. Written as a branch inside the row loop it reached the 255-register
+    ceiling and spilled 40 bytes to local memory, against 200 and no spill
+    without it, and that spill was paid by the 99.7% of scans that never fence.
+    Selecting the row value instead of branching on the row source keeps one
+    definition of the downstream address tensor and one allocation.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_the_fence_costs_no_registers(self):
+        import subprocess
+
+        from sglang.srt.layers.attention.vestigekv import decode_fork as df
+
+        use = {}
+        for fence in (False, True):
+            gen = torch.Generator(device="cuda").manual_seed(3)
+            pool = torch.randn(POOL, 1, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+            q = torch.randn(1, H, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+            vk = _rows(gen)
+            indices = torch.zeros(337, dtype=torch.int64, device="cuda")
+            indptr = torch.tensor([0, 337], dtype=torch.int32, device="cuda")
+            cache = df._vk_fwd_grouped_kernel_stage1.device_caches[torch.cuda.current_device()][0]
+            before = set(cache)
+            _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=True, fence=fence)
+            torch.cuda.synchronize()
+            new = set(cache) - before
+            if not new:  # already compiled in this process by an earlier case
+                self.skipTest("kernel already cached for this signature")
+            cubin = cache[new.pop()].asm["cubin"]
+            path = f"/tmp/vk_fence_{int(fence)}.cubin"
+            open(path, "wb").write(cubin)
+            out = subprocess.run(["cuobjdump", "-res-usage", path],
+                                 capture_output=True, text=True).stdout
+            use[fence] = {k: int(v) for k, v in
+                          (m.split(":") for m in re.findall(r"(?:REG|STACK):\d+", out))}
+        self.assertEqual(use[True].get("STACK", 0), 0,
+                         f"the fenced build spills: {use[True]}")
+        self.assertLessEqual(use[True]["REG"], use[False]["REG"],
+                             f"the fence costs registers: {use}")
 
 
 if __name__ == "__main__":
