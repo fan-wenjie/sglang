@@ -131,6 +131,8 @@ class VestigeKVMLABackend(AttentionBackend):
     # arm as off rather than raising on a missing attribute.
     _omit_blend = False
     _stepdump = False
+    _rand_fence_p = 0.0
+    _rand_coins = None
     _stepdump_rows: list = []
     _logm_stack = _archmu_stack = None
     _blend_logged = False
@@ -263,6 +265,11 @@ class VestigeKVMLABackend(AttentionBackend):
         # [max_reqs, kv] the archive mean it is carried at.
         self._omit_blend = envs.SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND.get()
         self._stepdump = envs.SGLANG_DEBUG_VESTIGEKV_STEPDUMP.get()
+        # Control for the fence: fence a random fraction of lanes at the same
+        # cost, so the gain can be attributed to the SELECTION or to the mere
+        # fact of attending densely more often.
+        self._rand_fence_p = float(envs.SGLANG_DEBUG_VESTIGEKV_RANDOM_FENCE.get() or 0.0)
+        self._rand_coins = None
         self._stepdump_rows: list = []
         self._logm: dict = {}
         self._archmu: dict = {}
@@ -345,6 +352,10 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._last_step_tok = tok
                 st["steps"] += 1
                 self._account_step(forward_batch, reqs)
+        if self._rand_fence_p > 0.0 and self._rand_coins is not None:
+            # Refreshed every step outside the graph, into the fixed-address
+            # buffer the captured compaction reads.
+            self._rand_coins.bernoulli_(self._rand_fence_p)
         if self._stepdump:
             self._dump_step_attribution(forward_batch, reqs)
         if self._omit_blend:
@@ -704,6 +715,7 @@ class VestigeKVMLABackend(AttentionBackend):
             margin=self.config.recall_margin,
             ent_gain=self.config.entropy_margin_gain,
             fence_rows=self.config.multikey_fence_rows,
+            rand_coins=self._rand_coins,
             thr_lse=self.config.recall_threshold == "lse",
         )
         torch.cuda.synchronize()
@@ -1508,6 +1520,10 @@ class VestigeKVMLABackend(AttentionBackend):
                 n, max_reqs, dtype=torch.int32, device=dev
             )
             self._ovf_count_stack = torch.zeros(n, dtype=torch.int32, device=dev)
+            if self._rand_fence_p > 0.0:
+                self._rand_coins = torch.zeros(
+                    max_reqs, dtype=torch.int32, device=dev
+                )
             if self._omit_blend:
                 # Allocated here, with every other fixed-address buffer, because
                 # the blend has to be part of the CAPTURED graph: the router's
@@ -1832,6 +1848,7 @@ class VestigeKVMLABackend(AttentionBackend):
             margin=self.config.recall_margin,
             ent_gain=self.config.entropy_margin_gain,
             fence_rows=self.config.multikey_fence_rows,
+            rand_coins=self._rand_coins,
             thr_lse=self.config.recall_threshold == "lse",
         )
 
