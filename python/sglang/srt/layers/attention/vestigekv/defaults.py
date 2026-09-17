@@ -289,3 +289,10 @@ PAGETABLE_PROBE_EVERY = 512
 (_probe_page_table, stats only). The probe reads req_to_token[slot, :seq],
 which is the one O(context) host-queued op in the instrument, so it is sampled
 rather than run every step; 512 gives ~500 samples over a 256k stream."""
+
+INDEX_STALE_FACTOR = 2.0
+"""Context growth past which a fitted index counts as stale, for the stats
+line's per-state buckets. An index fitted at `built_at` tokens serving a
+request now `seq` tokens long is stale once seq > INDEX_STALE_FACTOR *
+built_at: the archive it was fitted on is less than half of what it now has to
+rank. Reporting only; nothing reads it on the token path."""

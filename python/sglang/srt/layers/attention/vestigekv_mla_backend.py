@@ -125,6 +125,7 @@ class VestigeKVMLABackend(AttentionBackend):
     _stat_acc = None
     _affine_ok = None  # [max_reqs] int32, see _verify_affine
     _affine_capture = False  # the AFFINE constexpr this capture baked
+    _idx_state = None  # [3, 2] int64: (scans, overflows) by index state
     _affine_base = None  # [max_reqs] int64
     _pt_acc = None  # (consecutive pairs, pairs) of the page table; see _probe_page_table
     _router = None  # TierDecodeRouter when config.tier_decode, else the CSR path
@@ -301,7 +302,7 @@ class VestigeKVMLABackend(AttentionBackend):
         # --disable-cuda-graph measurement came back empty.
         if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
             self._stats["steps"] += 1
-            self._account_step(forward_batch)
+            self._account_step(forward_batch, reqs)
         self._maybe_close_blocks(forward_batch, reqs)
         # Collecting a calibration query is five 74 KB clones; it does not
         # need the eager scan path, and tying it to that path cost 16 eager
@@ -830,7 +831,7 @@ class VestigeKVMLABackend(AttentionBackend):
             torch.cuda.synchronize()
             st["t_pack"] += _t.perf_counter() - t1
 
-    def _account_step(self, forward_batch):
+    def _account_step(self, forward_batch, reqs):
         # SGLANG_DEBUG_VESTIGEKV_STATS=1 bookkeeping for one decode step, on
         # every launch path, with no host readback: the per-scan sums
         # (fetched, kept, seq) and a histogram of the fetched-row count per
@@ -862,10 +863,66 @@ class VestigeKVMLABackend(AttentionBackend):
                     self._fetch_hist += torch.bincount(
                         fetched.clamp_(0, self._fetch_w), minlength=self._fetch_w + 1
                     )
+        self._account_index_state(forward_batch, reqs, slots, real)
         if st["steps"] % D.PAGETABLE_PROBE_EVERY == 0:
             self._probe_page_table(slots, forward_batch.seq_lens[:real])
         if st["steps"] % 50 == 0:
             self._dump_stats()
+
+    def _account_index_state(self, forward_batch, reqs, slots, real):
+        """Scans, fired rows and overflows split by the state of the index that
+        served them.
+
+        A miss only says something once you know which index missed it. The
+        offline scan says a *calibrated* index fires every archived row that
+        beats the kept maximum -- 1081 of 1081 on the Kimi snapshots -- so the
+        rows RULER loses are lost on steps some other index served. Three
+        states, in the order a request passes through them:
+
+        PROVISIONAL  no tier yet, or one whose calibration has not collected
+                     enough evidence and is serving with z clamped to Z_MAX.
+        FRESH        fitted, and the request has not outgrown the archive it
+                     was fitted on.
+        STALE        fitted, but the context is now more than
+                     INDEX_STALE_FACTOR times the length at the fit.
+
+        A fourteen-step answer whose layer builds once spends most of its steps
+        outside FRESH, which is the thing this is here to confirm or refute.
+        Host side is a dict lookup per (layer, lane) over the slot list
+        `_step_slots` already cached; the counts accumulate on the device and
+        are read back with the rest in _dump_stats.
+        """
+        dev = slots.device
+        if self._idx_state is None:
+            self._idx_state = torch.zeros(3, 3, dtype=torch.int64, device=dev)
+        seq = self._seq_lens_host(forward_batch)[:real].tolist()
+        for lid in self._mla_lids:
+            fl = self._fetch_len.get(lid)
+            ovf = self._fetch_ovf.get(lid)
+            if lid not in self._qbuf or fl is None or ovf is None:
+                continue
+            bucket = []
+            for i in range(real):
+                rec = self._recall.get((reqs[i], lid))
+                tier = None if rec is None else rec["tier"]
+                if tier is None or getattr(tier, "need_more_hard", True):
+                    bucket.append(0)
+                else:
+                    at = max(int(rec["built_at"]), 1)
+                    bucket.append(2 if seq[i] > D.INDEX_STALE_FACTOR * at else 1)
+            b = torch.tensor(bucket, dtype=torch.int64, device=dev)
+            self._idx_state.index_add_(
+                0,
+                b,
+                torch.stack(
+                    [
+                        torch.ones_like(b),
+                        fl.gather(0, slots).to(torch.int64),
+                        (ovf.gather(0, slots) != 0).to(torch.int64),
+                    ],
+                    dim=1,
+                ),
+            )
 
     def _probe_page_table(self, slots, seq_lens):
         """How affine is a request's page table?
@@ -905,7 +962,7 @@ class VestigeKVMLABackend(AttentionBackend):
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
             "pack=%.2fms/step "
             "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
-            "attended_frac=%.4f pagetable_affine=%s",
+            "attended_frac=%.4f pagetable_affine=%s idx(scans/fetch/ovf)[%s]",
             st["steps"],
             len(self._mla_lids),
             100.0 * st["replays"] / n,
@@ -933,6 +990,13 @@ class VestigeKVMLABackend(AttentionBackend):
             (st["fetched"] + st["kept"]) / max(st["seq"], 1),
             "n/a" if self._pt_acc is None
             else f"{(lambda c, t: c / max(t, 1))(*self._pt_acc.tolist()):.4f}",
+            "n/a" if self._idx_state is None
+            else " ".join(
+                f"{nm}={sc:d}/{fr / max(sc, 1):.1f}/{ov / max(sc, 1):.4f}"
+                for nm, (sc, fr, ov) in zip(
+                    ("prov", "fresh", "stale"), self._idx_state.tolist()
+                )
+            ),
         )
 
     def _overflow_total(self) -> int:
