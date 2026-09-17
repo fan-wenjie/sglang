@@ -138,6 +138,7 @@ class VestigeKVMLABackend(AttentionBackend):
         rebuild_overflow_fraction=0.0,
         attended_splits=False,
         tier_decode=False,
+        affine_page_table=False,
     )
 
     def __init__(

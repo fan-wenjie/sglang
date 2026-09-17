@@ -48,6 +48,8 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # Read a lane's rows from the tiers (kept table + fetch buffer, or the page
     # table when fenced) instead of from a CSR packed for the step.
     tier_decode: bool
+    # Assert the page table is contiguous so a fenced lane computes its row ids.
+    affine_page_table: bool
 
     @classmethod
     def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
@@ -63,11 +65,17 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             rebuild_overflow_fraction=kernel.vestigekv_rebuild_overflow_fraction,
             attended_splits=kernel.enable_vestigekv_attended_splits,
             tier_decode=kernel.enable_vestigekv_tier_decode,
+            affine_page_table=kernel.enable_vestigekv_affine_page_table,
         )
         cfg.validate()
         return cfg
 
     def validate(self) -> None:
+        if self.affine_page_table and not self.tier_decode:
+            raise ValueError(
+                "--enable-vestigekv-affine-page-table needs "
+                "--enable-vestigekv-tier-decode: only the tier path reads the page table"
+            )
         if not 0.0 <= self.rebuild_overflow_fraction <= 1.0:
             raise ValueError(
                 "--vestigekv-rebuild-overflow-fraction must be in [0, 1], got "
@@ -105,5 +113,6 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"prefill_calibration={self.prefill_calibration} "
             f"rebuild_overflow_fraction={self.rebuild_overflow_fraction} "
             f"attended_splits={self.attended_splits} "
-            f"tier_decode={self.tier_decode}"
+            f"tier_decode={self.tier_decode} "
+            f"affine_page_table={self.affine_page_table}"
         )

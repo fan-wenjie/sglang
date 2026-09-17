@@ -76,4 +76,5 @@ def rows_for_layer(backend, lid, slots, seq, loc) -> VestigeKVRows:
         # says whether to act on it; without this the tier path would attend the
         # full row set where the CSR path truncates.
         fence=backend.config.overflow_fallback,
+        affine=backend.config.affine_page_table,
     )

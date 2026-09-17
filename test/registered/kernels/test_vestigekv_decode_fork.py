@@ -43,7 +43,7 @@ def _rows(gen):
     )
 
 
-def _run(q, kb, vb, indptr, indices, vk, tiers, fence=True):
+def _run(q, kb, vb, indptr, indices, vk, tiers, fence=True, affine=False):
     import msgspec
 
     from sglang.srt.layers.attention.vestigekv.decode_fork import decode_grouped_att_m_fwd
@@ -54,7 +54,7 @@ def _run(q, kb, vb, indptr, indices, vk, tiers, fence=True):
     splits = torch.full((bs,), SPLITS, dtype=torch.int32, device="cuda")
     decode_grouped_att_m_fwd(
         q, kb, vb, out, lse, indptr, indices,
-        msgspec.structs.replace(vk, tiers=tiers, fence=fence),
+        msgspec.structs.replace(vk, tiers=tiers, fence=fence, affine=affine),
         splits, SPLITS, 1.0 / (LK**0.5), 0.0, has_mla=True,
     )
     return out, lse
@@ -90,6 +90,30 @@ class TestDecodeForkRowSource(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_a_fenced_lane_equals_its_page_table_as_a_csr(self):
         self._case(fenced=True)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_affine_equals_the_page_table_when_it_is_contiguous(self):
+        # The affine arm computes a fenced row id as base + offs_n instead of
+        # loading it, which is only the same row set when the page table is one
+        # contiguous run. pagetable_affine measures that it is; this pins that
+        # the two arms then agree bit for bit.
+        gen = torch.Generator(device="cuda").manual_seed(13)
+        pool = torch.randn(POOL, 1, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+        q = torch.randn(1, H, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+        vk = _rows(gen)
+        slot = int(vk.slots[0])
+        vk.fetch_ovf[slot] = 1
+        n = int(vk.seq[0])
+        base = 7
+        vk.r2t[slot, :n] = base + torch.arange(n, dtype=torch.int32, device="cuda")
+        vk.loc.fill_(base + n - 1)  # the affine arm has no last-row fixup
+        indices = vk.r2t[slot, :n].to(torch.int64)
+        indptr = torch.tensor([0, n], dtype=torch.int32, device="cuda")
+        a_out, a_lse = _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=True)
+        b_out, b_lse = _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=True, affine=True)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(a_out, b_out), "att_out differs under the affine arm")
+        self.assertTrue(torch.equal(a_lse, b_lse), "att_lse differs under the affine arm")
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_fence_off_ignores_the_overflow_flag(self):

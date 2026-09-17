@@ -95,6 +95,7 @@ def _vk_fwd_grouped_kernel_stage1(
     VK_R2T: tl.constexpr,
     ROW_SRC: tl.constexpr,
     FENCE: tl.constexpr = True,
+    AFFINE: tl.constexpr = False,
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
@@ -135,6 +136,7 @@ def _vk_fwd_grouped_kernel_stage1(
         vk_fenced = False
         vk_loc = 0
         vk_last = 0
+        vk_base = 0
     else:
         cur_batch_kv_start_idx = 0
         vk_slot = tl.load(vk_slots + cur_batch).to(tl.int64)
@@ -150,6 +152,7 @@ def _vk_fwd_grouped_kernel_stage1(
         # allocator carry the whole branch across the loop (255 regs, 40B spill).
         vk_loc = tl.load(vk_loc_ptr + cur_batch)
         vk_last = cur_batch_seq_len - 1
+        vk_base = tl.load(vk_r2t + vk_slot * VK_R2T).to(tl.int64)
     # runtime, not constexpr: it only feeds the kv_len_per_split arithmetic below, so
     # a constexpr buys nothing and costs one stage-1 variant per cuda-graph ladder
     # rung (stage-2 does need it at compile time). Any count covers any length since
@@ -208,132 +211,236 @@ def _vk_fwd_grouped_kernel_stage1(
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
             )
-        for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
-            offs_n = start_n + tl.arange(0, BLOCK_N)
-            if ROW_SRC == SRC_CSR:
-                kv_loc = tl.load(
-                    kv_indices + cur_batch_kv_start_idx + offs_n,
-                    mask=offs_n < split_kv_end,
-                    other=0,
-                )
-            else:
-                # One straight-line row read for both arms. Written as a branch,
-                # the fenced and unfenced definitions of kv_loc each carried their
-                # own downstream address tensor through the loop and the allocator
-                # spilled (255 regs, 40B stack, against 200 and none unfenced);
-                # selecting the value instead of the path keeps one definition.
-                # The masked-off load of the arm that does not apply is predicated
-                # away, and vk_last/vk_loc are loop invariants hoisted above.
-                live = offs_n < split_kv_end
-                kept = tl.load(
-                    vk_kept_buf + vk_slot * VK_CAP + offs_n,
-                    mask=live & (offs_n < vk_nk) & (not vk_fenced),
-                    other=0,
-                )
-                fired = tl.load(
-                    vk_fetch_buf + vk_slot * VK_FW + (offs_n - vk_nk),
-                    mask=live & (offs_n >= vk_nk) & (not vk_fenced),
-                    other=0,
-                )
-                rid = tl.load(
-                    vk_r2t + vk_slot * VK_R2T + offs_n, mask=live & vk_fenced, other=0
-                )
-                tier = tl.where(offs_n < vk_nk, kept, fired)
-                fenced_row = tl.where(offs_n == vk_last, vk_loc.to(rid.dtype), rid)
-                kv_loc = tl.where(vk_fenced, fenced_row, tier).to(tl.int64)
-            # Page-aware KV address math (see _fwd_kernel_stage1).
-            if PAGE_SIZE == 1:
-                offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
-            else:
-                page_id = kv_loc // PAGE_SIZE
-                tok_in_p = kv_loc % PAGE_SIZE
-                offs_buf_k = (
-                    page_id[None, :] * stride_buf_kpage
-                    + tok_in_p[None, :] * stride_buf_ktok
-                    + base_offs_k
-                )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                other=0.0,
-            )
-            if IS_GFX1250:
-                qk = tl.dot(q_k, k.to(q_k.dtype))
-            else:
-                qk = tl.dot(q_k, k)
-            if BLOCK_DPE > 0:
+        if AFFINE and vk_fenced:
+            for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                # AFFINE: the page table of this request is one contiguous run, so a
+                # fenced row id is base + offs_n and the K address is affine in the
+                # loop variable. Written as its own loop because a predicated-off
+                # indirect load would still stop the pipeliner (see the engine rule
+                # disassemble-check-for-spills.md).
+                kv_loc = (vk_base + offs_n).to(tl.int64)
+                # Page-aware KV address math (see _fwd_kernel_stage1).
                 if PAGE_SIZE == 1:
-                    offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                    offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
                 else:
-                    offs_buf_kpe = (
+                    page_id = kv_loc // PAGE_SIZE
+                    tok_in_p = kv_loc % PAGE_SIZE
+                    offs_buf_k = (
                         page_id[None, :] * stride_buf_kpage
                         + tok_in_p[None, :] * stride_buf_ktok
-                        + base_offs_kpe
+                        + base_offs_k
                     )
-                kpe = tl.load(
-                    K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                     other=0.0,
                 )
-                qk += tl.dot(qpe, kpe.to(qpe.dtype))
-            qk *= sm_scale_withk
-
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
-
-            if xai_temperature_len > 0:
-                qk *= xai_temperature_reg[:, None]
-
-            if SCORE_MOD is not None:
-                qk = SCORE_MOD(
-                    qk,
-                    cur_batch_seq_len - 1,
-                    offs_n[None, :],
-                    cur_batch,
-                    cur_head[:, None],
-                    mask_h[:, None] & (offs_n[None, :] < split_kv_end),
-                    Aux0,
-                    aux0_stride_t,
-                    aux0_stride_h,
-                    aux0_len,
-                )
-
-            qk = tl.where(
-                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
-            )
-            if HAS_MLA:
-                v = tl.trans(k)
-            else:
-                if PAGE_SIZE == 1:
-                    offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                if IS_GFX1250:
+                    qk = tl.dot(q_k, k.to(q_k.dtype))
                 else:
-                    offs_buf_v = (
-                        page_id[:, None] * stride_buf_vpage
-                        + tok_in_p[:, None] * stride_buf_vtok
-                        + base_offs_v
+                    qk = tl.dot(q_k, k)
+                if BLOCK_DPE > 0:
+                    if PAGE_SIZE == 1:
+                        offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                    else:
+                        offs_buf_kpe = (
+                            page_id[None, :] * stride_buf_kpage
+                            + tok_in_p[None, :] * stride_buf_ktok
+                            + base_offs_kpe
+                        )
+                    kpe = tl.load(
+                        K_Buffer + offs_buf_kpe,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=0.0,
                     )
-                v = tl.load(
-                    V_Buffer + offs_buf_v,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                qk *= sm_scale_withk
+
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
+
+                if xai_temperature_len > 0:
+                    qk *= xai_temperature_reg[:, None]
+
+                if SCORE_MOD is not None:
+                    qk = SCORE_MOD(
+                        qk,
+                        cur_batch_seq_len - 1,
+                        offs_n[None, :],
+                        cur_batch,
+                        cur_head[:, None],
+                        mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                        Aux0,
+                        aux0_stride_t,
+                        aux0_stride_h,
+                        aux0_len,
+                    )
+
+                qk = tl.where(
+                    mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
+                )
+                if HAS_MLA:
+                    v = tl.trans(k)
+                else:
+                    if PAGE_SIZE == 1:
+                        offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                    else:
+                        offs_buf_v = (
+                            page_id[:, None] * stride_buf_vpage
+                            + tok_in_p[:, None] * stride_buf_vtok
+                            + base_offs_v
+                        )
+                    v = tl.load(
+                        V_Buffer + offs_buf_v,
+                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                        other=0.0,
+                    )
+
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc *= re_scale[:, None]
+                # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
+                # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
+                # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
+                # attention idealized). On other platforms restore the p.to(v.dtype) cast.
+                # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+                if IS_GFX1250:
+                    acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+                else:
+                    acc += tl.dot(p.to(v.dtype), v)
+
+                e_sum = e_sum * re_scale + tl.sum(p, 1)
+                e_max = n_e_max
+
+        else:
+            for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                if ROW_SRC == SRC_CSR:
+                    kv_loc = tl.load(
+                        kv_indices + cur_batch_kv_start_idx + offs_n,
+                        mask=offs_n < split_kv_end,
+                        other=0,
+                    )
+                else:
+                    # One straight-line row read for both arms. Written as a branch,
+                    # the fenced and unfenced definitions of kv_loc each carried their
+                    # own downstream address tensor through the loop and the allocator
+                    # spilled (255 regs, 40B stack, against 200 and none unfenced);
+                    # selecting the value instead of the path keeps one definition.
+                    # The masked-off load of the arm that does not apply is predicated
+                    # away, and vk_last/vk_loc are loop invariants hoisted above.
+                    live = offs_n < split_kv_end
+                    kept = tl.load(
+                        vk_kept_buf + vk_slot * VK_CAP + offs_n,
+                        mask=live & (offs_n < vk_nk) & (not vk_fenced),
+                        other=0,
+                    )
+                    fired = tl.load(
+                        vk_fetch_buf + vk_slot * VK_FW + (offs_n - vk_nk),
+                        mask=live & (offs_n >= vk_nk) & (not vk_fenced),
+                        other=0,
+                    )
+                    rid = tl.load(
+                        vk_r2t + vk_slot * VK_R2T + offs_n, mask=live & vk_fenced, other=0
+                    )
+                    tier = tl.where(offs_n < vk_nk, kept, fired)
+                    fenced_row = tl.where(offs_n == vk_last, vk_loc.to(rid.dtype), rid)
+                    kv_loc = tl.where(vk_fenced, fenced_row, tier).to(tl.int64)
+                # Page-aware KV address math (see _fwd_kernel_stage1).
+                if PAGE_SIZE == 1:
+                    offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
+                else:
+                    page_id = kv_loc // PAGE_SIZE
+                    tok_in_p = kv_loc % PAGE_SIZE
+                    offs_buf_k = (
+                        page_id[None, :] * stride_buf_kpage
+                        + tok_in_p[None, :] * stride_buf_ktok
+                        + base_offs_k
+                    )
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                     other=0.0,
                 )
+                if IS_GFX1250:
+                    qk = tl.dot(q_k, k.to(q_k.dtype))
+                else:
+                    qk = tl.dot(q_k, k)
+                if BLOCK_DPE > 0:
+                    if PAGE_SIZE == 1:
+                        offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                    else:
+                        offs_buf_kpe = (
+                            page_id[None, :] * stride_buf_kpage
+                            + tok_in_p[None, :] * stride_buf_ktok
+                            + base_offs_kpe
+                        )
+                    kpe = tl.load(
+                        K_Buffer + offs_buf_kpe,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=0.0,
+                    )
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                qk *= sm_scale_withk
 
-            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            acc *= re_scale[:, None]
-            # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
-            # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
-            # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
-            # attention idealized). On other platforms restore the p.to(v.dtype) cast.
-            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
-            if IS_GFX1250:
-                acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
-            else:
-                acc += tl.dot(p.to(v.dtype), v)
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
 
-            e_sum = e_sum * re_scale + tl.sum(p, 1)
-            e_max = n_e_max
+                if xai_temperature_len > 0:
+                    qk *= xai_temperature_reg[:, None]
+
+                if SCORE_MOD is not None:
+                    qk = SCORE_MOD(
+                        qk,
+                        cur_batch_seq_len - 1,
+                        offs_n[None, :],
+                        cur_batch,
+                        cur_head[:, None],
+                        mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                        Aux0,
+                        aux0_stride_t,
+                        aux0_stride_h,
+                        aux0_len,
+                    )
+
+                qk = tl.where(
+                    mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
+                )
+                if HAS_MLA:
+                    v = tl.trans(k)
+                else:
+                    if PAGE_SIZE == 1:
+                        offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                    else:
+                        offs_buf_v = (
+                            page_id[:, None] * stride_buf_vpage
+                            + tok_in_p[:, None] * stride_buf_vtok
+                            + base_offs_v
+                        )
+                    v = tl.load(
+                        V_Buffer + offs_buf_v,
+                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                        other=0.0,
+                    )
+
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc *= re_scale[:, None]
+                # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
+                # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
+                # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
+                # attention idealized). On other platforms restore the p.to(v.dtype) cast.
+                # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+                if IS_GFX1250:
+                    acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+                else:
+                    acc += tl.dot(p.to(v.dtype), v)
+
+                e_sum = e_sum * re_scale + tl.sum(p, 1)
+                e_max = n_e_max
 
         offs_mid_o = (
             cur_batch * stride_mid_ob
@@ -385,6 +492,7 @@ class VestigeKVRows(msgspec.Struct):
     loc: torch.Tensor
     tiers: bool = True
     fence: bool = True
+    affine: bool = False
 
 
 def decode_grouped_att_m_fwd(
@@ -522,6 +630,7 @@ def decode_grouped_att_m_fwd(
         VK_R2T=vk.r2t.shape[1],
         ROW_SRC=SRC_TIERS if vk.tiers else SRC_CSR,
         FENCE=vk.fence,
+        AFFINE=vk.affine,
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         IS_GFX1250=_is_gfx1250,
