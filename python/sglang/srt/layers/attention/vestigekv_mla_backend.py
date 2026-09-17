@@ -126,6 +126,11 @@ class VestigeKVMLABackend(AttentionBackend):
     _affine_ok = None  # [max_reqs] int32, see _verify_affine
     _affine_capture = False  # the AFFINE constexpr this capture baked
     _idx_state = None  # [3, 2] int64: (scans, overflows) by index state
+    # Class-level so a backend built with __new__ (the unit tests) reads the
+    # arm as off rather than raising on a missing attribute.
+    _omit_blend = False
+    _logm_stack = _archmu_stack = None
+    _blend_logged = False
     _affine_base = None  # [max_reqs] int64
     _pt_acc = None  # (consecutive pairs, pairs) of the page table; see _probe_page_table
     _router = None  # TierDecodeRouter when config.tier_decode, else the CSR path
@@ -255,6 +260,8 @@ class VestigeKVMLABackend(AttentionBackend):
         self._omit_blend = envs.SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND.get()
         self._logm: dict = {}
         self._archmu: dict = {}
+        self._logm_stack = self._archmu_stack = None
+        self._blend_logged = False
         self._mem_dir = envs.SGLANG_DEBUG_VESTIGEKV_MEM_DIR.get()
         self._mem_reqs = 0  # requests seen at their first prefill chunk (mem trace)
         if self._mem_dir is not None:
@@ -1418,6 +1425,21 @@ class VestigeKVMLABackend(AttentionBackend):
                 n, max_reqs, dtype=torch.int32, device=dev
             )
             self._ovf_count_stack = torch.zeros(n, dtype=torch.int32, device=dev)
+            if self._omit_blend:
+                # Allocated here, with every other fixed-address buffer, because
+                # the blend has to be part of the CAPTURED graph: the router's
+                # python runs once at capture and never again at replay, so a
+                # blend installed later is simply not in the graph. -inf means
+                # "no omitted mass", i.e. sigma = 1, so the captured op is a
+                # no-op until a step writes real values into it.
+                self._logm_stack = torch.full(
+                    (n, max_reqs, self._q_heads), float("-inf"),
+                    dtype=torch.float32, device=dev,
+                )
+                self._archmu_stack = torch.zeros(
+                    n, max_reqs, self._q_heads, D.KV_LORA_RANK,
+                    dtype=torch.float32, device=dev,
+                )
             # Per pool slot, not per layer: whether this request's page table is
             # one contiguous run, and where it starts. Maintained incrementally
             # (see _verify_affine and the pack's prep kernel) so a fenced lane
@@ -1429,6 +1451,9 @@ class VestigeKVMLABackend(AttentionBackend):
         self._fetch_buf[lid] = self._fetch_stack[li]
         self._fetch_len[lid] = self._fetch_len_stack[li]
         self._fetch_ovf[lid] = self._fetch_ovf_stack[li]
+        if self._omit_blend:
+            self._logm[lid] = self._logm_stack[li]
+            self._archmu[lid] = self._archmu_stack[li]
 
     def _full_arm(self) -> bool:
         # Benchmark-only A/B switch (SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG names a
@@ -1534,6 +1559,10 @@ class VestigeKVMLABackend(AttentionBackend):
                     self._stage_seq[:bs],
                     self._stage_loc[:bs],
                 )
+                if self._omit_blend and lid in self._logm:
+                    self._router.blend[lid] = (
+                        self._logm[lid], self._archmu[lid], self._stage_slots[:bs],
+                    )
         else:
             # Eager step: the metadata hook packed this step's CSR into the
             # same buffers the graphs read. Sized for the whole request
@@ -1958,14 +1987,8 @@ class VestigeKVMLABackend(AttentionBackend):
         leaves the offline output error at 0.367 against 0.195.
         """
         qb = self._qbuf.get(lid)
-        if qb is None:
+        if qb is None or lid not in self._logm:
             return
-        H = qb.shape[1]
-        if lid not in self._logm:
-            self._logm[lid] = qb.new_full((qb.shape[0], H), float("-inf"),
-                                          dtype=torch.float32)
-            self._archmu[lid] = qb.new_zeros((qb.shape[0], H, D.KV_LORA_RANK),
-                                             dtype=torch.float32)
         lm, mu = self._logm[lid], self._archmu[lid]
         for i in range(real):
             slot = reqs[i]
@@ -1977,6 +2000,13 @@ class VestigeKVMLABackend(AttentionBackend):
             lg, ct = tier.omitted_mass_and_mean(qb[slot])
             lm[slot].copy_(lg)
             mu[slot].copy_(ct)
+        if not self._blend_logged:
+            self._blend_logged = True
+            logger.info(
+                "VKBLEND fill: layer %d wrote logM in [%.2f, %.2f] over %d lanes",
+                lid, float(lm.index_select(0, slots).min()),
+                float(lm.index_select(0, slots).max()), real,
+            )
         fenced = self._fetch_ovf[lid].index_select(0, slots) != 0
         lm.index_copy_(
             0,
@@ -1984,8 +2014,7 @@ class VestigeKVMLABackend(AttentionBackend):
             torch.where(fenced[:, None], torch.full_like(lm[:real], float("-inf")),
                         lm.index_select(0, slots)),
         )
-        if self._router is not None:
-            self._router.blend[lid] = (lm, mu, slots)
+
 
     def _seq_lens_host(self, forward_batch):
         """Host-side seq_lens without a device readback. The scheduler ships
