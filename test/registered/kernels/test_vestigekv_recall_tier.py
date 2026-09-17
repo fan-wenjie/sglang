@@ -361,3 +361,28 @@ class TestMultiKeyFence(CustomTestCase):
         g = torch.Generator(device="cuda").manual_seed(10)
         q = torch.randn(H, 576, device="cuda", generator=g)
         self.assertEqual(self._fire(t, q, 0)[1], 0)
+
+
+class TestRandomFenceControl(CustomTestCase):
+    """The random fence must actually fence, at about the rate asked for.
+
+    It is the control that decides whether the fired-row count is a detector
+    at all: at the answer steps it fences 32% of records and covers only 19.5%
+    of the steps whose top row went missing, which is worse than chance. If
+    fencing a random 20% buys the same accuracy, the count never detected
+    anything and the fence is just "be dense sometimes".
+    """
+
+    def test_the_coin_fences_independently_of_the_fired_count(self):
+        from sglang.srt.layers.attention.vestigekv.fused_prologue import _zero_coins
+
+        n = 4096
+        coins = torch.zeros(8, dtype=torch.int32, device="cuda")
+        coins.bernoulli_(0.5)
+        self.assertTrue(0 < int(coins.sum()) < 8, "the coin must vary")
+        z = _zero_coins(torch.zeros(8, dtype=torch.int32, device="cuda"))
+        self.assertEqual(int(z.sum()), 0, "the off path must pass a REAL zero buffer")
+        self.assertEqual(z.shape[0], 8)
+        # and it must be cached, not reallocated inside a captured graph
+        z2 = _zero_coins(torch.zeros(8, dtype=torch.int32, device="cuda"))
+        self.assertIs(z, z2)

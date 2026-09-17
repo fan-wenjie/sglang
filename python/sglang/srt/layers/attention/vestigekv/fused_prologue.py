@@ -626,6 +626,7 @@ def _compact_write_kernel(
     Am,
     W,
     FENCE,
+    rand_fence_ptr,  # [NSLOT] int32 per-step coin, or 0 when the control is off
     NSLOT,
     BLOCK_A: tl.constexpr,
     SPREAD: tl.constexpr,
@@ -655,8 +656,14 @@ def _compact_write_kernel(
         # this step needs SEVERAL of them, measured monotonic in the number of
         # rows that beat max1 -- attends its full row set instead of ranking.
         # Raising the flag early is safe: a fenced lane never reads the buffer.
-        tl.store(out_ovf_ptr + li * NSLOT + slot, (t > FENCE).to(tl.int32))
-        if t > FENCE:
+        # The random control ORs in a coin the host refreshes each step, so a
+        # lane can be fenced without regard to how many rows it fired. Same
+        # cost, different selection: if the accuracy gain survives, the count
+        # was never a detector.
+        coin = tl.load(rand_fence_ptr + slot) != 0
+        fenced = (t > FENCE) or coin
+        tl.store(out_ovf_ptr + li * NSLOT + slot, fenced.to(tl.int32))
+        if fenced:
             tl.atomic_add(ovf_count_ptr + li, 1)
     alen = tl.load(a_len_ptr + p)
     live = tl.minimum(nb, (alen + BLOCK_A - 1) // BLOCK_A)
@@ -681,6 +688,18 @@ def _compact_write_kernel(
             tl.store(out_ptr + li * NSLOT * W + slot * W + pos, arch, mask=ok)
 
 
+_ZERO_COINS: dict = {}
+
+
+def _zero_coins(like):
+    key = (like.device, int(like.shape[-1]))
+    z = _ZERO_COINS.get(key)
+    if z is None:
+        z = torch.zeros(like.shape[-1], dtype=torch.int32, device=like.device)
+        _ZERO_COINS[key] = z
+    return z
+
+
 def compact_fired(
     hit,
     arch,
@@ -696,6 +715,7 @@ def compact_fired(
     am_grid,
     p_live=None,
     fence_rows=0,
+    rand_fence=None,
 ):
     """Deterministic fired-row compaction. scratch: (counts, offsets, total)
     int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W]; fetch_len/fetch_ovf
@@ -744,6 +764,9 @@ def compact_fired(
         # attends its full row set. 0 keeps the historical behaviour, where the
         # only fence is the buffer overflowing.
         min(W, fence_rows) if fence_rows > 0 else W,
+        # A real zero buffer when the control is off: passing any live tensor
+        # here would fence every lane whose entry happens to be non-zero.
+        rand_fence if rand_fence is not None else _zero_coins(fetch_len),
         fetch_buf.shape[1],
         BLOCK_A=BLOCK_A,
         SPREAD=envs.SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE.get(),

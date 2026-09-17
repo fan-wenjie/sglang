@@ -613,6 +613,12 @@ class Envs:
     # it. Computes the dense attention the method exists to avoid, so it is
     # far slower than serving; debug only.
     SGLANG_DEBUG_VESTIGEKV_STEPDUMP = EnvBool(False)
+
+    # Control for the multi-key fence: fence a random fraction of lanes at the
+    # same cost instead of choosing them by fired-row count. If the gain
+    # survives, the fired-row count is not a detector and the fence works only
+    # by making some steps exactly dense.
+    SGLANG_DEBUG_VESTIGEKV_RANDOM_FENCE = EnvFloat(0.0)
     # Directory for one calibration snapshot per (request slot, layer): the
     # closed-prefix content rows, the tier-1 keep set and the calibration
     # queries the calibrated index was fitted on, written at its install.
