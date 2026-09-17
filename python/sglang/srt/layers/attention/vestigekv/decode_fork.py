@@ -259,8 +259,6 @@ def _vk_fwd_grouped_kernel_stage1(
     vk_fetch_len,  # [R1] int32
     vk_fetch_ovf,  # [R1] int32; nonzero means the lane attends its whole row set
     vk_r2t,  # [R1 - 1, VK_R2T] int32 page table
-    vk_affine_ok,  # [R1] int32: this request's page table is one run
-    vk_affine_base,  # [R1] int64 where it starts
     vk_seq,  # [bs] int64 rows of a fenced lane
     vk_loc_ptr,  # [bs] int64 this step's appended pool row
     Att_Out,
@@ -297,6 +295,7 @@ def _vk_fwd_grouped_kernel_stage1(
     VK_R2T: tl.constexpr,
     ROW_SRC: tl.constexpr,
     FENCE: tl.constexpr = True,
+    AFFINE: tl.constexpr = False,
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
@@ -338,7 +337,6 @@ def _vk_fwd_grouped_kernel_stage1(
         vk_loc = 0
         vk_last = 0
         vk_base = 0
-        vk_affine = False
     else:
         cur_batch_kv_start_idx = 0
         vk_slot = tl.load(vk_slots + cur_batch).to(tl.int64)
@@ -354,11 +352,8 @@ def _vk_fwd_grouped_kernel_stage1(
         # allocator carry the whole branch across the loop (255 regs, 40B spill).
         vk_loc = tl.load(vk_loc_ptr + cur_batch)
         vk_last = cur_batch_seq_len - 1
-        # Detected, not asserted: _verify_affine re-checks the whole table when
-        # the batch composition changes and the pack's prep kernel clears the
-        # flag on any step whose row does not land at base + seq - 1.
-        vk_affine = tl.load(vk_affine_ok + vk_slot) != 0
-        vk_base = tl.load(vk_affine_base + vk_slot)
+        # AFFINE builds read this; the others compile the load away with the arm.
+        vk_base = tl.load(vk_r2t + vk_slot * VK_R2T).to(tl.int64)
     # runtime, not constexpr: it only feeds the kv_len_per_split arithmetic below, so
     # a constexpr buys nothing and costs one stage-1 variant per cuda-graph ladder
     # rung (stage-2 does need it at compile time). Any count covers any length since
@@ -420,7 +415,7 @@ def _vk_fwd_grouped_kernel_stage1(
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
             )
-        if vk_affine and vk_fenced:
+        if AFFINE and vk_fenced:
             acc, e_sum, e_max = _vk_row_loop(
                 acc,
                 e_sum,
@@ -586,8 +581,7 @@ class VestigeKVRows(msgspec.Struct):
     loc: torch.Tensor
     tiers: bool = True
     fence: bool = True
-    affine_ok: torch.Tensor = None
-    affine_base: torch.Tensor = None
+    affine: bool = False
 
 
 def decode_grouped_att_m_fwd(
@@ -688,8 +682,6 @@ def decode_grouped_att_m_fwd(
         vk.fetch_len,
         vk.fetch_ovf,
         vk.r2t,
-        vk.affine_ok,
-        vk.affine_base,
         vk.seq,
         vk.loc,
         att_out,
@@ -727,6 +719,7 @@ def decode_grouped_att_m_fwd(
         VK_R2T=vk.r2t.shape[1],
         ROW_SRC=SRC_TIERS if vk.tiers else SRC_CSR,
         FENCE=vk.fence,
+        AFFINE=vk.affine,
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         IS_GFX1250=_is_gfx1250,

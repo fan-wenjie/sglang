@@ -84,17 +84,23 @@ def _pack_csr_prep_kernel(
             tl.store(
                 kept_buf_ptr + (li * R1 + slot) * CAP + n_old, tl.load(loc_ptr + i)
             )
-        if AFFINE_TRACK and li == 0:
-            # The per-step half of the affine flag: this step's row must land
-            # exactly at base + seq - 1, or the table has a hole from now on.
-            # One program does it because the flag is per slot, not per layer.
+        if AFFINE_TRACK:
+            # The per-step half of the affine guarantee. An AFFINE build bakes
+            # "a fenced lane's rows are base .. base+seq-1" into the kernel, so
+            # the moment a lane's row set stops being that run its fence flag is
+            # cleared here: the lane truncates to its fired rows for this step,
+            # which loses rows but never reads rows that belong to someone else.
+            # Per slot and per layer, because the flag it clears is per layer.
             for i in range(0, bs):
                 slot = tl.load(slots_ptr + i).to(tl.int64)
                 seq_i = tl.load(seq_ptr + i).to(tl.int64)
                 base = tl.load(affine_base_ptr + slot)
-                was = tl.load(affine_ok_ptr + slot) != 0
-                good = was and (tl.load(loc_ptr + i).to(tl.int64) == base + seq_i - 1)
-                tl.store(affine_ok_ptr + slot, good.to(tl.int32))
+                still = tl.load(affine_ok_ptr + slot) != 0
+                still = still and (tl.load(loc_ptr + i).to(tl.int64) == base + seq_i - 1)
+                if li == 0:
+                    tl.store(affine_ok_ptr + slot, still.to(tl.int32))
+                if not still:
+                    tl.store(fetch_ovf_ptr + li * R1 + slot, 0)
         for i in range(0, bs):  # lengths: first occurrence only (+1 once,
             slot = tl.load(slots_ptr + i).to(tl.int64)  # duplicates skip)
             dup = 0

@@ -124,6 +124,7 @@ class VestigeKVMLABackend(AttentionBackend):
     _fetch_hist = None
     _stat_acc = None
     _affine_ok = None  # [max_reqs] int32, see _verify_affine
+    _affine_capture = False  # the AFFINE constexpr this capture baked
     _affine_base = None  # [max_reqs] int64
     _pt_acc = None  # (consecutive pairs, pairs) of the page table; see _probe_page_table
     _router = None  # TierDecodeRouter when config.tier_decode, else the CSR path
@@ -398,17 +399,33 @@ class VestigeKVMLABackend(AttentionBackend):
         key = self._scan_key(forward_batch, reqs)
         self._step_cache = (sig, reqs, key)
         self._verify_affine(forward_batch)
+        # One readback, on the same rare path the verification runs on: the
+        # kernel takes AFFINE as a constexpr, so an affine build is 197
+        # registers against the 237 a run-time test costs, and the cost of a
+        # run-time test exceeded what the affine arm saves (measured 4.534
+        # against 4.456 with no affine arm at all).
+        if self._affine_ok is not None:
+            real = forward_batch.out_cache_loc.shape[0]
+            if real:
+                sl = forward_batch.req_pool_indices[:real].to(torch.int64)
+                self._affine_capture = bool(self._affine_ok[sl].all())
         return reqs, key
 
     def _verify_affine(self, forward_batch):
-        """Re-establish the affine flag for the lanes of a changed batch.
+        """Re-establish the affine claim for the lanes of a changed batch.
 
-        A fenced lane may read its rows as base + offset instead of loading
-        them, which is only the same row set when the page table is one
-        contiguous run. This is the O(seq) half of knowing that: it runs when
-        the batch composition changes, which is when a request joins. The
-        per-step half is one comparison in the pack's prep kernel, so a table
-        that stops being contiguous clears the flag on the step it happens.
+        NoPE makes the attended rows a multiset: order does not reach the
+        output, so a fenced lane may read base .. base+seq-1 whenever its row
+        SET is that run, however the page table orders it. That is what is
+        tested here -- the ids are distinct because a token occupies one slot,
+        so min, max and count settle set equality -- and it is a weaker
+        condition than the table being sorted.
+
+        This is the O(seq) half, run when the batch composition changes, which
+        is when a request joins. The per-step half is in the pack's prep
+        kernel: it clears a lane's fence flag the moment its new row does not
+        extend the run, so an AFFINE build truncates that step instead of
+        reading rows that are not the lane's.
         """
         if self._affine_ok is None:
             return
@@ -421,14 +438,17 @@ class VestigeKVMLABackend(AttentionBackend):
         if n < 1:
             return
         rows = self.req_to_token_pool.req_to_token[slots, :n].to(torch.int64)
-        # rows[:, i] == rows[:, 0] + i for every i the request actually holds.
-        # The step's own row is not in the table yet, so the last cell is the
-        # prep kernel's to check.
+        # The step's own row is not in the table yet, so the run under test is
+        # the first seq - 1 cells.
         col = torch.arange(n, device=rows.device)
         live = col[None, :] < (seq[:, None] - 1)
-        ok = ((rows == rows[:, :1] + col[None, :]) | ~live).all(dim=1)
+        held = (seq - 1).clamp_(min=1)
+        big = torch.iinfo(torch.int64).max
+        lo = torch.where(live, rows, big).min(dim=1).values
+        hi = torch.where(live, rows, -1).max(dim=1).values
+        ok = (hi - lo + 1) == held
         self._affine_ok[slots] = ok.to(torch.int32)
-        self._affine_base[slots] = rows[:, 0]
+        self._affine_base[slots] = lo
 
     # ---- tier-2 scan capture: 215 launches/step -> 1 ----
 
