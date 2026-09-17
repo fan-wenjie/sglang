@@ -100,5 +100,58 @@ class TestFusedPrologue(CustomTestCase):
         )
 
 
+class TestSpreadTruncation(CustomTestCase):
+    """An overflowing pair keeps the same number of rows, spread not prefixed.
+
+    With the fallback off a pair that fires more than the buffer holds keeps
+    its first W rows in position order, and the multi-key tasks lose 0.70 of a
+    cell to that. SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE keeps W rows spread
+    over the archive instead, which is the falsifiable half of "the keys are
+    spread and a prefix cuts the later ones". This pins that the switch keeps
+    the count it reports, writes inside the buffer, and reaches the tail of the
+    archive that the prefix never sees.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_spread_reaches_the_tail_and_reports_its_count(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.vestigekv.fused_prologue import compact_fired
+
+        A, W = 4096, 64  # fires every row, so the buffer overflows 64-fold
+        dev = "cuda"
+        hit = torch.ones(A, dtype=torch.int32, device=dev)
+        arch = torch.arange(A, dtype=torch.int32, device=dev)
+        a_len = torch.tensor([A], dtype=torch.int32, device=dev)
+        a_off = torch.zeros(1, dtype=torch.int64, device=dev)
+        li = torch.zeros(1, dtype=torch.int32, device=dev)
+        slot = torch.zeros(1, dtype=torch.int32, device=dev)
+        got = {}
+        for spread in (False, True):
+            buf = torch.full((1, 1, W), -1, dtype=torch.int32, device=dev)
+            ln = torch.zeros(1, 1, dtype=torch.int32, device=dev)
+            ovf = torch.zeros(1, 1, dtype=torch.int32, device=dev)
+            cnt = torch.zeros(1, dtype=torch.int32, device=dev)
+            # counts arrive pre-filled by the scan; every row fires here
+            nb = (A + 1023) // 1024
+            scratch = (
+                torch.full((1, nb), 1024, dtype=torch.int32, device=dev),
+                torch.zeros(1, nb, dtype=torch.int32, device=dev),
+                torch.zeros(1, dtype=torch.int32, device=dev),
+            )
+            with envs.SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE.override(spread):
+                compact_fired(hit, arch, a_len, a_off, li, slot, buf, ln, ovf, cnt,
+                              scratch, A)
+            torch.cuda.synchronize()
+            n = int(ln[0, 0])
+            got[spread] = (n, buf[0, 0, :n].clone())
+            self.assertEqual(int(ovf[0, 0]), 1, "the pair must be flagged as overflowing")
+            self.assertLessEqual(n, W, f"reported count {n} exceeds the buffer")
+            self.assertTrue((buf[0, 0, :n] >= 0).all(), "reported count covers unwritten cells")
+        pre_max = int(got[False][1].max())
+        spr_max = int(got[True][1].max())
+        self.assertLess(pre_max, A // 2, "the prefix should not reach the archive's tail")
+        self.assertGreater(spr_max, A // 2, "the spread selection must reach the tail")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=3)
