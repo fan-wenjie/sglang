@@ -339,6 +339,20 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._last_step_tok = tok
                 st["steps"] += 1
                 self._account_step(forward_batch, reqs)
+        if self._omit_blend:
+            # Hung off the prologue, not off _recall_step: with the in-graph
+            # scan on (the default) the decode path is
+            # init_forward_metadata_out_graph -> _decode_prologue ->
+            # _ingraph_host_step -> return, and _recall_step is never reached.
+            # This function is the one that provably runs exactly once per
+            # decode step however the step is launched -- calls/step reads 1.00
+            # -- so it is the only safe place to hang per-step work.
+            real = forward_batch.out_cache_loc.shape[0]
+            if real:
+                self._fill_omitted_mass(
+                    forward_batch, reqs, real,
+                    forward_batch.req_pool_indices[:real].to(torch.int64),
+                )
         self._maybe_close_blocks(forward_batch, reqs)
         # Collecting a calibration query is five 74 KB clones; it does not
         # need the eager scan path, and tying it to that path cost 16 eager
@@ -1967,10 +1981,8 @@ class VestigeKVMLABackend(AttentionBackend):
         self._ovf_count_stack[self._li_map[lid]] += (
             self._fetch_ovf[lid].gather(0, slots).sum(dtype=torch.int32)
         )
-        if self._omit_blend:
-            self._fill_omitted_mass(lid, forward_batch, reqs, real, slots)
 
-    def _fill_omitted_mass(self, lid, forward_batch, reqs, real, slots):
+    def _fill_omitted_mass(self, forward_batch, reqs, real, slots):
         """This step's omitted softmax mass and its compensator, per lane.
 
         A research arm, not the serving path: it materialises the [H, archive]
@@ -1986,9 +1998,12 @@ class VestigeKVMLABackend(AttentionBackend):
         weights are the head's own scores, and the arithmetic mean that is not
         leaves the offline output error at 0.367 against 0.195.
         """
-        qb = self._qbuf.get(lid)
-        if qb is None or lid not in self._logm:
-            return
+        for lid in self._local_mla_lids:
+            if lid in self._qbuf and lid in self._logm:
+                self._fill_one_layer(lid, reqs, real, slots)
+
+    def _fill_one_layer(self, lid, reqs, real, slots):
+        qb = self._qbuf[lid]
         lm, mu = self._logm[lid], self._archmu[lid]
         for i in range(real):
             slot = reqs[i]
