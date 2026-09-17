@@ -46,6 +46,8 @@ def _pack_csr_prep_kernel(
     kept_len_ptr,  # [L, R1] int32
     fetch_len_ptr,  # [L, R1] int32
     fetch_ovf_ptr,  # [L, R1] int32 overflow flag (FENCE only)
+    affine_ok_ptr,  # [R1] int32 in/out: page table still one run (FENCE only)
+    affine_base_ptr,  # [R1] int64 where it starts (FENCE only)
     indptr_ptr,  # [L, MAXBS1] out
     R1,
     CAP,
@@ -53,6 +55,7 @@ def _pack_csr_prep_kernel(
     L,
     MAXBS1,
     FENCE: tl.constexpr,
+    AFFINE_TRACK: tl.constexpr,
 ):
     # One program PER LAYER (layers share no state), three passes each
     # reading only PRE-STEP state:
@@ -81,6 +84,17 @@ def _pack_csr_prep_kernel(
             tl.store(
                 kept_buf_ptr + (li * R1 + slot) * CAP + n_old, tl.load(loc_ptr + i)
             )
+        if AFFINE_TRACK and li == 0:
+            # The per-step half of the affine flag: this step's row must land
+            # exactly at base + seq - 1, or the table has a hole from now on.
+            # One program does it because the flag is per slot, not per layer.
+            for i in range(0, bs):
+                slot = tl.load(slots_ptr + i).to(tl.int64)
+                seq_i = tl.load(seq_ptr + i).to(tl.int64)
+                base = tl.load(affine_base_ptr + slot)
+                was = tl.load(affine_ok_ptr + slot) != 0
+                good = was and (tl.load(loc_ptr + i).to(tl.int64) == base + seq_i - 1)
+                tl.store(affine_ok_ptr + slot, good.to(tl.int32))
         for i in range(0, bs):  # lengths: first occurrence only (+1 once,
             slot = tl.load(slots_ptr + i).to(tl.int64)  # duplicates skip)
             dup = 0
@@ -177,6 +191,8 @@ def pack_csr_all_layers(
     seq=None,
     fetch_ovf=None,
     req_to_token=None,
+    affine_ok=None,
+    affine_base=None,
     gather=True,
 ):
     """Two launches for every layer's CSR. Stacked tensors: kept_buf
@@ -198,6 +214,12 @@ def pack_csr_all_layers(
     if not fence:
         # Unused pointer arguments still have to be tensors.
         seq, fetch_ovf, req_to_token = loc, fetch_len, fetch_len
+    track = affine_ok is not None
+    if not track:
+        # Unused pointer arguments still have to be tensors; the block that
+        # would write through them is compiled out, so aliasing a real one
+        # here would be a silent corruption rather than a dead store.
+        affine_ok, affine_base = fetch_len, loc
     L, R1, CAP = kept_buf.shape
     bs = slots.shape[0]
     _pack_csr_prep_kernel[(L,)](
@@ -208,6 +230,8 @@ def pack_csr_all_layers(
         kept_len,
         fetch_len,
         fetch_ovf,
+        affine_ok,
+        affine_base,
         indptr,
         R1,
         CAP,
@@ -215,6 +239,7 @@ def pack_csr_all_layers(
         L,
         indptr.shape[1],
         FENCE=fence,
+        AFFINE_TRACK=track,
     )
     if not gather:
         return

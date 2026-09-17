@@ -376,27 +376,6 @@ class ExecKernel(msgspec.Struct):
         "floating-point accumulation grouping, so outputs stop being bitwise "
         "identical to the dense arm at the same context; row sets are unaffected.",
     ] = False
-    enable_vestigekv_affine_page_table: A[
-        bool,
-        "VestigeKV: assert that a request's page table is one contiguous run, so a "
-        "fenced lane computes its row ids as base + offset instead of loading them. "
-        "The address is then affine in the loop variable and the decode kernel gets "
-        "its own async-copy pipeline (measured: 8 LDGSTS against 4). This is an "
-        "assertion, not a check -- SGLANG_DEBUG_VESTIGEKV_STATS reports "
-        "pagetable_affine, which must read 1.0 for the allocator in use, and a "
-        "fragmented table would silently attend the wrong rows. Requires "
-        "--enable-vestigekv-tier-decode.",
-    ] = False
-    enable_vestigekv_tier_decode: A[
-        bool,
-        "VestigeKV: let the decode kernel read a lane's rows from the kept table "
-        "and the fetch buffer directly, instead of from a CSR packed for it each "
-        "step. A fenced lane reads its page table, so the overflow path is "
-        "unchanged; what goes away is copying every lane's rows into one array "
-        "on every step, which is what arming the fence costs (measured: 1.169x "
-        "against 1.288x with the fence compiled out, at 256k). Same row sets, so "
-        "outputs stay bitwise identical.",
-    ] = False
 
 
 class ExecMamba(msgspec.Struct):
