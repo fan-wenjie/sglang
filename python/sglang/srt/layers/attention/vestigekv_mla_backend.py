@@ -249,6 +249,12 @@ class VestigeKVMLABackend(AttentionBackend):
         # The dedup token for "steps": see _decode_prologue.
         self._last_step_tok = None
         self._pcal: dict = {}  # prefill calibration queries per (slot, lid)
+        # Omitted-mass arm (SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND): per layer,
+        # [max_reqs, H] log of the softmax mass the scan skipped and
+        # [max_reqs, kv] the archive mean it is carried at.
+        self._omit_blend = envs.SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND.get()
+        self._logm: dict = {}
+        self._archmu: dict = {}
         self._mem_dir = envs.SGLANG_DEBUG_VESTIGEKV_MEM_DIR.get()
         self._mem_reqs = 0  # requests seen at their first prefill chunk (mem trace)
         if self._mem_dir is not None:
@@ -1932,6 +1938,54 @@ class VestigeKVMLABackend(AttentionBackend):
         self._ovf_count_stack[self._li_map[lid]] += (
             self._fetch_ovf[lid].gather(0, slots).sum(dtype=torch.int32)
         )
+        if self._omit_blend:
+            self._fill_omitted_mass(lid, forward_batch, reqs, real, slots)
+
+    def _fill_omitted_mass(self, lid, forward_batch, reqs, real, slots):
+        """This step's omitted softmax mass and its compensator, per lane.
+
+        A research arm, not the serving path: it materialises the [H, archive]
+        score matrix that query_fixed exists to avoid, once per lane per layer
+        per step. What it buys is the one term every other measurement here
+        conditioned away -- the scan attends ~6% of rows and captures ~57% of
+        the dense softmax mass, so the retained weights are inflated by Z/Zv
+        and the output is a convex combination over the wrong denominator.
+
+        A fenced lane attends its full row set, so it has no omitted mass and
+        is handed -inf; the flag lives on the device, so the choice is a
+        `where`, not a readback. The centroid is per HEAD, not per lane: the
+        weights are the head's own scores, and the arithmetic mean that is not
+        leaves the offline output error at 0.367 against 0.195.
+        """
+        qb = self._qbuf.get(lid)
+        if qb is None:
+            return
+        H = qb.shape[1]
+        if lid not in self._logm:
+            self._logm[lid] = qb.new_full((qb.shape[0], H), float("-inf"),
+                                          dtype=torch.float32)
+            self._archmu[lid] = qb.new_zeros((qb.shape[0], H, D.KV_LORA_RANK),
+                                             dtype=torch.float32)
+        lm, mu = self._logm[lid], self._archmu[lid]
+        for i in range(real):
+            slot = reqs[i]
+            st = self._recall.get((slot, lid))
+            tier = None if st is None else st["tier"]
+            if tier is None:
+                lm[slot].fill_(float("-inf"))
+                continue
+            lg, ct = tier.omitted_mass_and_mean(qb[slot])
+            lm[slot].copy_(lg)
+            mu[slot].copy_(ct)
+        fenced = self._fetch_ovf[lid].index_select(0, slots) != 0
+        lm.index_copy_(
+            0,
+            slots,
+            torch.where(fenced[:, None], torch.full_like(lm[:real], float("-inf")),
+                        lm.index_select(0, slots)),
+        )
+        if self._router is not None:
+            self._router.blend[lid] = (lm, mu, slots)
 
     def _seq_lens_host(self, forward_batch):
         """Host-side seq_lens without a device readback. The scheduler ships

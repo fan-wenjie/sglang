@@ -656,6 +656,89 @@ class RecallTier:
         out_ovf[slot] = total > W
 
     @torch.inference_mode()
+    def omitted_mass_and_mean(self, qe: torch.Tensor):
+        """The softmax mass this step's scan does NOT attend, and its centroid.
+
+        Returns (logM [H], mu [H, kv_lora_rank]). The scan attends kept +
+        fired, and fired is the UNION over heads -- a row one head fires is
+        read by all of them -- so a head's omitted set is the archive minus
+        that union. Their true scores are unknown; what the scan has is the
+        certified upper bound idxs + zp*cert, the same quantity it compares
+        against the threshold, so the mass is overestimated rather than
+        guessed.
+
+        Why the centroid is mass-weighted and not the plain archive mean:
+        blending the output toward a synthetic row is one exact step of the
+        online-softmax recurrence
+
+            O_n = lerp(O_{n-1}, v_n, sigmoid(s_n - lse_{n-1}))
+
+        and that step is exact only when the synthetic row carries the
+        omitted set's mass-weighted centroid. Measured offline on the Kimi
+        dumps, the arithmetic mean leaves the attention-output error at 0.367
+        against 0.195 for the weighted one (0.471 uncompensated).
+
+        Chunked over the archive: the unchunked form materialises an [H, A]
+        score matrix and an [A, 512] value selection, 123 MB of fp32 at 64k,
+        against the peak footprint that decides whether a long request fits.
+        Shifted by max1 per head, which is what the bound is compared against,
+        so the exponentials cannot overflow.
+
+        A research arm (SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND), not the serving
+        path: it touches every archived row's value, which costs about six
+        times the attention over the kept set. What it buys is the one term
+        every other measurement here conditioned away.
+        """
+        sc_ = self.scale
+        qe = qe.float()
+        H = qe.shape[0]
+        kv = D.KV_LORA_RANK
+        ninf = qe.new_full((H,), float("-inf"))
+        if self.arch is None or self.arch.numel() == 0:
+            return ninf, qe.new_zeros((H, kv))
+        if self.kept_slots.shape[0] == 0:
+            max1 = ninf
+            gate = qe.new_ones(H, dtype=torch.bool)
+            emarg = 0.0
+        else:
+            skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
+            max1 = self._thr_base(skept, skept.max(-1).values)
+            emarg = self._ent_margin(skept)
+            p1 = torch.softmax(skept, -1)
+            ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
+            gate = ent > self.thr_g
+        if not torch.isfinite(max1).all():
+            return ninf, qe.new_zeros((H, kv))
+        thr = max1 - self.margin - emarg
+        qsk = qe[:, :kv] @ self.V.T
+        qres = (qe[:, :kv] - qsk @ self.V).norm(dim=-1)
+        qside = qe[:, kv:].to(torch.bfloat16)
+        qskh = qsk.half()
+        denom = (kv - self.r) ** 0.5
+        rows = self.arch.to(torch.int64)
+        side_a, csk_a, rho_a = self.side, self.csk, self.rho
+        acc_w = qe.new_zeros((H,))
+        acc_v = qe.new_zeros((H, kv))
+        for i in range(0, rows.numel(), 8192):
+            sl = slice(i, i + 8192)
+            idxs = (
+                (qside @ side_a[sl].T).float() + (qskh @ csk_a[sl].T).float()
+            ) * sc_
+            cert = (qres[:, None] * rho_a[sl][None, :]) * sc_ / denom
+            score = idxs + self.zp * cert
+            fired = (score > thr[:, None]) & gate[:, None]
+            om = ~fired.any(0)  # the union is what the fetch buffer holds
+            if not bool(om.any()):
+                continue
+            w = (score[:, om] - max1[:, None]).exp()
+            acc_w += w.sum(-1)
+            vals = self._kbuf.index_select(0, rows[sl][om])[:, :kv].float()
+            acc_v += w @ vals
+        safe = acc_w.clamp_min(D.ENTROPY_EPS)
+        logm = torch.where(acc_w > 0, acc_w.log() + max1, ninf)
+        return logm, acc_v / safe[:, None]
+
+    @torch.inference_mode()
     @ieee_fp32
     def query(self, qe: torch.Tensor) -> torch.Tensor:
         """qe: [H, 576] one decode step's expanded queries (float).
