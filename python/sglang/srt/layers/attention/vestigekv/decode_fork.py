@@ -45,6 +45,206 @@ SRC_TIERS = tl.constexpr(1)  # kept table then fetch buffer, or the page table w
 
 
 @triton.jit
+def _vk_row_loop(
+    acc,
+    e_sum,
+    e_max,
+    split_kv_start,
+    split_kv_end,
+    sm_scale_withk,
+    logit_cap,
+    xai_temperature_len,
+    base_offs_k,
+    K_Buffer,
+    q_k,
+    qpe,
+    xai_temperature_reg,
+    cur_batch,
+    Aux0,
+    aux0_stride_t,
+    aux0_stride_h,
+    aux0_len,
+    vk_nk,
+    vk_last,
+    stride_buf_kbs,
+    base_offs_kpe,
+    cur_batch_seq_len,
+    cur_head,
+    mask_h,
+    base_offs_v,
+    V_Buffer,
+    kv_indices,
+    cur_batch_kv_start_idx,
+    vk_kept_buf,
+    vk_fetch_buf,
+    vk_r2t,
+    vk_fenced,
+    vk_loc,
+    vk_base,
+    stride_buf_kpage,
+    stride_buf_ktok,
+    mask_d,
+    stride_buf_vbs,
+    vk_slot,
+    mask_dpe,
+    stride_buf_vpage,
+    stride_buf_vtok,
+    mask_dv,
+    BLOCK_N: tl.constexpr,
+    IS_GFX1250: tl.constexpr,
+    HAS_MLA: tl.constexpr,
+    ROW_SRC: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    SCORE_MOD: tl.constexpr,
+    VK_CAP: tl.constexpr,
+    VK_FW: tl.constexpr,
+    VK_R2T: tl.constexpr,
+    AFFINE: tl.constexpr,
+):
+    """One pass over a lane's rows. AFFINE picks where a row id comes from and is
+    the only difference between the two arms; the attention math below it is the
+    same, so it is written once and Triton inlines a specialized copy per call
+    site. The SASS is unchanged against the two hand-duplicated loops."""
+    for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        if AFFINE:
+            # AFFINE: the page table of this request is one contiguous run, so a
+            # fenced row id is base + offs_n and the K address is affine in the
+            # loop variable. Written as its own loop because a predicated-off
+            # indirect load would still stop the pipeliner (see the engine rule
+            # disassemble-check-for-spills.md).
+            kv_loc = (vk_base + offs_n).to(tl.int64)
+        else:
+            if ROW_SRC == SRC_CSR:
+                kv_loc = tl.load(
+                    kv_indices + cur_batch_kv_start_idx + offs_n,
+                    mask=offs_n < split_kv_end,
+                    other=0,
+                )
+            else:
+                # One straight-line row read for both arms. Written as a branch,
+                # the fenced and unfenced definitions of kv_loc each carried their
+                # own downstream address tensor through the loop and the allocator
+                # spilled (255 regs, 40B stack, against 200 and none unfenced);
+                # selecting the value instead of the path keeps one definition.
+                # The masked-off load of the arm that does not apply is predicated
+                # away, and vk_last/vk_loc are loop invariants hoisted above.
+                live = offs_n < split_kv_end
+                kept = tl.load(
+                    vk_kept_buf + vk_slot * VK_CAP + offs_n,
+                    mask=live & (offs_n < vk_nk) & (not vk_fenced),
+                    other=0,
+                )
+                fired = tl.load(
+                    vk_fetch_buf + vk_slot * VK_FW + (offs_n - vk_nk),
+                    mask=live & (offs_n >= vk_nk) & (not vk_fenced),
+                    other=0,
+                )
+                rid = tl.load(
+                    vk_r2t + vk_slot * VK_R2T + offs_n, mask=live & vk_fenced, other=0
+                )
+                tier = tl.where(offs_n < vk_nk, kept, fired)
+                fenced_row = tl.where(offs_n == vk_last, vk_loc.to(rid.dtype), rid)
+                kv_loc = tl.where(vk_fenced, fenced_row, tier).to(tl.int64)
+        # Page-aware KV address math (see _fwd_kernel_stage1).
+        if PAGE_SIZE == 1:
+            offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
+        else:
+            page_id = kv_loc // PAGE_SIZE
+            tok_in_p = kv_loc % PAGE_SIZE
+            offs_buf_k = (
+                page_id[None, :] * stride_buf_kpage
+                + tok_in_p[None, :] * stride_buf_ktok
+                + base_offs_k
+            )
+        k = tl.load(
+            K_Buffer + offs_buf_k,
+            mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+            other=0.0,
+        )
+        if IS_GFX1250:
+            qk = tl.dot(q_k, k.to(q_k.dtype))
+        else:
+            qk = tl.dot(q_k, k)
+        if BLOCK_DPE > 0:
+            if PAGE_SIZE == 1:
+                offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+            else:
+                offs_buf_kpe = (
+                    page_id[None, :] * stride_buf_kpage
+                    + tok_in_p[None, :] * stride_buf_ktok
+                    + base_offs_kpe
+                )
+            kpe = tl.load(
+                K_Buffer + offs_buf_kpe,
+                mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                other=0.0,
+            )
+            qk += tl.dot(qpe, kpe.to(qpe.dtype))
+        qk *= sm_scale_withk
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
+        if xai_temperature_len > 0:
+            qk *= xai_temperature_reg[:, None]
+
+        if SCORE_MOD is not None:
+            qk = SCORE_MOD(
+                qk,
+                cur_batch_seq_len - 1,
+                offs_n[None, :],
+                cur_batch,
+                cur_head[:, None],
+                mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                Aux0,
+                aux0_stride_t,
+                aux0_stride_h,
+                aux0_len,
+            )
+
+        qk = tl.where(
+            mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
+        )
+        if HAS_MLA:
+            v = tl.trans(k)
+        else:
+            if PAGE_SIZE == 1:
+                offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+            else:
+                offs_buf_v = (
+                    page_id[:, None] * stride_buf_vpage
+                    + tok_in_p[:, None] * stride_buf_vtok
+                    + base_offs_v
+                )
+            v = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                other=0.0,
+            )
+
+        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        acc *= re_scale[:, None]
+        # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
+        # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
+        # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
+        # attention idealized). On other platforms restore the p.to(v.dtype) cast.
+        # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+        if IS_GFX1250:
+            acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+        else:
+            acc += tl.dot(p.to(v.dtype), v)
+
+        e_sum = e_sum * re_scale + tl.sum(p, 1)
+        e_max = n_e_max
+
+    return acc, e_sum, e_max
+
+
+@triton.jit
 def _vk_fwd_grouped_kernel_stage1(
     Q,
     K_Buffer,
@@ -168,6 +368,9 @@ def _vk_fwd_grouped_kernel_stage1(
     else:
         kv_splits = tl.load(num_kv_splits + cur_batch)
 
+    # Always defined: the row loop is a function now and takes it as an argument,
+    # so a conditional definition would not be in scope at the call.
+    xai_temperature_reg = tl.zeros([1], dtype=tl.float32)
     if xai_temperature_len > 0:
         offs_qidx = cur_batch_seq_len - 1
         xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
@@ -195,10 +398,10 @@ def _vk_fwd_grouped_kernel_stage1(
 
     # Hoist loop-invariant base offsets
     base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
-    if BLOCK_DPE > 0:
-        base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe[:, None]
-    if not HAS_MLA:
-        base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
+    # Both always defined: the row loop takes them as arguments now, so a
+    # definition under a constexpr guard would not be in scope at the call.
+    base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe[:, None]
+    base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
@@ -218,236 +421,121 @@ def _vk_fwd_grouped_kernel_stage1(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
             )
         if vk_affine and vk_fenced:
-            for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
-                offs_n = start_n + tl.arange(0, BLOCK_N)
-                # AFFINE: the page table of this request is one contiguous run, so a
-                # fenced row id is base + offs_n and the K address is affine in the
-                # loop variable. Written as its own loop because a predicated-off
-                # indirect load would still stop the pipeliner (see the engine rule
-                # disassemble-check-for-spills.md).
-                kv_loc = (vk_base + offs_n).to(tl.int64)
-                # Page-aware KV address math (see _fwd_kernel_stage1).
-                if PAGE_SIZE == 1:
-                    offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
-                else:
-                    page_id = kv_loc // PAGE_SIZE
-                    tok_in_p = kv_loc % PAGE_SIZE
-                    offs_buf_k = (
-                        page_id[None, :] * stride_buf_kpage
-                        + tok_in_p[None, :] * stride_buf_ktok
-                        + base_offs_k
-                    )
-                k = tl.load(
-                    K_Buffer + offs_buf_k,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                    other=0.0,
-                )
-                if IS_GFX1250:
-                    qk = tl.dot(q_k, k.to(q_k.dtype))
-                else:
-                    qk = tl.dot(q_k, k)
-                if BLOCK_DPE > 0:
-                    if PAGE_SIZE == 1:
-                        offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
-                    else:
-                        offs_buf_kpe = (
-                            page_id[None, :] * stride_buf_kpage
-                            + tok_in_p[None, :] * stride_buf_ktok
-                            + base_offs_kpe
-                        )
-                    kpe = tl.load(
-                        K_Buffer + offs_buf_kpe,
-                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
-                        other=0.0,
-                    )
-                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
-                qk *= sm_scale_withk
-
-                if logit_cap > 0:
-                    qk = logit_cap * tanh(qk / logit_cap)
-
-                if xai_temperature_len > 0:
-                    qk *= xai_temperature_reg[:, None]
-
-                if SCORE_MOD is not None:
-                    qk = SCORE_MOD(
-                        qk,
-                        cur_batch_seq_len - 1,
-                        offs_n[None, :],
-                        cur_batch,
-                        cur_head[:, None],
-                        mask_h[:, None] & (offs_n[None, :] < split_kv_end),
-                        Aux0,
-                        aux0_stride_t,
-                        aux0_stride_h,
-                        aux0_len,
-                    )
-
-                qk = tl.where(
-                    mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
-                )
-                if HAS_MLA:
-                    v = tl.trans(k)
-                else:
-                    if PAGE_SIZE == 1:
-                        offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
-                    else:
-                        offs_buf_v = (
-                            page_id[:, None] * stride_buf_vpage
-                            + tok_in_p[:, None] * stride_buf_vtok
-                            + base_offs_v
-                        )
-                    v = tl.load(
-                        V_Buffer + offs_buf_v,
-                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                        other=0.0,
-                    )
-
-                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-                re_scale = tl.exp(e_max - n_e_max)
-                p = tl.exp(qk - n_e_max[:, None])
-                acc *= re_scale[:, None]
-                # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
-                # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
-                # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
-                # attention idealized). On other platforms restore the p.to(v.dtype) cast.
-                # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
-                if IS_GFX1250:
-                    acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
-                else:
-                    acc += tl.dot(p.to(v.dtype), v)
-
-                e_sum = e_sum * re_scale + tl.sum(p, 1)
-                e_max = n_e_max
-
+            acc, e_sum, e_max = _vk_row_loop(
+                acc,
+                e_sum,
+                e_max,
+                split_kv_start,
+                split_kv_end,
+                sm_scale_withk,
+                logit_cap,
+                xai_temperature_len,
+                base_offs_k,
+                K_Buffer,
+                q_k,
+                qpe,
+                xai_temperature_reg,
+                cur_batch,
+                Aux0,
+                aux0_stride_t,
+                aux0_stride_h,
+                aux0_len,
+                vk_nk,
+                vk_last,
+                stride_buf_kbs,
+                base_offs_kpe,
+                cur_batch_seq_len,
+                cur_head,
+                mask_h,
+                base_offs_v,
+                V_Buffer,
+                kv_indices,
+                cur_batch_kv_start_idx,
+                vk_kept_buf,
+                vk_fetch_buf,
+                vk_r2t,
+                vk_fenced,
+                vk_loc,
+                vk_base,
+                stride_buf_kpage,
+                stride_buf_ktok,
+                mask_d,
+                stride_buf_vbs,
+                vk_slot,
+                mask_dpe,
+                stride_buf_vpage,
+                stride_buf_vtok,
+                mask_dv,
+                BLOCK_N=BLOCK_N,
+                IS_GFX1250=IS_GFX1250,
+                HAS_MLA=HAS_MLA,
+                ROW_SRC=ROW_SRC,
+                PAGE_SIZE=PAGE_SIZE,
+                BLOCK_DPE=BLOCK_DPE,
+                SCORE_MOD=SCORE_MOD,
+                VK_CAP=VK_CAP,
+                VK_FW=VK_FW,
+                VK_R2T=VK_R2T,
+                AFFINE=True,
+            )
         else:
-            for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
-                offs_n = start_n + tl.arange(0, BLOCK_N)
-                if ROW_SRC == SRC_CSR:
-                    kv_loc = tl.load(
-                        kv_indices + cur_batch_kv_start_idx + offs_n,
-                        mask=offs_n < split_kv_end,
-                        other=0,
-                    )
-                else:
-                    # One straight-line row read for both arms. Written as a branch,
-                    # the fenced and unfenced definitions of kv_loc each carried their
-                    # own downstream address tensor through the loop and the allocator
-                    # spilled (255 regs, 40B stack, against 200 and none unfenced);
-                    # selecting the value instead of the path keeps one definition.
-                    # The masked-off load of the arm that does not apply is predicated
-                    # away, and vk_last/vk_loc are loop invariants hoisted above.
-                    live = offs_n < split_kv_end
-                    kept = tl.load(
-                        vk_kept_buf + vk_slot * VK_CAP + offs_n,
-                        mask=live & (offs_n < vk_nk) & (not vk_fenced),
-                        other=0,
-                    )
-                    fired = tl.load(
-                        vk_fetch_buf + vk_slot * VK_FW + (offs_n - vk_nk),
-                        mask=live & (offs_n >= vk_nk) & (not vk_fenced),
-                        other=0,
-                    )
-                    rid = tl.load(
-                        vk_r2t + vk_slot * VK_R2T + offs_n, mask=live & vk_fenced, other=0
-                    )
-                    tier = tl.where(offs_n < vk_nk, kept, fired)
-                    fenced_row = tl.where(offs_n == vk_last, vk_loc.to(rid.dtype), rid)
-                    kv_loc = tl.where(vk_fenced, fenced_row, tier).to(tl.int64)
-                # Page-aware KV address math (see _fwd_kernel_stage1).
-                if PAGE_SIZE == 1:
-                    offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
-                else:
-                    page_id = kv_loc // PAGE_SIZE
-                    tok_in_p = kv_loc % PAGE_SIZE
-                    offs_buf_k = (
-                        page_id[None, :] * stride_buf_kpage
-                        + tok_in_p[None, :] * stride_buf_ktok
-                        + base_offs_k
-                    )
-                k = tl.load(
-                    K_Buffer + offs_buf_k,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                    other=0.0,
-                )
-                if IS_GFX1250:
-                    qk = tl.dot(q_k, k.to(q_k.dtype))
-                else:
-                    qk = tl.dot(q_k, k)
-                if BLOCK_DPE > 0:
-                    if PAGE_SIZE == 1:
-                        offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
-                    else:
-                        offs_buf_kpe = (
-                            page_id[None, :] * stride_buf_kpage
-                            + tok_in_p[None, :] * stride_buf_ktok
-                            + base_offs_kpe
-                        )
-                    kpe = tl.load(
-                        K_Buffer + offs_buf_kpe,
-                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
-                        other=0.0,
-                    )
-                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
-                qk *= sm_scale_withk
-
-                if logit_cap > 0:
-                    qk = logit_cap * tanh(qk / logit_cap)
-
-                if xai_temperature_len > 0:
-                    qk *= xai_temperature_reg[:, None]
-
-                if SCORE_MOD is not None:
-                    qk = SCORE_MOD(
-                        qk,
-                        cur_batch_seq_len - 1,
-                        offs_n[None, :],
-                        cur_batch,
-                        cur_head[:, None],
-                        mask_h[:, None] & (offs_n[None, :] < split_kv_end),
-                        Aux0,
-                        aux0_stride_t,
-                        aux0_stride_h,
-                        aux0_len,
-                    )
-
-                qk = tl.where(
-                    mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
-                )
-                if HAS_MLA:
-                    v = tl.trans(k)
-                else:
-                    if PAGE_SIZE == 1:
-                        offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
-                    else:
-                        offs_buf_v = (
-                            page_id[:, None] * stride_buf_vpage
-                            + tok_in_p[:, None] * stride_buf_vtok
-                            + base_offs_v
-                        )
-                    v = tl.load(
-                        V_Buffer + offs_buf_v,
-                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                        other=0.0,
-                    )
-
-                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-                re_scale = tl.exp(e_max - n_e_max)
-                p = tl.exp(qk - n_e_max[:, None])
-                acc *= re_scale[:, None]
-                # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
-                # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
-                # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
-                # attention idealized). On other platforms restore the p.to(v.dtype) cast.
-                # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
-                if IS_GFX1250:
-                    acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
-                else:
-                    acc += tl.dot(p.to(v.dtype), v)
-
-                e_sum = e_sum * re_scale + tl.sum(p, 1)
-                e_max = n_e_max
-
+            acc, e_sum, e_max = _vk_row_loop(
+                acc,
+                e_sum,
+                e_max,
+                split_kv_start,
+                split_kv_end,
+                sm_scale_withk,
+                logit_cap,
+                xai_temperature_len,
+                base_offs_k,
+                K_Buffer,
+                q_k,
+                qpe,
+                xai_temperature_reg,
+                cur_batch,
+                Aux0,
+                aux0_stride_t,
+                aux0_stride_h,
+                aux0_len,
+                vk_nk,
+                vk_last,
+                stride_buf_kbs,
+                base_offs_kpe,
+                cur_batch_seq_len,
+                cur_head,
+                mask_h,
+                base_offs_v,
+                V_Buffer,
+                kv_indices,
+                cur_batch_kv_start_idx,
+                vk_kept_buf,
+                vk_fetch_buf,
+                vk_r2t,
+                vk_fenced,
+                vk_loc,
+                vk_base,
+                stride_buf_kpage,
+                stride_buf_ktok,
+                mask_d,
+                stride_buf_vbs,
+                vk_slot,
+                mask_dpe,
+                stride_buf_vpage,
+                stride_buf_vtok,
+                mask_dv,
+                BLOCK_N=BLOCK_N,
+                IS_GFX1250=IS_GFX1250,
+                HAS_MLA=HAS_MLA,
+                ROW_SRC=ROW_SRC,
+                PAGE_SIZE=PAGE_SIZE,
+                BLOCK_DPE=BLOCK_DPE,
+                SCORE_MOD=SCORE_MOD,
+                VK_CAP=VK_CAP,
+                VK_FW=VK_FW,
+                VK_R2T=VK_R2T,
+                AFFINE=False,
+            )
         offs_mid_o = (
             cur_batch * stride_mid_ob
             + cur_head[:, None] * stride_mid_oh
