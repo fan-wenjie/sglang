@@ -283,3 +283,9 @@ def ieee_fp32(fn):
     wrapped.__name__ = fn.__name__
     wrapped.__doc__ = fn.__doc__
     return wrapped
+
+PAGETABLE_PROBE_EVERY = 512
+"""Decode steps between two samples of the page table's affinity
+(_probe_page_table, stats only). The probe reads req_to_token[slot, :seq],
+which is the one O(context) host-queued op in the instrument, so it is sampled
+rather than run every step; 512 gives ~500 samples over a 256k stream."""

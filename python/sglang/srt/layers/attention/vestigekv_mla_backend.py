@@ -123,6 +123,7 @@ class VestigeKVMLABackend(AttentionBackend):
     _mem_reqs = 0
     _fetch_hist = None
     _stat_acc = None
+    _pt_acc = None  # (consecutive pairs, pairs) of the page table; see _probe_page_table
     _router = None  # TierDecodeRouter when config.tier_decode, else the CSR path
     # The flag defaults, for __new__-constructed fakes; a registered test pins
     # them to the ExecKernel field defaults.
@@ -805,8 +806,31 @@ class VestigeKVMLABackend(AttentionBackend):
                     self._fetch_hist += torch.bincount(
                         fetched.clamp_(0, self._fetch_w), minlength=self._fetch_w + 1
                     )
+        if st["steps"] % D.PAGETABLE_PROBE_EVERY == 0:
+            self._probe_page_table(slots, forward_batch.seq_lens[:real])
         if st["steps"] % 50 == 0:
             self._dump_stats()
+
+    def _probe_page_table(self, slots, seq_lens):
+        """How affine is a request's page table?
+
+        A fenced lane reads its row ids out of req_to_token, one dependent load
+        per block, and an indirect load is not affine so the pipeliner emits no
+        cp.async for it. If the ids are consecutive the address is affine in
+        offs_n and the load disappears -- but whether they are is a property of
+        the allocator at run time, so it is measured rather than assumed.
+        Accumulates (consecutive pairs, pairs) on the device; no readback here.
+        """
+        r2t = self.req_to_token_pool.req_to_token
+        n = int(seq_lens.max()) if seq_lens.numel() else 0
+        if n < 2:
+            return
+        rows = r2t[slots, :n].to(torch.int64)
+        live = torch.arange(n - 1, device=rows.device)[None, :] < (seq_lens[:, None] - 1)
+        step1 = ((rows[:, 1:] - rows[:, :-1]) == 1) & live
+        if self._pt_acc is None:
+            self._pt_acc = torch.zeros(2, dtype=torch.int64, device=rows.device)
+        self._pt_acc += torch.stack([step1.sum(), live.sum()])
 
     def _dump_stats(self):
         import logging
@@ -825,7 +849,7 @@ class VestigeKVMLABackend(AttentionBackend):
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
             "pack=%.2fms/step "
             "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
-            "attended_frac=%.4f",
+            "attended_frac=%.4f pagetable_affine=%s",
             st["steps"],
             len(self._mla_lids),
             100.0 * st["replays"] / n,
@@ -851,6 +875,8 @@ class VestigeKVMLABackend(AttentionBackend):
             st["kept"] / c,
             st["seq"] / c,
             (st["fetched"] + st["kept"]) / max(st["seq"], 1),
+            "n/a" if self._pt_acc is None
+            else f"{(lambda c, t: c / max(t, 1))(*self._pt_acc.tolist()):.4f}",
         )
 
     def _overflow_total(self) -> int:
