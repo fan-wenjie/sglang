@@ -119,18 +119,22 @@ def _blend_omitted_mass(o, attn_lse, num_kv_splits, logm_buf, mu_buf, slots):
         attn_lse[:n].float().masked_fill(~live, float("-inf")), dim=-1
     )  # [n, H]
     sigma = torch.sigmoid(lse - logm)[..., None]  # [n, H, 1]
-    if _BLEND_SEEN[0] == 1:
-        # One reading of sigma, which separates the two ways this arm can be
-        # wrong. Offline says the attended set holds ~57% of the mass, so a
-        # correct implementation sits near 0.5-0.6. A sigma near 0 means logM
-        # is being compared against an lse on a different scale and the output
-        # is being swamped by the centroid -- an implementation fault, not a
-        # verdict on the idea.
-        _BLEND_SEEN[0] = 2
+    _BLEND_SEEN[0] += 1
+    if _BLEND_SEEN[0] % 500 == 1:
+        # Sampled periodically, not once: the FIRST call happens before any
+        # block has closed, so there is no archive, logM is -inf and sigma is
+        # exactly 1. A single reading there says nothing and is what made the
+        # first attempt at this diagnostic useless. Offline the attended set
+        # holds ~57% of the mass, so a correct implementation settles near
+        # 0.5-0.6 once an archive exists; a sigma near 0 means logM is being
+        # compared against an lse on a different scale and the output is being
+        # swamped by the centroid -- an implementation fault, not a verdict on
+        # the idea.
         f = sigma.flatten().float()
         logging.getLogger(__name__).info(
-            "VKBLEND sigma: min %.4f p50 %.4f max %.4f over %d (q, head)",
-            float(f.min()), float(f.median()), float(f.max()), f.numel(),
+            "VKBLEND sigma @call %d: min %.4f p50 %.4f max %.4f over %d (q, head)",
+            _BLEND_SEEN[0], float(f.min()), float(f.median()), float(f.max()),
+            f.numel(),
         )
     view = o.view(-1, H, o.shape[-1])[:n]
     view.copy_(view.float() * sigma + mu.float() * (1.0 - sigma))
