@@ -366,6 +366,20 @@ class ExecKernel(msgspec.Struct):
         "then serves that step from the full row set. 0 disables the trigger; "
         "0.05 is the measured-regime starting point.",
     ] = 0.0
+    vestigekv_multikey_fence_rows: A[
+        int,
+        "VestigeKV: rows fired above which a lane attends its FULL row set "
+        "instead of ranking. The scan's fired-row count rises monotonically "
+        "with how many archived rows a query actually needs (median 0, 1, 2, 4, "
+        "13 for 0, 1, 2, 3, 4+ such rows on the Kimi dumps), so it is a free "
+        "detector for the multi-key case the certificate is weakest on -- and "
+        "the fence is the one response that is exactly right there, because a "
+        "fenced lane IS dense. 0 keeps the historical behaviour, where only the "
+        "fetch buffer overflowing fences. Costs fallback: at 1 it catches every "
+        "lane needing two or more archived rows and fences 30% of RULER's lanes, "
+        "which is about what RULER already pays; a long decode pays far more, "
+        "so this is a short-answer knob.",
+    ] = 0
     vestigekv_entropy_margin_gain: A[
         float,
         "VestigeKV: extra recall margin per nat of kept-distribution flatness, "

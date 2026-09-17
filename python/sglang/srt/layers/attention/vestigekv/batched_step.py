@@ -197,10 +197,12 @@ class BatchedScanPack:
         self, pairs, tiers, qbuf, fetch_buf, fetch_len, fetch_ovf, ovf_count, q_heads,
         margin=0.0,
         ent_gain=0.0,
+        fence_rows=0,
         thr_lse=False,
     ):
         self.margin = margin  # scan threshold = base - margin, every pair
         self.ent_gain = ent_gain
+        self.fence_rows = fence_rows
         self.thr_lse = thr_lse  # base = kept log-sum-exp instead of the kept max
         # pairs: list of (lid, slot); tiers: matching RecallTier list.
         # fetch_buf/fetch_len/fetch_ovf are the backend's stacked fixed-address
@@ -299,6 +301,7 @@ class BatchedScanPack:
         csk_from_tier=False,
         margin=0.0,
         ent_gain=0.0,
+        fence_rows=0,
         thr_lse=False,
     ):
         """An empty pack sized for the worst case, for the in-graph scan.
@@ -313,6 +316,7 @@ class BatchedScanPack:
         dev = qbuf.device
         self.margin = margin
         self.ent_gain = ent_gain
+        self.fence_rows = fence_rows
         self.thr_lse = thr_lse
         self.q_heads = q_heads
         self._pad_slot = pad_slot
@@ -687,4 +691,5 @@ class BatchedScanPack:
             self.ovf_count,
             (self.c_counts, self.c_offsets, self.c_total),
             self.am_grid,
+            fence_rows=self.fence_rows,
         )

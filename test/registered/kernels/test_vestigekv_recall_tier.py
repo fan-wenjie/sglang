@@ -319,3 +319,45 @@ class TestOmittedMass(CustomTestCase):
             f"{float(torch.logsumexp(arch_true, -1).median()):.2f}, "
             f"omitted rows {int(om.sum())} of {int(om.numel())}",
         )
+
+
+class TestMultiKeyFence(CustomTestCase):
+    """A lowered fence must actually raise the flag, not just be configured.
+
+    The fence is the retreat position for multi-key: the certificate is
+    weakest where a query needs SEVERAL archived rows, and a fenced lane
+    attends its full row set, which is exactly dense. The fired-row count is
+    the detector, free because the scan already produces it -- median 0, 1, 2,
+    4, 13 rows for queries needing 0, 1, 2, 3, 4+ archived rows.
+    """
+
+    def _fire(self, t, q, fence):
+        W = 4096
+        out = torch.zeros(1, W, dtype=torch.int32, device="cuda")
+        ln = torch.zeros(1, dtype=torch.int32, device="cuda")
+        ovf = torch.zeros(1, dtype=torch.int32, device="cuda")
+        t.fence_rows = fence
+        t.query_fixed(q, out, ln, ovf, 0)
+        return int(ln[0]), int(ovf[0])
+
+    def test_the_flag_follows_the_fence_not_only_the_buffer(self):
+        t, kbuf, slots, keep, D = _mk(4096, 21)
+        g = torch.Generator(device="cuda").manual_seed(9)
+        q = torch.randn(H, 576, device="cuda", generator=g)
+        n0, ovf0 = self._fire(t, q, 0)
+        self.assertEqual(ovf0, 0, "a short fire must not overflow a 4096 buffer")
+        # fence one below what this query fires: the lane must fence
+        if n0 >= 1:
+            n1, ovf1 = self._fire(t, q, max(n0 - 1, 0))
+            self.assertEqual(n1, n0, "the fence changes the FLAG, not the rows kept")
+            self.assertEqual(ovf1, 1, f"fired {n0} rows against a fence of {n0 - 1}")
+        # a fence above the fire leaves it alone
+        n2, ovf2 = self._fire(t, q, n0 + 8)
+        self.assertEqual(ovf2, 0)
+        self.assertEqual(n2, n0)
+
+    def test_fence_zero_is_the_historical_behaviour(self):
+        t, kbuf, slots, keep, D = _mk(4096, 22)
+        g = torch.Generator(device="cuda").manual_seed(10)
+        q = torch.randn(H, 576, device="cuda", generator=g)
+        self.assertEqual(self._fire(t, q, 0)[1], 0)

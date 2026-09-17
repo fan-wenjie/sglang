@@ -606,6 +606,13 @@ class Envs:
     # already computes and blends the attention output toward the archive's
     # mean value by that weight. Changes the output; off by default.
     SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND = EnvBool(False)
+
+    # Per-step attribution against dense: writes one record per (step, layer,
+    # lane) to SGLANG_DEBUG_VESTIGEKV_DUMP_DIR saying how much of the dense
+    # softmax mass the attended set holds and whether dense's argmax row is in
+    # it. Computes the dense attention the method exists to avoid, so it is
+    # far slower than serving; debug only.
+    SGLANG_DEBUG_VESTIGEKV_STEPDUMP = EnvBool(False)
     # Directory for one calibration snapshot per (request slot, layer): the
     # closed-prefix content rows, the tier-1 keep set and the calibration
     # queries the calibrated index was fitted on, written at its install.

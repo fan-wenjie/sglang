@@ -35,6 +35,7 @@ class RecallTier:
         margin: float = 0.0,
         threshold: str = "max",
         ent_gain: float = 0.0,
+        fence_rows: int = 0,
     ):
         self.r = r
         self.recall_target = recall_target
@@ -45,6 +46,9 @@ class RecallTier:
         # prologue applies it inside the kernel; these reference forms have to
         # apply the same one or the equivalence tests compare two thresholds.
         self.ent_gain = ent_gain
+        # Rows fired above which the lane is fenced to its full row set; 0 =
+        # only the buffer overflowing fences. See pre-registration 7.
+        self.fence_rows = fence_rows
         self.built = False
         # live-archive projection caches: None until the first decode-time
         # close backfills them (extend_closed); _pos_all doubles as the fill
@@ -653,7 +657,66 @@ class RecallTier:
         scratch.scatter_(0, dst, self.arch.to(out.dtype))
         out[slot].copy_(scratch[:W])
         out_len[slot] = n
-        out_ovf[slot] = total > W
+        # See compact_fired: the flag's threshold is separate from the buffer
+        # cap, so a multi-key fence can raise it early. A fenced lane attends
+        # its full row set and never reads the buffer, so this is safe.
+        out_ovf[slot] = total > (min(W, self.fence_rows) if self.fence_rows else W)
+
+    @torch.inference_mode()
+    def step_attribution(self, qe: torch.Tensor) -> dict:
+        """Where this step's attention mass actually went, against dense.
+
+        Every offline study so far conditions on the kept set as given and
+        asks only whether an archived row that beats max1 is fired. That
+        question is answered -- held-out recall is 99.9% with no decay in k --
+        and the multi-key accuracy gap survives it, so the next question is
+        the one nothing has asked: of the mass DENSE puts somewhere, how much
+        does VestigeKV attend, and is the row dense leans on even in the
+        attended set?
+
+        Computes the true scores over the whole closed prefix (kept plus
+        archive), which is what makes this a debug-only path: it is the dense
+        attention the method exists to avoid. Returns per-head medians, small
+        enough to keep one record per (step, layer, lane).
+        """
+        sc_ = self.scale
+        qe = qe.float()
+        kv = D.KV_LORA_RANK
+        if self.arch is None or self.arch.numel() == 0:
+            return {}
+        skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
+        max1 = skept.max(-1).values
+        rows = self.arch.to(torch.int64)
+        arch_rows = self._kbuf.index_select(0, rows).float()
+        strue = (qe @ arch_rows.T) * sc_
+        qsk = qe[:, :kv] @ self.V.T
+        qres = (qe[:, :kv] - qsk @ self.V).norm(dim=-1)
+        idxs = (
+            (qe[:, kv:].to(torch.bfloat16) @ self.side.T).float()
+            + (qsk.half() @ self.csk.T).float()
+        ) * sc_
+        cert = (qres[:, None] * self.rho[None, :]) * sc_ / (kv - self.r) ** 0.5
+        fired = ((idxs + self.zp * cert) > (max1 - self.margin)[:, None]).any(0)
+        allsc = torch.cat([skept, strue], dim=-1)
+        m = allsc.max(-1, keepdim=True).values
+        w = (allsc - m).exp()
+        Z = w.sum(-1)
+        att = torch.cat(
+            [torch.ones_like(skept, dtype=torch.bool), fired.expand_as(strue)], -1
+        )
+        pr = w / Z[:, None]
+        ent = -(pr * pr.clamp_min(1e-30).log()).sum(-1)
+        top1 = allsc.argmax(-1)
+        return {
+            "coverage": float(((w * att).sum(-1) / Z).median()),
+            "coverage_min": float(((w * att).sum(-1) / Z).min()),
+            "top1_attended": float(att.gather(1, top1[:, None]).float().mean()),
+            "entropy": float(ent.median()),
+            "n_beat_max1": int((strue > max1[:, None]).sum(1).max()),
+            "n_fired": int(fired.sum()),
+            "n_kept": int(self.kept_slots.shape[0]),
+            "n_arch": int(rows.numel()),
+        }
 
     @torch.inference_mode()
     def omitted_mass_and_mean(self, qe: torch.Tensor):

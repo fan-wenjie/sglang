@@ -147,6 +147,7 @@ class VestigeKVMLABackend(AttentionBackend):
         rebuild_overflow_fraction=0.0,
         attended_splits=False,
         entropy_margin_gain=0.0,
+        multikey_fence_rows=0,
     )
 
     def __init__(
@@ -695,6 +696,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._q_heads,
             margin=self.config.recall_margin,
             ent_gain=self.config.entropy_margin_gain,
+            fence_rows=self.config.multikey_fence_rows,
             thr_lse=self.config.recall_threshold == "lse",
         )
         torch.cuda.synchronize()
@@ -1762,6 +1764,7 @@ class VestigeKVMLABackend(AttentionBackend):
             csk_from_tier=True,
             margin=self.config.recall_margin,
             ent_gain=self.config.entropy_margin_gain,
+            fence_rows=self.config.multikey_fence_rows,
             thr_lse=self.config.recall_threshold == "lse",
         )
 
@@ -2315,6 +2318,7 @@ class VestigeKVMLABackend(AttentionBackend):
             r=self.index_rank,
             margin=self.config.recall_margin,
             ent_gain=self.config.entropy_margin_gain,
+            fence_rows=self.config.multikey_fence_rows,
             threshold=self.config.recall_threshold,
         )
                     stats = tier.build(
@@ -2544,6 +2548,7 @@ class VestigeKVMLABackend(AttentionBackend):
             r=self.index_rank,
             margin=self.config.recall_margin,
             ent_gain=self.config.entropy_margin_gain,
+            fence_rows=self.config.multikey_fence_rows,
             threshold=self.config.recall_threshold,
         )
         stats = tier.build(
