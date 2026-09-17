@@ -676,6 +676,41 @@ class TestStatsTelemetry(CustomTestCase):
         self.assertEqual(be._stats["prologue_calls"], 5)
         self.assertEqual(seen, [100, 101])  # accounting ran once per step
 
+    def test_the_prologue_is_where_per_step_work_must_hang(self):
+        """Per-step work hung off _recall_step never runs in the default config.
+
+        With the in-graph scan on (the default) the decode path is
+        init_forward_metadata_out_graph -> _decode_prologue ->
+        _ingraph_host_step -> return, so _recall_step is not reached at all.
+        The omitted-mass arm hung its fill there and shipped THREE runs whose
+        blend was a silent no-op. _decode_prologue is the one function that
+        runs exactly once per decode step however the step is launched, and
+        this pins that anything per-step goes through it.
+        """
+        from sglang.srt.environ import envs
+
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._stats = dict.fromkeys(
+            ("steps", "scan_calls", "fetched", "kept", "seq", "replays",
+             "prologue_calls"), 0)
+        be._last_step_tok = None
+        be._collecting = False
+        be._omit_blend = True
+        called = []
+        be._step_slots = lambda fb: ([1], "k")
+        be._account_step = lambda fb, reqs: None
+        be._maybe_close_blocks = lambda fb, reqs: None
+        be._fill_omitted_mass = lambda fb, reqs, real, slots: called.append(real)
+        fb = SimpleNamespace(
+            out_cache_loc=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([100, 100], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([100, 100], dtype=torch.int64),
+        )
+        with envs.SGLANG_DEBUG_VESTIGEKV_STATS.override(False):
+            be._decode_prologue(fb)
+        self.assertEqual(called, [2])  # the arm's per-step work actually ran
+
     def test_index_state_buckets_by_the_index_that_served_the_scan(self):
         """A scan is attributed to the state of the index that served it.
 
