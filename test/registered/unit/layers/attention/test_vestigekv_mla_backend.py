@@ -632,6 +632,50 @@ class TestStatsTelemetry(CustomTestCase):
         self.assertEqual(be._stat_acc.tolist(), [13, 60, 300])
         self.assertEqual(be._stats["fetched"], 0)
 
+    def test_a_step_is_counted_once_however_many_times_the_prologue_runs(self):
+        """The prologue is entered more than once per decode step.
+
+        init_forward_metadata reaches it through _eager_decode_step and the
+        graph runner's load_batch reaches it again through
+        init_forward_metadata_out_graph. Counting on entry multiplied steps and
+        scan_calls by that multiplicity and DIVIDED the reported fallback rate
+        by it -- RULER 64k read 0.118 against the once-per-step 0.360, and the
+        two were compared as if they measured the same thing. So: repeated
+        entries at one step count once, the next step counts again, and
+        prologue_calls keeps the raw entry count so the multiplicity stays
+        visible instead of being inferred from a ratio.
+        """
+        from sglang.srt.environ import envs
+
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._stats = dict.fromkeys(
+            ("steps", "scan_calls", "fetched", "kept", "seq", "replays",
+             "prologue_calls"), 0)
+        be._last_step_tok = None
+        be._collecting = False
+        seen = []
+        be._step_slots = lambda fb: ([1], "k")
+        be._account_step = lambda fb, reqs: seen.append(int(fb.seq_lens_cpu.sum()))
+        be._maybe_close_blocks = lambda fb, reqs: None
+
+        def fb_at(total):
+            return SimpleNamespace(
+                out_cache_loc=torch.zeros(1, dtype=torch.int64),
+                req_pool_indices=torch.tensor([1], dtype=torch.int64),
+                seq_lens=torch.tensor([total], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([total], dtype=torch.int64),
+            )
+
+        with envs.SGLANG_DEBUG_VESTIGEKV_STATS.override(True):
+            for _ in range(3):  # one step, entered three times
+                be._decode_prologue(fb_at(100))
+            be._decode_prologue(fb_at(101))  # the next step
+            be._decode_prologue(fb_at(101))
+
+        self.assertEqual(be._stats["steps"], 2)
+        self.assertEqual(be._stats["prologue_calls"], 5)
+        self.assertEqual(seen, [100, 101])  # accounting ran once per step
+
     def test_index_state_buckets_by_the_index_that_served_the_scan(self):
         """A scan is attributed to the state of the index that served it.
 
