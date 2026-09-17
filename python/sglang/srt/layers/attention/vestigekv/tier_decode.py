@@ -16,8 +16,12 @@ carries which one the base is about to compute. A layer this backend does not
 own falls through to the base's own function unchanged.
 """
 
+import logging
+
 import msgspec
 import torch
+
+_BLEND_SEEN = [False]
 
 from sglang.kernels.ops.attention.decode_attention import _decode_softmax_reducev_fwd
 from sglang.srt.layers.attention.vestigekv.decode_fork import (
@@ -91,6 +95,15 @@ def _blend_omitted_mass(o, attn_lse, num_kv_splits, logm_buf, mu_buf, slots):
     entries of each row are written, so the unwritten tail is masked out rather
     than folded into the merge.
     """
+    if not _BLEND_SEEN[0]:
+        # An arm that silently does not run reads exactly like an arm that
+        # ran and changed nothing -- which is how two different compensators
+        # once returned bit-identical answers over 650 questions. This line is
+        # the difference between a null result and a void one.
+        _BLEND_SEEN[0] = True
+        logging.getLogger(__name__).info(
+            "VKBLEND active: omitted-mass blend is in the decode path"
+        )
     bs, H = attn_lse.shape[0], attn_lse.shape[1]
     # Gathered here, not by the caller: under graph capture the gather has to
     # be an op reading the step's fixed slot buffer, not a host-side index.
