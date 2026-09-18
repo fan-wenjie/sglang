@@ -586,7 +586,7 @@ class Envs:
     # Directory for one calibration snapshot per (request slot, layer): the
     # closed-prefix content rows, the tier-1 keep set and the calibration
     # queries the calibrated index was fitted on, written at its install.
-    # Offline certificate studies read these (mexp/glm53/cert_offline.py).
+    # The offline certificate studies in the experiment repository read these.
     SGLANG_DEBUG_VESTIGEKV_DUMP_DIR = EnvStr(None)
     # Directory for allocator snapshots: records allocation stacks from
     # startup, logs VKMEM (allocated / reserved) at every new request's first

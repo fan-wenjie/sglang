@@ -222,7 +222,8 @@ class RecallTier:
             # Fitted on THIS request's calibration queries, every calibrated
             # build. The certificate is sound for any orthonormal basis, but
             # its tightness is not: a basis carried over from another request
-            # left GLM queries with 2x the residual norm of their own PCA and
+            # left another model family's queries with 2x the residual norm of
+            # their own PCA and
             # the certificate fired the whole archive (fallback 0.6-0.8).
             evals, evecs = torch.linalg.eigh(qcal_c.T @ qcal_c)
             V = evecs[:, -self.r :].T.flip(0)  # descending singular value order
