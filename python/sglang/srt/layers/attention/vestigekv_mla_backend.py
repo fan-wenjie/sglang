@@ -153,6 +153,7 @@ class VestigeKVMLABackend(AttentionBackend):
         attended_splits=False,
         entropy_margin_gain=0.0,
         multikey_fence_rows=0,
+        min_hard_factor=1.0,
     )
 
     def __init__(
@@ -263,6 +264,9 @@ class VestigeKVMLABackend(AttentionBackend):
         # Omitted-mass arm (SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND): per layer,
         # [max_reqs, H] log of the softmax mass the scan skipped and
         # [max_reqs, kv] the archive mean it is carried at.
+        # A module-level constant because min_hard() is called from the tier and
+        # the offline tools alike; set here, once, from the resolved config.
+        D.MIN_HARD_FACTOR = float(self.config.min_hard_factor)
         self._omit_blend = envs.SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND.get()
         # Its OWN directory: sharing SGLANG_DEBUG_VESTIGEKV_DUMP_DIR also turns
         # on the calibration dump, which wrote 9.9 GB of 72 MB snapshots beside
