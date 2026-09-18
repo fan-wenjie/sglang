@@ -1081,7 +1081,7 @@ class TestTierTwoIsNeverOff(CustomTestCase):
     def test_install_writes_the_calibration_snapshot_when_dump_dir_is_set(self):
         # SGLANG_DEBUG_VESTIGEKV_DUMP_DIR contract: the installed build's exact
         # inputs land in one file, rows gathered in the row_slots order, so the
-        # offline certificate study (mexp/glm53/cert_offline.py) can refit them.
+        # offline certificate study in the experiment repository can refit them.
         import os
         import tempfile
 
