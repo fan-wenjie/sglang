@@ -366,6 +366,17 @@ class ExecKernel(msgspec.Struct):
         "then serves that step from the full row set. 0 disables the trigger; "
         "0.05 is the measured-regime starting point.",
     ] = 0.0
+    vestigekv_min_hard_factor: A[
+        float,
+        "VestigeKV: multiple of the conformal EXISTENCE bound a tier must collect "
+        "before it leaves the Z_MAX safety clamp. The bound is the fewest samples "
+        "for which the quantile is definable (18 at recall target 0.90), not the "
+        "fewest for which it is trustworthy, and at answer steps the clamp loses "
+        "the top archived row on 16.0% of records against the fitted "
+        "certificate's 22.85%. 1.0 is the historical behaviour: trust the "
+        "quantile the moment it exists. Higher keeps the clamp longer, which "
+        "over-fetches and so costs fallback.",
+    ] = 1.0
     vestigekv_multikey_fence_rows: A[
         int,
         "VestigeKV: rows fired above which a lane attends its FULL row set "

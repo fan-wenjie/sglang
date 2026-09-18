@@ -232,16 +232,33 @@ def scan_target(tau: float = RECALL_TARGET) -> float:
     return tau / (1.0 - gate_alpha(tau))
 
 
+MIN_HARD_FACTOR = 1.0
+"""Multiple of the conformal EXISTENCE bound required before a tier leaves the
+safety clamp.
+
+The bound below is the fewest samples for which the quantile is definable, not
+the fewest for which it is trustworthy: at tau = 0.90 it is 18, and the
+quantile there is the maximum of 18 draws. Measured at answer steps, the
+clamp loses the top-scoring archived row on 16.0% of records and the fitted
+certificate on 22.85% -- the untrusted clamp is the SAFER of the two on
+multi-key -- and prefill calibration, which removes the clamp period
+altogether, took niah_multikey_3 from 0.900 to 0.320. So leaving the clamp at
+the existence bound is the weakest defensible policy, and this is the knob
+that asks for more evidence. Costs fallback: the clamp over-fetches.
+"""
+
+
 def min_hard(tau: float = RECALL_TARGET) -> int:
     """Fewest hard samples for which the conformal quantile at scan_target
-    exists: ceil((n+1)*t) <= n requires n >= t / (1 - t)."""
+    exists: ceil((n+1)*t) <= n requires n >= t / (1 - t), scaled by
+    MIN_HARD_FACTOR when more evidence than existence is wanted."""
 
     t = scan_target(tau)
     # 1e-9 guard: for rational tau the ratio is often an exact integer that
     # floating point lands a hair ABOVE (0.9 -> t = 18/19, t/(1-t) = 18 but
     # floats give 18.000000000000004), and a raw ceil would then demand one
     # sample more than the guarantee needs.
-    return math.ceil(t / (1.0 - t) - 1e-9)
+    return math.ceil(MIN_HARD_FACTOR * (t / (1.0 - t)) - 1e-9)
 
 
 def conformal_k(n: int, tau: float = RECALL_TARGET) -> int:

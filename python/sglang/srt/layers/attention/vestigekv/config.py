@@ -48,6 +48,7 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # Extra margin per nat of kept-distribution flatness (0 = threshold unchanged).
     entropy_margin_gain: float
     multikey_fence_rows: int
+    min_hard_factor: float
     # Read a lane's rows from the tiers (kept table + fetch buffer, or the page
     # table when fenced) instead of from a CSR packed for the step.
 
@@ -66,6 +67,7 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             attended_splits=kernel.enable_vestigekv_attended_splits,
             entropy_margin_gain=kernel.vestigekv_entropy_margin_gain,
             multikey_fence_rows=kernel.vestigekv_multikey_fence_rows,
+            min_hard_factor=kernel.vestigekv_min_hard_factor,
         )
         cfg.validate()
         return cfg
@@ -114,5 +116,6 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"rebuild_overflow_fraction={self.rebuild_overflow_fraction} "
             f"attended_splits={self.attended_splits} "
             f"entropy_margin_gain={self.entropy_margin_gain} "
-            f"multikey_fence_rows={self.multikey_fence_rows}"
+            f"multikey_fence_rows={self.multikey_fence_rows} "
+            f"min_hard_factor={self.min_hard_factor}"
         )
