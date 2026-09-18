@@ -19,11 +19,32 @@ and the gate is open; fetch top-j fired archived rows.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
+
+
+_ZP_SEEN = [0]
+
+
+def _log_zp(method, target, zp, n, zmax):
+    """One reading per process of what the certificate actually fitted.
+
+    Three arms shipped this month as silent no-ops, and an arm that changes
+    nothing reads exactly like an arm that ran and changed nothing. zp is the
+    one number that says which fit ran and what it produced, and the sample
+    maximum beside it is the ceiling the order statistic cannot pass.
+    """
+    _ZP_SEEN[0] += 1
+    if _ZP_SEEN[0] % 200 == 1:
+        logging.getLogger(__name__).info(
+            "VKZP fit=%s target=%.4f zp=%.4f n_cal=%d sample_max=%.4f (build %d)",
+            method, target, zp, n, zmax, _ZP_SEEN[0],
+        )
 
 
 class RecallTier:
@@ -508,9 +529,13 @@ class RecallTier:
                                  dtype=z_req.dtype)
                 )
                 self.zp = min(float(mu + q * sd), D.Z_MAX)
+                _log_zp("gauss", self.gauss_target, self.zp, n_cal_q,
+                        float(z_req.max()))
             else:
                 k = D.conformal_k(n_cal_q, self.recall_target)
                 self.zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
+                _log_zp("conformal", self.recall_target, self.zp, n_cal_q,
+                        float(z_req.max()))
         zp = self.zp
         # Per-row projection caches over ALL closed rows (kept and archived
         # alike), so a decode-time block close -- which rebalances membership
