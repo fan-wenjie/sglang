@@ -36,6 +36,7 @@ class RecallTier:
         threshold: str = "max",
         ent_gain: float = 0.0,
         fence_rows: int = 0,
+        gauss_target: float = 0.0,
     ):
         self.r = r
         self.recall_target = recall_target
@@ -49,6 +50,9 @@ class RecallTier:
         # Rows fired above which the lane is fenced to its full row set; 0 =
         # only the buffer overflowing fences. See pre-registration 7.
         self.fence_rows = fence_rows
+        # >0 fits zp as mu + Phi^-1(target) * sigma instead of taking the
+        # conformal order statistic. See build().
+        self.gauss_target = gauss_target
         self.built = False
         # live-archive projection caches: None until the first decode-time
         # close backfills them (extend_closed); _pos_all doubles as the fill
@@ -481,8 +485,32 @@ class RecallTier:
                 qresh * tgt_rho * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
             ).clamp_min(D.ENTROPY_EPS)
             z_req = (abest_val[has_arch] - idxs_t) / cert_t
-            k = D.conformal_k(n_cal_q, self.recall_target)
-            self.zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
+            if self.gauss_target > 0.0:
+                # A parametric fit instead of an order statistic. z_req is the
+                # inner product of two residuals in the (kv - r)-dimensional
+                # orthogonal complement, divided by sqrt(kv - r), so under
+                # isotropy it is standard normal by construction -- and it
+                # measures that way: skewness -0.18, excess kurtosis -0.00 over
+                # the Kimi dumps.
+                #
+                # Three things the order statistic cannot do. It is the MAXIMUM
+                # of the sample at the min_hard bar, where it varies by 1.35
+                # across layers about a median of 1.88; it can never exceed the
+                # sample max, which is the 0.99 Gaussian target, so a higher
+                # target is inexpressible; and conformal's one advantage, a
+                # distribution-free guarantee under exchangeability, is bought
+                # at that price while exchangeability demonstrably fails --
+                # calibration queries miss the top archived row on 0.1% of
+                # cases and answer steps on 22.85%.
+                mu, sd = z_req.mean(), z_req.std()
+                q = torch.special.ndtri(
+                    torch.tensor(self.gauss_target, device=z_req.device,
+                                 dtype=z_req.dtype)
+                )
+                self.zp = min(float(mu + q * sd), D.Z_MAX)
+            else:
+                k = D.conformal_k(n_cal_q, self.recall_target)
+                self.zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
         zp = self.zp
         # Per-row projection caches over ALL closed rows (kept and archived
         # alike), so a decode-time block close -- which rebalances membership
