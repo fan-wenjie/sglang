@@ -749,7 +749,7 @@ class TestModelOverrideMovesMirroredFields(unittest.TestCase):
     """A '{"text_config": {...}}' override must also move the top-level
     mirror the parser makes of that field: top-level readers
     (is_deepseek_dsa) see the mirror, and with it left at the checkpoint
-    value GLM-5.3-Flash with index_topk nulled still resolved as DSA (page
+    value a model whose index_topk was nulled still resolved as DSA (page
     size 64, an index cache) while the model itself ran without one."""
 
     def test_nested_override_updates_the_mirror(self):
@@ -757,11 +757,11 @@ class TestModelOverrideMovesMirroredFields(unittest.TestCase):
 
         text = PretrainedConfig(index_topk=2048, index_head_dim=128)
         top = PretrainedConfig(
-            architectures=["Glm5NextForConditionalGeneration"],
+            architectures=["ExampleNextForConditionalGeneration"],
             text_config=text,
             index_topk=2048,  # the parser's mirror of text_config.index_topk
             index_head_dim=128,
-            model_type="glm5_next",
+            model_type="example_next",
         )
         parser = SimpleNamespace(parse=lambda *a, **k: top)
         with (
