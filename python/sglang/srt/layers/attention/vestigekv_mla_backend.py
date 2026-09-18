@@ -154,6 +154,7 @@ class VestigeKVMLABackend(AttentionBackend):
         entropy_margin_gain=0.0,
         multikey_fence_rows=0,
         min_hard_factor=1.0,
+        cert_gaussian_target=0.0,
     )
 
     def __init__(
@@ -2411,6 +2412,7 @@ class VestigeKVMLABackend(AttentionBackend):
             ent_gain=self.config.entropy_margin_gain,
             fence_rows=self.config.multikey_fence_rows,
             threshold=self.config.recall_threshold,
+            gauss_target=self.config.cert_gaussian_target,
         )
                     stats = tier.build(
                         kbuf,
@@ -2641,6 +2643,7 @@ class VestigeKVMLABackend(AttentionBackend):
             ent_gain=self.config.entropy_margin_gain,
             fence_rows=self.config.multikey_fence_rows,
             threshold=self.config.recall_threshold,
+            gauss_target=self.config.cert_gaussian_target,
         )
         stats = tier.build(
             kbuf,

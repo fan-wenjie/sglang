@@ -386,3 +386,44 @@ class TestRandomFenceControl(CustomTestCase):
         # and it must be cached, not reallocated inside a captured graph
         z2 = _zero_coins(torch.zeros(8, dtype=torch.int32, device="cuda"))
         self.assertIs(z, z2)
+
+
+class TestGaussianCertificate(CustomTestCase):
+    """The parametric fit must actually replace the order statistic.
+
+    z_req is an inner product of two residuals in the orthogonal complement
+    over sqrt of its dimension, so it is standard normal under isotropy and
+    measures that way on the Kimi dumps (skewness -0.18, excess kurtosis
+    -0.00). What the fit buys is stability where the order statistic is the
+    maximum of 18 samples, and a target the sample cannot reach -- the sample
+    maximum IS about the 0.99 Gaussian point.
+    """
+
+    def _zp(self, target, seed=41):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
+
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        B = torch.randn(24, 576, device="cuda", generator=g)
+        A = torch.randn(POOL, 24, device="cuda", generator=g)
+        mag = torch.rand(POOL, 1, device="cuda", generator=g) ** 4 * 8 + 0.2
+        kbuf = ((A @ B) / 24**0.5 * mag).to(torch.bfloat16)
+        slots = torch.randperm(POOL, device="cuda", generator=g)[:4096]
+        nkeep = max(1, int(D.RHO * 4096))
+        keep = torch.zeros(4096, dtype=torch.bool, device="cuda")
+        keep[kbuf[slots].float().norm(dim=-1).topk(nkeep).indices] = True
+        qcal = torch.randn(32, H, 576, device="cuda", generator=g)
+        qpos = torch.randint(0, 4096, (32,), device="cuda", generator=g)
+        t = RecallTier(r=R, gauss_target=target)
+        t.build(kbuf, slots, keep, qcal, qpos)
+        return t.zp
+
+    def test_a_higher_target_gives_a_larger_z(self):
+        z90, z999 = self._zp(0.90), self._zp(0.999)
+        self.assertLess(z90, z999, "the Gaussian target must move zp monotonically")
+
+    def test_zero_keeps_the_conformal_quantile(self):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+
+        self.assertNotAlmostEqual(self._zp(0.0), self._zp(0.999), places=3)
+        self.assertLessEqual(self._zp(0.0), D.Z_MAX)

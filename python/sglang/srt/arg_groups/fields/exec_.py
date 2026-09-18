@@ -366,6 +366,18 @@ class ExecKernel(msgspec.Struct):
         "then serves that step from the full row set. 0 disables the trigger; "
         "0.05 is the measured-regime starting point.",
     ] = 0.0
+    vestigekv_cert_gaussian_target: A[
+        float,
+        "VestigeKV: fit the certificate's z as mu + Phi^-1(target) * sigma over "
+        "the calibration requirements, instead of taking the conformal order "
+        "statistic at the recall target. z is an inner product of two residuals "
+        "in the orthogonal complement over sqrt of its dimension, so it is "
+        "standard normal under isotropy and measures that way (skewness -0.18, "
+        "excess kurtosis 0.00). The parametric fit is stable where the order "
+        "statistic is the maximum of 18 samples, and can express a target the "
+        "sample cannot reach: the sample maximum IS the 0.99 Gaussian target. "
+        "0 keeps the conformal quantile.",
+    ] = 0.0
     vestigekv_min_hard_factor: A[
         float,
         "VestigeKV: multiple of the conformal EXISTENCE bound a tier must collect "
