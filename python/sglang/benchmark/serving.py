@@ -1030,6 +1030,11 @@ class BenchmarkMetrics:
     p95_tpot_ms: float
     p99_tpot_ms: float
 
+    # False when the client's own arrival timestamps cannot be trusted as a
+    # latency measurement: see stream_itl_is_trustworthy().
+    itl_trustworthy: bool
+    itl_untrustworthy_reason: str
+
     # ITL - Inter-Token Latency (ms)
     mean_itl_ms: float
     median_itl_ms: float
@@ -1091,6 +1096,55 @@ async def get_request(
             interval = np.random.exponential(1.0 / request_rate)
             # The next request will be sent after the interval.
             await asyncio.sleep(interval)
+
+
+def stream_itl_is_trustworthy(outputs, itls):
+    """Can the client's arrival timestamps be read as decode latency?
+
+    On a long stream they cannot, and the failure is silent and directional.
+    With stream_interval=1 the server emits one detokenize + SSE event per
+    generated token, and the cost of that path grows with the length of the
+    stream. Once emission is slower than generation the server accumulates a
+    send backlog, so what the client timestamps is its own drain rate, not the
+    model's. The faster arm builds the deeper backlog, so the metric reports it
+    as SLOWER: on the run that produced this check the server finished
+    generating at 2297 s while the client was still draining at 5308 s, and the
+    reduced curve made the faster arm look 15x slower at 508k where the
+    server-side log had it 1.43x faster.
+
+    Two signals, both cheap:
+
+      length   a stream past ~64k tokens is in the regime where the emission
+               path's per-token cost has grown enough to matter. This is the
+               mechanism, so it is checked directly rather than inferred.
+      decay    the arrival rate collapsing from start to end. Attention makes
+               a long decode genuinely slower, so a mild decay is expected and
+               is not flagged; a backlog produces a far steeper one (245 ->
+               42 tok/s on the diagnosed run, against 249 -> 149 for a clean
+               arm over the same span).
+
+    Returns (trustworthy, reason). The caller records both rather than
+    dropping the numbers: a flagged run is still evidence about the client
+    path, it is just not evidence about the model.
+    """
+    longest = max((o.output_len for o in outputs if o.success), default=0)
+    if longest <= 65536:
+        return True, ""
+    per_request = [o.itl for o in outputs if o.success and len(o.itl) >= 2000]
+    worst = 0.0
+    for itl in per_request:
+        k = len(itl) // 10
+        head, tail = sum(itl[:k]) / k, sum(itl[-k:]) / k
+        if head > 0:
+            worst = max(worst, tail / head)
+    if worst >= 2.5:
+        return False, (
+            f"output_len {longest} with per-token streaming, and the arrival "
+            f"rate decays {worst:.1f}x from the first decile to the last: the "
+            f"server's SSE path is behind the decode and the client is timing "
+            f"its own backlog. Use the server-side decode log for latency."
+        )
+    return True, ""
 
 
 def calculate_metrics(
@@ -1226,6 +1280,13 @@ def calculate_metrics(
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
     itls = retokenized_itls if use_retokenized_itl else itls
+    _itl_ok, _itl_why = stream_itl_is_trustworthy(outputs, itls)
+    if not _itl_ok:
+        print(
+            "\n" + "=" * 78 + "\nWARNING: client-side ITL is not a latency "
+            "measurement for this run.\n  " + _itl_why + "\n" + "=" * 78,
+            file=sys.stderr, flush=True,
+        )
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -1253,6 +1314,8 @@ def calculate_metrics(
         p90_tpot_ms=np.percentile(tpots or 0, 90) * 1000,
         p95_tpot_ms=np.percentile(tpots or 0, 95) * 1000,
         p99_tpot_ms=np.percentile(tpots or 0, 99) * 1000,
+        itl_trustworthy=_itl_ok,
+        itl_untrustworthy_reason=_itl_why,
         mean_itl_ms=np.mean(itls or 0) * 1000,
         median_itl_ms=np.median(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
@@ -1837,6 +1900,8 @@ async def benchmark(
             "p95_tpot_ms": metrics.p95_tpot_ms,
             "p99_tpot_ms": metrics.p99_tpot_ms,
             "mean_itl_ms": metrics.mean_itl_ms,
+            "itl_trustworthy": metrics.itl_trustworthy,
+            "itl_untrustworthy_reason": metrics.itl_untrustworthy_reason,
             "median_itl_ms": metrics.median_itl_ms,
             "std_itl_ms": metrics.std_itl_ms,
             "p90_itl_ms": metrics.p90_itl_ms,
