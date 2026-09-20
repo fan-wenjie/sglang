@@ -1,0 +1,987 @@
+"""GPU-resident recall tier for VestigeKV (PREREG19/20).
+
+Originally vendored from the validated mini-sglang stack
+(minisgl/kimi/tier2.py); deliberately changed since (conformal closed-form
+zp, storage-dtype scoring, eigh basis, live-archive caches -- see the
+vestigekv-dev history for each why). The equivalence net is self-contained:
+test/manual/test_vestigekv_equiv.py asserts this module equal to an in-test
+naive reference encoding the same math; change the math only in lockstep
+with that reference, never one-sided.
+
+Index per MLA slot, built once at a compression event: exact 64-dim sidecar
+summand over archived rows, rank-r sketch of the 512-dim content (PCA basis of
+prefix queries), residual-norm certificate self-calibrated (z) on prefix queries
+with full-cache labels, entropy gate threshold from the same calibration
+(auto-off when it cannot separate, PREREG24). Per decode query:
+score = sidecar + sketch + z*certificate; fire where score beats the tier-1 max
+and the gate is open; fetch top-j fired archived rows.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import torch
+
+from sglang.srt.layers.attention.vestigekv import defaults as D
+from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
+from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
+
+_ZP_SEEN = [0]
+
+
+def _log_zp(method, target, zp, n, zmax):
+    """One reading per process of what the certificate actually fitted.
+
+    Three arms shipped this month as silent no-ops, and an arm that changes
+    nothing reads exactly like an arm that ran and changed nothing. zp is the
+    one number that says which fit ran and what it produced, and the sample
+    maximum beside it is the ceiling the order statistic cannot pass.
+    """
+    _ZP_SEEN[0] += 1
+    if _ZP_SEEN[0] % 200 == 1:
+        logging.getLogger(__name__).info(
+            "VKZP fit=%s target=%.4f zp=%.4f n_cal=%d sample_max=%.4f (build %d)",
+            method,
+            target,
+            zp,
+            n,
+            zmax,
+            _ZP_SEEN[0],
+        )
+
+
+class RecallTier:
+    def __init__(
+        self,
+        r: int = D.INDEX_RANK,
+        recall_target: float = D.RECALL_TARGET,
+        scale: float = D.ATTN_SCALE,
+        margin: float = 0.0,
+        threshold: str = "max",
+        ent_gain: float = 0.0,
+        fence_rows: int = 0,
+        gauss_target: float = 0.0,
+    ):
+        self.r = r
+        self.recall_target = recall_target
+        self.scale = scale
+        self.margin = margin  # scan threshold = base - margin (see VestigeKVConfig)
+        self.threshold = threshold  # base: "max" kept score or "lse" of kept scores
+        # Extra margin per nat of kept-distribution flatness. The fused
+        # prologue applies it inside the kernel; these reference forms have to
+        # apply the same one or the equivalence tests compare two thresholds.
+        self.ent_gain = ent_gain
+        # Rows fired above which the lane is fenced to its full row set; 0 =
+        # only the buffer overflowing fences. See pre-registration 7.
+        self.fence_rows = fence_rows
+        # >0 fits zp as mu + Phi^-1(target) * sigma instead of taking the
+        # conformal order statistic. See build().
+        self.gauss_target = gauss_target
+        self.built = False
+        # live-archive projection caches: None until the first decode-time
+        # close backfills them (extend_closed); _pos_all doubles as the fill
+        # watermark read by the close path.
+        self._pos_all = self._csk_all = self._rho_all = None
+        self._side_mat = None  # lazily materialised; see the `side` property
+        self._kept_mat = None  # lazily materialised; see `kept_rows`
+        self._csk_mat = self._rho_mat = None  # selections over the _all caches
+        self._arch_idx = None  # positions of the archive in the closed prefix
+        # Index tables. These are what the tier STORES; the row tables
+        # (side, kept_rows) and the archive selections (csk, rho) are
+        # properties over them.
+        self.arch = None  # pool row ids of the archive
+        self.kept_slots = None  # pool row ids tier-1 keeps
+        self._kbuf = None  # the layer's pool buffer, to re-read from
+        self.version = 0  # bumped on in-place membership refresh (pack sync key)
+        self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
+        # fixed-address staging for the fused scan (capturable)
+        self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
+
+    def _from_all(self, name, cache):
+        """Select the archive's rows out of a closed-prefix cache."""
+        src = getattr(self, name)
+        if src is None or self._arch_idx is None:
+            raise RuntimeError(
+                f"{name} is not populated; build()/extend_closed() must fill "
+                "the closed-prefix caches before the archive can be selected"
+            )
+        return src.index_select(0, self._arch_idx.to(torch.int64)).contiguous()
+
+    @property
+    def csk(self):
+        """The archive's sketch projections, [A, r] fp16 -- a selection over
+        _csk_all, materialised on demand. Tier-1 re-decides membership at
+        every block close, so the closed-prefix cache is the store and the
+        archive is a view of it; keeping a compacted copy alongside is the
+        same numbers twice."""
+        if self._csk_mat is None:
+            self._csk_mat = self._from_all("_csk_all", None)
+        return self._csk_mat
+
+    @csk.setter
+    def csk(self, v):
+        self._csk_mat = v
+
+    @property
+    def rho(self):
+        """The archive's residual norms, [A] fp32 -- a selection over
+        _rho_all, on the same terms as `csk`."""
+        if self._rho_mat is None:
+            self._rho_mat = self._from_all("_rho_all", None)
+        return self._rho_mat
+
+    @rho.setter
+    def rho(self, v):
+        self._rho_mat = v
+
+    def drop_operands(self):
+        """Release the materialised archive selections; the properties
+        re-derive them from the closed-prefix caches."""
+        self._csk_mat = self._rho_mat = None
+
+    @property
+    def kept_rows(self):
+        """Tier-1's kept rows, [nk, 576] bf16 -- lazily materialised.
+
+        Same story as `side`: kept_slots names them and the pool holds them, so
+        a resident bf16 copy is 1152 bytes per row of nothing new. The in-graph
+        prologue scores them straight out of the pool; the eager reference path
+        and the max1 competition in query_fixed are what still want the rows.
+        """
+        if self._kept_mat is not None:
+            return self._kept_mat
+        if self._kbuf is None or self.kept_slots is None:
+            raise RuntimeError(
+                "tier has neither materialised kept rows nor a pool to read "
+                "them from; build()/refresh_membership() must record kbuf"
+            )
+        self._kept_mat = self._kbuf[self.kept_slots.to(torch.int64)].to(torch.bfloat16)
+        return self._kept_mat
+
+    @kept_rows.setter
+    def kept_rows(self, v):
+        self._kept_mat = v
+
+    def drop_kept_rows(self):
+        """Release the materialised kept rows; the property re-derives them."""
+        self._kept_mat = None
+
+    @property
+    def side(self):
+        """The archive's sidecars, [A, 64] bf16.
+
+        Materialised on demand rather than stored. The sidecar is the pool
+        row's own tail at KV_LORA_RANK and `arch` already names the row, so a
+        resident copy is bytes the pool still holds -- and it grows with the
+        context. The in-graph scan reads the pool directly and never asks for
+        this; only the eager reference path and calibration do, and both are
+        off the per-step path.
+        """
+        if self._side_mat is not None:
+            return self._side_mat
+        if self._kbuf is None or self.arch is None:
+            raise RuntimeError(
+                "tier has neither a materialised sidecar nor a pool to read it "
+                "from; build()/refresh_membership() must record kbuf"
+            )
+        self._side_mat = self._kbuf[self.arch][:, D.KV_LORA_RANK :].contiguous()
+        return self._side_mat
+
+    @side.setter
+    def side(self, v):
+        self._side_mat = v
+
+    def drop_side(self):
+        """Release the materialised sidecar; the property re-derives it."""
+        self._side_mat = None
+
+    @ieee_fp32
+    @torch.inference_mode()
+    def build(
+        self,
+        kbuf: torch.Tensor,
+        row_slots: torch.Tensor,
+        keep: torch.Tensor,
+        q_cal: torch.Tensor,
+        q_pos: torch.Tensor,
+        conservative: bool = False,
+        v_init: torch.Tensor | None = None,
+        operands_from: RecallTier | None = None,
+        diag: bool = False,
+    ) -> dict:
+        """rows: [T,576] pool rows (fp32). keep: [T] bool tier-1 mask.
+        q_cal: [n,H,576] expanded calibration queries; q_pos: [n] positions.
+        Returns stats. All thresholds derive from the prefix itself.
+
+        operands_from: a previous tier for the SAME (slot, layer) whose
+        archive row-set is unchanged (tier-1 selection is frozen between
+        block closes, so every calibrated rebuild inside the calibration
+        window sees the identical archive). The scan operands (V, csk, rho,
+        side, arch) are pure functions of (prefix rows, basis, keep mask)
+        and are INDEPENDENT of the calibration queries, so reusing them is
+        bit-exact -- the rebuild then only refits the calibration scalars
+        (zp, thr_g) and regathers the (small, growing) kept rows. This is
+        what turns the per-request calibration ladder from 5-9 full archive
+        passes into one: measured 10 ms -> ~1.5 ms per rebuild at S=8k.
+        The caller owns the row-set-unchanged guard."""
+        sc_ = self.scale
+        T = row_slots.numel()
+        dev = row_slots.device
+        H = q_cal.shape[1]
+        self.keep = keep
+        arch_idx = (~keep).nonzero().flatten()
+        self._arch_idx = arch_idx
+        qe = q_cal.reshape(-1, D.LATENT_DIM).float()  # [n*H, 576]
+
+        qcal_c = qe[:, : D.KV_LORA_RANK] - qe[:, : D.KV_LORA_RANK].mean(0, keepdim=True)
+        # Top-r right singular vectors via the covariance eigendecomposition:
+        # V(SVD) == eigenvectors of C^T C, and only r=64 of 512 are used, so the
+        # full Jacobi SVD computes 448 vectors that are thrown away. Measured on
+        # the real shape (512x512): 17.4 ms -> 4.3 ms, subspace alignment 1.0000
+        # (torch.svd_lowrank was faster still but only 0.87-aligned: rejected).
+        if v_init is not None:
+            V = v_init
+        elif conservative:
+            # The PROVISIONAL build must never block the first decode step on a
+            # cusolver eigendecomposition (measured ~4 ms/layer, ~20 ms/request
+            # on the token path, and a one-shot ~230 ms cusolver init on the
+            # very first call). Its basis is thrown away n_cal steps later by
+            # the async calibrated build, and this index over-fetches anyway
+            # (zp clamped, gate open), so basis QUALITY is irrelevant here --
+            # only orthonormality matters for the Cauchy-Schwarz certificate.
+            # Use the leading r rows of the identity: orthonormal by
+            # construction, allocation-only, no factorization. The calibrated
+            # build (async, off the token path) still fits the real PCA basis
+            # and caches it, so every subsequent provisional build reuses that.
+            V = torch.zeros(self.r, D.KV_LORA_RANK, device=dev, dtype=qe.dtype)
+            V[torch.arange(self.r, device=dev), torch.arange(self.r, device=dev)] = 1.0
+        else:
+            # Fitted on THIS request's calibration queries, every calibrated
+            # build. The certificate is sound for any orthonormal basis, but
+            # its tightness is not: a basis carried over from another request
+            # left another model family's queries with 2x the residual norm of
+            # their own PCA and
+            # the certificate fired the whole archive (fallback 0.6-0.8).
+            evals, evecs = torch.linalg.eigh(qcal_c.T @ qcal_c)
+            V = evecs[:, -self.r :].T.flip(0)  # descending singular value order
+        self.V = V
+        # Chunked, and the pool rows are never materialized in fp32 as a whole.
+        # The unchunked form allocated the full [T, 576] fp32 copy plus TWO
+        # [A, 512] content copies (csk and rho each indexed it), ~429 MB per
+        # build at S=64k. Ten builds per request of that, against a serving
+        # mem-fraction, is why an in-server build cost 3.8x its isolated time.
+        A = int(arch_idx.numel())
+        if operands_from is not None:
+            # Bit-exact adoption (see the docstring): same prefix rows, same
+            # basis, same keep mask => same operands, no recompute. The guard
+            # is the caller's; this assert catches a broken one.
+            # Two conditions, not one. The archive must have the same size,
+            # AND the donor's closed-prefix cache must cover THIS tier's
+            # prefix -- _arch_idx indexes into that cache, so a donor built on
+            # a shorter prefix makes every selection an out-of-bounds gather.
+            # The old code adopted the already-compacted selection, where the
+            # size check alone was sufficient; adopting the cache is what makes
+            # the second condition load-bearing.
+            donor_pos = operands_from._pos_all
+            assert int(operands_from._arch_idx.numel()) == A, (
+                "operand reuse across a changed archive row-set"
+            )
+            assert donor_pos is not None and donor_pos.numel() == int(
+                row_slots.numel()
+            ), (
+                "operand reuse from a tier whose closed prefix differs: donor "
+                f"{None if donor_pos is None else donor_pos.numel()} rows vs "
+                f"{int(row_slots.numel())} here"
+            )
+            assert torch.equal(donor_pos, row_slots), (
+                "operand reuse from a tier holding a different prefix row-set"
+            )
+            self.V = V = operands_from.V
+            # Adopt the closed-prefix CACHES, not the archive selections over
+            # them: the selections are properties now, and a tier that owns
+            # only a selection cannot re-derive one after a drop or a
+            # membership refresh. The precondition (same rows, same basis)
+            # makes the caches identical, which is what makes this bit-exact.
+            self._csk_all = operands_from._csk_all
+            self._rho_all = operands_from._rho_all
+            assert self._csk_all.shape[0] == int(row_slots.numel()), (
+                "adopted cache does not cover the prefix it will be indexed by"
+            )
+        else:
+            # Project the WHOLE closed prefix, not just the archive. Tier-1's
+            # membership is re-decided at every block close, so a row that is
+            # kept now can be archived later; projecting only today's archive
+            # means the close has to re-project, and holding both a
+            # [closed, r] cache and a [A, r] compacted copy of it means
+            # storing the same numbers twice. One store, and the archive is a
+            # selection over it. The extra rows are the kept fraction, ~3%.
+            #
+            # The caches are filled TOGETHER with _pos_all here. An earlier
+            # attempt set _pos_all eagerly while side/csk stayed lazy, and the
+            # close path -- which reads _pos_all.shape[0] as its backfill
+            # watermark -- then indexed a cache that did not cover it.
+            from sglang.srt.layers.attention.vestigekv.operand_fused import (
+                build_operands_fused,
+            )
+
+            if kbuf.is_cuda and kbuf.dtype == torch.bfloat16:
+                # Fused single-kernel operand build: gather + project +
+                # residual + casts (operand_fused.py). Same fp32-ieee
+                # arithmetic; ~1 ulp reduction-order difference vs cuBLAS,
+                # gated by fire-set stability + retrieval. Per row, so the
+                # values on the archived subset do not depend on the row set.
+                self._csk_all, self._rho_all, _side = build_operands_fused(
+                    kbuf, row_slots, V
+                )
+                del _side
+            else:
+                # Storage precision (gated): side at bf16 is BIT-EXACT relative to the
+                # bf16 pool it is copied from (the old fp32 store was an uninformative
+                # upcast); csk keeps fp16 -- it is an fp32 GEMM product and the fire
+                # decision compares scores near a threshold, so the 11-bit mantissa
+                # (vs bf16's 8) matters, while its magnitude sits far below the fp16
+                # range cap, asserted below; rho stays fp32 (4 B/row, why touch it).
+                # Scan traffic drops 516 -> 260 B/row: slope ratio 0.475 -> 0.256.
+                # Accumulation everywhere stays fp32/ieee (the tf32 lesson).
+                T = int(row_slots.numel())
+                self._csk_all = torch.empty(T, self.r, device=dev, dtype=torch.float16)
+                self._rho_all = torch.empty(T, device=dev, dtype=torch.float32)
+                for a0 in range(0, T, D.BUILD_ROW_CHUNK):
+                    a1 = min(a0 + D.BUILD_ROW_CHUNK, T)
+                    blk = kbuf[row_slots[a0:a1]].float()
+                    content = blk[:, : D.KV_LORA_RANK]
+                    c = content @ V.T
+                    torch._assert_async(
+                        (c.abs().amax() < 6e4).to(torch.bool)
+                    )  # fp16 range guard: a violation here is a model-scale anomaly
+                    self._csk_all[a0:a1] = c.half()
+                    self._rho_all[a0:a1] = (content - c @ V).norm(dim=-1)
+                    del blk, content, c
+        # Index tables in place, and the closed-prefix caches now cover the
+        # built prefix, so _pos_all is an honest backfill watermark for the
+        # close path. Everything below (calibration included) reads the row
+        # tables and the archive selections through these.
+        self._kbuf = kbuf
+        self._pos_all = row_slots
+        # int32 throughout: a pool row id indexes a pool with far fewer
+        # than 2^31 slots, and these two are 15.5 B/token at int64 --
+        # 9% of the whole index.
+        self._arch_idx = arch_idx.to(torch.int32)
+        self.arch = row_slots.index_select(0, arch_idx).to(torch.int32)
+        # Pool row ids for the kept set, and nothing else: a latent row is
+        # written once when its token enters the pool and never rewritten, so
+        # a consumer that can address the pool wants these 4 bytes, not the
+        # 1152-byte copy. `kept_rows` is a property over these.
+        self.kept_slots = row_slots[keep].to(torch.int32)
+        self._kept_mat = self._side_mat = None
+        self._csk_mat = self._rho_mat = None
+
+        if conservative:
+            # Provisional index: serve immediately, calibrate nothing. Fitting
+            # zp on cache-row proxies looked like calibration and was not --
+            # measured on the port it returned zp anywhere from 0.0 to 8.0 for
+            # the same layer across consecutive requests, and zp=0 means NO
+            # certificate inflation, i.e. it can fire too little and miss the
+            # target. The honest provisional setting is the most conservative
+            # rung with the gate open: it over-fetches, which costs latency and
+            # never recall. The real index replaces it n_cal decode steps later.
+            self.thr_g = float("-inf")
+            self.zp = D.Z_MAX
+            self.need_more_hard = True
+            self.built = True
+            return {
+                "zp": self.zp,
+                "gate_off": True,
+                "n_hard": None,
+                "arch": int(arch_idx.numel()),
+                "conservative": True,
+            }
+        # calibration: full-cache causal labels (pool is complete by invariant).
+        # CHUNKED over keys to avoid a [n*H, T] materialization (OOMs at 512k).
+        qpos_r = q_pos.repeat_interleave(H)
+        nq = qe.shape[0]
+        best_val = torch.full((nq,), torch.finfo(torch.float32).min, device=dev)
+        tgt = torch.zeros(nq, dtype=torch.long, device=dev)
+        # Best ARCHIVED row per query (true score, causal): the certificate is
+        # calibrated on it for every query, not only for the queries whose
+        # global argmax is archived -- see the zp block below.
+        abest_val = torch.full((nq,), torch.finfo(torch.float32).min, device=dev)
+        atgt = torch.zeros(nq, dtype=torch.long, device=dev)
+        KB = D.BUILD_KEY_CHUNK
+        if diag:
+            # Debug telemetry: how many ARCHIVED rows each calibration query
+            # truly prefers to its best kept row (the recall need), against
+            # what the certificate fires below.
+            max1_d = (
+                (qe.to(torch.bfloat16) @ self.kept_rows.T)
+                .float()
+                .mul_(sc_)
+                .max(-1)
+                .values
+            )
+            need = torch.zeros(nq, dtype=torch.int64, device=dev)
+        for k0 in range(0, T, KB):
+            k1 = min(k0 + KB, T)
+            # In place throughout: `* sc_` and `masked_fill` each copied the
+            # whole [n*H, KB] block, 67 MB per chunk that the allocator then had
+            # to find under a serving mem-fraction.
+            cblk = kbuf[row_slots[k0:k1]].float()
+            blk = qe @ cblk.T
+            del cblk
+            blk.mul_(sc_)
+            colk = torch.arange(k0, k1, device=dev)[None, :]
+            blk.masked_fill_(colk > qpos_r[:, None], torch.finfo(torch.float32).min)
+            if diag:
+                arch_col = (~keep[k0:k1])[None, :]
+                need += ((blk > max1_d[:, None]) & arch_col).sum(-1)
+            bval, bidx = blk.max(-1)
+            take = bval > best_val
+            best_val = torch.where(take, bval, best_val)
+            tgt = torch.where(take, bidx + k0, tgt)
+            blk.masked_fill_(keep[k0:k1][None, :], torch.finfo(torch.float32).min)
+            abval, abidx = blk.max(-1)
+            atake = abval > abest_val
+            abest_val = torch.where(atake, abval, abest_val)
+            atgt = torch.where(atake, abidx + k0, atgt)
+            del blk
+        del best_val
+        hard = ~keep[tgt]
+
+        s_kept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
+        p1 = torch.softmax(s_kept, -1)
+        ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
+        max1 = self._thr_base(s_kept, s_kept.max(-1).values)
+        del s_kept, p1
+
+        n_hard = int(hard.sum())
+        alpha = D.gate_alpha(self.recall_target)
+        thr_g = (
+            float(ent[hard].quantile(alpha))
+            if n_hard >= D.min_hard(self.recall_target)
+            else float("-inf")
+        )
+        if float((ent > thr_g).float().mean()) > D.GATE_SELF_DISABLE_FRACTION:
+            thr_g = float("-inf")
+        self.thr_g = thr_g
+
+        # zp in closed form. Requirement per calibration query q: the certified
+        # score of its best ARCHIVED row t must reach that row's true score,
+        # idxs_t + z*cert_t >= true_t, i.e. z >= z_q := (true_t - idxs_t)/cert_t;
+        # then whenever an archived row truly beats the kept set, its certified
+        # score does too and the scan fires it. Over the n exchangeable queries
+        # the k-th order statistic of z_q at k = ceil((n+1)*scan_target) is the
+        # conformal quantile (distribution-free marginal guarantee). Every
+        # query contributes, not only the "hard" ones whose global argmax is
+        # archived: on a model whose kept set is good those are too few to
+        # calibrate on and the certificate collapsed to the Z_MAX clamp,
+        # firing the whole archive.
+        # Positional, not pool ids: atgt indexes the closed prefix and
+        # _arch_idx is the archive's positions in it, ascending.
+        has_arch = abest_val > torch.finfo(torch.float32).min
+        n_cal_q = int(has_arch.sum())
+        self.need_more_hard = n_cal_q < D.min_hard(self.recall_target)
+        if self.need_more_hard:
+            # Not enough evidence for the guarantee yet: serve with the safety
+            # clamp (over-fetches, never under-recalls) and tell the caller to
+            # keep collecting.
+            self.zp = D.Z_MAX
+        else:
+            qh = qe[has_arch]
+            qskh = qh[:, : D.KV_LORA_RANK] @ V.T
+            qresh = (qh[:, : D.KV_LORA_RANK] - qskh @ V).norm(dim=-1)
+            pa = torch.searchsorted(self._arch_idx.to(torch.int64), atgt[has_arch])
+            # Gather the target rows out of the caches directly. Going through
+            # self.side / self.csk / self.rho would materialise the WHOLE
+            # archive's selection to read a few dozen rows of it, and those
+            # three views are the entire difference between the steady-state
+            # footprint and the peak -- which is the figure that decides
+            # whether a long request fits.
+            pa64 = pa.to(torch.int64)
+            arch_rows = self.arch.to(torch.int64).index_select(0, pa64)
+            tgt_side = self._kbuf.index_select(0, arch_rows)[
+                :, D.KV_LORA_RANK : D.LATENT_DIM
+            ]  # [n, side_dim]
+            src = self._arch_idx.to(torch.int64).index_select(0, pa64)
+            tgt_csk = self._csk_all.index_select(0, src)  # [n, r]
+            tgt_rho = self._rho_all.index_select(0, src)  # [n]
+            # Same rounding as the serve-time scoring path: query operands
+            # rounded to the storage dtypes before the (exact-in-fp32)
+            # products, so zp is calibrated on exactly what the kernel scores.
+            idxs_t = (
+                qh[:, D.KV_LORA_RANK :].to(torch.bfloat16).float() * tgt_side.float()
+            ).sum(-1) + (qskh.half().float() * tgt_csk.float()).sum(-1)
+            idxs_t = idxs_t * sc_
+            cert_t = (
+                qresh * tgt_rho * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
+            ).clamp_min(D.ENTROPY_EPS)
+            z_req = (abest_val[has_arch] - idxs_t) / cert_t
+            if self.gauss_target > 0.0:
+                # A parametric fit instead of an order statistic. z_req is the
+                # inner product of two residuals in the (kv - r)-dimensional
+                # orthogonal complement, divided by sqrt(kv - r), so under
+                # isotropy it is standard normal by construction -- and it
+                # measures that way: skewness -0.18, excess kurtosis -0.00 over
+                # the Kimi dumps.
+                #
+                # Three things the order statistic cannot do. It is the MAXIMUM
+                # of the sample at the min_hard bar, where it varies by 1.35
+                # across layers about a median of 1.88; it can never exceed the
+                # sample max, which is the 0.99 Gaussian target, so a higher
+                # target is inexpressible; and conformal's one advantage, a
+                # distribution-free guarantee under exchangeability, is bought
+                # at that price while exchangeability demonstrably fails --
+                # calibration queries miss the top archived row on 0.1% of
+                # cases and answer steps on 22.85%.
+                mu, sd = z_req.mean(), z_req.std()
+                q = torch.special.ndtri(
+                    torch.tensor(
+                        self.gauss_target, device=z_req.device, dtype=z_req.dtype
+                    )
+                )
+                self.zp = min(float(mu + q * sd), D.Z_MAX)
+                _log_zp(
+                    "gauss", self.gauss_target, self.zp, n_cal_q, float(z_req.max())
+                )
+            else:
+                k = D.conformal_k(n_cal_q, self.recall_target)
+                self.zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
+                _log_zp(
+                    "conformal",
+                    self.recall_target,
+                    self.zp,
+                    n_cal_q,
+                    float(z_req.max()),
+                )
+        zp = self.zp
+        # Per-row projection caches over ALL closed rows (kept and archived
+        # alike), so a decode-time block close -- which rebalances membership
+        # globally -- refreshes the index by index selection only: no
+        # re-projection GEMM, no stale archive, no unrecallable rows. Mirrors
+        # the reference engine's live-archive semantics.
+        # The caches now COVER the built prefix, so _pos_all is set to match
+        # and the close path backfills only [built, c1). The earlier contract
+        # (all three None, first close re-projects 0..c1) existed because an
+        # eager _pos_all with lazy side/csk left the watermark ahead of the
+        # cache contents; filling them together is what makes the watermark
+        # honest. _arch_idx indexes the archive INTO that prefix; `arch`
+        # carries the pool row ids the scan and the fetch output use.
+        self.built = True
+        stats = {
+            "zp": zp,
+            "gate_off": thr_g == float("-inf"),
+            "n_hard": n_hard,
+            "need_more_hard": self.need_more_hard,
+            "arch": int(arch_idx.numel()),
+        }
+        if diag:
+            stats.update(self._diag_fire(qe, max1, zp, sc_, need))
+        return stats
+
+    def _ent_margin(self, s_kept):
+        """How flat the kept distribution is, in nats: log-sum-exp of the kept
+        scores less their maximum. 0 when one kept row holds the attention
+        mass, log(n) when none does. Scaled by ent_gain it widens the scan's
+        threshold exactly where the maximum says least about the query; the
+        kernel computes the same quantity as `lse - e_max`.
+        """
+        if self.ent_gain == 0.0 or s_kept is None:
+            return 0.0
+        return self.ent_gain * (torch.logsumexp(s_kept, -1) - s_kept.max(-1).values)
+
+    def _thr_base(self, s_kept, max1):
+        # The score the margin is taken from: the best kept row, or the kept
+        # set's log-sum-exp (>= max1; equal when one row holds the mass).
+        if self.threshold == "lse":
+            return torch.logsumexp(s_kept, -1)
+        return max1
+
+    def _diag_fire(self, qe, max1, zp, sc_, need):
+        """Debug telemetry for one calibrated build: per calibration query, the
+        rows the certificate fires at the fitted zp against the rows the query
+        truly needs (true score above its best kept row); medians and maxima
+        over the queries, plus the certificate's own two terms."""
+        A = self.arch.shape[0]
+        qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
+        qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
+        idxs = (qsk.half().float() @ self.csk.float().T) * sc_
+        if D.SIDECAR_DIM:
+            idxs = (
+                idxs
+                + (
+                    qe[:, D.KV_LORA_RANK :].to(torch.bfloat16).float()
+                    @ self.side.float().T
+                )
+                * sc_
+            )
+        cert = (
+            (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
+        )
+        fire = ((idxs + zp * cert) > (max1 - self.margin)[:, None]).sum(-1)
+        fire0 = (idxs > (max1 - self.margin)[:, None]).sum(-1)  # sketch term alone
+        q = lambda t, p: float(t.float().quantile(p))
+        # Would a position-pooled (4 rows) certificate be usable? Group bound:
+        # q_sk . mean(c) + |q_sk| max|c_i - mean(c)| + zp cert(max rho); a
+        # fired group fetches its 4 rows.
+        A4 = (A // 4) * 4
+        cg = self.csk[:A4].float().view(-1, 4, self.r)
+        cbar = cg.mean(1)
+        delta = (cg - cbar[:, None, :]).norm(dim=-1).max(1).values
+        rho_g = self.rho[:A4].view(-1, 4).max(1).values
+        bound_g = (qsk @ cbar.T) * sc_ + (
+            qsk.norm(dim=-1)[:, None] * delta[None, :]
+        ) * sc_
+        bound_g = (
+            bound_g
+            + (qres[:, None] * rho_g[None, :])
+            * sc_
+            * zp
+            / (D.KV_LORA_RANK - self.r) ** 0.5
+        )
+        gfire = (bound_g > (max1 - self.margin)[:, None]).sum(-1) * 4
+        return {
+            "gfire_p50": q(gfire, 0.5),
+            "gfire_p90": q(gfire, 0.9),
+            "delta_over_c_p50": q(delta / cbar.norm(dim=-1).clamp_min(1e-6), 0.5),
+            "A": A,
+            "need_p50": q(need, 0.5),
+            "need_p90": q(need, 0.9),
+            "need_max": int(need.max()),
+            "fire_p50": q(fire, 0.5),
+            "fire_p90": q(fire, 0.9),
+            "fire_sketch_only_p50": q(fire0, 0.5),
+            "max1_p50": q(max1, 0.5),
+            "cert_p50": q(cert.median(dim=-1).values * zp, 0.5),
+            "rho_p50": q(self.rho, 0.5),
+            "qres_p50": q(qres, 0.5),
+        }
+
+    @torch.inference_mode()
+    @ieee_fp32
+    def query_fixed(
+        self,
+        qe: torch.Tensor,
+        out: torch.Tensor,
+        out_len: torch.Tensor,
+        out_ovf: torch.Tensor,
+        slot: int,
+    ) -> None:
+        """Device-only variant of query(): writes the fired pool rows into
+        out[slot, :W], their count (at most W) into out_len[slot] and whether
+        the fire exceeded W into out_ovf[slot], with NO host sync (no
+        .numel(), no bool() early-exit). Serving decode uses this; query()
+        stays as the reference/equivalence-tested form. An overflow keeps the
+        first W rows in position order; the flag is what the pack's fence
+        reads."""
+        sc_ = self.scale
+        qe = qe.float()
+        H = qe.shape[0]
+        if self.kept_slots.shape[0] == 0:
+            # No tier-1 row kept => there is no max1 baseline to beat, so every
+            # archived row is eligible: attend the whole archive this step
+            # (degenerates to full attention, never under-recalls). A kept set
+            # this small is itself anomalous (see the close/build invariant);
+            # the +inf-open form keeps serving correct while it is investigated.
+            max1 = qe.new_full((H,), float("-inf"))
+            gate = qe.new_ones(H, dtype=torch.bool)
+            emarg = 0.0
+        else:
+            s_kept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
+            max1 = self._thr_base(s_kept, s_kept.max(-1).values)
+            emarg = self._ent_margin(s_kept)
+            p1 = torch.softmax(s_kept, -1)
+            ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
+            gate = ent > self.thr_g
+        qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
+        qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
+        if self._qside_t is None:
+            H = qe.shape[0]
+            # Storage dtypes, matching the kernel's native-dtype dots: bf16 for
+            # the sidecar branch (exact -- qbuf is bf16), fp16 for the sketch
+            # projection (rounded here AND at calibration, so zp covers it).
+            self._qside_t = qe.new_empty(D.SIDECAR_DIM, H, dtype=torch.bfloat16)
+            self._qsk_t = qe.new_empty(self.r, H, dtype=torch.float16)
+            self._hit_buf = torch.empty(
+                self.side.shape[0], dtype=torch.int32, device=qe.device
+            )
+            self._inf = qe.new_full((), float("inf"))
+        self._qside_t.copy_(qe[:, D.KV_LORA_RANK :].T)
+        self._qsk_t.copy_(qsk.T)
+        # Fold the gate into the threshold: a closed head can never fire, so
+        # +inf makes it lose every comparison and the kernel needs no second
+        # predicate. Scores stay in registers -- see scan_kernel for why
+        # that, not arithmetic, is what the scan costs.
+        max1g = torch.where(gate, max1 - self.margin - emarg, self._inf)
+        hit = (
+            vestige_scan(
+                self._qside_t,
+                self._qsk_t,
+                qres,
+                max1g,
+                self.side,
+                self.csk,
+                self.rho,
+                sc_,
+                self.zp * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5,
+                out=self._hit_buf,
+            )
+            != 0
+        )
+        W = out.shape[1]
+        total = hit.sum()  # [] int64 on device
+        n = total.clamp(max=W)
+        # Rank the hit rows by position and keep the first W. Everything here is
+        # static-shape on purpose: boolean-mask indexing (`pos[sel]`) is a
+        # masked_select, whose output size is only known on the device, so eager
+        # mode reads it back and drains the pipeline. Two such reads per call x
+        # one call per local MLA layer per request was 8.0 of the 10.5 ms/step
+        # of host-side cost (VKSTATS, S=61k bs=1). Instead, scatter every archive
+        # row -- misses and overflow all target a scratch slot W that is dropped.
+        pos = torch.cumsum(hit.to(torch.int64), 0) - 1
+        dst = torch.where(hit & (pos < W), pos, W)
+        scratch = self._scatter_buf
+        if scratch is None or scratch.shape[0] != W + 1:
+            scratch = out.new_zeros(W + 1)
+            self._scatter_buf = scratch
+        scratch.zero_()
+        scratch.scatter_(0, dst, self.arch.to(out.dtype))
+        out[slot].copy_(scratch[:W])
+        out_len[slot] = n
+        # See compact_fired: the flag's threshold is separate from the buffer
+        # cap, so a multi-key fence can raise it early. A fenced lane attends
+        # its full row set and never reads the buffer, so this is safe.
+        out_ovf[slot] = total > (min(W, self.fence_rows) if self.fence_rows else W)
+
+    @torch.inference_mode()
+    def step_attribution(self, qe: torch.Tensor) -> dict:
+        """Where this step's attention mass actually went, against dense.
+
+        Every offline study so far conditions on the kept set as given and
+        asks only whether an archived row that beats max1 is fired. That
+        question is answered -- held-out recall is 99.9% with no decay in k --
+        and the multi-key accuracy gap survives it, so the next question is
+        the one nothing has asked: of the mass DENSE puts somewhere, how much
+        does VestigeKV attend, and is the row dense leans on even in the
+        attended set?
+
+        Computes the true scores over the whole closed prefix (kept plus
+        archive), which is what makes this a debug-only path: it is the dense
+        attention the method exists to avoid. Returns per-head medians, small
+        enough to keep one record per (step, layer, lane).
+        """
+        sc_ = self.scale
+        qe = qe.float()
+        kv = D.KV_LORA_RANK
+        if self.arch is None or self.arch.numel() == 0:
+            return {}
+        s_kept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
+        max1 = s_kept.max(-1).values
+        rows = self.arch.to(torch.int64)
+        arch_rows = self._kbuf.index_select(0, rows).float()
+        strue = (qe @ arch_rows.T) * sc_
+        qsk = qe[:, :kv] @ self.V.T
+        qres = (qe[:, :kv] - qsk @ self.V).norm(dim=-1)
+        idxs = (
+            (qe[:, kv:].to(torch.bfloat16) @ self.side.T).float()
+            + (qsk.half() @ self.csk.T).float()
+        ) * sc_
+        cert = (qres[:, None] * self.rho[None, :]) * sc_ / (kv - self.r) ** 0.5
+        fired = ((idxs + self.zp * cert) > (max1 - self.margin)[:, None]).any(0)
+        allsc = torch.cat([s_kept, strue], dim=-1)
+        m = allsc.max(-1, keepdim=True).values
+        w = (allsc - m).exp()
+        Z = w.sum(-1)
+        att = torch.cat(
+            [torch.ones_like(s_kept, dtype=torch.bool), fired.expand_as(strue)], -1
+        )
+        pr = w / Z[:, None]
+        ent = -(pr * pr.clamp_min(1e-30).log()).sum(-1)
+        # WHY a missed row was missed: where the true argmax ranks under the
+        # certified score the scan actually orders by, and how far its
+        # certified score fell short of the kept maximum. A row ranked 3rd but
+        # below threshold is a threshold problem; one ranked 40000th is an
+        # ordering problem, and they have different fixes.
+        top1 = allsc.argmax(-1)
+        cert_sc = idxs + self.zp * cert
+        a_top1 = (top1 - s_kept.shape[1]).clamp_min(0)
+        arch_is_top = top1 >= s_kept.shape[1]
+        rank = (cert_sc > cert_sc.gather(1, a_top1[:, None])).sum(1)
+        marg = cert_sc.gather(1, a_top1[:, None]).squeeze(1) - max1
+        sel = arch_is_top & (~fired.gather(0, a_top1.clamp_max(fired.numel() - 1)))
+        return {
+            "top1_rank_p50": float(rank[sel].median()) if bool(sel.any()) else -1.0,
+            "top1_margin_p50": float(marg[sel].median()) if bool(sel.any()) else 0.0,
+            "qperp_rel": float((qres / qe[:, :kv].norm(dim=-1)).median()),
+            "coverage": float(((w * att).sum(-1) / Z).median()),
+            "coverage_min": float(((w * att).sum(-1) / Z).min()),
+            "top1_attended": float(att.gather(1, top1[:, None]).float().mean()),
+            "entropy": float(ent.median()),
+            "n_beat_max1": int((strue > max1[:, None]).sum(1).max()),
+            "n_fired": int(fired.sum()),
+            "n_kept": int(self.kept_slots.shape[0]),
+            "n_arch": int(rows.numel()),
+        }
+
+    @torch.inference_mode()
+    def omitted_mass_and_mean(self, qe: torch.Tensor):
+        """The softmax mass this step's scan does NOT attend, and its centroid.
+
+        Returns (logM [H], mu [H, kv_lora_rank]). The scan attends kept +
+        fired, and fired is the UNION over heads -- a row one head fires is
+        read by all of them -- so a head's omitted set is the archive minus
+        that union. Their true scores are unknown; what the scan has is the
+        certified upper bound idxs + zp*cert, the same quantity it compares
+        against the threshold, so the mass is overestimated rather than
+        guessed.
+
+        Why the centroid is mass-weighted and not the plain archive mean:
+        blending the output toward a synthetic row is one exact step of the
+        online-softmax recurrence
+
+            O_n = lerp(O_{n-1}, v_n, sigmoid(s_n - lse_{n-1}))
+
+        and that step is exact only when the synthetic row carries the
+        omitted set's mass-weighted centroid. Measured offline on the Kimi
+        dumps, the arithmetic mean leaves the attention-output error at 0.367
+        against 0.195 for the weighted one (0.471 uncompensated).
+
+        Chunked over the archive: the unchunked form materialises an [H, A]
+        score matrix and an [A, 512] value selection, 123 MB of fp32 at 64k,
+        against the peak footprint that decides whether a long request fits.
+        Shifted by max1 per head, which is what the bound is compared against,
+        so the exponentials cannot overflow.
+
+        A research arm (SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND), not the serving
+        path: it touches every archived row's value, which costs about six
+        times the attention over the kept set. What it buys is the one term
+        every other measurement here conditioned away.
+        """
+        sc_ = self.scale
+        qe = qe.float()
+        H = qe.shape[0]
+        kv = D.KV_LORA_RANK
+        ninf = qe.new_full((H,), float("-inf"))
+        if self.arch is None or self.arch.numel() == 0:
+            return ninf, qe.new_zeros((H, kv))
+        if self.kept_slots.shape[0] == 0:
+            max1 = ninf
+            gate = qe.new_ones(H, dtype=torch.bool)
+            emarg = 0.0
+        else:
+            s_kept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
+            max1 = self._thr_base(s_kept, s_kept.max(-1).values)
+            emarg = self._ent_margin(s_kept)
+            p1 = torch.softmax(s_kept, -1)
+            ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
+            gate = ent > self.thr_g
+        if not torch.isfinite(max1).all():
+            return ninf, qe.new_zeros((H, kv))
+        thr = max1 - self.margin - emarg
+        qsk = qe[:, :kv] @ self.V.T
+        qres = (qe[:, :kv] - qsk @ self.V).norm(dim=-1)
+        qside = qe[:, kv:].to(torch.bfloat16)
+        qskh = qsk.half()
+        denom = (kv - self.r) ** 0.5
+        rows = self.arch.to(torch.int64)
+        side_a, csk_a, rho_a = self.side, self.csk, self.rho
+        acc_w = qe.new_zeros((H,))
+        acc_v = qe.new_zeros((H, kv))
+        for i in range(0, rows.numel(), 8192):
+            sl = slice(i, i + 8192)
+            idxs = ((qside @ side_a[sl].T).float() + (qskh @ csk_a[sl].T).float()) * sc_
+            cert = (qres[:, None] * rho_a[sl][None, :]) * sc_ / denom
+            score = idxs + self.zp * cert
+            fired = (score > thr[:, None]) & gate[:, None]
+            om = ~fired.any(0)  # the union is what the fetch buffer holds
+            if not bool(om.any()):
+                continue
+            w = (score[:, om] - max1[:, None]).exp()
+            acc_w += w.sum(-1)
+            vals = self._kbuf.index_select(0, rows[sl][om])[:, :kv].float()
+            acc_v += w @ vals
+        safe = acc_w.clamp_min(D.ENTROPY_EPS)
+        logm = torch.where(acc_w > 0, acc_w.log() + max1, ninf)
+        return logm, acc_v / safe[:, None]
+
+    @torch.inference_mode()
+    @ieee_fp32
+    def query(self, qe: torch.Tensor) -> torch.Tensor:
+        """qe: [H, 576] one decode step's expanded queries (float).
+        Returns absolute pool indices of rows to fetch (possibly empty)."""
+        sc_ = self.scale
+        qe = qe.float()
+        if self.kept_slots.shape[0] == 0:
+            H = qe.shape[0]
+            max1 = qe.new_full((H,), float("-inf"))  # no baseline: all eligible
+            gate = qe.new_ones(H, dtype=torch.bool)
+            emarg = 0.0
+        else:
+            s_kept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
+            max1 = self._thr_base(s_kept, s_kept.max(-1).values)  # [H]
+            emarg = self._ent_margin(s_kept)
+            p1 = torch.softmax(s_kept, -1)
+            ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
+            gate = ent > self.thr_g  # [H]
+            if not bool(gate.any()):
+                return self.arch[:0]
+        qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
+        qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
+        idxs = (
+            (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16) @ self.side.T).float()
+            + (qsk.half() @ self.csk.T).float()
+        ) * sc_
+        cert = (
+            (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
+        )
+        score = idxs + self.zp * cert
+        fire = (score > (max1 - self.margin - emarg)[:, None]) & gate[:, None]
+        return self.arch[fire.any(0)]
+
+    @ieee_fp32
+    @torch.inference_mode()
+    def extend_closed(self, new_rows: torch.Tensor, new_slots: torch.Tensor) -> None:
+        """Append a newly CLOSED block to the projection caches.
+        new_rows: [B, 576] pool rows of the block; new_slots: [B] pool row ids.
+        """
+        if self._csk_all is None:
+            dev = new_rows.device
+            self._pos_all = torch.zeros(0, dtype=torch.int64, device=dev)
+            self._csk_all = torch.zeros(0, self.r, device=dev, dtype=torch.float16)
+            self._rho_all = torch.zeros(0, device=dev)
+        Cf = new_rows.float()
+        csk = Cf[:, : D.KV_LORA_RANK] @ self.V.T
+        rho = (Cf[:, : D.KV_LORA_RANK] - csk @ self.V).norm(dim=-1)
+        # No _side_all. The sidecar is the pool row's own tail at KV_LORA_RANK
+        # and _pos_all already names every closed row, so carrying a [closed,64]
+        # bf16 copy alongside is storing what the pool still holds -- 8 MiB per
+        # (layer, request) at 64k, and it grows with the context.
+        self._csk_all = torch.cat([self._csk_all, csk.half()])
+        self._rho_all = torch.cat([self._rho_all, rho])
+        self._pos_all = torch.cat([self._pos_all, new_slots])
+
+    @ieee_fp32
+    @torch.inference_mode()
+    def refresh_membership(
+        self,
+        keep: torch.Tensor,
+        kbuf: torch.Tensor,
+    ) -> None:
+        """Re-derive the archive from a NEW keep mask over all closed rows.
+        keep: [closed] bool (True = tier-1 keeps it); kbuf the layer's pool
+        buffer, which both the sidecars and the kept rows are re-read from by
+        row id -- the caller used to gather the kept rows and hand them in,
+        which is the gather this now does on demand and only if asked.
+        Thresholds (zp, gate) are untouched: the conformal certificate is
+        sound for any archive."""
+        # Membership changes are an index change, not a data movement: the
+        # closed-prefix caches already hold every row's projection, and the
+        # archive is a selection over them.
+        idx = (~keep).nonzero().flatten()
+        self._arch_idx = idx.to(torch.int32)
+        self.arch = self._pos_all.index_select(0, idx).to(torch.int32)
+        self.kept_slots = self._pos_all[keep].to(torch.int32)
+        self._kbuf = kbuf
+        self._side_mat = self._kept_mat = None  # re-read from the pool on use
+        self._csk_mat = self._rho_mat = None  # re-selected from the caches
+        self._qside_t = self._qsk_t = self._hit_buf = None  # re-size lazily
+        self.version += 1

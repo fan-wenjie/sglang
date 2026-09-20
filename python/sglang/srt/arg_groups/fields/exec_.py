@@ -10,19 +10,11 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import argparse
-from typing import (
-    List,
-    Literal,
-    Optional,
-)
+from typing import List, Literal, Optional
 
 import msgspec
 
-from sglang.srt.arg_groups.arg_utils import (
-    A,
-    Arg,
-    Derived,
-)
+from sglang.srt.arg_groups.arg_utils import A, Arg, Derived
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
     FP4_GEMM_RUNNER_BACKEND_CHOICES,
@@ -307,6 +299,122 @@ class ExecKernel(msgspec.Struct):
     enable_deepseek_v4_fp4_indexer: A[
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # VestigeKV (--attention-backend vestigekv_mla)
+    # -------------------------------------------------------------------------
+    vestigekv_recall_capacity: A[
+        int,
+        "VestigeKV: rows the tier-2 recall may fetch per layer, request and decode "
+        "step. A fixed buffer width (CUDA graphs bake it), not a per-head cap; a "
+        "step that fires more rows than this overflows. Default 4096 sits above "
+        "the largest fire observed on the reference stack.",
+    ] = 4096
+    vestigekv_activation_min_tokens: A[
+        int,
+        "VestigeKV: requests shorter than this many tokens are served dense "
+        "(nothing closed, archived or recalled). 0 compresses every request from "
+        "its first token.",
+    ] = 0
+    vestigekv_index_rank: A[
+        int,
+        "VestigeKV: rank of the tier-2 recall sketch (rows of the per-layer basis). "
+        "Higher ranks certify more of the latent row and fire fewer rows per scan, at "
+        "2 bytes per rank per archived row per layer of scan traffic and memory.",
+    ] = 64
+    vestigekv_recall_margin: A[
+        float,
+        "VestigeKV: recall margin in scaled-logit units. An archived row is fetched "
+        "when its certified score exceeds the request's best kept-row score minus this "
+        "margin; 0 recalls only rows that could beat the kept max, ln(K) also keeps "
+        "K-way near ties (the softmax weight of a dropped row is bounded by e^-margin "
+        "of the kept max). More rows fetched per step as it grows.",
+    ] = 0.0
+    vestigekv_recall_threshold: A[
+        str,
+        Arg(
+            help="VestigeKV: what --vestigekv-recall-margin is subtracted from. max: the "
+            "best kept-row score (a dropped row holds at most e^-margin of the max "
+            "row's weight). lse: the log-sum-exp of the kept scores (at most e^-margin "
+            "of the whole kept mass; fires less where the kept distribution is diffuse).",
+            choices=["max", "lse"],
+        ),
+    ] = "max"
+    enable_vestigekv_prefill_calibration: A[
+        bool,
+        "VestigeKV: calibrate the recall index during prefill on absorbed prompt "
+        "queries (one every 512 positions plus each chunk's last, built at the "
+        "first closed block and then at every doubling of the prompt), so decode "
+        "starts on a calibrated index instead of the provisional one that fires "
+        "most of a large archive. Decode queries still refine it.",
+    ] = False
+    vestigekv_rebuild_overflow_fraction: A[
+        float,
+        "VestigeKV: refit a layer's recall index when its scan overflowed the "
+        "capacity on more than this fraction of the steps since that layer's last "
+        "block close. The index is otherwise fitted once, early in the request, "
+        "and a fit made at 8k context over-fires at 256k: every overflowing lane "
+        "then serves that step from the full row set. 0 disables the trigger; "
+        "0.05 is the measured-regime starting point.",
+    ] = 0.0
+    vestigekv_cert_gaussian_target: A[
+        float,
+        "VestigeKV: fit the certificate's z as mu + Phi^-1(target) * sigma over "
+        "the calibration requirements, instead of taking the conformal order "
+        "statistic at the recall target. z is an inner product of two residuals "
+        "in the orthogonal complement over sqrt of its dimension, so it is "
+        "standard normal under isotropy and measures that way (skewness -0.18, "
+        "excess kurtosis 0.00). The parametric fit is stable where the order "
+        "statistic is the maximum of 18 samples, and can express a target the "
+        "sample cannot reach: the sample maximum IS the 0.99 Gaussian target. "
+        "0 keeps the conformal quantile.",
+    ] = 0.0
+    vestigekv_min_hard_factor: A[
+        float,
+        "VestigeKV: multiple of the conformal EXISTENCE bound a tier must collect "
+        "before it leaves the Z_MAX safety clamp. The bound is the fewest samples "
+        "for which the quantile is definable (18 at recall target 0.90), not the "
+        "fewest for which it is trustworthy, and at answer steps the clamp loses "
+        "the top archived row on 16.0% of records against the fitted "
+        "certificate's 22.85%. 1.0 is the historical behaviour: trust the "
+        "quantile the moment it exists. Higher keeps the clamp longer, which "
+        "over-fetches and so costs fallback.",
+    ] = 1.0
+    vestigekv_multikey_fence_rows: A[
+        int,
+        "VestigeKV: rows fired above which a lane attends its FULL row set "
+        "instead of ranking. The scan's fired-row count rises monotonically "
+        "with how many archived rows a query actually needs (median 0, 1, 2, 4, "
+        "13 for 0, 1, 2, 3, 4+ such rows on the Kimi dumps), so it is a free "
+        "detector for the multi-key case the certificate is weakest on -- and "
+        "the fence is the one response that is exactly right there, because a "
+        "fenced lane IS dense. 0 keeps the historical behaviour, where only the "
+        "fetch buffer overflowing fences. Costs fallback: at 1 it catches every "
+        "lane needing two or more archived rows and fences 30% of RULER's lanes, "
+        "which is about what RULER already pays; a long decode pays far more, "
+        "so this is a short-answer knob.",
+    ] = 0
+    vestigekv_entropy_margin_gain: A[
+        float,
+        "VestigeKV: extra recall margin per nat of kept-distribution flatness, "
+        "measured as the log-sum-exp of the kept scores minus their maximum. It "
+        "is 0 when one kept row holds the attention mass and grows when none "
+        "does, which is the query whose kept maximum says least and which needs "
+        "several archived rows rather than one. 0 leaves the threshold exactly "
+        "as it is, and natural text with a confident match pays nothing either "
+        "way. Raises the fired-row count and so the fallback rate; accuracy is "
+        "what it is measured on.",
+    ] = 0.0
+    enable_vestigekv_attended_splits: A[
+        bool,
+        "VestigeKV: size the decode kernel's KV split count from the attended row "
+        "count (kept plus the recall capacity) instead of the request's full "
+        "length. The split count is otherwise chosen for a 256k row range while "
+        "the kernel reads about 8k rows, which both starves each split of work "
+        "and makes the combine stage cost more than the read. Changes the "
+        "floating-point accumulation grouping, so outputs stop being bitwise "
+        "identical to the dense arm at the same context; row sets are unaffected.",
     ] = False
 
 

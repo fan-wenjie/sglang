@@ -569,6 +569,76 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # VestigeKV: training-free NoPE-MLA KV-cache eviction attention backend
+    # (vestigekv_mla). Default on; set False for the kill-switch parity test that
+    # runs the wrapper as pure pass-through to the base MLA backend.
+    # VestigeKV benchmark arm switch: path of a flag file checked at each
+    # prefill; file present -> the FULL arm (attend all rows, the A/B
+    # baseline). Unset (default) disables arm switching entirely -- no
+    # file stat on any path in production.
+    SGLANG_DEBUG_VESTIGEKV_ROWS = EnvBool(False)
+    # Device-side check that the previous decode step appended the request's
+    # own previous row to its kept table (no per-step sync: a counter of
+    # mismatches per layer, read back every 200 steps and logged as VKTAIL).
+    SGLANG_DEBUG_VESTIGEKV_TAIL = EnvBool(False)
+
+    SGLANG_DEBUG_VESTIGEKV_STATS = EnvBool(False)
+    # Ablation only: attends the truncated fetch on a recall overflow instead
+    # of the request's full row set, which gives up no-under-recall.
+    SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK = EnvBool(False)
+    # Timing probe, never a serving mode: compiles the CSR gather's fenced
+    # branch as a no-op while every other part of the fence stays armed, so the
+    # cost of the branch merely EXISTING (it is sized into the kernel's register
+    # and shared-memory budget) separates from the cost of it running. A fenced
+    # lane then attends nothing, so the output is wrong on the steps that fence.
+    SGLANG_DEBUG_VESTIGEKV_FENCE_STUB = EnvBool(False)
+    SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE = EnvBool(False)
+    # Research arm: compensate the softmax denominator for the rows the scan
+    # never attends. VestigeKV attends ~6% of rows and captures ~57% of the
+    # dense softmax mass, so every retained weight is inflated ~2.9x. This
+    # estimates the omitted mass from the certified upper bound the scan
+    # already computes and blends the attention output toward the archive's
+    # mean value by that weight. Changes the output; off by default.
+    SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND = EnvBool(False)
+
+    # Per-step attribution against dense: writes one record per (step, layer,
+    # lane) to SGLANG_DEBUG_VESTIGEKV_DUMP_DIR saying how much of the dense
+    # softmax mass the attended set holds and whether dense's argmax row is in
+    # it. Computes the dense attention the method exists to avoid, so it is
+    # far slower than serving; debug only.
+    SGLANG_DEBUG_VESTIGEKV_STEPDUMP = EnvStr(None)
+
+    # Control for the multi-key fence: fence a random fraction of lanes at the
+    # same cost instead of choosing them by fired-row count. If the gain
+    # survives, the fired-row count is not a detector and the fence works only
+    # by making some steps exactly dense.
+    SGLANG_DEBUG_VESTIGEKV_RANDOM_FENCE = EnvFloat(0.0)
+    # Directory for one calibration snapshot per (request slot, layer): the
+    # closed-prefix content rows, the tier-1 keep set and the calibration
+    # queries the calibrated index was fitted on, written at its install.
+    # The offline certificate studies in the experiment repository read these.
+    SGLANG_DEBUG_VESTIGEKV_DUMP_DIR = EnvStr(None)
+    # Directory for allocator snapshots: records allocation stacks from
+    # startup, logs VKMEM (allocated / reserved) at every new request's first
+    # prefill chunk and writes torch.cuda.memory._dump_snapshot every fifth
+    # request, to find what grows across requests without the stats syncs.
+    SGLANG_DEBUG_VESTIGEKV_MEM_DIR = EnvStr(None)
+
+    # Capture the tier-2 recall scan + CSR pack INSIDE the decode model graph
+    # (via init_forward_metadata_in_graph) instead of replaying a second scan
+    # graph per step: removes the second cudaGraphLaunch's fixed ~0.9 ms
+    # batch-independent cost. The production path; False falls back to the
+    # separately captured scan graph (kill-switch A/B).
+    SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN = EnvBool(True)
+
+    SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG = EnvStr(None)
+
+    # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
+    # rows the KV pool already holds. Unset picks the fastest form that runs on
+    # the device (a TMA row gather where that compiles, an indirect load
+    # otherwise); 1 pins the indirect load, 2 pins the TMA gather. The two are
+    # bit-identical -- this selects instructions, never numerics.
+    SGLANG_VESTIGEKV_POOL_READ = EnvInt(None)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
@@ -1902,6 +1972,15 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
         note="The unified radix tree is the default tree cache now; unset this "
         "env. The field is still defined for legacy call sites."
+    ),
+    "SGLANG_VESTIGEKV_TOPJ": _DeprecatedEnv(
+        note="The per-head fetch cap is gone: the recall fetch is a fixed "
+        "capacity, set with '--vestigekv-recall-capacity', and an overflow "
+        "falls back to dense attention, which is not optional."
+    ),
+    "SGLANG_VESTIGEKV_ACTIVATION_MIN_TOKENS": _DeprecatedEnv(
+        note="Please use '--vestigekv-activation-min-tokens' instead "
+        "(its default is 0: every request compresses)."
     ),
 }
 
