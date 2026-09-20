@@ -319,18 +319,6 @@ class ExecKernel(msgspec.Struct):
         "step that fires more rows than this overflows. Default 4096 sits above "
         "the largest fire observed on the reference stack.",
     ] = 4096
-    disable_vestigekv_recall_overflow_fallback: A[
-        bool,
-        "VestigeKV: ABLATION SWITCH, not a deployment option. On a recall "
-        "overflow, attend the truncated fetch instead of the request's full row "
-        "set. The fallback is a component of the method, not a safety net "
-        "around it: the admission rule is uncapped and the buffer is a graph "
-        "width, so an overflow is the certificate reporting that this step "
-        "cannot be served sparsely at the recall target. Deleting it gives up "
-        "no-under-recall and leaves an incomplete algorithm -- measurably so on "
-        "the tasks that overflow most. Use it to measure what the component "
-        "buys, never to serve.",
-    ] = False
     vestigekv_activation_min_tokens: A[
         int,
         "VestigeKV: requests shorter than this many tokens are served dense "

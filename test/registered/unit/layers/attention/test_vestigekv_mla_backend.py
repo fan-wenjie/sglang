@@ -418,12 +418,22 @@ class TestConfig(CustomTestCase):
             VestigeKVConfig.from_kernel_config(ExecKernel()), FLAG_DEFAULT_CONFIG
         )
 
-    def test_disable_flag_switches_the_fallback_off(self):
-        from sglang.srt.arg_groups.fields.exec_ import ExecKernel
+    def test_overflow_fallback_is_on_unless_the_debug_key_is_set(self):
+        """The fallback has no deployment off-switch.
 
-        cfg = VestigeKVConfig.from_kernel_config(
-            ExecKernel(disable_vestigekv_recall_overflow_fallback=True)
+        It was a ServerArgs flag and is now a debug key, so a config built
+        from the kernel bag alone must have it ON; only the ablation key
+        turns it off. A regression here would put the trade back on a
+        deployment config surface, where there is no trade to take.
+        """
+        from sglang.srt.arg_groups.fields.exec_ import ExecKernel
+        from sglang.srt.environ import envs
+
+        self.assertTrue(
+            VestigeKVConfig.from_kernel_config(ExecKernel()).overflow_fallback
         )
+        with envs.SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK.override(True):
+            cfg = VestigeKVConfig.from_kernel_config(ExecKernel())
         self.assertFalse(cfg.overflow_fallback)
 
     def test_out_of_range_values_are_refused(self):

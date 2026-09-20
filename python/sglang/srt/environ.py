@@ -583,6 +583,15 @@ class Envs:
     SGLANG_DEBUG_VESTIGEKV_TAIL = EnvBool(False)
 
     SGLANG_DEBUG_VESTIGEKV_STATS = EnvBool(False)
+    # ABLATION ONLY. Attend the truncated fetch on a recall overflow
+    # instead of the request's full row set. The fallback is a component
+    # of the method, not a safety net around it: the admission rule is
+    # uncapped and the buffer is a graph width, so an overflow is the
+    # certificate reporting that a step cannot be served sparsely at the
+    # recall target. This was a ServerArgs flag; it is a debug key now so
+    # that no deployment config surface offers the trade, because there is
+    # no trade -- setting it leaves an incomplete algorithm.
+    SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK = EnvBool(False)
     # Directory for one calibration snapshot per (request slot, layer): the
     # closed-prefix content rows, the tier-1 keep set and the calibration
     # queries the calibrated index was fitted on, written at its install.
@@ -1946,8 +1955,7 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_VESTIGEKV_TOPJ": _DeprecatedEnv(
         note="The per-head fetch cap is gone: the recall fetch is a fixed "
         "capacity, set with '--vestigekv-recall-capacity', and an overflow "
-        "falls back to dense attention unless "
-        "'--disable-vestigekv-recall-overflow-fallback' is given."
+        "falls back to dense attention, which is not optional."
     ),
     "SGLANG_VESTIGEKV_ACTIVATION_MIN_TOKENS": _DeprecatedEnv(
         note="Please use '--vestigekv-activation-min-tokens' instead "

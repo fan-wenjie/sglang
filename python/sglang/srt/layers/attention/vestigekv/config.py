@@ -7,6 +7,7 @@ configuration is logged as one line.
 """
 
 import msgspec
+from sglang.srt.environ import envs
 
 RECALL_THRESHOLDS = ("max", "lse")
 
@@ -43,7 +44,7 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
         """Build from the ``exec.kernel`` config bag (``get_exec().kernel``)."""
         cfg = cls(
             recall_capacity=kernel.vestigekv_recall_capacity,
-            overflow_fallback=not kernel.disable_vestigekv_recall_overflow_fallback,
+            overflow_fallback=not envs.SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK.get(),
             activation_min_tokens=kernel.vestigekv_activation_min_tokens,
             index_rank=kernel.vestigekv_index_rank,
             recall_margin=kernel.vestigekv_recall_margin,
