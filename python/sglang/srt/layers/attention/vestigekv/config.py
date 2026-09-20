@@ -7,6 +7,7 @@ configuration is logged as one line.
 """
 
 import msgspec
+
 from sglang.srt.environ import envs
 
 RECALL_THRESHOLDS = ("max", "lse")
@@ -107,6 +108,7 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError(
                 f"--vestigekv-index-rank must be a positive multiple of 8, got {self.index_rank}"
             )
+
     def describe(self) -> str:
         return (
             f"recall_capacity={self.recall_capacity} "

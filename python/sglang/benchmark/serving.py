@@ -1099,34 +1099,10 @@ async def get_request(
 
 
 def stream_itl_is_trustworthy(outputs, itls):
-    """Can the client's arrival timestamps be read as decode latency?
-
-    On a long stream they cannot, and the failure is silent and directional.
-    With stream_interval=1 the server emits one detokenize + SSE event per
-    generated token, and the cost of that path grows with the length of the
-    stream. Once emission is slower than generation the server accumulates a
-    send backlog, so what the client timestamps is its own drain rate, not the
-    model's. The faster arm builds the deeper backlog, so the metric reports it
-    as SLOWER: on the run that produced this check the server finished
-    generating at 2297 s while the client was still draining at 5308 s, and the
-    reduced curve made the faster arm look 15x slower at 508k where the
-    server-side log had it 1.43x faster.
-
-    Two signals, both cheap:
-
-      length   a stream past ~64k tokens is in the regime where the emission
-               path's per-token cost has grown enough to matter. This is the
-               mechanism, so it is checked directly rather than inferred.
-      decay    the arrival rate collapsing from start to end. Attention makes
-               a long decode genuinely slower, so a mild decay is expected and
-               is not flagged; a backlog produces a far steeper one (245 ->
-               42 tok/s on the diagnosed run, against 249 -> 149 for a clean
-               arm over the same span).
-
-    Returns (trustworthy, reason). The caller records both rather than
-    dropping the numbers: a flagged run is still evidence about the client
-    path, it is just not evidence about the model.
-    """
+    """Whether the client's arrival timestamps measure decode, or its own
+    backlog. Returns (trustworthy, reason)."""
+    # Past ~64k tokens the server's per-token SSE cost has grown enough that
+    # emission can fall behind decode; below it the client keeps up.
     longest = max((o.output_len for o in outputs if o.success), default=0)
     if longest <= 65536:
         return True, ""
@@ -1137,6 +1113,9 @@ def stream_itl_is_trustworthy(outputs, itls):
         head, tail = sum(itl[:k]) / k, sum(itl[-k:]) / k
         if head > 0:
             worst = max(worst, tail / head)
+    # Attention makes a long decode genuinely slower, so decay alone is not
+    # evidence: a clean arm measured 249 -> 149 tok/s over this span while the
+    # backlogged one measured 245 -> 42.
     if worst >= 2.5:
         return False, (
             f"output_len {longest} with per-token streaming, and the arrival "
@@ -1285,7 +1264,8 @@ def calculate_metrics(
         print(
             "\n" + "=" * 78 + "\nWARNING: client-side ITL is not a latency "
             "measurement for this run.\n  " + _itl_why + "\n" + "=" * 78,
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
     metrics = BenchmarkMetrics(
         completed=completed,

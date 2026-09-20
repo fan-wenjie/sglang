@@ -10,19 +10,11 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import argparse
-from typing import (
-    List,
-    Literal,
-    Optional,
-)
+from typing import List, Literal, Optional
 
 import msgspec
 
-from sglang.srt.arg_groups.arg_utils import (
-    A,
-    Arg,
-    Derived,
-)
+from sglang.srt.arg_groups.arg_utils import A, Arg, Derived
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
     FP4_GEMM_RUNNER_BACKEND_CHOICES,

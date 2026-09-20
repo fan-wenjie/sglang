@@ -12,7 +12,9 @@ def hist_percentiles(counts, qs):
         if total == 0:
             out.append(0)
             continue
-        rank = max(1, -(-int(q * total * 1_000_000) // 1_000_000))  # ceil without float drift
+        rank = max(
+            1, -(-int(q * total * 1_000_000) // 1_000_000)
+        )  # ceil without float drift
         acc = 0
         value = len(counts) - 1
         for i, c in enumerate(counts):

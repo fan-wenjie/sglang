@@ -583,14 +583,8 @@ class Envs:
     SGLANG_DEBUG_VESTIGEKV_TAIL = EnvBool(False)
 
     SGLANG_DEBUG_VESTIGEKV_STATS = EnvBool(False)
-    # ABLATION ONLY. Attend the truncated fetch on a recall overflow
-    # instead of the request's full row set. The fallback is a component
-    # of the method, not a safety net around it: the admission rule is
-    # uncapped and the buffer is a graph width, so an overflow is the
-    # certificate reporting that a step cannot be served sparsely at the
-    # recall target. This was a ServerArgs flag; it is a debug key now so
-    # that no deployment config surface offers the trade, because there is
-    # no trade -- setting it leaves an incomplete algorithm.
+    # Ablation only: attends the truncated fetch on a recall overflow instead
+    # of the request's full row set, which gives up no-under-recall.
     SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK = EnvBool(False)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the

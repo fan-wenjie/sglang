@@ -14,7 +14,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 H, R, W = 32, 64, 512
 
@@ -65,7 +65,10 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         torch.manual_seed(3)
         L, max_reqs = 2, 6
         pairs = [(0, 1), (1, 4)]
-        base = {p: _mk_tier(800, 12000, seed=7 + p[1], zp=1.0, thr_g=-float("inf")) for p in pairs}
+        base = {
+            p: _mk_tier(800, 12000, seed=7 + p[1], zp=1.0, thr_g=-float("inf"))
+            for p in pairs
+        }
         qbuf = torch.randn(L, max_reqs, H, 576, device="cuda")
         out = torch.zeros(max_reqs, W, dtype=torch.int64, device="cuda")
         ol = torch.zeros(max_reqs, dtype=torch.int64, device="cuda")
@@ -79,15 +82,27 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
             fetch = torch.zeros(L, max_reqs, W, dtype=torch.int64, device="cuda")
             flen = torch.zeros(L, max_reqs, dtype=torch.int64, device="cuda")
             pack = BatchedScanPack(
-                pairs, [base[p] for p in pairs], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H,
-                margin=margin, thr_lse=(mode == "lse"),
+                pairs,
+                [base[p] for p in pairs],
+                qbuf,
+                fetch,
+                flen,
+                _ovf(flen),
+                _cnt(flen),
+                H,
+                margin=margin,
+                thr_lse=(mode == "lse"),
             )
             pack.run()
             torch.cuda.synchronize()
             for (li, slot), rows in ref.items():
                 n = int(flen[li, slot])
-                self.assertEqual(sorted(fetch[li, slot, :n].tolist()), sorted(rows.tolist()))
-            n_by_margin[(mode, margin)] = sum(int(flen[li, slot]) for (li, slot) in pairs)
+                self.assertEqual(
+                    sorted(fetch[li, slot, :n].tolist()), sorted(rows.tolist())
+                )
+            n_by_margin[(mode, margin)] = sum(
+                int(flen[li, slot]) for (li, slot) in pairs
+            )
         self.assertGreaterEqual(n_by_margin[("max", 2.0)], n_by_margin[("max", 0.0)])
         # the kept log-sum-exp is >= the kept max: the lse base fires no more than max
         self.assertLessEqual(n_by_margin[("lse", 0.0)], n_by_margin[("max", 0.0)])
@@ -125,7 +140,16 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
             ref_rows[(li, slot)] = out[slot, : int(ol[slot])].clone()
 
         pairs = list(tiers.keys())
-        pack = BatchedScanPack(pairs, [tiers[p] for p in pairs], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H)
+        pack = BatchedScanPack(
+            pairs,
+            [tiers[p] for p in pairs],
+            qbuf,
+            fetch,
+            flen,
+            _ovf(flen),
+            _cnt(flen),
+            H,
+        )
         pack.run()
         torch.cuda.synchronize()
         for li, slot in pairs:
@@ -148,7 +172,16 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         qbuf = torch.randn(1, 4, H, 576, device="cuda")
         fetch = torch.zeros(1, 4, W, dtype=torch.int64, device="cuda")
         flen = torch.zeros(1, 4, dtype=torch.int64, device="cuda")
-        pack = BatchedScanPack([(0, 0), (0, 1)], [small, wide], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H)
+        pack = BatchedScanPack(
+            [(0, 0), (0, 1)],
+            [small, wide],
+            qbuf,
+            fetch,
+            flen,
+            _ovf(flen),
+            _cnt(flen),
+            H,
+        )
         pack.run()
         torch.cuda.synchronize()
         n_small = int(flen[0, 0])
@@ -168,16 +201,23 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
         qbuf = torch.randn(1, 2, H, 576, device="cuda")
         fetch = torch.zeros(1, 2, W, dtype=torch.int64, device="cuda")
         flen = torch.zeros(1, 2, dtype=torch.int64, device="cuda")
-        pack = BatchedScanPack([(0, 0), (0, 1)], [t_neg, t_pad], qbuf, fetch, flen, _ovf(flen), _cnt(flen), H)
+        pack = BatchedScanPack(
+            [(0, 0), (0, 1)],
+            [t_neg, t_pad],
+            qbuf,
+            fetch,
+            flen,
+            _ovf(flen),
+            _cnt(flen),
+            H,
+        )
         pack.run()
         torch.cuda.synchronize()
         self.assertGreater(int(flen[0, 0]), 0, "pad row won the max: nothing fired")
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_update_matches_a_fresh_pack_bit_identically(self):
-        from sglang.srt.layers.attention.vestigekv.batched_step import (
-            BatchedScanPack,
-        )
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
 
         torch.manual_seed(5)
         max_reqs = 4
@@ -202,9 +242,7 @@ class TestBatchedStepMatchesPerPair(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_update_refuses_nothing_but_fits_reports_overflow(self):
-        from sglang.srt.layers.attention.vestigekv.batched_step import (
-            BatchedScanPack,
-        )
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
 
         qbuf = torch.randn(1, 4, H, 576, device="cuda")
         f = torch.zeros(1, 4, W, dtype=torch.int64, device="cuda")
@@ -326,7 +364,16 @@ class TestBatchedEmptyKept(CustomTestCase):
         qbuf = torch.randn(2, 2, H, D.LATENT_DIM, device=dev)
         fetch_buf = torch.zeros(2, 2, A + 8, dtype=torch.int64, device=dev)
         fetch_len = torch.zeros(2, 2, dtype=torch.int64, device=dev)
-        pack = BatchedScanPack(pairs, tiers, qbuf, fetch_buf, fetch_len, _ovf(fetch_len), _cnt(fetch_len), H)
+        pack = BatchedScanPack(
+            pairs,
+            tiers,
+            qbuf,
+            fetch_buf,
+            fetch_len,
+            _ovf(fetch_len),
+            _cnt(fetch_len),
+            H,
+        )
         pack.run()  # must not raise (was: zero-width kr -> max(-1) crash)
         # empty kept => whole archive eligible; both pairs fire > 0 rows
         self.assertGreater(int(fetch_len.sum()), 0)
@@ -761,6 +808,7 @@ class TestProjectionsFromTierCache(CustomTestCase):
         )
         self.assertEqual(int(pack.cbase[0]), t0._csk_all.data_ptr())
 
+
 class TestRecallOverflowFlag(CustomTestCase):
     """A pair firing more rows than the fetch buffer holds must keep the first
     W rows, raise its overflow flag and count once per step in its layer's
@@ -801,5 +849,7 @@ class TestRecallOverflowFlag(CustomTestCase):
         self.assertEqual(int(fovf[0, 1]), 0)
         self.assertEqual(int(flen[0, 1]), int(ol[1]))
         self.assertEqual(fcnt.tolist(), [0, 2], "one overflow per run, layer 1")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

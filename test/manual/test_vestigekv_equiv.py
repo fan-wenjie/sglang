@@ -43,7 +43,7 @@ import torch
 
 from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv import eviction
-from sglang.srt.layers.attention.vestigekv.eviction import select_kept, sidecar_sigma
+from sglang.srt.layers.attention.vestigekv.eviction import select_kept
 from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
 
 KV = D.KV_LORA_RANK  # 512
@@ -146,13 +146,11 @@ def _naive_build(kbuf, row_slots, keep, q_cal, q_pos, r, recall_target, scale):
             tgt_side = rows[apos, KV:]
             tgt_csk = csk_all[apos]
             tgt_rho = rho_all[apos]
-            idxs_t = (
-                qh[:, KV:].to(torch.bfloat16).float() * tgt_side.float()
-            ).sum(-1) + (qskh.half().float() * tgt_csk.float()).sum(-1)
+            idxs_t = (qh[:, KV:].to(torch.bfloat16).float() * tgt_side.float()).sum(
+                -1
+            ) + (qskh.half().float() * tgt_csk.float()).sum(-1)
             idxs_t = idxs_t * sc_
-            cert_t = (
-                qresh * tgt_rho * sc_ / (KV - r) ** 0.5
-            ).clamp_min(D.ENTROPY_EPS)
+            cert_t = (qresh * tgt_rho * sc_ / (KV - r) ** 0.5).clamp_min(D.ENTROPY_EPS)
             z_req = (abest[has_arch] - idxs_t) / cert_t
             k = D.conformal_k(n_cal_q, recall_target)
             zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
@@ -281,9 +279,7 @@ def test_eviction_equiv(dev=None):
     if dev.type == "cuda":
         sig_pool = eviction.blockwise_sigma_from_pool(kbuf, slots, block)
         kp = select_kept(sig_pool, D.RHO, (B // block) * block)
-        kp_ref = _naive_select_kept(
-            naive_pool, D.RHO, (B // block) * block, D.SINKS
-        )
+        kp_ref = _naive_select_kept(naive_pool, D.RHO, (B // block) * block, D.SINKS)
         assert torch.equal(kp, kp_ref), "fused pool sigma moved the keep mask"
 
     print(

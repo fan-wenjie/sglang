@@ -194,7 +194,15 @@ class BatchedScanPack:
     HEADROOM = 1.05
 
     def __init__(
-        self, pairs, tiers, qbuf, fetch_buf, fetch_len, fetch_ovf, ovf_count, q_heads,
+        self,
+        pairs,
+        tiers,
+        qbuf,
+        fetch_buf,
+        fetch_len,
+        fetch_ovf,
+        ovf_count,
+        q_heads,
         margin=0.0,
         ent_gain=0.0,
         fence_rows=0,

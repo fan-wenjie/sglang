@@ -301,6 +301,7 @@ def ieee_fp32(fn):
     wrapped.__doc__ = fn.__doc__
     return wrapped
 
+
 PAGETABLE_PROBE_EVERY = 512
 """Decode steps between two samples of the page table's affinity
 (_probe_page_table, stats only). The probe reads req_to_token[slot, :seq],

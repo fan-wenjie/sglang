@@ -15,7 +15,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=40, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 H, R, POOL = 32, 64, 8192
 
@@ -266,14 +266,17 @@ class TestOmittedMass(CustomTestCase):
         max1 = t._thr_base(skept, skept.max(-1).values)
         qsk = qe[:, : D.KV_LORA_RANK] @ t.V.T
         qres = (qe[:, : D.KV_LORA_RANK] - qsk @ t.V).norm(dim=-1)
-        idxs = ((qe[:, D.KV_LORA_RANK :].to(torch.bfloat16) @ t.side.T).float()
-                + (qsk.half() @ t.csk.T).float()) * sc
+        idxs = (
+            (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16) @ t.side.T).float()
+            + (qsk.half() @ t.csk.T).float()
+        ) * sc
         cert = (qres[:, None] * t.rho[None, :]) * sc / (D.KV_LORA_RANK - t.r) ** 0.5
         score = idxs + t.zp * cert
         p1 = torch.softmax(skept, -1)
         ent = -(p1 * p1.clamp_min(D.ENTROPY_EPS).log()).sum(-1)
         fire = (score > (max1 - t.margin - t._ent_margin(skept))[:, None]) & (
-            ent > t.thr_g)[:, None]
+            ent > t.thr_g
+        )[:, None]
         return skept, max1, score, ~fire.any(0)
 
     def test_log_mass_matches_an_independent_sum_over_the_omitted_rows(self):
@@ -282,13 +285,13 @@ class TestOmittedMass(CustomTestCase):
         logm, mu = t.omitted_mass_and_mean(q)
         skept, max1, score, om = self._parts(t, q, D)
         torch.testing.assert_close(
-            logm, torch.logsumexp(score[:, om], dim=-1), rtol=2e-3, atol=2e-3)
+            logm, torch.logsumexp(score[:, om], dim=-1), rtol=2e-3, atol=2e-3
+        )
         # The centroid is the MASS-WEIGHTED one: a synthetic row is an exact
         # online-softmax step only if it carries the weighted centroid
         # (offline 0.195 output error against 0.367 for the plain mean).
         w = (score[:, om] - max1[:, None]).exp()
-        vals = kbuf.index_select(0, t.arch.to(torch.int64))[
-            :, : D.KV_LORA_RANK].float()
+        vals = kbuf.index_select(0, t.arch.to(torch.int64))[:, : D.KV_LORA_RANK].float()
         want_mu = (w @ vals[om]) / w.sum(-1, keepdim=True)
         torch.testing.assert_close(mu, want_mu, rtol=5e-3, atol=5e-3)
 
@@ -308,10 +311,12 @@ class TestOmittedMass(CustomTestCase):
         fired = score[:, ~om]
         lse_att = torch.logsumexp(torch.cat([skept, fired], dim=-1), dim=-1)
         sigma = torch.sigmoid(lse_att - logm)
-        arch_true = (q.float() @ kbuf.index_select(
-            0, t.arch.to(torch.int64)).float().T) * t.scale
+        arch_true = (
+            q.float() @ kbuf.index_select(0, t.arch.to(torch.int64)).float().T
+        ) * t.scale
         self.assertGreater(
-            float(sigma.median()), 0.02,
+            float(sigma.median()),
+            0.02,
             f"sigma p50 {float(sigma.median()):.5f}: the blend REPLACES the "
             f"output instead of correcting it. logM p50 "
             f"{float(logm.median()):.2f}, attended lse p50 "
@@ -427,3 +432,7 @@ class TestGaussianCertificate(CustomTestCase):
 
         self.assertNotAlmostEqual(self._zp(0.0), self._zp(0.999), places=3)
         self.assertLessEqual(self._zp(0.0), D.Z_MAX)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

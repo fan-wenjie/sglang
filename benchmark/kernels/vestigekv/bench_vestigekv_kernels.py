@@ -77,7 +77,16 @@ def bench_prologue(S):
     li = torch.zeros(P, dtype=torch.int64, device=dev)
     slot = torch.arange(P, dtype=torch.int64, device=dev)
     split = lambda: fused_prologue_split(  # noqa: E731
-        qbuf, li, slot, kr, v, nk_len, thr, sc, out=out, partials=parts,
+        qbuf,
+        li,
+        slot,
+        kr,
+        v,
+        nk_len,
+        thr,
+        sc,
+        out=out,
+        partials=parts,
         # no archive concept in this bench: ones = never take the empty-
         # archive early exits (the conservative-but-explicit form)
         a_len=torch.ones_like(nk_len),
@@ -139,6 +148,7 @@ def bench_compact(S):
         # refill per call (the kernel re-zeros the table), same as serving.
         scr[0].copy_(counts_src)
         compact_fired(hit, arch, a_len, a_off, li, slot, fb, fl, scr, a)
+
     print(
         f"  compact S={S // 1024}k: torch-chain {t(torch_chain):.3f}  triton {t(tri):.3f} ms"
     )

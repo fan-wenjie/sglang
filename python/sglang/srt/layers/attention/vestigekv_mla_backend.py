@@ -35,8 +35,8 @@ safety width.
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -45,11 +45,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.vestigekv import defaults as D
+from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv.eviction import (
     blockwise_sigma_from_pool,
     select_kept,
 )
-from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
 from sglang.srt.layers.attention.vestigekv.tier_decode import rows_for_layer
 from sglang.srt.runtime_context import get_parallel
@@ -117,7 +117,9 @@ class VestigeKVMLABackend(AttentionBackend):
     _dense_cache = None  # (forward_batch, dense rows) of the eager step's fence
     _dbg_prev_lanes: list = []  # ROWS check: (slot, seq) per lane of the last decode step
     _pcal: dict = {}  # (slot, lid) -> {"q": [[H, 576]...], "pos": [...], "built_at": int}
-    _dbg_prev_tail = None  # TAIL check: (slots, seqs) device tensors of the last decode step
+    _dbg_prev_tail = (
+        None  # TAIL check: (slots, seqs) device tensors of the last decode step
+    )
     _dbg_tail_bad = None  # TAIL check: per-layer mismatch counters (+ lanes checked)
     _dbg_tail_steps = 0
     _mem_dir = None  # SGLANG_DEBUG_VESTIGEKV_MEM_DIR; class default for __new__ fakes
@@ -137,7 +139,9 @@ class VestigeKVMLABackend(AttentionBackend):
     _logm_stack = _archmu_stack = None
     _blend_logged = False
     _affine_base = None  # [max_reqs] int64
-    _pt_acc = None  # (consecutive pairs, pairs) of the page table; see _probe_page_table
+    _pt_acc = (
+        None  # (consecutive pairs, pairs) of the page table; see _probe_page_table
+    )
     _router = None  # TierDecodeRouter when config.tier_decode, else the CSR path
     # The flag defaults, for __new__-constructed fakes; a registered test pins
     # them to the ExecKernel field defaults.
@@ -256,8 +260,16 @@ class VestigeKVMLABackend(AttentionBackend):
         self._fetch_ovf: dict = {}  # lid -> [max_reqs] int32 overflow flag
         self._recall: dict = {}  # (slot, lid) -> {"tier", "built_at"}
         self._stats = dict.fromkeys(
-            ("steps", "scan_calls", "fetched", "kept", "seq", "replays",
-             "prologue_calls"), 0
+            (
+                "steps",
+                "scan_calls",
+                "fetched",
+                "kept",
+                "seq",
+                "replays",
+                "prologue_calls",
+            ),
+            0,
         )
         # The dedup token for "steps": see _decode_prologue.
         self._last_step_tok = None
@@ -276,7 +288,9 @@ class VestigeKVMLABackend(AttentionBackend):
         # Control for the fence: fence a random fraction of lanes at the same
         # cost, so the gain can be attributed to the SELECTION or to the mere
         # fact of attending densely more often.
-        self._rand_fence_p = float(envs.SGLANG_DEBUG_VESTIGEKV_RANDOM_FENCE.get() or 0.0)
+        self._rand_fence_p = float(
+            envs.SGLANG_DEBUG_VESTIGEKV_RANDOM_FENCE.get() or 0.0
+        )
         self._rand_coins = None
         self._stepdump_rows: list = []
         self._logm: dict = {}
@@ -354,8 +368,10 @@ class VestigeKVMLABackend(AttentionBackend):
             st = self._stats
             st["prologue_calls"] += 1
             real = forward_batch.out_cache_loc.shape[0]
-            tok = (real, int(self._seq_lens_host(forward_batch)[:real].sum())
-                   if real else 0)
+            tok = (
+                real,
+                int(self._seq_lens_host(forward_batch)[:real].sum()) if real else 0,
+            )
             if tok != self._last_step_tok:
                 self._last_step_tok = tok
                 st["steps"] += 1
@@ -377,7 +393,9 @@ class VestigeKVMLABackend(AttentionBackend):
             real = forward_batch.out_cache_loc.shape[0]
             if real:
                 self._fill_omitted_mass(
-                    forward_batch, reqs, real,
+                    forward_batch,
+                    reqs,
+                    real,
                     forward_batch.req_pool_indices[:real].to(torch.int64),
                 )
         self._maybe_close_blocks(forward_batch, reqs)
@@ -930,7 +948,9 @@ class VestigeKVMLABackend(AttentionBackend):
                         self._fetch_hist = torch.zeros(
                             self._fetch_w + 1, dtype=torch.int64, device=fl.device
                         )
-                        self._stat_acc = torch.zeros(3, dtype=torch.int64, device=fl.device)
+                        self._stat_acc = torch.zeros(
+                            3, dtype=torch.int64, device=fl.device
+                        )
                     fetched = fl.gather(0, slots).to(torch.int64)
                     self._stat_acc += torch.stack(
                         [
@@ -1036,10 +1056,14 @@ class VestigeKVMLABackend(AttentionBackend):
                 if not rec:
                     continue
                 rec.update(
-                    step=step, lid=lid, slot=int(slot), seq=int(seq[i]),
+                    step=step,
+                    lid=lid,
+                    slot=int(slot),
+                    seq=int(seq[i]),
                     # the state the blind spot is about
                     provisional=bool(getattr(tier, "need_more_hard", True)),
-                    zp=float(tier.zp), built_at=int(st.get("built_at", 0)),
+                    zp=float(tier.zp),
+                    built_at=int(st.get("built_at", 0)),
                 )
                 self._stepdump_rows.append(rec)
         if len(self._stepdump_rows) >= 200:
@@ -1078,7 +1102,9 @@ class VestigeKVMLABackend(AttentionBackend):
         if n < 2:
             return
         rows = r2t[slots, :n].to(torch.int64)
-        live = torch.arange(n - 1, device=rows.device)[None, :] < (seq_lens[:, None] - 1)
+        live = torch.arange(n - 1, device=rows.device)[None, :] < (
+            seq_lens[:, None] - 1
+        )
         step1 = ((rows[:, 1:] - rows[:, :-1]) == 1) & live
         if self._pt_acc is None:
             self._pt_acc = torch.zeros(2, dtype=torch.int64, device=rows.device)
@@ -1128,9 +1154,11 @@ class VestigeKVMLABackend(AttentionBackend):
             st["kept"] / c,
             st["seq"] / c,
             (st["fetched"] + st["kept"]) / max(st["seq"], 1),
-            "n/a" if self._pt_acc is None
+            "n/a"
+            if self._pt_acc is None
             else f"{(lambda c, t: c / max(t, 1))(*self._pt_acc.tolist()):.4f}",
-            "n/a" if self._idx_state is None
+            "n/a"
+            if self._idx_state is None
             else " ".join(
                 f"{nm}={sc:d}/{fr / max(sc, 1):.1f}/{ov / max(sc, 1):.4f}"
                 for nm, (sc, fr, ov) in zip(
@@ -1204,7 +1232,10 @@ class VestigeKVMLABackend(AttentionBackend):
             # extended here) are packed dense by design; the invariant is
             # about the lanes that compress.
             seen = torch.tensor(
-                [self._close_state.get((s, lid)) is not None for s in all_slots.tolist()],
+                [
+                    self._close_state.get((s, lid)) is not None
+                    for s in all_slots.tolist()
+                ],
                 dtype=torch.bool,
                 device=all_slots.device,
             )
@@ -1381,7 +1412,9 @@ class VestigeKVMLABackend(AttentionBackend):
             if lid in self._fetch_len:
                 self._fetch_len[lid][slot] = 0
                 self._fetch_ovf[lid][slot] = 0
-            self._maybe_prefill_build(slot=slot, lid=lid, seq_len=seq_len, closed=closed0)
+            self._maybe_prefill_build(
+                slot=slot, lid=lid, seq_len=seq_len, closed=closed0
+            )
             # Deliberately NOT built here: under chunked prefill seq_lens is the
             # running total, not the request length, so "is this the last chunk?"
             # is not decidable from the ForwardBatch (measured: the obvious
@@ -1420,7 +1453,9 @@ class VestigeKVMLABackend(AttentionBackend):
             rows = q[start : start + n][pick]  # [m, H, nope + rope]
             q_nope = rows[..., :nope].to(w_kc.dtype)
             absorbed = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
-            qe = torch.cat([absorbed, rows[..., nope:].to(absorbed.dtype)], dim=-1).float()
+            qe = torch.cat(
+                [absorbed, rows[..., nope:].to(absorbed.dtype)], dim=-1
+            ).float()
             pc = self._pcal[key]
             for j, m in enumerate(pick):
                 pc["q"].append(qe[j].clone())
@@ -1446,7 +1481,9 @@ class VestigeKVMLABackend(AttentionBackend):
         st = self._recall.get((slot, lid))
         if pc is None or st is None or "job" in st or st.get("qcal") is None:
             return
-        if len(pc["q"]) < D.N_CAL_START or seq_len < max(D.PREFILL_BUILD_MIN, 2 * pc["built_at"]):
+        if len(pc["q"]) < D.N_CAL_START or seq_len < max(
+            D.PREFILL_BUILD_MIN, 2 * pc["built_at"]
+        ):
             return
         pc["built_at"] = seq_len
         st["job"] = self._enqueue_build(slot, lid, seq_len, st)
@@ -1529,9 +1566,7 @@ class VestigeKVMLABackend(AttentionBackend):
             )
             self._ovf_count_stack = torch.zeros(n, dtype=torch.int32, device=dev)
             if self._rand_fence_p > 0.0:
-                self._rand_coins = torch.zeros(
-                    max_reqs, dtype=torch.int32, device=dev
-                )
+                self._rand_coins = torch.zeros(max_reqs, dtype=torch.int32, device=dev)
             if self._omit_blend:
                 # Allocated here, with every other fixed-address buffer, because
                 # the blend has to be part of the CAPTURED graph: the router's
@@ -1540,12 +1575,18 @@ class VestigeKVMLABackend(AttentionBackend):
                 # "no omitted mass", i.e. sigma = 1, so the captured op is a
                 # no-op until a step writes real values into it.
                 self._logm_stack = torch.full(
-                    (n, max_reqs, self._q_heads), float("-inf"),
-                    dtype=torch.float32, device=dev,
+                    (n, max_reqs, self._q_heads),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=dev,
                 )
                 self._archmu_stack = torch.zeros(
-                    n, max_reqs, self._q_heads, D.KV_LORA_RANK,
-                    dtype=torch.float32, device=dev,
+                    n,
+                    max_reqs,
+                    self._q_heads,
+                    D.KV_LORA_RANK,
+                    dtype=torch.float32,
+                    device=dev,
                 )
             # Per pool slot, not per layer: whether this request's page table is
             # one contiguous run, and where it starts. Maintained incrementally
@@ -1668,7 +1709,9 @@ class VestigeKVMLABackend(AttentionBackend):
                 )
                 if self._omit_blend and lid in self._logm:
                     self._router.blend[lid] = (
-                        self._logm[lid], self._archmu[lid], self._stage_slots[:bs],
+                        self._logm[lid],
+                        self._archmu[lid],
+                        self._stage_slots[:bs],
                     )
         else:
             # Eager step: the metadata hook packed this step's CSR into the
@@ -1912,7 +1955,9 @@ class VestigeKVMLABackend(AttentionBackend):
         )
         self._stage_loc[:real].copy_(forward_batch.out_cache_loc, non_blocking=True)
         if fence:
-            self._stage_seq[:real].copy_(forward_batch.seq_lens[:real], non_blocking=True)
+            self._stage_seq[:real].copy_(
+                forward_batch.seq_lens[:real], non_blocking=True
+            )
         if real < bs:
             self._stage_slots[real:bs].fill_(self._trash_slot)
             self._stage_loc[real:bs].zero_()
@@ -1955,7 +2000,12 @@ class VestigeKVMLABackend(AttentionBackend):
         self._dbg_tail_steps += 1
         if self._dbg_tail_steps % 200 == 0:
             v = self._dbg_tail_bad.tolist()
-            logger.info("VKTAIL steps=%d checked=%d bad_per_layer=%s", self._dbg_tail_steps, v[-1], v[:-1])
+            logger.info(
+                "VKTAIL steps=%d checked=%d bad_per_layer=%s",
+                self._dbg_tail_steps,
+                v[-1],
+                v[:-1],
+            )
 
     def _ingraph_host_step(self, forward_batch, reqs):
         real = forward_batch.out_cache_loc.shape[0]
@@ -2107,17 +2157,21 @@ class VestigeKVMLABackend(AttentionBackend):
             self._blend_logged = True
             logger.info(
                 "VKBLEND fill: layer %d wrote logM in [%.2f, %.2f] over %d lanes",
-                lid, float(lm.index_select(0, slots).min()),
-                float(lm.index_select(0, slots).max()), real,
+                lid,
+                float(lm.index_select(0, slots).min()),
+                float(lm.index_select(0, slots).max()),
+                real,
             )
         fenced = self._fetch_ovf[lid].index_select(0, slots) != 0
         lm.index_copy_(
             0,
             slots,
-            torch.where(fenced[:, None], torch.full_like(lm[:real], float("-inf")),
-                        lm.index_select(0, slots)),
+            torch.where(
+                fenced[:, None],
+                torch.full_like(lm[:real], float("-inf")),
+                lm.index_select(0, slots),
+            ),
         )
-
 
     def _seq_lens_host(self, forward_batch):
         """Host-side seq_lens without a device readback. The scheduler ships
@@ -2400,13 +2454,13 @@ class VestigeKVMLABackend(AttentionBackend):
                         job["qpos"], device=kbuf.device, dtype=torch.long
                     )
                     tier = RecallTier(
-            r=self.index_rank,
-            margin=self.config.recall_margin,
-            ent_gain=self.config.entropy_margin_gain,
-            fence_rows=self.config.multikey_fence_rows,
-            threshold=self.config.recall_threshold,
-            gauss_target=self.config.cert_gaussian_target,
-        )
+                        r=self.index_rank,
+                        margin=self.config.recall_margin,
+                        ent_gain=self.config.entropy_margin_gain,
+                        fence_rows=self.config.multikey_fence_rows,
+                        threshold=self.config.recall_threshold,
+                        gauss_target=self.config.cert_gaussian_target,
+                    )
                     stats = tier.build(
                         kbuf,
                         job["row_slots"],
@@ -2520,13 +2574,17 @@ class VestigeKVMLABackend(AttentionBackend):
             alloc = torch.cuda.memory_allocated() / 2**30
             reserved = torch.cuda.memory_reserved() / 2**30
             logger.info(
-                "VKMEM req=%d alloc=%.3fGB reserved=%.3fGB", self._mem_reqs, alloc, reserved
+                "VKMEM req=%d alloc=%.3fGB reserved=%.3fGB",
+                self._mem_reqs,
+                alloc,
+                reserved,
             )
             if self._mem_reqs % 5 == 0:
                 os.makedirs(self._mem_dir, exist_ok=True)
                 torch.cuda.memory._dump_snapshot(
                     os.path.join(
-                        self._mem_dir, f"mem_tp{get_parallel().tp_rank}_req{self._mem_reqs}.pickle"
+                        self._mem_dir,
+                        f"mem_tp{get_parallel().tp_rank}_req{self._mem_reqs}.pickle",
                     )
                 )
 
@@ -2560,7 +2618,8 @@ class VestigeKVMLABackend(AttentionBackend):
                 "stats": stats,
             },
             os.path.join(
-                out_dir, f"cal_tp{get_parallel().tp_rank}_slot{slot}_lid{lid}_seq{job['seq_len']}.pt"
+                out_dir,
+                f"cal_tp{get_parallel().tp_rank}_slot{slot}_lid{lid}_seq{job['seq_len']}.pt",
             ),
         )
 

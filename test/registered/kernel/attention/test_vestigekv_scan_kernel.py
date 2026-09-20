@@ -16,7 +16,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=40, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 H, D, R = 32, 64, 64
 SCALE = 192**-0.5
