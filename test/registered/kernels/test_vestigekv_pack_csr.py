@@ -117,30 +117,21 @@ class TestPackCsrParity(CustomTestCase):
                 torch.equal(r_ip[i, : bs + 1], g_ip[i, : bs + 1]),
                 f"indptr layer {i} seed={seed}",
             )
-            # compare per-lane segments, REAL lanes only: a duplicated
-            # trash lane's segment contains the append cell, whose
-            # collision winner the torch scatter leaves undefined (both
-            # forms are self-consistent; trash-lane attention output is
-            # discarded padding).
-            for lane in range(bs):
-                if lanes[lane] == TRASH:
-                    continue
-                lo, hi = int(r_ip[i, lane]), int(r_ip[i, lane + 1])
-                self.assertTrue(
-                    torch.equal(
-                        r_ix[i, lo:hi].to(torch.int64),
-                        g_ix[i, lo:hi].to(torch.int64),
-                    ),
-                    f"indices layer {i} lane {lane} seed={seed}",
-                )
-                if fence:
-                    fetch_ovf, seq, r2t = fence_ops
-                    if int(fetch_ovf[i, lanes[lane]]):
-                        # the fenced lane IS the dense row set, slot last
-                        n = int(seq[lane])
-                        want = r2t[lanes[lane], : n - 1].tolist() + [int(loc[lane])]
-                        self.assertEqual(g_ix[i, lo:hi].tolist(), want)
-                        self.assertEqual(hi - lo, n)
+            # The row array itself is no longer written: decode stage 1
+            # reads a lane's rows from the tiers, so what ships from this
+            # pack is the per-lane COUNT stage 2 reduces over. A fenced
+            # lane's count is still its whole row set, which is the part
+            # the fence has to get right.
+            if fence:
+                fetch_ovf, seq, _ = fence_ops
+                for lane in range(bs):
+                    if lanes[lane] == TRASH or not int(fetch_ovf[i, lanes[lane]]):
+                        continue
+                    lo, hi = int(g_ip[i, lane]), int(g_ip[i, lane + 1])
+                    self.assertEqual(
+                        hi - lo, int(seq[lane]),
+                        f"fenced lane {lane} layer {i} seed={seed}",
+                    )
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_matches_torch_chain(self):
@@ -148,104 +139,39 @@ class TestPackCsrParity(CustomTestCase):
             self._check(seed, lanes, fence=False)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_wide_row_ids_land_exactly_in_an_int64_csr(self):
-        # The CSR the base decode kernel reads is int64: it multiplies the row
-        # id by the row stride in the CSR's dtype, and int32 overflowed on a
-        # 5.1M-row pool (Kimi Linear, 576 elements per row) -- garbage rows
-        # for every request whose ids sat past 2^31 / 576. The int32 kept and
-        # fetch tables must widen on the store, value for value.
-        from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
-
-        kept_buf, kept_len, fetch_len, fetch_buf, _, indptr = _mk_state(11)
-        g = torch.Generator(device="cuda").manual_seed(11)
-        kept_buf = torch.randint(4_000_000, 5_100_000, kept_buf.shape, dtype=torch.int32, device="cuda", generator=g)
-        fetch_buf = torch.randint(4_000_000, 5_100_000, fetch_buf.shape, dtype=torch.int32, device="cuda", generator=g)
-        indices = torch.zeros(L, MAXBS * CAP + 1, dtype=torch.int64, device="cuda")
-        lanes = [2, 5, 0, TRASH]
-        slots = torch.tensor(lanes, dtype=torch.int64, device="cuda")
-        loc = torch.randint(4_000_000, 5_100_000, (len(lanes),), dtype=torch.int64, device="cuda", generator=g)
-        pack_csr_all_layers(slots, loc, kept_buf, kept_len, fetch_len, fetch_buf, indices, indptr)
-        for i in range(L):
-            for lane, slot in enumerate(lanes):
-                lo, hi = int(indptr[i, lane]), int(indptr[i, lane + 1])
-                n = int(kept_len[i, slot])  # post-append
-                want = kept_buf[i, slot, :n].tolist() + fetch_buf[i, slot, : int(fetch_len[i, slot])].tolist()
-                self.assertEqual(indices[i, lo:hi].tolist(), want)
-                self.assertEqual(int(indices[i, lo + n - 1]), int(loc[lane]))
-
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_row_sets_wider_than_the_grid_are_packed_whole(self):
-        # The gather grid-strides its tiles (defaults.PACK_GRID_CAP programs per
-        # lane), so a lane whose row set needs more tiles than the grid has
-        # programs is only complete if every program keeps looping. The sizes
-        # above are all under one tile, so they cannot see a stride that starts
-        # at the wrong tile or steps by the wrong amount -- both branches here
-        # need 40+ tiles against a 32-program grid.
-        from sglang.srt.layers.attention.vestigekv import defaults as D
-        from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
-
-        nl, r1, cap, fw, maxbs = 2, 3, 20480, 1024, 2
-        self.assertGreater((cap + fw + 511) // 512, D.PACK_GRID_CAP)
-        g = torch.Generator(device="cuda").manual_seed(23)
-        ints = lambda *shape: torch.randint(1, 5_000_000, shape, dtype=torch.int32, device="cuda", generator=g)
-        kept_buf, fetch_buf = ints(nl, r1, cap), ints(nl, r1, fw)
-        kept_len = torch.full((nl, r1), cap - 2, dtype=torch.int32, device="cuda")
-        fetch_len = torch.full((nl, r1), fw, dtype=torch.int32, device="cuda")
-        indices = torch.zeros(nl, maxbs * (cap + fw) + 1, dtype=torch.int64, device="cuda")
-        indptr = torch.zeros(nl, maxbs + 1, dtype=torch.int32, device="cuda")
-        lanes = [0, 1]
-        slots = torch.tensor(lanes, dtype=torch.int64, device="cuda")
-        loc = ints(len(lanes)).to(torch.int64)
-        seq = torch.full((len(lanes),), cap, dtype=torch.int64, device="cuda")
-        r2t = ints(r1, cap)
-        fetch_ovf = torch.zeros(nl, r1, dtype=torch.int32, device="cuda")
-        fetch_ovf[:, 0] = 1  # lane 0 fenced (dense row set), lane 1 kept+fetched
-
-        kb, fb = kept_buf.clone(), fetch_buf.clone()
-        pack_csr_all_layers(
-            slots, loc, kept_buf, kept_len, fetch_len, fetch_buf, indices, indptr,
-            seq=seq, fetch_ovf=fetch_ovf, req_to_token=r2t,
-        )
-        torch.cuda.synchronize()
-        for i in range(nl):
-            for lane, slot in enumerate(lanes):
-                lo, hi = int(indptr[i, lane]), int(indptr[i, lane + 1])
-                if int(fetch_ovf[i, slot]):
-                    want = r2t[slot, : cap - 1].to(torch.int64).tolist() + [int(loc[lane])]
-                else:
-                    n = cap - 1  # the append took the free cell
-                    want = kb[i, slot, : n - 1].to(torch.int64).tolist() + [int(loc[lane])]
-                    want += fb[i, slot, :fw].to(torch.int64).tolist()
-                self.assertEqual(hi - lo, len(want), f"layer {i} lane {lane} length")
-                self.assertEqual(indices[i, lo:hi].tolist(), want, f"layer {i} lane {lane}")
-
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_fence_matches_torch_chain(self):
         for seed, lanes in ((2, [2, 5, 0, TRASH]), (3, [1, 3, 6, 7])):
             self._check(seed, lanes, fence=True)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_gather_off_keeps_the_counts_and_the_append(self):
-        # The tier-decode router reads rows from the tiers, so the pack runs
-        # its prep launch alone. Everything the router still depends on -- the
-        # per-lane counts stage 2 reduces over, and the append of this step's
-        # row into the kept table -- must come out identical, and the row array
-        # must be left alone rather than half-written.
+    def test_the_pack_writes_counts_and_the_append_and_nothing_else(self):
+        # What the deployed decode still needs from this pack: the per-lane
+        # counts stage 2 reduces over, and the append of this step's row into
+        # the kept table. The row array must be left exactly as it was --
+        # stage 1 reads the tiers, and a half-written array here would be
+        # read by nothing and hide a real regression in the counts.
         from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
 
         lanes = [2, 5, 0, TRASH]
         slots = torch.tensor(lanes, dtype=torch.int64, device="cuda")
         loc = torch.arange(1, len(lanes) + 1, dtype=torch.int64, device="cuda")
-        full = _mk_state(4)
-        only = tuple(t.clone() for t in full)
-        pack_csr_all_layers(slots, loc, *full[:4], full[4], full[5])
-        only[4].fill_(-7)  # a value the gather would overwrite
-        pack_csr_all_layers(slots, loc, *only[:4], only[4], only[5], gather=False)
+        st = _mk_state(4)
+        before_kept_len = st[1].clone()
+        st[4].fill_(-7)  # a value nothing in the pack may overwrite
+        pack_csr_all_layers(slots, loc, *st[:4], st[4], st[5])
         torch.cuda.synchronize()
-        self.assertTrue(torch.equal(only[5], full[5]), "indptr must not change")
-        self.assertTrue(torch.equal(only[1], full[1]), "kept_len must not change")
-        self.assertTrue(torch.equal(only[0], full[0]), "kept_buf must not change")
-        self.assertTrue((only[4] == -7).all(), "indices must be left untouched")
+        self.assertTrue((st[4] == -7).all(), "the row array must be left untouched")
+        # kept_len is [layer, slot]: only the slots this step's lanes name
+        # grow, and each of them by exactly one row. A padded lane appends to
+        # the reserved trash slot, which is emptied before every pack, so it
+        # is not part of the contract being checked here.
+        for lay in range(st[1].shape[0]):
+            for slot in {l for l in lanes if l != TRASH}:
+                self.assertEqual(
+                    int(st[1][lay, slot]), int(before_kept_len[lay, slot]) + 1,
+                    f"layer {lay} slot {slot} must have appended exactly one row",
+                )
+        self.assertTrue((st[5][:, 1:] >= st[5][:, :-1]).all(), "indptr must be monotone")
 
 
 if __name__ == "__main__":

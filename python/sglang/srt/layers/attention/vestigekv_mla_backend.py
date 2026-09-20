@@ -1887,13 +1887,6 @@ class VestigeKVMLABackend(AttentionBackend):
             req_to_token=self.req_to_token_pool.req_to_token if fence else None,
             affine_ok=self._affine_ok if fence else None,
             affine_base=self._affine_base if fence else None,
-            # The router reads the rows from the tiers, so only the prep
-            # launch's per-lane counts are still consumed.
-            # The router reads rows from the tiers, so nothing consumes the
-            # index array any more: only the prep launch's per-lane counts are,
-            # by stage 2. It is never None; the argument stays because the
-            # eager path and the registered tests still build a CSR.
-            gather=self._router is None,
         )
 
     def _ensure_stage(self, n, dev):
