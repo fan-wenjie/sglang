@@ -40,8 +40,21 @@ class TierDecodeRouter(msgspec.Struct, dict=True):
     blend: dict = {}  # layer id -> (logm [B,H], mu [B,Lv]); omitted-mass arm only
 
     def __call__(
-        self, q, k_buffer, v_buffer, o, kv_indptr, kv_indices, attn_logits, attn_lse,
-        num_kv_splits, max_kv_splits, sm_scale, k_descale=None, v_descale=None, **kw,
+        self,
+        q,
+        k_buffer,
+        v_buffer,
+        o,
+        kv_indptr,
+        kv_indices,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        max_kv_splits,
+        sm_scale,
+        k_descale=None,
+        v_descale=None,
+        **kw,
     ):
         vk = self.rows.get(self.current_layer)
         # The blend is independent of which stage 1 ran: an eager step keeps the
@@ -50,8 +63,20 @@ class TierDecodeRouter(msgspec.Struct, dict=True):
         bl = self.blend.get(self.current_layer)
         if vk is None:
             out = self.inner(
-                q, k_buffer, v_buffer, o, kv_indptr, kv_indices, attn_logits, attn_lse,
-                num_kv_splits, max_kv_splits, sm_scale, k_descale, v_descale, **kw,
+                q,
+                k_buffer,
+                v_buffer,
+                o,
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                attn_lse,
+                num_kv_splits,
+                max_kv_splits,
+                sm_scale,
+                k_descale,
+                v_descale,
+                **kw,
             )
             if bl is not None:
                 _blend_omitted_mass(o, attn_lse, num_kv_splits, *bl)
@@ -59,13 +84,31 @@ class TierDecodeRouter(msgspec.Struct, dict=True):
         # k_descale folds into the scale exactly as upstream does before the
         # grouped launch; the tier path serves bf16 latents, where both are None.
         decode_grouped_att_m_fwd(
-            q, k_buffer, v_buffer, attn_logits, attn_lse, kv_indptr, kv_indices, vk,
-            num_kv_splits, max_kv_splits, sm_scale, kw.get("logit_cap", 0.0),
+            q,
+            k_buffer,
+            v_buffer,
+            attn_logits,
+            attn_lse,
+            kv_indptr,
+            kv_indices,
+            vk,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            kw.get("logit_cap", 0.0),
             has_mla=kw.get("has_mla", True),
         )
         _decode_softmax_reducev_fwd(
-            attn_logits, attn_lse, q, o, v_descale, v_buffer, kv_indptr,
-            num_kv_splits, max_kv_splits, kw.get("sinks"),
+            attn_logits,
+            attn_lse,
+            q,
+            o,
+            v_descale,
+            v_buffer,
+            kv_indptr,
+            num_kv_splits,
+            max_kv_splits,
+            kw.get("sinks"),
             use_pdl=kw.get("use_pdl", False),
         )
         if bl is not None:
@@ -133,7 +176,10 @@ def _blend_omitted_mass(o, attn_lse, num_kv_splits, logm_buf, mu_buf, slots):
         f = sigma.flatten().float()
         logging.getLogger(__name__).info(
             "VKBLEND sigma @call %d: min %.4f p50 %.4f max %.4f over %d (q, head)",
-            _BLEND_SEEN[0], float(f.min()), float(f.median()), float(f.max()),
+            _BLEND_SEEN[0],
+            float(f.min()),
+            float(f.median()),
+            float(f.max()),
             f.numel(),
         )
     view = o.view(-1, H, o.shape[-1])[:n]

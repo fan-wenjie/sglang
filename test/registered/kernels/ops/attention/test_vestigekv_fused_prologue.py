@@ -13,7 +13,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=40, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 H, R, KV, DD = 32, 64, 512, 64
 
@@ -122,10 +122,14 @@ class TestEntropyMargin(CustomTestCase):
         self.assertTrue(torch.equal(base, same), "gain 0 must change nothing")
         fin = torch.isfinite(base) & torch.isfinite(lower)
         self.assertTrue(bool(fin.any()), "no open gate to compare")
-        self.assertTrue(bool((lower[fin] <= base[fin] + 1e-6).all()),
-                        "a positive gain may only lower the threshold")
-        self.assertTrue(bool((lower[fin] < base[fin] - 1e-6).any()),
-                        "a positive gain must lower some threshold")
+        self.assertTrue(
+            bool((lower[fin] <= base[fin] + 1e-6).all()),
+            "a positive gain may only lower the threshold",
+        )
+        self.assertTrue(
+            bool((lower[fin] < base[fin] - 1e-6).any()),
+            "a positive gain must lower some threshold",
+        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_empty_kept_stays_minus_inf_under_a_gain(self):
@@ -134,8 +138,10 @@ class TestEntropyMargin(CustomTestCase):
         q, kr, v, nk_len, thr = _case(P=3, NKm=256, seed=2, empty=(0, 2))
         g, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, 1 / 24.0, ent_gain=0.5)
         for p in (0, 2):
-            self.assertTrue(bool((g[p] == -float("inf")).all()),
-                            f"empty kept pair {p} produced {g[p][:4]}")
+            self.assertTrue(
+                bool((g[p] == -float("inf")).all()),
+                f"empty kept pair {p} produced {g[p][:4]}",
+            )
 
 
 class TestSpreadTruncation(CustomTestCase):
@@ -177,17 +183,24 @@ class TestSpreadTruncation(CustomTestCase):
                 torch.zeros(1, dtype=torch.int32, device=dev),
             )
             with envs.SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE.override(spread):
-                compact_fired(hit, arch, a_len, a_off, li, slot, buf, ln, ovf, cnt,
-                              scratch, A)
+                compact_fired(
+                    hit, arch, a_len, a_off, li, slot, buf, ln, ovf, cnt, scratch, A
+                )
             torch.cuda.synchronize()
             n = int(ln[0, 0])
             got[spread] = (n, buf[0, 0, :n].clone())
-            self.assertEqual(int(ovf[0, 0]), 1, "the pair must be flagged as overflowing")
+            self.assertEqual(
+                int(ovf[0, 0]), 1, "the pair must be flagged as overflowing"
+            )
             self.assertLessEqual(n, W, f"reported count {n} exceeds the buffer")
-            self.assertTrue((buf[0, 0, :n] >= 0).all(), "reported count covers unwritten cells")
+            self.assertTrue(
+                (buf[0, 0, :n] >= 0).all(), "reported count covers unwritten cells"
+            )
         pre_max = int(got[False][1].max())
         spr_max = int(got[True][1].max())
-        self.assertLess(pre_max, A // 2, "the prefix should not reach the archive's tail")
+        self.assertLess(
+            pre_max, A // 2, "the prefix should not reach the archive's tail"
+        )
         self.assertGreater(spr_max, A // 2, "the spread selection must reach the tail")
 
 

@@ -129,8 +129,9 @@ def _fused_prologue_kernel(
     )
 
 
-def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0, thr_lse=False,
-                   ent_gain=0.0):
+def fused_prologue(
+    q, kr, v, nk_len, thr, sc, out=None, margin=0.0, thr_lse=False, ent_gain=0.0
+):
     """q [P,H,576] fp32, kr [P,NKm,576] bf16, v [P,R,512] fp32.
     Returns (max1g [P,H] fp32, qside_t [P,64,H] bf16, qsk_t [P,R,H] fp16,
     qres [P,H] fp32); pass `out` to reuse fixed-address buffers (capture)."""

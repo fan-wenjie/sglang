@@ -46,6 +46,7 @@ def _vestigekv_prefill_queries(layer, q, forward_batch):
         w_kc=layer.w_kc,
     )
 
+
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 

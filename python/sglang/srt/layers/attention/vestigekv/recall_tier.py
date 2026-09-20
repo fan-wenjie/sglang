@@ -27,7 +27,6 @@ from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
 
-
 _ZP_SEEN = [0]
 
 
@@ -43,7 +42,12 @@ def _log_zp(method, target, zp, n, zmax):
     if _ZP_SEEN[0] % 200 == 1:
         logging.getLogger(__name__).info(
             "VKZP fit=%s target=%.4f zp=%.4f n_cal=%d sample_max=%.4f (build %d)",
-            method, target, zp, n, zmax, _ZP_SEEN[0],
+            method,
+            target,
+            zp,
+            n,
+            zmax,
+            _ZP_SEEN[0],
         )
 
 
@@ -409,7 +413,13 @@ class RecallTier:
             # Debug telemetry: how many ARCHIVED rows each calibration query
             # truly prefers to its best kept row (the recall need), against
             # what the certificate fires below.
-            max1_d = (qe.to(torch.bfloat16) @ self.kept_rows.T).float().mul_(sc_).max(-1).values
+            max1_d = (
+                (qe.to(torch.bfloat16) @ self.kept_rows.T)
+                .float()
+                .mul_(sc_)
+                .max(-1)
+                .values
+            )
             need = torch.zeros(nq, dtype=torch.int64, device=dev)
         for k0 in range(0, T, KB):
             k1 = min(k0 + KB, T)
@@ -525,17 +535,24 @@ class RecallTier:
                 # cases and answer steps on 22.85%.
                 mu, sd = z_req.mean(), z_req.std()
                 q = torch.special.ndtri(
-                    torch.tensor(self.gauss_target, device=z_req.device,
-                                 dtype=z_req.dtype)
+                    torch.tensor(
+                        self.gauss_target, device=z_req.device, dtype=z_req.dtype
+                    )
                 )
                 self.zp = min(float(mu + q * sd), D.Z_MAX)
-                _log_zp("gauss", self.gauss_target, self.zp, n_cal_q,
-                        float(z_req.max()))
+                _log_zp(
+                    "gauss", self.gauss_target, self.zp, n_cal_q, float(z_req.max())
+                )
             else:
                 k = D.conformal_k(n_cal_q, self.recall_target)
                 self.zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
-                _log_zp("conformal", self.recall_target, self.zp, n_cal_q,
-                        float(z_req.max()))
+                _log_zp(
+                    "conformal",
+                    self.recall_target,
+                    self.zp,
+                    n_cal_q,
+                    float(z_req.max()),
+                )
         zp = self.zp
         # Per-row projection caches over ALL closed rows (kept and archived
         # alike), so a decode-time block close -- which rebalances membership
@@ -570,9 +587,7 @@ class RecallTier:
         """
         if self.ent_gain == 0.0 or skept is None:
             return 0.0
-        return self.ent_gain * (
-            torch.logsumexp(skept, -1) - skept.max(-1).values
-        )
+        return self.ent_gain * (torch.logsumexp(skept, -1) - skept.max(-1).values)
 
     def _thr_base(self, skept, max1):
         # The score the margin is taken from: the best kept row, or the kept
@@ -591,8 +606,17 @@ class RecallTier:
         qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
         idxs = (qsk.half().float() @ self.csk.float().T) * sc_
         if D.SIDECAR_DIM:
-            idxs = idxs + (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16).float() @ self.side.float().T) * sc_
-        cert = (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
+            idxs = (
+                idxs
+                + (
+                    qe[:, D.KV_LORA_RANK :].to(torch.bfloat16).float()
+                    @ self.side.float().T
+                )
+                * sc_
+            )
+        cert = (
+            (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
+        )
         fire = ((idxs + zp * cert) > (max1 - self.margin)[:, None]).sum(-1)
         fire0 = (idxs > (max1 - self.margin)[:, None]).sum(-1)  # sketch term alone
         q = lambda t, p: float(t.float().quantile(p))
@@ -604,19 +628,32 @@ class RecallTier:
         cbar = cg.mean(1)
         delta = (cg - cbar[:, None, :]).norm(dim=-1).max(1).values
         rho_g = self.rho[:A4].view(-1, 4).max(1).values
-        bound_g = (qsk @ cbar.T) * sc_ + (qsk.norm(dim=-1)[:, None] * delta[None, :]) * sc_
-        bound_g = bound_g + (qres[:, None] * rho_g[None, :]) * sc_ * zp / (D.KV_LORA_RANK - self.r) ** 0.5
+        bound_g = (qsk @ cbar.T) * sc_ + (
+            qsk.norm(dim=-1)[:, None] * delta[None, :]
+        ) * sc_
+        bound_g = (
+            bound_g
+            + (qres[:, None] * rho_g[None, :])
+            * sc_
+            * zp
+            / (D.KV_LORA_RANK - self.r) ** 0.5
+        )
         gfire = (bound_g > (max1 - self.margin)[:, None]).sum(-1) * 4
         return {
-            "gfire_p50": q(gfire, 0.5), "gfire_p90": q(gfire, 0.9),
+            "gfire_p50": q(gfire, 0.5),
+            "gfire_p90": q(gfire, 0.9),
             "delta_over_c_p50": q(delta / cbar.norm(dim=-1).clamp_min(1e-6), 0.5),
             "A": A,
-            "need_p50": q(need, 0.5), "need_p90": q(need, 0.9), "need_max": int(need.max()),
-            "fire_p50": q(fire, 0.5), "fire_p90": q(fire, 0.9),
+            "need_p50": q(need, 0.5),
+            "need_p90": q(need, 0.9),
+            "need_max": int(need.max()),
+            "fire_p50": q(fire, 0.5),
+            "fire_p90": q(fire, 0.9),
             "fire_sketch_only_p50": q(fire0, 0.5),
             "max1_p50": q(max1, 0.5),
             "cert_p50": q(cert.median(dim=-1).values * zp, 0.5),
-            "rho_p50": q(self.rho, 0.5), "qres_p50": q(qres, 0.5),
+            "rho_p50": q(self.rho, 0.5),
+            "qres_p50": q(qres, 0.5),
         }
 
     @torch.inference_mode()
@@ -774,9 +811,7 @@ class RecallTier:
         return {
             "top1_rank_p50": float(rank[sel].median()) if bool(sel.any()) else -1.0,
             "top1_margin_p50": float(marg[sel].median()) if bool(sel.any()) else 0.0,
-            "qperp_rel": float(
-                (qres / qe[:, :kv].norm(dim=-1)).median()
-            ),
+            "qperp_rel": float((qres / qe[:, :kv].norm(dim=-1)).median()),
             "coverage": float(((w * att).sum(-1) / Z).median()),
             "coverage_min": float(((w * att).sum(-1) / Z).min()),
             "top1_attended": float(att.gather(1, top1[:, None]).float().mean()),
@@ -853,9 +888,7 @@ class RecallTier:
         acc_v = qe.new_zeros((H, kv))
         for i in range(0, rows.numel(), 8192):
             sl = slice(i, i + 8192)
-            idxs = (
-                (qside @ side_a[sl].T).float() + (qskh @ csk_a[sl].T).float()
-            ) * sc_
+            idxs = ((qside @ side_a[sl].T).float() + (qskh @ csk_a[sl].T).float()) * sc_
             cert = (qres[:, None] * rho_a[sl][None, :]) * sc_ / denom
             score = idxs + self.zp * cert
             fired = (score > thr[:, None]) & gate[:, None]

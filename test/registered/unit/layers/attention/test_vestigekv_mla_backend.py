@@ -278,9 +278,6 @@ class TestRowInvariantCheck(CustomTestCase):
         with self.assertRaisesRegex(AssertionError, "never built"):
             self._run(be, fb, full_arm=False)
 
-
-
-
     def test_lane_without_state_is_outside_the_invariant(self):
         # the warmup's dummy batch has no compressed state for its slots and
         # packs dense; the check must not read that as a missing table
@@ -288,8 +285,6 @@ class TestRowInvariantCheck(CustomTestCase):
         be._close_state = {}
         with patch.object(VestigeKVMLABackend, "_full_arm", return_value=False):
             be._check_row_invariant(fb)  # must not raise
-
-
 
 
 class TestPrefillCalibration(CustomTestCase):
@@ -300,7 +295,9 @@ class TestPrefillCalibration(CustomTestCase):
 
     def _backend(self, enabled=True):
         be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
-        be.config = msgspec.structs.replace(FLAG_DEFAULT_CONFIG, prefill_calibration=enabled)
+        be.config = msgspec.structs.replace(
+            FLAG_DEFAULT_CONFIG, prefill_calibration=enabled
+        )
         be._pcal = {}
         be._recall = {}
         return be
@@ -320,18 +317,44 @@ class TestPrefillCalibration(CustomTestCase):
         be = self._backend()
         n = 3 * D.PREFILL_CAL_STRIDE + 7  # three stride hits plus the chunk's last row
         q = torch.randn(n, H, nope + rope)
-        be.write_prefill_queries(layer_id=LID, forward_batch=self._fb([5], [n], [0]), q=q, positions=None, w_kc=w_kc)
+        be.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([5], [n], [0]),
+            q=q,
+            positions=None,
+            w_kc=w_kc,
+        )
         pc = be._pcal[(5, LID)]
-        want_pos = [D.PREFILL_CAL_STRIDE - 1, 2 * D.PREFILL_CAL_STRIDE - 1, 3 * D.PREFILL_CAL_STRIDE - 1, n - 1]
+        want_pos = [
+            D.PREFILL_CAL_STRIDE - 1,
+            2 * D.PREFILL_CAL_STRIDE - 1,
+            3 * D.PREFILL_CAL_STRIDE - 1,
+            n - 1,
+        ]
         self.assertEqual(pc["pos"], want_pos)
         for qe, pos in zip(pc["q"], want_pos):
-            ref = torch.cat([torch.einsum("hd,hdk->hk", q[pos, :, :nope], w_kc), q[pos, :, nope:]], -1)
+            ref = torch.cat(
+                [torch.einsum("hd,hdk->hk", q[pos, :, :nope], w_kc), q[pos, :, nope:]],
+                -1,
+            )
             self.assertTrue(torch.allclose(qe, ref, atol=1e-5))
         # second chunk continues the same request; a new request (prefix 0) starts over
-        be.write_prefill_queries(layer_id=LID, forward_batch=self._fb([5], [10], [n]), q=torch.randn(10, H, nope + rope), positions=None, w_kc=w_kc)
+        be.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([5], [10], [n]),
+            q=torch.randn(10, H, nope + rope),
+            positions=None,
+            w_kc=w_kc,
+        )
         self.assertEqual(be._pcal[(5, LID)]["pos"][-1], n + 9)
         self.assertEqual(len(be._pcal[(5, LID)]["q"]), 5)
-        be.write_prefill_queries(layer_id=LID, forward_batch=self._fb([5], [10], [0]), q=torch.randn(10, H, nope + rope), positions=None, w_kc=w_kc)
+        be.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([5], [10], [0]),
+            q=torch.randn(10, H, nope + rope),
+            positions=None,
+            w_kc=w_kc,
+        )
         self.assertEqual(be._pcal[(5, LID)]["pos"], [9])
 
     def test_collection_keeps_the_newest_queries_and_is_off_by_default(self):
@@ -339,38 +362,81 @@ class TestPrefillCalibration(CustomTestCase):
         w_kc = torch.randn(H, nope, kv)
         be = self._backend()
         n = (D.N_CAL_MAX + 5) * D.PREFILL_CAL_STRIDE
-        be.write_prefill_queries(layer_id=LID, forward_batch=self._fb([0], [n], [0]), q=torch.randn(n, H, nope + rope), positions=None, w_kc=w_kc)
+        be.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([0], [n], [0]),
+            q=torch.randn(n, H, nope + rope),
+            positions=None,
+            w_kc=w_kc,
+        )
         self.assertEqual(len(be._pcal[(0, LID)]["q"]), D.N_CAL_MAX)
         self.assertEqual(be._pcal[(0, LID)]["pos"][-1], n - 1)
         off = self._backend(enabled=False)
-        off.write_prefill_queries(layer_id=LID, forward_batch=self._fb([0], [n], [0]), q=torch.randn(n, H, nope + rope), positions=None, w_kc=w_kc)
+        off.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([0], [n], [0]),
+            q=torch.randn(n, H, nope + rope),
+            positions=None,
+            w_kc=w_kc,
+        )
         self.assertEqual(off._pcal, {})
 
     def test_prefill_build_is_paced_and_needs_an_archive(self):
         be = self._backend()
-        st = {"tier": None, "built_at": 0, "qcal": [], "qpos": [], "target": D.N_CAL_START}
+        st = {
+            "tier": None,
+            "built_at": 0,
+            "qcal": [],
+            "qpos": [],
+            "target": D.N_CAL_START,
+        }
         be._recall[(0, LID)] = st
-        be._pcal[(0, LID)] = {"q": [torch.zeros(1, 1)] * D.N_CAL_START, "pos": list(range(D.N_CAL_START)), "built_at": 0}
+        be._pcal[(0, LID)] = {
+            "q": [torch.zeros(1, 1)] * D.N_CAL_START,
+            "pos": list(range(D.N_CAL_START)),
+            "built_at": 0,
+        }
         calls = []
-        with patch.object(VestigeKVMLABackend, "_enqueue_build", lambda _s, slot, lid, seq_len, st: calls.append(seq_len) or {"done": None}):
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN, closed=0)  # no archive
+        with patch.object(
+            VestigeKVMLABackend,
+            "_enqueue_build",
+            lambda _s, slot, lid, seq_len, st: calls.append(seq_len) or {"done": None},
+        ):
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN, closed=0
+            )  # no archive
             self.assertEqual(calls, [])
             # Regression: builds were paced every 16k prompt tokens, so 4k-16k
             # prompts (RULER's short cells) started decode on the provisional
             # index; the first closed block must already get a build.
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK)
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK
+            )
             self.assertEqual(calls, [D.PREFILL_BUILD_MIN])
             self.assertIn("job", st)
             st.pop("job")
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN + 100, closed=D.CLOSE_BLOCK)
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN + 100, closed=D.CLOSE_BLOCK
+            )
             self.assertEqual(calls, [D.PREFILL_BUILD_MIN])  # next build at the doubling
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=2 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK)
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=2 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK
+            )
             self.assertEqual(calls, [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN])
             st.pop("job")
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=3 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK)
-            self.assertEqual(calls, [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN])  # 12k < 2 x 8k
-            be._maybe_prefill_build(slot=0, lid=LID, seq_len=4 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK)
-            self.assertEqual(calls, [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN, 4 * D.PREFILL_BUILD_MIN])
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=3 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK
+            )
+            self.assertEqual(
+                calls, [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN]
+            )  # 12k < 2 x 8k
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=4 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK
+            )
+            self.assertEqual(
+                calls,
+                [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN, 4 * D.PREFILL_BUILD_MIN],
+            )
         # the build's inputs put the prompt queries before the decode ones
         st["qcal"], st["qpos"] = [torch.ones(1, 1)], [99]
         q, pos = be._calibration_inputs(0, LID, st)
@@ -391,7 +457,9 @@ class TestPackedCsrDtype(CustomTestCase):
             ),
             max_context_len=64,
         )
-        be.req_to_token_pool = SimpleNamespace(req_to_token=torch.zeros(3, 64, dtype=torch.int32))
+        be.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros(3, 64, dtype=torch.int32)
+        )
         be.token_to_kv_pool = SimpleNamespace(size=5_095_798)
         be._local_mla_lids = [LID]
         be._li_map = {LID: 0}
@@ -483,7 +551,9 @@ class TestSplitLens(CustomTestCase):
 
     def test_off_and_before_any_close_the_request_length_is_used(self):
         lens = torch.tensor([262144], dtype=torch.int64)
-        self.assertEqual(self._backend(False, {3: 8192})._split_lens(lens).tolist(), [262144])
+        self.assertEqual(
+            self._backend(False, {3: 8192})._split_lens(lens).tolist(), [262144]
+        )
         # no layer has closed a block yet: there is no attended bound to clamp to
         self.assertEqual(self._backend(True)._split_lens(lens).tolist(), [262144])
 
@@ -530,7 +600,6 @@ class TestConfig(CustomTestCase):
         ):
             with self.assertRaises(ValueError, msg=str(bad)):
                 msgspec.structs.replace(base, **bad).validate()
-
 
 
 class TestOverflowFence(CustomTestCase):
@@ -649,8 +718,17 @@ class TestStatsTelemetry(CustomTestCase):
 
         be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
         be._stats = dict.fromkeys(
-            ("steps", "scan_calls", "fetched", "kept", "seq", "replays",
-             "prologue_calls"), 0)
+            (
+                "steps",
+                "scan_calls",
+                "fetched",
+                "kept",
+                "seq",
+                "replays",
+                "prologue_calls",
+            ),
+            0,
+        )
         be._last_step_tok = None
         be._collecting = False
         seen = []
@@ -691,8 +769,17 @@ class TestStatsTelemetry(CustomTestCase):
 
         be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
         be._stats = dict.fromkeys(
-            ("steps", "scan_calls", "fetched", "kept", "seq", "replays",
-             "prologue_calls"), 0)
+            (
+                "steps",
+                "scan_calls",
+                "fetched",
+                "kept",
+                "seq",
+                "replays",
+                "prologue_calls",
+            ),
+            0,
+        )
         be._last_step_tok = None
         be._collecting = False
         be._omit_blend = True
@@ -722,8 +809,17 @@ class TestStatsTelemetry(CustomTestCase):
 
         be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
         be._stats = dict.fromkeys(
-            ("steps", "scan_calls", "fetched", "kept", "seq", "replays",
-             "prologue_calls"), 0)
+            (
+                "steps",
+                "scan_calls",
+                "fetched",
+                "kept",
+                "seq",
+                "replays",
+                "prologue_calls",
+            ),
+            0,
+        )
         be._last_step_tok = None
         be._collecting = False
         be._omit_blend = False
@@ -1255,14 +1351,21 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         self.assertEqual(be._recall[(0, LID)]["qcal"], [])
         self.assertTrue(be._collecting)
 
-    def test_a_build_finished_during_prefill_installs_before_the_provisional_index(self):
+    def test_a_build_finished_during_prefill_installs_before_the_provisional_index(
+        self,
+    ):
         # With prefill calibration the calibrated job can be done before the
         # first decode step; installing it first skips the provisional build.
         be = self._backend()
         st = be._recall[(0, LID)]
         job = {
-            "slot": 0, "lid": LID, "st": st, "seq_len": 100, "qcal": [None] * 8,
-            "done": SimpleNamespace(is_set=lambda: True), "error": None,
+            "slot": 0,
+            "lid": LID,
+            "st": st,
+            "seq_len": 100,
+            "qcal": [None] * 8,
+            "done": SimpleNamespace(is_set=lambda: True),
+            "error": None,
             "tier": SimpleNamespace(built_at=100, proxy=False, V="V"),
             "stats": {"need_more_hard": False, "n_hard": 99},
         }
@@ -1352,7 +1455,10 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         with (
             tempfile.TemporaryDirectory() as d,
             envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.override(d),
-            patch(f"{VestigeKVMLABackend.__module__}.get_parallel", lambda: SimpleNamespace(tp_rank=0)),
+            patch(
+                f"{VestigeKVMLABackend.__module__}.get_parallel",
+                lambda: SimpleNamespace(tp_rank=0),
+            ),
         ):
             self.assertTrue(be._install_finished_builds())
             (name,) = os.listdir(d)
@@ -1381,6 +1487,7 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         job = be.enqueued[0]
         self.assertIs(old_st["job"], job)
         self._finish(job)
+
         # dicts take no weakref: watch the tiers they hold (the provisional
         # one in the state, the calibrated one in the job)
         class Tier:
@@ -1412,8 +1519,13 @@ class TestTierTwoIsNeverOff(CustomTestCase):
             tempfile.TemporaryDirectory() as d,
             patch.object(torch.cuda, "memory_allocated", lambda: 0),
             patch.object(torch.cuda, "memory_reserved", lambda: 0),
-            patch.object(torch.cuda.memory, "_dump_snapshot", lambda p: dumped.append(p)),
-            patch(f"{VestigeKVMLABackend.__module__}.get_parallel", lambda: SimpleNamespace(tp_rank=0)),
+            patch.object(
+                torch.cuda.memory, "_dump_snapshot", lambda p: dumped.append(p)
+            ),
+            patch(
+                f"{VestigeKVMLABackend.__module__}.get_parallel",
+                lambda: SimpleNamespace(tp_rank=0),
+            ),
         ):
             be._mem_dir = d
             be._trace_request_memory(3)
@@ -1679,7 +1791,9 @@ class TestCaptureDoesNotDuplicateKeptRows(CustomTestCase):
         for _ in range(3):  # warmups + capture
             kept_len.scatter_(0, slots, kept_len.gather(0, slots) + 1)
             appended += 1
-        kept_len.scatter_(0, slots, (kept_len.gather(0, slots) - appended).clamp_min_(0))
+        kept_len.scatter_(
+            0, slots, (kept_len.gather(0, slots) - appended).clamp_min_(0)
+        )
         kept_len.scatter_(0, slots, kept_len.gather(0, slots) + 1)  # the replay
         self.assertEqual(kept_len.tolist(), [11, 21])
 
@@ -1739,12 +1853,8 @@ class TestDecodeTimeBlockClose(CustomTestCase):
 
     def test_no_close_before_a_full_block(self):
         be = self._backend(prefill=ACT_MIN)
-        be._maybe_close_blocks(
-            self._fb(ACT_MIN + D.CLOSE_BLOCK - 1), [0]
-        )
-        self.assertEqual(
-            be._close_state[(0, self.LID2)]["closed"], ACT_MIN
-        )
+        be._maybe_close_blocks(self._fb(ACT_MIN + D.CLOSE_BLOCK - 1), [0])
+        self.assertEqual(be._close_state[(0, self.LID2)]["closed"], ACT_MIN)
 
     def test_no_close_below_the_activation_threshold(self):
         # Dense regime: even with whole closable blocks outstanding, nothing
@@ -1759,9 +1869,7 @@ class TestDecodeTimeBlockClose(CustomTestCase):
         # the kept set matches having compressed from the start.
         be = self._backend(prefill=8192)
         be._maybe_close_blocks(self._fb(ACT_MIN + 7), [0])
-        self.assertEqual(
-            be._close_state[(0, self.LID2)]["closed"], ACT_MIN
-        )
+        self.assertEqual(be._close_state[(0, self.LID2)]["closed"], ACT_MIN)
 
     def test_close_advances_and_rewrites_kept(self):
         be = self._backend(prefill=ACT_MIN)
@@ -2125,6 +2233,7 @@ class TestEagerDecodeRunsTheStep(CustomTestCase):
         be.init_forward_metadata(fb)
         self.assertEqual(calls[0], ("bufs",))
         self.assertIn(("pack", LID), calls)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,9 +33,6 @@ it on shared inputs.
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.vestigekv import defaults as D
-
 
 @triton.jit
 def _pack_csr_prep_kernel(
@@ -96,7 +93,9 @@ def _pack_csr_prep_kernel(
                 seq_i = tl.load(seq_ptr + i).to(tl.int64)
                 base = tl.load(affine_base_ptr + slot)
                 still = tl.load(affine_ok_ptr + slot) != 0
-                still = still and (tl.load(loc_ptr + i).to(tl.int64) == base + seq_i - 1)
+                still = still and (
+                    tl.load(loc_ptr + i).to(tl.int64) == base + seq_i - 1
+                )
                 if li == 0:
                     tl.store(affine_ok_ptr + slot, still.to(tl.int32))
                 if not still:
@@ -135,12 +134,9 @@ def pack_csr_all_layers(
     together arms the overflow fence (see the module docstring); all three
     or none.
 
-    `indices` is not written and is accepted only so the eager torch path and
-    the registered tests keep one signature. Decode stage 1 reads a lane's
-    rows from the tiers themselves, so the only thing still consumed here is
-    the per-lane count in `indptr`, which stage 2 sizes its reduction from.
-    The launch that copied rows into one array is gone, and with it every
-    per-step cost of arming the fence."""
+    `indices` is accepted but never written: decode stage 1 reads a lane's
+    rows from the tiers, so the only output consumed here is the per-lane
+    count in `indptr`, which stage 2 sizes its reduction from."""
     fence = seq is not None
     if fence != (fetch_ovf is not None) or fence != (req_to_token is not None):
         raise ValueError("the fence needs seq, fetch_ovf and req_to_token together")

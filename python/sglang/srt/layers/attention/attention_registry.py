@@ -2,10 +2,7 @@ import logging
 import warnings
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import (
-    attention_backends_of,
-    resolved_view,
-)
+from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
     hybrid_gdn_config,
@@ -18,12 +15,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_parallel,
-    get_platform,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_platform, get_spec
 from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
@@ -54,9 +46,7 @@ def create_flashinfer_backend(runner):
     import torch
 
     if not runner.use_mla_backend:
-        from sglang.srt.layers.attention.flashinfer_backend import (
-            FlashInferAttnBackend,
-        )
+        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
         # Init streams
         if get_spec().speculative_algorithm == "EAGLE":
@@ -158,9 +148,7 @@ def create_trtllm_mla_backend(runner):
 def create_tokenspeed_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("tokenspeed_mla backend can only be used with MLA models.")
-    from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-        TokenspeedMLABackend,
-    )
+    from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 
     return TokenspeedMLABackend(runner)
 
@@ -304,18 +292,14 @@ def create_flashattention_v3_backend(runner):
             "FlashAttention v3 Backend requires MP>=31. "
             "Please use `--attention-backend triton`."
         )
-        from sglang.srt.hardware_backend.musa.attention import (
-            MusaFlashAttentionBackend,
-        )
+        from sglang.srt.hardware_backend.musa.attention import MusaFlashAttentionBackend
 
         return MusaFlashAttentionBackend(runner)
 
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
-    from sglang.srt.layers.attention.flashattention_backend import (
-        FlashAttentionBackend,
-    )
+    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
     return FlashAttentionBackend(runner, fa_impl_ver=4)
 
@@ -451,11 +435,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.linear.utils import (
             resolve_linear_attn_backends,
         )
-        from sglang.srt.utils import (
-            is_blackwell,
-            is_npu,
-            is_xpu,
-        )
+        from sglang.srt.utils import is_blackwell, is_npu, is_xpu
 
         if not is_npu():
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (

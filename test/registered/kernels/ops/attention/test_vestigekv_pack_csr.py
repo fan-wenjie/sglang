@@ -14,7 +14,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 L, R1, CAP, FW, MAXBS = 3, 9, 64, 16, 4
 TRASH = R1 - 1
@@ -129,7 +129,8 @@ class TestPackCsrParity(CustomTestCase):
                         continue
                     lo, hi = int(g_ip[i, lane]), int(g_ip[i, lane + 1])
                     self.assertEqual(
-                        hi - lo, int(seq[lane]),
+                        hi - lo,
+                        int(seq[lane]),
                         f"fenced lane {lane} layer {i} seed={seed}",
                     )
 
@@ -168,10 +169,13 @@ class TestPackCsrParity(CustomTestCase):
         for lay in range(st[1].shape[0]):
             for slot in {l for l in lanes if l != TRASH}:
                 self.assertEqual(
-                    int(st[1][lay, slot]), int(before_kept_len[lay, slot]) + 1,
+                    int(st[1][lay, slot]),
+                    int(before_kept_len[lay, slot]) + 1,
                     f"layer {lay} slot {slot} must have appended exactly one row",
                 )
-        self.assertTrue((st[5][:, 1:] >= st[5][:, :-1]).all(), "indptr must be monotone")
+        self.assertTrue(
+            (st[5][:, 1:] >= st[5][:, :-1]).all(), "indptr must be monotone"
+        )
 
 
 if __name__ == "__main__":
