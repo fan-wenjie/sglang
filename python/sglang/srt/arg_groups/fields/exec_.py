@@ -321,10 +321,15 @@ class ExecKernel(msgspec.Struct):
     ] = 4096
     disable_vestigekv_recall_overflow_fallback: A[
         bool,
-        "VestigeKV: on a recall overflow, attend the truncated fetch instead of "
-        "falling back to the request's full row set (dense MLA) for that step. "
-        "Trades the no-under-recall guarantee for a bounded per-step cost; the "
-        "overflow count is reported in the VestigeKV stats.",
+        "VestigeKV: ABLATION SWITCH, not a deployment option. On a recall "
+        "overflow, attend the truncated fetch instead of the request's full row "
+        "set. The fallback is a component of the method, not a safety net "
+        "around it: the admission rule is uncapped and the buffer is a graph "
+        "width, so an overflow is the certificate reporting that this step "
+        "cannot be served sparsely at the recall target. Deleting it gives up "
+        "no-under-recall and leaves an incomplete algorithm -- measurably so on "
+        "the tasks that overflow most. Use it to measure what the component "
+        "buys, never to serve.",
     ] = False
     vestigekv_activation_min_tokens: A[
         int,
