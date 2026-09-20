@@ -111,79 +111,6 @@ def _pack_csr_prep_kernel(
                 tl.store(kept_len_ptr + li * R1 + slot, n_old + 1)
 
 
-@triton.jit
-def _pack_csr_gather_kernel(
-    slots_ptr,
-    loc_ptr,  # [bs] (FENCE only: the dense row set ends with this step's slot)
-    seq_ptr,  # [bs] int64 (FENCE only)
-    kept_buf_ptr,  # [L, R1, CAP]
-    kept_len_ptr,  # [L, R1] (post-append)
-    fetch_len_ptr,  # [L, R1]
-    fetch_buf_ptr,  # [L, R1, FW]
-    fetch_ovf_ptr,  # [L, R1] int32 (FENCE only)
-    r2t_ptr,  # [R1 - 1, R2T] req_to_token (FENCE only)
-    indptr_ptr,  # [L, MAXBS1] (from prep)
-    indices_ptr,  # [L, CAPI] out
-    R1,
-    CAP,
-    FW,
-    CAPI,
-    MAXBS1,
-    R2T,
-    BLOCK: tl.constexpr,
-    FENCE: tl.constexpr,
-    FENCE_BODY: tl.constexpr,  # 0 stubs the dense branch; see SGLANG_DEBUG_VESTIGEKV_FENCE_STUB
-):
-    li = tl.program_id(0)
-    lane = tl.program_id(1)
-    # Tile workers of this lane: the loops below grid-stride, so the launch
-    # covers the worst case (a fenced lane's whole row set) without one
-    # program per tile (defaults.PACK_GRID_CAP).
-    g = tl.program_id(2)
-    G = tl.num_programs(2)
-    slot = tl.load(slots_ptr + lane).to(tl.int64)
-    start = tl.load(indptr_ptr + li * MAXBS1 + lane).to(tl.int64)
-    n = tl.load(kept_len_ptr + li * R1 + slot).to(tl.int64)
-    # One program-uniform branch per lane: the fenced loop is a separate
-    # region, so an unfenced lane runs exactly the pre-fence loop (no extra
-    # masks or selects) and pays one scalar load for the flag.
-    fenced = False
-    if FENCE:
-        fenced = tl.load(fetch_ovf_ptr + li * R1 + slot) != 0
-    if fenced and FENCE_BODY:
-        seq = tl.load(seq_ptr + lane).to(tl.int64)
-        loc = tl.load(loc_ptr + lane)
-        for i in range(g, tl.cdiv(seq, BLOCK), G):
-            j = i * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
-            m = j < seq
-            dense = tl.load(r2t_ptr + slot * R2T + j, mask=m, other=0)
-            dense = tl.where(j == seq - 1, loc.to(dense.dtype), dense)
-            tl.store(
-                indices_ptr + li * CAPI + start + j,
-                dense.to(indices_ptr.dtype.element_ty),
-                mask=m,
-            )
-    if (not fenced) or (not FENCE_BODY):
-        f_len = tl.load(fetch_len_ptr + li * R1 + slot).to(tl.int64)
-        lens_tot = n + f_len
-        for i in range(g, tl.cdiv(lens_tot, BLOCK), G):
-            j = i * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
-            m = j < lens_tot
-            kept = tl.load(
-                kept_buf_ptr + (li * R1 + slot) * CAP + j, mask=m & (j < n), other=0
-            )
-            fired = tl.load(
-                fetch_buf_ptr + (li * R1 + slot) * FW + (j - n),
-                mask=m & (j >= n),
-                other=0,
-            )
-            tl.store(
-                indices_ptr + li * CAPI + start + j,
-                tl.where(j < n, kept, fired).to(indices_ptr.dtype.element_ty),
-                mask=m,
-            )
-
-
 def pack_csr_all_layers(
     slots,
     loc,
@@ -199,9 +126,8 @@ def pack_csr_all_layers(
     req_to_token=None,
     affine_ok=None,
     affine_base=None,
-    gather=True,
 ):
-    """Two launches for every layer's CSR. Stacked tensors: kept_buf
+    """One launch for every layer: the per-lane row counts. Stacked tensors: kept_buf
     [L, R1, CAP], kept_len/fetch_len [L, R1], fetch_buf [L, R1, FW],
     indices [L, CAPI], indptr [L, MAXBS1]; slots/loc [bs].
 
@@ -209,11 +135,12 @@ def pack_csr_all_layers(
     together arms the overflow fence (see the module docstring); all three
     or none.
 
-    `gather=False` runs the prep launch alone, leaving `indices` untouched:
-    the tier-decode router reads a lane's rows from the tiers themselves, so
-    only the per-lane counts in `indptr` are still consumed (stage 2 sizes its
-    reduction from them). Copying the rows into one array is what arming the
-    fence costs, and this is the switch that stops paying it."""
+    `indices` is not written and is accepted only so the eager torch path and
+    the registered tests keep one signature. Decode stage 1 reads a lane's
+    rows from the tiers themselves, so the only thing still consumed here is
+    the per-lane count in `indptr`, which stage 2 sizes its reduction from.
+    The launch that copied rows into one array is gone, and with it every
+    per-step cost of arming the fence."""
     fence = seq is not None
     if fence != (fetch_ovf is not None) or fence != (req_to_token is not None):
         raise ValueError("the fence needs seq, fetch_ovf and req_to_token together")
@@ -246,31 +173,4 @@ def pack_csr_all_layers(
         indptr.shape[1],
         FENCE=fence,
         AFFINE_TRACK=track,
-    )
-    if not gather:
-        return
-    # Worst case a single lane packs: the whole row set when the fence can
-    # fire, the kept table plus the fetch buffer otherwise.
-    max_rows = req_to_token.shape[1] if fence else CAP + fetch_buf.shape[2]
-    _pack_csr_gather_kernel[(L, bs, min(triton.cdiv(max_rows, 512), D.PACK_GRID_CAP))](
-        slots,
-        loc,
-        seq,
-        kept_buf,
-        kept_len,
-        fetch_len,
-        fetch_buf,
-        fetch_ovf,
-        req_to_token,
-        indptr,
-        indices,
-        R1,
-        CAP,
-        fetch_buf.shape[2],
-        indices.shape[1],
-        indptr.shape[1],
-        req_to_token.shape[1] if fence else 0,
-        BLOCK=512,
-        FENCE=fence,
-        FENCE_BODY=not envs.SGLANG_DEBUG_VESTIGEKV_FENCE_STUB.get(),
     )
