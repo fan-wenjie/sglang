@@ -156,6 +156,7 @@ class VestigeKVMLABackend(AttentionBackend):
         recall_margin=0.0,
         recall_threshold="max",
         prefill_calibration=False,
+        side_pool_dtype="bf16",
     )
     geom = KIMI_LINEAR  # __init__ derives the served model's; fakes keep the default
 
