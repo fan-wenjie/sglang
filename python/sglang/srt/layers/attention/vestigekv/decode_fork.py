@@ -567,11 +567,11 @@ class VestigeKVRows(msgspec.Struct):
     """Where a lane's attended rows are, for the forked stage 1: the kept table
     and the fetch buffer of ONE layer, plus the page table a fenced lane uses.
     `tiers` False falls back to upstream's CSR reading, so the same launcher
-    serves both and the comparison is like for like. `fence` False is
-    --disable-vestigekv-recall-overflow-fallback: the compaction raises
-    fetch_ovf whenever a scan overflowed, regardless of that flag, so the
-    kernel must be told not to act on it or the tier path would attend the
-    full row set where the CSR path truncates."""
+    serves both and the comparison is like for like. `fence` False is the
+    deleted-fallback ablation (SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK):
+    the compaction raises fetch_ovf whenever a scan overflowed, regardless of
+    that key, so the kernel must be told not to act on it or the tier path
+    would attend the full row set where the CSR path truncates."""
 
     slots: torch.Tensor
     kept_buf: torch.Tensor
