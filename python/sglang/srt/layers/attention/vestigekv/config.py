@@ -9,6 +9,7 @@ configuration is logged as one line.
 import msgspec
 
 RECALL_THRESHOLDS = ("max", "lse")
+SIDE_POOL_DTYPES = ("bf16", "fp8")
 
 
 class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -37,6 +38,10 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # (at PREFILL_BUILD_MIN tokens, then at every doubling) so the first decode
     # steps are served by a calibrated index instead of the provisional one.
     prefill_calibration: bool
+    # Storage dtype of the tier-1 salience side pool (rope-less MLA only).
+    # "fp8" is the DSA index-cache format the indexer already applies to these
+    # keys, so it is a storage choice rather than an extra approximation.
+    side_pool_dtype: str
 
     @classmethod
     def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
@@ -49,11 +54,17 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             recall_margin=kernel.vestigekv_recall_margin,
             recall_threshold=kernel.vestigekv_recall_threshold,
             prefill_calibration=kernel.enable_vestigekv_prefill_calibration,
+            side_pool_dtype=kernel.vestigekv_side_pool_dtype,
         )
         cfg.validate()
         return cfg
 
     def validate(self) -> None:
+        if self.side_pool_dtype not in SIDE_POOL_DTYPES:
+            raise ValueError(
+                f"--vestigekv-side-pool-dtype must be one of {SIDE_POOL_DTYPES}, "
+                f"got {self.side_pool_dtype!r}"
+            )
         if self.recall_capacity < 1:
             raise ValueError(
                 f"--vestigekv-recall-capacity must be >= 1, got {self.recall_capacity}"

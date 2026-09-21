@@ -356,6 +356,17 @@ class ExecKernel(msgspec.Struct):
             choices=["max", "lse"],
         ),
     ] = "max"
+    vestigekv_side_pool_dtype: A[
+        str,
+        Arg(
+            help="VestigeKV: storage dtype of the tier-1 salience side pool, which "
+            "holds one un-rotated key row per token on a rope-less MLA. bf16 is the "
+            "exact path; fp8 stores it in the DSA index-cache format (e4m3 with a "
+            "power-of-two per-token scale), halving the pool at the quantization the "
+            "indexer itself already applies to those keys.",
+            choices=["bf16", "fp8"],
+        ),
+    ] = "bf16"
     enable_vestigekv_prefill_calibration: A[
         bool,
         "VestigeKV: calibrate the recall index during prefill on absorbed prompt "

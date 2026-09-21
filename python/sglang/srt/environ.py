@@ -615,7 +615,6 @@ class Envs:
     # scale per token, halving the pool. Sigma then reads the dequantized
     # key, so this changes numerics (ranking fidelity), never the per-token
     # contract.
-    SGLANG_VESTIGEKV_USE_FP8_SIDE_POOL = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
@@ -1949,6 +1948,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
         note="The unified radix tree is the default tree cache now; unset this "
         "env. The field is still defined for legacy call sites."
+    ),
+    "SGLANG_VESTIGEKV_USE_FP8_SIDE_POOL": _DeprecatedEnv(
+        note="The tier-1 side pool's storage dtype is a server flag now: "
+        "'--vestigekv-side-pool-dtype {bf16,fp8}'."
     ),
     "SGLANG_VESTIGEKV_TOPJ": _DeprecatedEnv(
         note="The per-head fetch cap is gone: the recall fetch is a fixed "
