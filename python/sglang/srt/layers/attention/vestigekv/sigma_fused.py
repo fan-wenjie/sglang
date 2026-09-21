@@ -58,6 +58,8 @@ def _sigma_fused_kernel(
     c_ptr,  # [T, 32] fp32 basis
     sig_ptr,  # [N, T] fp32 out
     hist_ptr,  # [N_BINS] int32 SHARED (atomic across instances)
+    y_ptr,  # EMIT_Y or LOAD_Y: [N, KB, DD] fp32 partial/reduced projection
+    pos_ptr,  # HAS_POS=1: [N*T] int32 position of each row inside the block
     T,
     NB: tl.constexpr,
     BT: tl.constexpr,
@@ -67,6 +69,9 @@ def _sigma_fused_kernel(
     ROW: tl.constexpr,  # pool row width
     KV_OFF: tl.constexpr,  # branch offset inside the row
     HAS_SCALE: tl.constexpr,  # rows are fp8 with a per-row scale
+    EMIT_Y: tl.constexpr,  # stop after pass 1 and store Y (this rank's partial)
+    LOAD_Y: tl.constexpr,  # skip pass 1 and read Y (the reduced projection)
+    HAS_POS: tl.constexpr,  # rows are not the block's 0..T-1 in order
 ):
     inst = tl.program_id(0)
     sig_ptr = sig_ptr + inst.to(tl.int64) * T
@@ -74,9 +79,14 @@ def _sigma_fused_kernel(
         slots_ptr = slots_ptr + inst.to(tl.int64) * T
     else:
         r_ptr = r_ptr + inst.to(tl.int64) * T * DD
-    # pass 1: Y = C^T R   (KB x DD), fp32 ieee
+    kd = tl.arange(0, KB)[:, None] * DD + tl.arange(0, DD)[None, :]
+    # pass 1: Y = C^T R   (KB x DD), fp32 ieee. A sum over rows, so it splits
+    # over any partition of them: each holder projects its own rows against
+    # their own basis rows and the partials add. LOAD_Y takes the sum back.
     y = tl.zeros([KB, DD], dtype=tl.float32)
-    for t0 in range(0, T, BT):
+    if LOAD_Y:
+        y = tl.load(y_ptr + inst.to(tl.int64) * KB * DD + kd)
+    for t0 in range(0, T * (0 if LOAD_Y else 1), BT):
         t = t0 + tl.arange(0, BT)
         m = t < T
         if FROM_POOL:
@@ -97,14 +107,23 @@ def _sigma_fused_kernel(
                 mask=m[:, None],
                 other=0.0,
             ).to(tl.float32)
+        if HAS_POS:
+            # t numbers this holder's rows; the basis is indexed by where the
+            # row sits in the block, and the two coincide only when one holder
+            # has all of them in order.
+            pos = tl.load(pos_ptr + inst.to(tl.int64) * T + t, mask=m, other=0)
+        else:
+            pos = t
         c = tl.load(
-            c_ptr + t[:, None] * KB + tl.arange(0, KB)[None, :],
+            c_ptr + pos[:, None] * KB + tl.arange(0, KB)[None, :],
             mask=m[:, None],
             other=0.0,
         )
         y += tl.dot(tl.trans(c), r, input_precision="ieee")
+    if EMIT_Y:
+        tl.store(y_ptr + inst.to(tl.int64) * KB * DD + kd, y)
     # pass 2: residual norm + histogram
-    for t0 in range(0, T, BT):
+    for t0 in range(0, T * (0 if EMIT_Y else 1), BT):
         t = t0 + tl.arange(0, BT)
         m = t < T
         if FROM_POOL:
@@ -125,8 +144,15 @@ def _sigma_fused_kernel(
                 mask=m[:, None],
                 other=0.0,
             ).to(tl.float32)
+        if HAS_POS:
+            # t numbers this holder's rows; the basis is indexed by where the
+            # row sits in the block, and the two coincide only when one holder
+            # has all of them in order.
+            pos = tl.load(pos_ptr + inst.to(tl.int64) * T + t, mask=m, other=0)
+        else:
+            pos = t
         c = tl.load(
-            c_ptr + t[:, None] * KB + tl.arange(0, KB)[None, :],
+            c_ptr + pos[:, None] * KB + tl.arange(0, KB)[None, :],
             mask=m[:, None],
             other=0.0,
         )
@@ -148,6 +174,10 @@ def sigma_fused_from_pool(
     offset: int = D.KV_LORA_RANK,
     dim: int = D.SIDECAR_DIM,
     scale: torch.Tensor | None = None,
+    y: torch.Tensor | None = None,
+    emit_y: bool = False,
+    pos: torch.Tensor | None = None,
+    basis_len: int | None = None,
 ):
     """sigma for the blocks of `slots`, read STRAIGHT from the pool.
 
@@ -157,10 +187,21 @@ def sigma_fused_from_pool(
     instead of being gathered into a [T, ROW] intermediate and then sliced.
     `scale` [pool] fp32 marks an fp8 pool: each row is dequantized as
     row.float() * scale[row] before the projection.
+
+    Split mode, for a sequence whose rows are held by more than one rank.
+    `emit_y` stops after the projection and writes this holder's partial into
+    `y` [n, 32, dim]; passing a `y` without `emit_y` skips the projection and
+    finishes from the one handed in, which is where the summed partials go.
+    `pos` [n*block] int32 gives each row's index inside the block, required
+    once a holder's rows are not the block's own 0..block-1 in order, and
+    `basis_len` is the length of the block those positions index -- `block`
+    counts the rows THIS holder has, and the two stop being the same number
+    the moment a block is split. Neither argument changes the single-holder
+    path: the default is the fused kernel it has always been.
     """
     n = slots.numel() // block
     dev = kbuf.device
-    C = _basis(block, kappa, dev)
+    C = _basis(block if basis_len is None else basis_len, kappa, dev)
     sig = torch.empty(max(n, 1), block, dtype=torch.float32, device=dev)
     hist = torch.zeros(N_BINS, dtype=torch.int32, device=dev)
     if n == 0:
@@ -173,6 +214,8 @@ def sigma_fused_from_pool(
         C,
         sig,
         hist,
+        sig if y is None else y,
+        slots if pos is None else pos,
         block,
         NB=N_BINS,
         BT=64,
@@ -182,6 +225,9 @@ def sigma_fused_from_pool(
         ROW=kbuf.shape[-1],
         KV_OFF=offset,
         HAS_SCALE=scale is not None,
+        EMIT_Y=emit_y,
+        LOAD_Y=y is not None and not emit_y,
+        HAS_POS=pos is not None,
         num_warps=4,
         num_stages=1,
     )
@@ -209,6 +255,8 @@ def sigma_fused(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA):
         C,
         sig,
         hist,
+        sig,  # y_ptr unused: this launcher has no split mode
+        side,  # pos_ptr unused
         T,
         NB=N_BINS,
         BT=64,
@@ -218,6 +266,9 @@ def sigma_fused(side: torch.Tensor, kappa: int = D.LOWPASS_KAPPA):
         ROW=DD,
         KV_OFF=0,
         HAS_SCALE=False,
+        EMIT_Y=False,
+        LOAD_Y=False,
+        HAS_POS=False,
         num_warps=4,
         num_stages=1,
     )

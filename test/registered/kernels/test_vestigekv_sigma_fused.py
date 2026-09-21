@@ -4,10 +4,16 @@ import unittest
 
 import torch
 
+from sglang.srt.layers.attention.vestigekv import defaults as D
+from sglang.srt.layers.attention.vestigekv.sigma_fused import (
+    _KB_PAD,
+    sigma_fused_from_pool,
+    topm_from_hist,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=40, suite="base-b-test-1-gpu-small")
+register_cuda_ci(est_time=60, suite="base-b-test-1-gpu-small")
 
 
 class TestSigmaFused(CustomTestCase):
@@ -192,6 +198,118 @@ class TestFp8SidePoolKernel(CustomTestCase):
         )
         self.assertTrue(torch.equal(s_ref.reshape(-1), s_pool))
         self.assertTrue(torch.equal(h_ref, h_pool))
+
+
+
+# ---------------------------------------------------------------------------
+# The split form: sigma over a block whose rows are held by more than one rank.
+#
+# Y = C^T R is a sum over rows, so it decomposes over whatever partition holds
+# them and the residual pass is row-local once the sum is back
+# (docs/context-parallel.md). Two claims, two comparisons: one holder split
+# into two launches must be EXACT, because the rows add in the same order; two
+# holders must be CLOSE and must select the same top-m, because the partials
+# do not.
+# ---------------------------------------------------------------------------
+
+BLOCK = 512  # a whole CLOSE_BLOCK is 4096; the decomposition does not care
+DIM = D.SIDECAR_DIM
+ROW = D.KV_LORA_RANK + DIM
+
+
+def _pool(n_rows, seed=0):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.randn(n_rows, ROW, generator=g, device="cuda", dtype=torch.bfloat16)
+
+
+class TestSigmaSplit(CustomTestCase):
+    def setUp(self):
+        self.kbuf = _pool(BLOCK)
+        self.slots = torch.arange(BLOCK, device="cuda", dtype=torch.int64)
+        self.fused, self.fused_hist = sigma_fused_from_pool(
+            self.kbuf, self.slots, BLOCK
+        )
+
+    def _y(self, slots, rows, pos=None):
+        y = torch.zeros(1, _KB_PAD, DIM, device="cuda", dtype=torch.float32)
+        sigma_fused_from_pool(
+            self.kbuf, slots, rows, y=y, emit_y=True, pos=pos, basis_len=BLOCK
+        )
+        return y
+
+    def test_one_holder_split_into_two_launches_is_exact(self):
+        y = self._y(self.slots, BLOCK)
+        sig, hist = sigma_fused_from_pool(self.kbuf, self.slots, BLOCK, y=y)
+        self.assertTrue(torch.equal(sig, self.fused))
+        self.assertTrue(torch.equal(hist, self.fused_hist))
+
+    def test_identity_positions_change_nothing(self):
+        # HAS_POS must be a different way of saying the same thing when the
+        # positions are the ones the loop counter would have produced.
+        pos = torch.arange(BLOCK, device="cuda", dtype=torch.int32)
+        y = self._y(self.slots, BLOCK, pos=pos)
+        sig, _ = sigma_fused_from_pool(
+            self.kbuf, self.slots, BLOCK, y=y, pos=pos, basis_len=BLOCK
+        )
+        self.assertTrue(torch.equal(sig, self.fused))
+
+    def test_two_interleaved_holders_agree_with_the_fused_block(self):
+        pos = torch.arange(BLOCK, device="cuda", dtype=torch.int32)
+        halves = [(self.slots[r::2].contiguous(), pos[r::2].contiguous())
+                  for r in (0, 1)]
+
+        ys = [self._y(sl, BLOCK // 2, pos=p) for sl, p in halves]
+        total = ys[0] + ys[1]
+
+        rebuilt = torch.empty(BLOCK, device="cuda", dtype=torch.float32)
+        for (sl, p), r in zip(halves, (0, 1)):
+            part, _ = sigma_fused_from_pool(
+                self.kbuf, sl, BLOCK // 2, y=total, pos=p, basis_len=BLOCK
+            )
+            rebuilt[r::2] = part
+
+        rms = (rebuilt - self.fused).pow(2).mean().sqrt().item()
+        scale = self.fused.pow(2).mean().sqrt().item()
+        self.assertLess(rms / scale, 1e-5, f"relative rms {rms / scale:.2e}")
+
+        m = int(BLOCK * 0.03)
+        a = set(torch.topk(self.fused, m).indices.tolist())
+        b = set(torch.topk(rebuilt, m).indices.tolist())
+        self.assertEqual(a, b, "the kept set must not depend on who held the rows")
+
+    def test_a_wrong_partial_sum_is_caught(self):
+        # The check above is only worth running if it can fail: dropping one
+        # holder's partial is the mistake a sharded implementation makes.
+        pos = torch.arange(BLOCK, device="cuda", dtype=torch.int32)
+        sl0, p0 = self.slots[0::2].contiguous(), pos[0::2].contiguous()
+        only_one = self._y(sl0, BLOCK // 2, pos=p0)
+        part, _ = sigma_fused_from_pool(
+            self.kbuf, sl0, BLOCK // 2, y=only_one, pos=p0, basis_len=BLOCK
+        )
+        rms = (part - self.fused[0::2]).pow(2).mean().sqrt().item()
+        self.assertGreater(rms / self.fused.pow(2).mean().sqrt().item(), 1e-3)
+
+    def test_histograms_of_the_holders_sum_to_the_fused_one(self):
+        # Tier 1 selects from the summed histogram, so this is the property
+        # the global top-m rests on.
+        pos = torch.arange(BLOCK, device="cuda", dtype=torch.int32)
+        halves = [(self.slots[r::2].contiguous(), pos[r::2].contiguous())
+                  for r in (0, 1)]
+        total = sum(self._y(sl, BLOCK // 2, pos=p) for sl, p in halves)
+        hists = []
+        sigs = []
+        for sl, p in halves:
+            sig, h = sigma_fused_from_pool(
+                self.kbuf, sl, BLOCK // 2, y=total, pos=p, basis_len=BLOCK
+            )
+            hists.append(h)
+            sigs.append(sig)
+        summed = hists[0] + hists[1]
+        self.assertEqual(int(summed.sum()), BLOCK)
+        m = int(BLOCK * 0.03)
+        merged = torch.cat(sigs)
+        self.assertEqual(len(topm_from_hist(merged, summed, m)), m)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
