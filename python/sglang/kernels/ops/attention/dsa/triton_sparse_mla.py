@@ -334,7 +334,6 @@ def _sparse_mla_fwd_split_dim_kernel(
     s_i = tl.program_id(0)
 
     h = tl.arange(0, H)
-    dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
@@ -346,9 +345,12 @@ def _sparse_mla_fwd_split_dim_kernel(
         q2 = tl.load(q_row + (2 * _G + g)[None, :]).to(input_type)
     if NUM_GROUPS >= 4:
         q3 = tl.load(q_row + (3 * _G + g)[None, :]).to(input_type)
-    q_tail = tl.load(
-        q_rope_ptr + s_i * STRIDE_QR_T + h[:, None] * STRIDE_QR_H + dt[None, :]
-    ).to(input_type)
+    # tl.arange rejects empty ranges; rope-less MLA (D_TAIL == 0) has no tail dot.
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
+        q_tail = tl.load(
+            q_rope_ptr + s_i * STRIDE_QR_T + h[:, None] * STRIDE_QR_H + dt[None, :]
+        ).to(input_type)
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full([H], neg_large, tl.float32)
@@ -386,9 +388,6 @@ def _sparse_mla_fwd_split_dim_kernel(
             kv3 = tl.load(
                 kbase + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0
             ).to(input_type)
-        kv_tail = tl.load(
-            kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-        ).to(input_type)
 
         qk = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -397,7 +396,11 @@ def _sparse_mla_fwd_split_dim_kernel(
             qk += tl.dot(q2, tl.trans(kv2))
         if NUM_GROUPS >= 4:
             qk += tl.dot(q3, tl.trans(kv3))
-        qk += tl.dot(q_tail, tl.trans(kv_tail))
+        if D_TAIL > 0:
+            kv_tail = tl.load(
+                kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+            ).to(input_type)
+            qk += tl.dot(q_tail, tl.trans(kv_tail))
         qk = qk * qk_scale
         qk = tl.where(valid[None, :], qk, neg_large)
 
@@ -615,7 +618,6 @@ def _sparse_mla_fused_kernel(
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
-    dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
@@ -644,11 +646,13 @@ def _sparse_mla_fused_kernel(
             mask=h_mask[:, None],
             other=0.0,
         ).to(input_type)
-    q_tail = tl.load(
-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(input_type)
+    # tl.arange rejects empty ranges; rope-less MLA (D_TAIL == 0) has no tail dot.
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
+        qr_row = q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H
+        q_tail = tl.load(
+            qr_row + dt[None, :], mask=h_mask[:, None], other=0.0
+        ).to(input_type)
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
@@ -699,9 +703,6 @@ def _sparse_mla_fused_kernel(
                 mask=valid[:, None],
                 other=0.0,
             ).to(input_type)
-        kv_tail = tl.load(
-            kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-        ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -710,7 +711,11 @@ def _sparse_mla_fused_kernel(
             scores += tl.dot(q2, tl.trans(kv2))
         if NUM_GROUPS >= 4:
             scores += tl.dot(q3, tl.trans(kv3))
-        scores += tl.dot(q_tail, tl.trans(kv_tail))
+        if D_TAIL > 0:
+            kv_tail = tl.load(
+                kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+            ).to(input_type)
+            scores += tl.dot(q_tail, tl.trans(kv_tail))
         scores = scores * qk_scale
         scores = tl.where(valid[None, :], scores, neg_large)
 
@@ -807,7 +812,6 @@ def _sparse_mla_split_k_kernel(
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
-    dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
@@ -836,11 +840,13 @@ def _sparse_mla_split_k_kernel(
             mask=h_mask[:, None],
             other=0.0,
         ).to(input_type)
-    q_tail = tl.load(
-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(input_type)
+    # tl.arange rejects empty ranges; rope-less MLA (D_TAIL == 0) has no tail dot.
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
+        qr_row = q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H
+        q_tail = tl.load(
+            qr_row + dt[None, :], mask=h_mask[:, None], other=0.0
+        ).to(input_type)
 
     tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
     if pid_k * tiles_per_segment * BLOCK_K >= topk:
@@ -886,9 +892,6 @@ def _sparse_mla_split_k_kernel(
             kv3 = tl.load(
                 kv_base + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0
             ).to(input_type)
-        kv_tail = tl.load(
-            kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-        ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
         if NUM_GROUPS >= 2:
@@ -897,7 +900,11 @@ def _sparse_mla_split_k_kernel(
             scores += tl.dot(q2, tl.trans(kv2))
         if NUM_GROUPS >= 4:
             scores += tl.dot(q3, tl.trans(kv3))
-        scores += tl.dot(q_tail, tl.trans(kv_tail))
+        if D_TAIL > 0:
+            kv_tail = tl.load(
+                kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+            ).to(input_type)
+            scores += tl.dot(q_tail, tl.trans(kv_tail))
         scores = scores * qk_scale
         scores = tl.where(valid[None, :], scores, neg_large)
 
