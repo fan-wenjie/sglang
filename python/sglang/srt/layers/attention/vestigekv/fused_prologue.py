@@ -99,10 +99,12 @@ def _fused_prologue_kernel(
         x_sum = x_sum * rescale + tl.sum(pexp * tl.where(mrow[None, :], x, 0.0), 1)
         e_max = n_max
     if EMIT_MST:
-        # The threshold is a function of the WHOLE kept set -- the entropy gate
-        # reads its flatness -- so a holder's finished max1g cannot be merged
-        # with a max. The online accumulators can: combine_kept_stats() rescales
-        # and adds them exactly the way the loop above does.
+        # The max component of max1g would merge by max; the entropy gate does
+        # not, and it fails one way -- half a kept set is less flat than the
+        # whole, so a holder closes where the union stays open and the merged
+        # +inf fires nothing. The online accumulators carry what does merge:
+        # combine_kept_stats() rescales and adds them the way the loop above
+        # does, and forms the threshold once from the union.
         tl.store(mst_ptr + (p * H + h) * 3 + 0, e_max)
         tl.store(mst_ptr + (p * H + h) * 3 + 1, e_sum)
         tl.store(mst_ptr + (p * H + h) * 3 + 2, x_sum)
