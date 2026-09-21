@@ -314,11 +314,14 @@ class TestKeptSetParityWithReference(CustomTestCase):
         out = torch.zeros(max_reqs, W, dtype=torch.int64, device="cuda")
         ol = torch.zeros(max_reqs, dtype=torch.int64, device="cuda")
         for (li, slot), t in tiers.items():
-            t.query_fixed(qbuf[li, slot], out, ol, slot)
+            t.query_fixed(qbuf[li, slot], out, ol, _ovf(ol), slot)
             ref_n[(li, slot)] = int(ol[slot])
             ref_rows[(li, slot)] = out[slot, : int(ol[slot])].clone()
         pairs = list(tiers.keys())
-        pack = BatchedScanPack(pairs, [tiers[p] for p in pairs], qbuf, fetch, flen, H)
+        pack = BatchedScanPack(
+            pairs, [tiers[p] for p in pairs], qbuf, fetch, flen,
+            _ovf(flen), _cnt(flen), H,
+        )
         pack.run()
         torch.cuda.synchronize()
         for li, slot in pairs:
