@@ -1113,7 +1113,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.mm_config = config
         text_config = config.text_config
         self.encoder_only = bool(getattr(config, "encoder_only", False))
-        self.language_only = bool(getattr(config, "language_only", False))
+        # --language-model-only (standalone text serving) skips the vision tower
+        # the same way the EPD language side does. handle_language_model_only
+        # only validates -- it declares no field -- so without this read the
+        # flag passes its gate and the tower is still built.
+        self.language_only = bool(getattr(config, "language_only", False)) or bool(
+            getattr(config, "language_model_only", False)
+        )
 
         self.fuse_qkv_a_proj = (
             not self.encoder_only
