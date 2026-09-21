@@ -242,7 +242,7 @@ class VestigeKVMLABackend(AttentionBackend):
         # filled by the model through write_salience.
         self._side_pool: dict = {}
         self._side_scale: dict = {}  # fp8 pool only: [pool rows] fp32 per-row scale
-        self._side_fp8 = envs.SGLANG_VESTIGEKV_USE_FP8_SIDE_POOL.get()
+        self._side_fp8 = config.side_pool_dtype == "fp8"
         if not self.geom.sigma_in_row:
             dev = model_runner.device
             for lid in self._local_mla_lids:
