@@ -36,6 +36,7 @@ def _fused_prologue_kernel(
     nk_len_ptr,  # [P] int64
     thr_ptr,  # [P] fp32 gate threshold
     max1g_ptr,  # [P, H] fp32 out: max kept score, +inf closed gate, -inf empty
+    mst_ptr,  # EMIT_MST: [P, H, 3] fp32 out -- the online (max, sum, t) triple
     qside_t_ptr,  # [P, DD, H] bf16 out
     qsk_t_ptr,  # [P, R, H] fp16 out
     qres_ptr,  # [P, H] fp32 out
@@ -50,6 +51,7 @@ def _fused_prologue_kernel(
     BLOCK_NK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     THR_LSE: tl.constexpr = False,  # margin from the kept log-sum-exp, not the max
+    EMIT_MST: tl.constexpr = False,  # store (e_max, e_sum, x_sum), form no threshold
 ):
     p = tl.program_id(0)
     h = tl.arange(0, H)
@@ -96,6 +98,14 @@ def _fused_prologue_kernel(
         e_sum = e_sum * rescale + tl.sum(pexp, 1)
         x_sum = x_sum * rescale + tl.sum(pexp * tl.where(mrow[None, :], x, 0.0), 1)
         e_max = n_max
+    if EMIT_MST:
+        # The threshold is a function of the WHOLE kept set -- the entropy gate
+        # reads its flatness -- so a holder's finished max1g cannot be merged
+        # with a max. The online accumulators can: combine_kept_stats() rescales
+        # and adds them exactly the way the loop above does.
+        tl.store(mst_ptr + (p * H + h) * 3 + 0, e_max)
+        tl.store(mst_ptr + (p * H + h) * 3 + 1, e_sum)
+        tl.store(mst_ptr + (p * H + h) * 3 + 2, x_sum)
     # entropy = (m + log s) - t/s; empty kept (s==0) -> gate open, max1g=-inf
     nonempty = e_sum > 0.0
     lse = e_max + tl.log(tl.where(nonempty, e_sum, 1.0))
@@ -122,11 +132,48 @@ def _fused_prologue_kernel(
     )
 
 
+def combine_kept_stats(parts, thr, margin=0.0, thr_lse=False):
+    """max1g for a kept set spread over several holders.
+
+    parts: list of [P,H,3] fp32 (max, sum, t) triples, one per holder, as
+    fused_prologue writes them. The merge is the rescale the kernel's own loop
+    does when a block raises the running max, applied across holders instead of
+    across blocks, so the result is the threshold the union implies rather than
+    anything per-holder. A holder with no kept rows carries max -inf and sum 0
+    and drops out of the sum on its own.
+    """
+    m = torch.stack([p[..., 0] for p in parts])
+    s = torch.stack([p[..., 1] for p in parts])
+    t = torch.stack([p[..., 2] for p in parts])
+    top = m.max(0).values
+    # every holder empty: top is -inf and m - top is nan, so the scale is
+    # taken to zero there rather than letting the nan into the sums
+    alive = torch.isfinite(top)
+    scale = torch.where(alive.unsqueeze(0) & torch.isfinite(m), torch.exp(m - top), 0.0)
+    e_sum = (s * scale).sum(0)
+    x_sum = (t * scale).sum(0)
+    nonempty = e_sum > 0.0
+    safe = torch.where(nonempty, e_sum, 1.0)
+    lse = top + torch.log(safe)
+    ent = lse - x_sum / safe
+    gate = (ent > thr) | (~nonempty)
+    base = lse if thr_lse else top
+    max1 = torch.where(nonempty, base, float("-inf"))
+    return torch.where(gate, max1 - margin, float("inf"))
+
+
 def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0,
-                   thr_lse=False, *, kv=D.KV_LORA_RANK):
+                   thr_lse=False, *, kv=D.KV_LORA_RANK, mst=None):
     """q [P,H,QD] fp32, kr [P,NKm,QD] bf16, v [P,R,kv] fp32; QD = kv + sidecar.
     Returns (max1g [P,H] fp32, qside_t [P,DD,H] bf16, qsk_t [P,R,H] fp16,
-    qres [P,H] fp32); pass `out` to reuse fixed-address buffers (capture)."""
+    qres [P,H] fp32); pass `out` to reuse fixed-address buffers (capture).
+
+    `mst` [P,H,3] fp32 additionally receives the online (max, sum, t) triple
+    this holder's kept rows produced. It is what a sharded kept set is merged
+    through: the threshold reads the entropy of the whole set, so finished
+    max1g values cannot be combined, and these can (combine_kept_stats).
+    max1g is still written, and on a sharded run it is the local value -- the
+    caller overwrites it from the merged triple."""
     P, H, QD = q.shape
     NKm = kr.shape[1]
     R = v.shape[1]
@@ -145,6 +192,7 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0,
         nk_len,
         thr,
         max1g,
+        max1g if mst is None else mst,
         qside_t,
         qsk_t,
         qres,
@@ -157,6 +205,7 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0,
         DD=dd,
         QD=QD,
         BLOCK_NK=64,
+        EMIT_MST=mst is not None,
         BLOCK_D=D.d_block_for_rank(R),
         THR_LSE=bool(thr_lse),
         num_warps=4,
