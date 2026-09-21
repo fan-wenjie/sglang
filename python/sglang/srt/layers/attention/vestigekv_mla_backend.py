@@ -84,6 +84,28 @@ def vestigekv_backend_of(backend):
     return backend if isinstance(backend, VestigeKVMLABackend) else None
 
 
+def _refuse_sharded_sequence():
+    # Tier 1's top-m and tier 2's firing threshold are global over the sequence,
+    # so a sharded one makes both wrong on every rank; the output stays fluent,
+    # which is why this refuses instead of warning. docs/context-parallel.md
+    # derives what a correct implementation needs.
+    p = get_parallel()
+    sharded = {flag: n for flag, n in (("--dcp-size", p.dcp_size),
+                                       ("--attn-cp-size", p.attn_cp_size)) if n > 1}
+    if not sharded:
+        return
+    raise ValueError(
+        "vestigekv_mla does not support a sharded sequence ("
+        + ", ".join(f"{flag} {n}" for flag, n in sharded.items())
+        + "). Tier 1 selects rows by a global top-m over the whole sequence and "
+        "tier 2 fires a row when it beats the kept maximum for its head; with "
+        "the sequence split across ranks each rank selects from the part it "
+        "holds, so the kept set is wrong on every rank and the output stays "
+        "fluent. Run with dcp_size 1 and attn_cp_size 1, or implement the "
+        "cross-rank reductions described in docs/context-parallel.md."
+    )
+
+
 class VestigeKVMLABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.
 
@@ -145,6 +167,7 @@ class VestigeKVMLABackend(AttentionBackend):
         config: VestigeKVConfig,
         rho: float = D.RHO,
     ):
+        _refuse_sharded_sequence()
         self.base = base
         self.config = config
         index_rank = config.index_rank
