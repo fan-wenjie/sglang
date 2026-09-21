@@ -148,16 +148,6 @@ covers the buckets with SCAN_GRID_CAP programs per pair: same worst-case
 coverage, ~8x smaller dispatch floor, and real work (which is bandwidth-bound)
 is unaffected."""
 
-PACK_GRID_CAP = 32
-"""Programs per (layer, lane) of the CSR gather, which grid-strides over its
-BLOCK-sized tiles. One program per lane (the original shape) serializes the
-copy: a fenced lane at 256k context copies 262144 row ids through a single
-block, measured at 264 us/step against a bandwidth floor near 10 us, and an
-unfenced lane pays 13.5 us for 8k rows. The grid is baked into the decode CUDA
-graph, so it is sized for the hardware rather than the data: programs past a
-lane's tile count exit on one scalar load, and the dispatch floor scales with
-L x bs x this cap, not with context."""
-
 SCAN_CAPTURE_AFTER = 8
 """Decode steps one scan shape must hold before it is captured, so a short
 generation does not pay for a graph it replays a handful of times."""
