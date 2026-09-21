@@ -628,11 +628,13 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
+    # SM120 exception: TileLang DSA needs more per-block shared memory than the
+    # device reports (49152 bytes), while the Triton kernels size tiles to the limit.
     rocm_only = {"triton"} & chosen
-    if not hip and rocm_only:
+    if not hip and rocm_only and not get_platform().is_sm120:
         raise ValueError(
             f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
-            "ROCm/HIP. Pick an alternative DSA backend for CUDA "
+            "ROCm/HIP and NVIDIA SM120. Pick an alternative DSA backend for CUDA "
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
