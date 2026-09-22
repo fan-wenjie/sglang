@@ -52,6 +52,7 @@ from sglang.srt.layers.attention.vestigekv.eviction import (
 from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.attention.vestigekv.tier_decode import rows_for_layer
 from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR, Geometry
 
 if TYPE_CHECKING:
@@ -146,6 +147,8 @@ class VestigeKVMLABackend(AttentionBackend):
     _mem_reqs = 0
     _fetch_hist = None
     _stat_acc = None
+    _router = None  # TierDecodeRouter when the fork serves stage 1, else None
+    _affine_capture = False  # the AFFINE constexpr a capture baked; see decode_fork
     # The flag defaults, for __new__-constructed fakes; a registered test pins
     # them to the ExecKernel field defaults.
     config = VestigeKVConfig(
@@ -190,6 +193,15 @@ class VestigeKVMLABackend(AttentionBackend):
             setattr(self, _flag, getattr(base, _flag))
         self.rho = rho
         self.index_rank = index_rank
+        # Route the base's stage-1 decode at the tiers instead of a packed CSR.
+        # `decode_attention_fwd` is an instance attribute of the base, so the
+        # whole redirection is this assignment and nothing upstream is edited;
+        # a layer with no entry in `rows` falls through to the base's own
+        # function, which is how eager steps keep the CSR path.
+        from sglang.srt.layers.attention.vestigekv.tier_decode import TierDecodeRouter
+
+        self._router = TierDecodeRouter(inner=base.decode_attention_fwd)
+        base.decode_attention_fwd = self._router
         # Pool handles shared with the base (the latent rows VestigeKV compresses).
         self.token_to_kv_pool = base.token_to_kv_pool
         self.req_to_token_pool = base.req_to_token_pool
@@ -1400,6 +1412,19 @@ class VestigeKVMLABackend(AttentionBackend):
             bs = forward_batch.seq_lens.shape[0]
             bufs = self._graph_bufs[lid]
             indptr, indices = bufs["indptr"][: bs + 1], bufs["indices"]
+            if self._router is not None:
+                # Capture decides the path for every replay of this graph: the
+                # rows come from fixed-address buffers, so the recorded kernel
+                # reads whatever the step has written into them. The lane
+                # counts stage 2 needs still come from `indptr`, which the
+                # pack's prep kernel builds from these same tiers.
+                self._router.rows[lid] = rows_for_layer(
+                    self,
+                    lid,
+                    self._stage_slots[:bs],
+                    self._stage_seq[:bs],
+                    self._stage_loc[:bs],
+                )
         else:
             # Eager step: the metadata hook packed this step's CSR into the
             # same buffers the graphs read. Sized for the whole request
@@ -1414,6 +1439,13 @@ class VestigeKVMLABackend(AttentionBackend):
                     f"of {bs}; the step's metadata hook did not run"
                 )
             indptr, indices = bufs["indptr"][: bs + 1], bufs["indices"]
+        if self._router is not None and not get_is_capture_mode():
+            # Eager steps keep the CSR: their pack serves lanes the tiers
+            # cannot express (a slot with no compressed state for this layer
+            # attends its full row set), and they are off the hot path anyway.
+            self._router.rows.pop(lid, None)
+        if self._router is not None:
+            self._router.current_layer = lid
         saved = (fm.kv_indptr, fm.kv_indices)
         fm.kv_indptr, fm.kv_indices = indptr, indices
         try:
