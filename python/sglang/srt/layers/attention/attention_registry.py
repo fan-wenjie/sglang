@@ -76,6 +76,36 @@ def create_flashinfer_backend(runner):
         return FlashInferMLAAttnBackend(runner)
 
 
+@register_attention_backend("vestigekv_dsa")
+def create_vestigekv_dsa_backend(runner):
+    # The DSA-model copy of VestigeKV (GLM-5.3-Flash): the decode side of the
+    # split pair, over the Triton MLA base, with its own file so it can be
+    # specialised without touching the Kimi Linear backend.
+    _glm = glm5_next_config(runner.model_config)
+    if _glm is None:
+        raise ValueError("vestigekv_dsa is the GLM-5.3 (DSA) backend; Kimi Linear uses vestigekv_mla.")
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if _glm.qk_rope_head_dim != 0 or not is_deepseek_dsa(_glm):
+        raise ValueError("vestigekv_dsa requires a rope-less DSA model (qk_rope_head_dim == 0, DSA on).")
+    if not (
+        runner.prefill_attention_backend_str == "dsa"
+        and runner.decode_attention_backend_str == "vestigekv_dsa"
+    ):
+        raise ValueError(
+            "vestigekv_dsa: use --prefill-attention-backend dsa "
+            "--decode-attention-backend vestigekv_dsa."
+        )
+    if get_spec().speculative_algorithm is not None:
+        raise ValueError("vestigekv_dsa does not support speculative decoding yet.")
+    from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
+    from sglang.srt.layers.attention.vestigekv_dsa_backend import VestigeKVDSABackend
+
+    base = create_triton_backend(runner)
+    config = VestigeKVConfig.from_kernel_config(get_exec().kernel)
+    return VestigeKVDSABackend(base, runner, config=config)
+
+
 @register_attention_backend("vestigekv_mla")
 def create_vestigekv_mla_backend(runner):
     # VestigeKV wraps an MLA backend; for Kimi Linear the hybrid adopts this as
@@ -120,7 +150,7 @@ def create_vestigekv_mla_backend(runner):
             )
         if is_deepseek_dsa(_glm) and not (
             runner.prefill_attention_backend_str == "dsa"
-            and runner.decode_attention_backend_str == "vestigekv_mla"
+            and runner.decode_attention_backend_str in ("vestigekv_mla", "vestigekv_dsa")
         ):
             # As the sole backend VestigeKV would receive DSA's top-k on a dense
             # base and attend densely at prefill anyway (measured: +5.6 s TTFT

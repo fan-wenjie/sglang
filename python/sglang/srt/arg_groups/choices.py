@@ -90,6 +90,7 @@ ATTENTION_BACKEND_CHOICES = [
     "cutedsl_mla",
     "tokenspeed_mla",
     "vestigekv_mla",  # VestigeKV: training-free NoPE-MLA KV-cache compression wrapper
+    "vestigekv_dsa",  # VestigeKV, the DSA-model copy (GLM-5.3-Flash decode side of the split pair)
     "trtllm_mha",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     "minicpm_flashattn",
