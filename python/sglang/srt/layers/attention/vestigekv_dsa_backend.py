@@ -392,7 +392,7 @@ class VestigeKVDSABackend(AttentionBackend):
             host = torch.zeros((), dtype=torch.int32, pin_memory=True)
             self._ovf_probe = (dev, host, torch.cuda.Event())
         dev, host, event = self._ovf_probe
-        torch.sum(self._ovf_count_stack, out=dev)
+        torch.sum(self._ovf_count_stack, dim=0, out=dev)
         host.copy_(dev, non_blocking=True)
         event.record()
 
