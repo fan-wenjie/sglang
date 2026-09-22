@@ -84,7 +84,7 @@ class TestRopeLessRecall(CustomTestCase):
         keep[torch.randperm(T, generator=g)[: T // 8]] = True
         qcal = torch.randn(n_cal, H, 512, generator=g)
         qpos = torch.randint(0, T, (n_cal,), generator=g)
-        t = RecallTier(topj=-1, geom=ROPE_LESS_GEOM)
+        t = RecallTier(geom=ROPE_LESS_GEOM)
         t.build(kbuf, slots, keep, qcal, qpos, conservative=True)
         return t, torch.randn(H, 512, generator=g)
 
