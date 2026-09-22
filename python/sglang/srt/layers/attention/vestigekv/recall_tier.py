@@ -27,6 +27,56 @@ from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR, Geometry
 from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
 
 
+def owned_calibration_queries(local_best, other_bests, rank, ranks):
+    """Which calibration queries this rank fits zp on when the archive is split.
+
+    zp is calibrated on the best ARCHIVED row per query, and that best is a max
+    over the archive. Each rank holds a shard, so its own max is at or below
+    the union's: left alone, every rank calibrates against a worse row than the
+    one that exists, zp comes out too small and the certificate fires too
+    little -- rows that should be recalled are not. A recall failure, not a
+    tightness one.
+
+    So a query belongs to whichever rank actually holds its best archived row.
+    Ties go to the lowest rank, which matters only when two shards hold rows of
+    exactly equal score and costs nothing to make deterministic.
+    """
+    import torch
+
+    best = local_best
+    for other in other_bests:
+        best = torch.maximum(best, other)
+    mine = local_best >= best
+    for lower in other_bests[:rank]:
+        mine &= local_best > lower
+    return mine
+
+
+def zp_from_pooled(z_parts, n_cal_q, recall_target):
+    """The conformal quantile over the union of the ranks' z samples.
+
+    The guarantee is marginal over the exchangeable calibration queries, so the
+    order statistic has to be taken on all of them together; a per-rank
+    quantile of a per-rank sample guarantees nothing about the union. Each rank
+    contributes only the queries it owns, so concatenating is the union and
+    nothing is counted twice.
+    """
+    import torch
+
+    pooled = torch.cat([z for z in z_parts if z.numel()])
+    if pooled.numel() != n_cal_q:
+        # The count and the sample are computed separately -- one from the
+        # ownership masks, one from the values they select -- so a sharded
+        # caller that double-counts a query or drops a rank shows up here and
+        # not as a quantile taken at the wrong k.
+        raise ValueError(
+            f"pooled z sample is {pooled.numel()} but n_cal_q says {n_cal_q}; "
+            "the ownership masks and the values disagree"
+        )
+    k = D.conformal_k(n_cal_q, recall_target)
+    return min(float(pooled.kthvalue(k).values), D.Z_MAX)
+
+
 class RecallTier:
     def __init__(
         self,
