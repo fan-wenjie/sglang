@@ -179,5 +179,87 @@ class TestPackCsrParity(CustomTestCase):
             self._check(seed, lanes, fence=True)
 
 
+
+
+# ---------------------------------------------------------------------------
+# The sharded form: this rank holds positions off, off+stride, ... of every
+# request (docs/context-parallel.md). Two things change and nothing else does:
+# the step's new row lands in exactly one rank's pool, so only that rank
+# appends it; and a fenced lane walks the page table with the stride instead
+# of its whole length.
+# ---------------------------------------------------------------------------
+
+
+class TestPackCsrSharded(CustomTestCase):
+    def _run(self, state, slots, loc, fence=None, own=None, shard=None):
+        from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
+
+        kw = {}
+        if fence is not None:
+            fetch_ovf, seq, r2t = fence
+            kw.update(seq=seq, fetch_ovf=fetch_ovf, req_to_token=r2t)
+        if own is not None:
+            kw.update(own=own, shard=shard)
+        pack_csr_all_layers(slots, loc, *state, **kw)
+        return state
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_stride_one_owning_everything_is_the_unsharded_pack(self):
+        # The sharded path has to degenerate exactly, or every comparison
+        # below is measuring the wrong thing.
+        slots = torch.tensor([0, 1, 2, TRASH], device="cuda", dtype=torch.int64)
+        loc = torch.tensor([7001, 7002, 7003, 7004], device="cuda", dtype=torch.int32)
+        plain = self._run(_mk_state(5), slots, loc)
+        own = torch.ones(4, dtype=torch.int32, device="cuda")
+        shed = self._run(_mk_state(5), slots, loc, own=own, shard=(0, 1))
+        for a, b in zip(plain, shed):
+            self.assertTrue(torch.equal(a, b))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_only_the_owner_appends_the_step_row(self):
+        slots = torch.tensor([0, 1, 2, TRASH], device="cuda", dtype=torch.int64)
+        loc = torch.tensor([7001, 7002, 7003, 7004], device="cuda", dtype=torch.int32)
+        before = _mk_state(6)[1].clone()
+        own = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device="cuda")
+        state = self._run(_mk_state(6), slots, loc, own=own, shard=(0, 2))
+        kept_len = state[1]
+        for lane, slot in enumerate([0, 1, 2, TRASH]):
+            grew = int(kept_len[0, slot]) - int(before[0, slot])
+            self.assertEqual(grew, int(own[lane]), f"lane {lane} slot {slot}")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_two_ranks_fenced_rows_union_to_the_whole_page_table(self):
+        # The property the fence rests on: a fenced lane attends its request's
+        # whole row set, and with the sequence split that set is the union of
+        # what the ranks walk -- no row attended twice, none dropped.
+        slots = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
+        loc = torch.tensor([7001, 7002], device="cuda", dtype=torch.int32)
+        fetch_ovf, seq, r2t = _mk_fence(6, slots, loc)
+        fetch_ovf[:] = 1
+        fetch_ovf[:, TRASH] = 0
+        seq = torch.tensor([31, 24], device="cuda", dtype=torch.int64)
+
+        whole = self._run(_mk_state(7), slots, loc, fence=(fetch_ovf, seq, r2t))
+        w_idx, w_ptr = whole[4], whole[5]
+
+        halves = []
+        for r in (0, 1):
+            own = (torch.tensor([(int(seq[i]) - 1) % 2 for i in range(2)],
+                                device="cuda", dtype=torch.int32) == r).to(torch.int32)
+            st = self._run(_mk_state(7), slots, loc, fence=(fetch_ovf, seq, r2t),
+                           own=own, shard=(r, 2))
+            halves.append((st[4], st[5]))
+
+        for lane in range(2):
+            a, b = int(w_ptr[0, lane]), int(w_ptr[0, lane + 1])
+            want = sorted(w_idx[0, a:b].tolist())
+            got = []
+            for idx, ptr in halves:
+                lo, hi = int(ptr[0, lane]), int(ptr[0, lane + 1])
+                got += idx[0, lo:hi].tolist()
+            self.assertEqual(len(got), len(want), f"lane {lane}: row count")
+            self.assertEqual(sorted(got), want, f"lane {lane}: row set")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

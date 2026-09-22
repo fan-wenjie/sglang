@@ -43,6 +43,9 @@ def _pack_csr_prep_kernel(
     kept_len_ptr,  # [L, R1] int32
     fetch_len_ptr,  # [L, R1] int32
     fetch_ovf_ptr,  # [L, R1] int32 overflow flag (FENCE only)
+    own_ptr,  # SHARDED: [bs] int32, 1 where this rank holds the step's new row
+    sh_off,  # SHARDED: this rank's first global position
+    sh_stride,  # SHARDED: positions between two rows this rank holds
     indptr_ptr,  # [L, MAXBS1] out
     R1,
     CAP,
@@ -50,6 +53,7 @@ def _pack_csr_prep_kernel(
     L,
     MAXBS1,
     FENCE: tl.constexpr,
+    SHARDED: tl.constexpr,
 ):
     # One program PER LAYER (layers share no state), three passes each
     # reading only PRE-STEP state:
@@ -63,27 +67,42 @@ def _pack_csr_prep_kernel(
         run = tl.load(kept_len_ptr).to(tl.int64) * 0  # int64 scalar zero
         for i in range(0, bs):
             slot = tl.load(slots_ptr + i).to(tl.int64)
-            n = tl.load(kept_len_ptr + li * R1 + slot).to(tl.int64) + 1
+            grew = 1
+            if SHARDED:
+                # The step's new row lands in exactly one rank's pool; the
+                # others must not count a row they do not hold.
+                grew = tl.load(own_ptr + i).to(tl.int64)
+            n = tl.load(kept_len_ptr + li * R1 + slot).to(tl.int64) + grew
             n += tl.load(fetch_len_ptr + li * R1 + slot).to(tl.int64)
             if FENCE:
                 fenced = tl.load(fetch_ovf_ptr + li * R1 + slot) != 0
-                n = tl.where(fenced, tl.load(seq_ptr + i).to(tl.int64), n)
+                seq = tl.load(seq_ptr + i).to(tl.int64)
+                if SHARDED:
+                    seq = tl.cdiv(seq - sh_off, sh_stride)
+                n = tl.where(fenced, seq, n)
             run += n
             tl.store(indptr_ptr + li * MAXBS1 + i + 1, run)
         k = bs + 1 + tl.arange(0, 64)
         tl.store(indptr_ptr + li * MAXBS1 + k, run, mask=k < MAXBS1)
         for i in range(0, bs):  # appends (kept_len still pristine)
             slot = tl.load(slots_ptr + i).to(tl.int64)
-            n_old = tl.load(kept_len_ptr + li * R1 + slot).to(tl.int64)
-            tl.store(
-                kept_buf_ptr + (li * R1 + slot) * CAP + n_old, tl.load(loc_ptr + i)
-            )
+            own = 1
+            if SHARDED:
+                own = tl.load(own_ptr + i).to(tl.int32)
+            if own != 0:
+                n_old = tl.load(kept_len_ptr + li * R1 + slot).to(tl.int64)
+                tl.store(
+                    kept_buf_ptr + (li * R1 + slot) * CAP + n_old, tl.load(loc_ptr + i)
+                )
         for i in range(0, bs):  # lengths: first occurrence only (+1 once,
             slot = tl.load(slots_ptr + i).to(tl.int64)  # duplicates skip)
             dup = 0
             for jj in range(0, i):
                 dup += (tl.load(slots_ptr + jj).to(tl.int64) == slot).to(tl.int32)
-            if dup == 0:
+            own = 1
+            if SHARDED:
+                own = tl.load(own_ptr + i).to(tl.int32)
+            if dup == 0 and own != 0:
                 n_old = tl.load(kept_len_ptr + li * R1 + slot)
                 tl.store(kept_len_ptr + li * R1 + slot, n_old + 1)
 
@@ -99,6 +118,8 @@ def _pack_csr_gather_kernel(
     fetch_buf_ptr,  # [L, R1, FW]
     fetch_ovf_ptr,  # [L, R1] int32 (FENCE only)
     r2t_ptr,  # [R1 - 1, R2T] req_to_token (FENCE only)
+    sh_off,  # SHARDED: this rank's first global position
+    sh_stride,  # SHARDED: positions between two rows this rank holds
     indptr_ptr,  # [L, MAXBS1] (from prep)
     indices_ptr,  # [L, CAPI] out
     R1,
@@ -109,6 +130,7 @@ def _pack_csr_gather_kernel(
     R2T,
     BLOCK: tl.constexpr,
     FENCE: tl.constexpr,
+    SHARDED: tl.constexpr,
 ):
     li = tl.program_id(0)
     lane = tl.program_id(1)
@@ -124,11 +146,20 @@ def _pack_csr_gather_kernel(
     if fenced:
         seq = tl.load(seq_ptr + lane).to(tl.int64)
         loc = tl.load(loc_ptr + lane)
-        for i in range(tl.cdiv(seq, BLOCK)):
+        # `seq` is the request's GLOBAL length; a rank walks the positions it
+        # holds, so the rows it emits are cdiv(seq - off, stride) of them and
+        # the step's own row belongs to whichever rank owns position seq - 1.
+        rows = seq
+        if SHARDED:
+            rows = tl.cdiv(seq - sh_off, sh_stride)
+        for i in range(tl.cdiv(rows, BLOCK)):
             j = i * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
-            m = j < seq
-            dense = tl.load(r2t_ptr + slot * R2T + j, mask=m, other=0)
-            dense = tl.where(j == seq - 1, loc.to(dense.dtype), dense)
+            m = j < rows
+            gj = j
+            if SHARDED:
+                gj = sh_off + j * sh_stride
+            dense = tl.load(r2t_ptr + slot * R2T + gj, mask=m, other=0)
+            dense = tl.where(gj == seq - 1, loc.to(dense.dtype), dense)
             tl.store(
                 indices_ptr + li * CAPI + start + j,
                 dense.to(indices_ptr.dtype.element_ty),
@@ -168,6 +199,8 @@ def pack_csr_all_layers(
     seq=None,
     fetch_ovf=None,
     req_to_token=None,
+    own=None,
+    shard=None,
 ):
     """Two launches for every layer's CSR. Stacked tensors: kept_buf
     [L, R1, CAP], kept_len/fetch_len [L, R1], fetch_buf [L, R1, FW],
@@ -175,13 +208,26 @@ def pack_csr_all_layers(
 
     Passing `seq` [bs], `fetch_ovf` [L, R1] and `req_to_token` [reqs, ctx]
     together arms the overflow fence (see the module docstring); all three
-    or none."""
+    or none.
+
+    `own` [bs] int32 and `shard` (offset, stride) arm the sharded form, where
+    this rank holds only the positions `offset, offset+stride, ...` of each
+    request. `own[i]` says whether the step's new row for lane i landed in
+    this rank's pool -- exactly one rank's does -- and the fence walks the
+    page table with the same stride rather than its whole length. Both or
+    neither; without them the kernels are the single-holder ones."""
     fence = seq is not None
+    sharded = own is not None
+    if sharded != (shard is not None):
+        raise ValueError("the sharded form needs own and shard together")
+    sh_off, sh_stride = shard if sharded else (0, 1)
     if fence != (fetch_ovf is not None) or fence != (req_to_token is not None):
         raise ValueError("the fence needs seq, fetch_ovf and req_to_token together")
     if not fence:
         # Unused pointer arguments still have to be tensors.
         seq, fetch_ovf, req_to_token = loc, fetch_len, fetch_len
+    if not sharded:
+        own = loc
     L, R1, CAP = kept_buf.shape
     bs = slots.shape[0]
     _pack_csr_prep_kernel[(L,)](
@@ -192,6 +238,9 @@ def pack_csr_all_layers(
         kept_len,
         fetch_len,
         fetch_ovf,
+        own,
+        sh_off,
+        sh_stride,
         indptr,
         R1,
         CAP,
@@ -199,6 +248,7 @@ def pack_csr_all_layers(
         L,
         indptr.shape[1],
         FENCE=fence,
+        SHARDED=sharded,
     )
     _pack_csr_gather_kernel[(L, bs)](
         slots,
@@ -210,6 +260,8 @@ def pack_csr_all_layers(
         fetch_buf,
         fetch_ovf,
         req_to_token,
+        sh_off,
+        sh_stride,
         indptr,
         indices,
         R1,
@@ -220,4 +272,5 @@ def pack_csr_all_layers(
         req_to_token.shape[1] if fence else 0,
         BLOCK=512,
         FENCE=fence,
+        SHARDED=sharded,
     )
