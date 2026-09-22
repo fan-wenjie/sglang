@@ -539,108 +539,185 @@ class TestStatsTelemetry(CustomTestCase):
         self.assertEqual(be._stats["fetched"], 0)
 
 
-class TestSaliencePool(CustomTestCase):
-    """Rope-less geometry: tier-1 sigma comes from the per-layer side pool the
-    model fills through write_salience, never from the latent row."""
+class TestSalienceRing(CustomTestCase):
+    """Rope-less geometry: a token's salience key is read exactly once, when its
+    block closes, so the keys live in a per-request ring of the open positions
+    rather than in a table aligned with the KV pool. Addressed by position, and
+    stamped, so a row the ring has recycled is never mistaken for a live one."""
 
-    N = D.CLOSE_BLOCK + 64
+    RING = D.CLOSE_BLOCK + 512
 
-    def _mk(self):
+    def _mk(self, fp8=False, slots=2):
         from sglang.srt.layers.attention.vestigekv.geometry import Geometry
 
         be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
         be.geom = Geometry(
             kv_lora_rank=512, side_dim=0, qk_head_dim=256, sigma_dim=128, sigma_in_row=False
         )
-        be._side_fp8 = False
-        be._side_pool = {LID: torch.zeros(self.N, 128, dtype=torch.bfloat16)}
-        be._side_scale = {}
+        be._side_fp8 = fp8
+        be._side_ring_size = self.RING
+        dt = torch.float8_e4m3fn if fp8 else torch.bfloat16
+        be._side_ring = {LID: torch.zeros(slots, self.RING, 128, dtype=dt)}
+        be._side_stamp = {LID: torch.full((slots, self.RING), -1, dtype=torch.int32)}
+        be._side_ring_scale = (
+            {LID: torch.zeros(slots, self.RING, dtype=torch.float32)} if fp8 else {}
+        )
         return be
 
-    def test_keys_land_at_their_cache_rows(self):
+    @staticmethod
+    def _fb(slots, positions, extend=None):
+        return SimpleNamespace(
+            positions=torch.as_tensor(positions),
+            req_pool_indices=torch.as_tensor(slots),
+            extend_seq_lens=None if extend is None else torch.as_tensor(extend),
+            forward_mode=SimpleNamespace(is_decode=lambda: extend is None),
+        )
+
+    def test_keys_land_by_position_in_their_requests_ring(self):
         be = self._mk()
-        loc = torch.tensor([5, 900, 17])
-        key = torch.randn(3, 128)
-        be.write_salience(layer_id=LID, loc=loc, key=key)
-        pool = be._side_pool[LID]
-        self.assertTrue(torch.equal(pool[loc], key.to(torch.bfloat16)))
-        rest = torch.ones(self.N, dtype=torch.bool)
-        rest[loc] = False
-        self.assertEqual(float(pool[rest].abs().sum()), 0.0)
+        # distinct ring rows: wrapping is its own test below, and mixing the
+        # two here asserted that the earlier of two writes to one row had won
+        pos = torch.tensor([0, 1, 4095, self.RING - 1])
+        key = torch.randn(4, 128)
+        be.write_salience(layer_id=LID, forward_batch=self._fb([1], pos, extend=[4]), key=key)
+        ring = be._side_ring[LID]
+        for i, p in enumerate(pos.tolist()):
+            self.assertTrue(torch.equal(ring[1, p % self.RING], key[i].to(torch.bfloat16)))
+            self.assertEqual(int(be._side_stamp[LID][1, p % self.RING]), p)
+        # slot 0 was never written by this request
+        self.assertEqual(float(ring[0].abs().sum()), 0.0)
+
+    def test_a_wrapped_position_overwrites_its_own_ring_row(self):
+        """RING is one open block plus a prefill step, so position p and p+RING
+        share a row; the later write wins and the stamp says which one it is."""
+        be = self._mk()
+        be.write_salience(
+            layer_id=LID,
+            forward_batch=self._fb([0], [9], extend=[1]),
+            key=torch.ones(1, 128),
+        )
+        be.write_salience(
+            layer_id=LID,
+            forward_batch=self._fb([0], [9 + self.RING], extend=[1]),
+            key=torch.full((1, 128), 2.0),
+        )
+        self.assertEqual(float(be._side_ring[LID][0, 9][0]), 2.0)
+        self.assertEqual(int(be._side_stamp[LID][0, 9]), 9 + self.RING)
+
+    def test_decode_writes_one_key_per_request(self):
+        be = self._mk()
+        fb = self._fb([0, 1], [40, 41])  # decode: no extend_seq_lens
+        be.write_salience(layer_id=LID, forward_batch=fb, key=torch.randn(2, 128))
+        self.assertEqual(int(be._side_stamp[LID][0, 40]), 40)
+        self.assertEqual(int(be._side_stamp[LID][1, 41]), 41)
 
     def test_row_count_mismatch_is_refused(self):
         be = self._mk()
         with self.assertRaises(ValueError):
-            be.write_salience(layer_id=LID, loc=torch.tensor([1, 2]), key=torch.randn(3, 128))
+            be.write_salience(
+                layer_id=LID,
+                forward_batch=self._fb([0], [1, 2], extend=[2]),
+                key=torch.randn(3, 128),
+            )
 
-    def test_sigma_reads_the_side_pool_not_the_latent(self):
+    def test_sigma_reads_the_ring_and_marks_missing_keys_kept(self):
+        """A position the ring does not hold -- a prefix-cache hit, a reused
+        slot -- scores +inf, so it is kept. Over-keeping is safe; under-
+        recalling is not."""
         from sglang.srt.layers.attention.vestigekv.eviction import blockwise_sigma
 
         be = self._mk()
         g = torch.Generator().manual_seed(0)
-        slots = torch.randperm(self.N, generator=g)[: D.CLOSE_BLOCK]
-        be._side_pool[LID][slots] = torch.randn(D.CLOSE_BLOCK, 128, generator=g).to(
-            torch.bfloat16
+        key = torch.randn(D.CLOSE_BLOCK, 128, generator=g)
+        pos = torch.arange(D.CLOSE_BLOCK)
+        be.write_salience(
+            layer_id=LID,
+            forward_batch=self._fb([0], pos, extend=[D.CLOSE_BLOCK]),
+            key=key,
         )
-        a = be._block_sigma(torch.randn(self.N, 512, generator=g), slots, lid=LID)
-        b = be._block_sigma(torch.randn(self.N, 512, generator=g), slots, lid=LID)
-        self.assertTrue(torch.equal(a, b))
-        self.assertTrue(
-            torch.equal(a, blockwise_sigma(be._side_pool[LID][slots], D.CLOSE_BLOCK))
-        )
+        got = be._ring_sigma(0, LID, 0, D.CLOSE_BLOCK)
+        want = blockwise_sigma(be._side_ring[LID][0, : D.CLOSE_BLOCK], D.CLOSE_BLOCK)
+        self.assertTrue(torch.equal(got, want))
+        # the same span on a slot nothing ever wrote: every row unheld
+        other = be._ring_sigma(1, LID, 0, D.CLOSE_BLOCK)
+        self.assertTrue(bool(torch.isinf(other).all()))
 
-
-
-class TestFp8SidePool(CustomTestCase):
-    """The fp8 side pool changes bytes, not the contract: keys round-trip to
-    fp8 e4m3 * per-token scale, and sigma equals sigma over the dequantized
-    keys -- the same rows the bf16 path would score, at fp8 fidelity."""
-
-    N = D.CLOSE_BLOCK + 64
-
-    def _mk(self):
-        from sglang.srt.layers.attention.vestigekv.geometry import Geometry
-
-        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
-        be.geom = Geometry(
-            kv_lora_rank=512, side_dim=0, qk_head_dim=256, sigma_dim=128, sigma_in_row=False
-        )
-        be._side_fp8 = True
-        be._side_pool = {LID: torch.zeros(self.N, 128, dtype=torch.float8_e4m3fn)}
-        be._side_scale = {LID: torch.zeros(self.N, dtype=torch.float32)}
-        return be
-
-    def test_keys_round_trip_within_fp8_precision(self):
+    def test_fp8_ring_round_trips_within_fp8_precision(self):
         from sglang.srt.layers.attention.vestigekv.salience import dequantize_salience
 
-        be = self._mk()
-        loc = torch.tensor([3, 700, 4000])
+        be = self._mk(fp8=True)
+        pos = torch.tensor([3, 700, 4000])
         key = torch.randn(3, 128) * torch.tensor([[0.1], [1.0], [40.0]])
-        be.write_salience(layer_id=LID, loc=loc, key=key)
-        scale = be._side_scale[LID][loc]
-        back = dequantize_salience(be._side_pool[LID][loc], scale)
+        be.write_salience(layer_id=LID, forward_batch=self._fb([0], pos, extend=[3]), key=key)
+        idx = pos % self.RING
+        scale = be._side_ring_scale[LID][0, idx]
+        back = dequantize_salience(be._side_ring[LID][0, idx], scale)
         # DSA index-cache alignment: ue8m0 scales are exact powers of two
         self.assertTrue(torch.equal(scale, torch.exp2(torch.log2(scale).round())))
         # e4m3: 3 mantissa bits (rel 2^-4) down to the subnormal step (2^-9 * scale)
         tol = key.abs() * 2**-4 + scale[:, None] * 2**-9
         self.assertTrue(bool(((back - key).abs() <= tol).all()))
 
-    def test_sigma_equals_sigma_over_the_dequantized_keys(self):
-        from sglang.srt.layers.attention.vestigekv.eviction import blockwise_sigma
-        from sglang.srt.layers.attention.vestigekv.salience import dequantize_salience
+    def test_in_row_geometry_refuses_the_ring_path(self):
+        from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR
 
         be = self._mk()
-        g = torch.Generator().manual_seed(1)
-        slots = torch.randperm(self.N, generator=g)[: D.CLOSE_BLOCK]
-        be.write_salience(
-            layer_id=LID, loc=slots, key=torch.randn(D.CLOSE_BLOCK, 128, generator=g)
+        be.geom = KIMI_LINEAR
+        # _block_sigma is the in-row path; asking a ring geometry for it, or the
+        # reverse, has to fail loudly rather than score the wrong buffer.
+        be.geom = be.geom.__class__(
+            kv_lora_rank=512, side_dim=0, qk_head_dim=256, sigma_dim=128, sigma_in_row=False
         )
-        got = be._block_sigma(torch.randn(self.N, 512, generator=g), slots, lid=LID)
-        rows = dequantize_salience(be._side_pool[LID][slots], be._side_scale[LID][slots])
-        self.assertTrue(torch.equal(got, blockwise_sigma(rows, D.CLOSE_BLOCK)))
+        with self.assertRaises(RuntimeError):
+            be._block_sigma(torch.randn(16, 576), torch.arange(0), lid=LID)
 
-if __name__ == "__main__":
-    unittest.main()
+
+class TestIncrementalSigmaRecord(CustomTestCase):
+    """The record grows by whole blocks as chunks arrive. Accumulated over
+    chunks it must equal the one-shot blockwise sigma of the same prefix, bit
+    for bit -- the kept set is a function of it, so anything less makes the
+    compressed arm depend on how the prefill happened to be chunked.
+
+    Recomputing it per chunk instead is what made prefill quadratic in the
+    chunk count: 32.5x the necessary work at a 512-token chunk, measured as
+    +5.8 s of TTFT on a 32k prompt.
+    """
+
+    def _backend(self, pool=20000):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR
+
+        be.geom = KIMI_LINEAR
+        torch.manual_seed(1)
+        be._kbuf = torch.randn(pool, 576)
+        be.req_to_token_pool = SimpleNamespace(
+            req_to_token=(torch.arange(2 * pool).reshape(2, pool) % pool)
+        )
+        return be
+
+    def test_chunked_record_equals_one_shot_sigma(self):
+        from sglang.srt.layers.attention.vestigekv.eviction import (
+            blockwise_sigma_from_pool,
+        )
+
+        be = self._backend()
+        cl = {"closed": 0, "sigmaed": 0, "seq": 0, "sigma": torch.zeros(0)}
+        seq = 3 * D.CLOSE_BLOCK + 500
+        for upto in (1000, 5000, D.CLOSE_BLOCK * 2, 9000, seq):  # uneven chunk ends
+            be._advance_sigma(0, LID, cl, upto, be._kbuf)
+            self.assertEqual(cl["sigmaed"], (upto // D.CLOSE_BLOCK) * D.CLOSE_BLOCK)
+        rows = be.req_to_token_pool.req_to_token[0, : 3 * D.CLOSE_BLOCK]
+        want = blockwise_sigma_from_pool(
+            be._kbuf, rows, D.CLOSE_BLOCK, offset=512, dim=64
+        )
+        self.assertTrue(torch.equal(cl["sigma"], want))
+
+    def test_the_record_never_runs_ahead_of_a_complete_block(self):
+        be = self._backend()
+        cl = {"closed": 0, "sigmaed": 0, "seq": 0, "sigma": torch.zeros(0)}
+        be._advance_sigma(0, LID, cl, D.CLOSE_BLOCK - 1, be._kbuf)
+        self.assertEqual(cl["sigmaed"], 0)
+        self.assertEqual(cl["sigma"].numel(), 0)
 
 
 class TestCapabilityDelegation(CustomTestCase):
@@ -1587,6 +1664,11 @@ class TestDecodeTimeBlockClose(CustomTestCase):
         )
         be._close_state[(0, self.LID2)] = {
             "closed": prefill,
+            # the record has already been advanced over the prefix by the
+            # prefill path; sigmaed is how far it reaches, seq how far the
+            # request does
+            "sigmaed": prefill,
+            "seq": prefill,
             "sigma": torch.rand(prefill),
         }
         return be

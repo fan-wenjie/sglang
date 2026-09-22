@@ -51,7 +51,7 @@ from sglang.srt.layers.attention.vestigekv.eviction import (
 )
 from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.layers.attention.vestigekv.tier_decode import rows_for_layer
 from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR, Geometry
 
@@ -250,24 +250,46 @@ class VestigeKVMLABackend(AttentionBackend):
         self.geom = Geometry.from_hf_config(text_cfg)
         self._q_dim = self.geom.latent_dim  # kv_lora_rank + un-roped sidecar
         logger.info("VestigeKV: %s", config.describe())
-        # Salience channel outside the latent row: one bf16 [pool rows, sigma_dim]
-        # table per local MLA layer, row-aligned with that layer's KV pool and
-        # filled by the model through write_salience.
-        self._side_pool: dict = {}
-        self._side_scale: dict = {}  # fp8 pool only: [pool rows] fp32 per-row scale
+        # Salience channel outside the latent row. A key is read exactly once,
+        # when its CLOSE_BLOCK closes and sigma is computed, so the keys live in
+        # a per-request ring of the un-closed positions -- ring row pos % RING,
+        # stamped with the position it holds -- not in a table aligned with the
+        # KV pool. RING covers the widest span that can be open at once: an
+        # unfinished block plus one prefill step.
+        #
+        # The pool-aligned table this replaces cost 132 B per cached token per
+        # layer, which on this deployment is 894 MiB against a 6.78 GiB pool and
+        # carries the whole gap between 1+alpha = 1.28 and 1.16; the ring is 52
+        # MiB and, being sized by slots rather than tokens, does not grow with
+        # context at all.
+        self._side_ring: dict = {}  # lid -> [slots, RING, sigma_dim]
+        self._side_ring_scale: dict = {}  # fp8 ring only: [slots, RING] fp32
+        self._side_stamp: dict = {}  # lid -> [slots, RING] int32 position, -1 empty
         self._side_fp8 = config.side_pool_dtype == "fp8"
+        self._side_ring_size = 0
         if not self.geom.sigma_in_row:
             dev = model_runner.device
+            sched = get_schedule()
+            step = sched.chunked_prefill_size
+            if step is None or step <= 0:
+                step = sched.max_prefill_tokens
+            self._side_ring_size = D.CLOSE_BLOCK + int(step)
+            n_slots = base.req_to_token_pool.req_to_token.shape[0] + 1
             for lid in self._local_mla_lids:
-                rows = base.token_to_kv_pool.get_key_buffer(lid).shape[0]
-                self._side_pool[lid] = torch.zeros(
-                    rows,
+                self._side_ring[lid] = torch.zeros(
+                    n_slots,
+                    self._side_ring_size,
                     self.geom.sigma_dim,
                     dtype=torch.float8_e4m3fn if self._side_fp8 else torch.bfloat16,
                     device=dev,
                 )
+                self._side_stamp[lid] = torch.full(
+                    (n_slots, self._side_ring_size), -1, dtype=torch.int32, device=dev
+                )
                 if self._side_fp8:
-                    self._side_scale[lid] = torch.zeros(rows, dtype=torch.float32, device=dev)
+                    self._side_ring_scale[lid] = torch.zeros(
+                        n_slots, self._side_ring_size, dtype=torch.float32, device=dev
+                    )
         # Fixed fetch-buffer width: graph capture needs a fixed WIDTH, not a
         # cap. A fire past it raises the pair's overflow flag; the pack then
         # fences that step to the full row set (config.overflow_fallback) or
@@ -1084,26 +1106,39 @@ class VestigeKVMLABackend(AttentionBackend):
         for i, (slot, seq_len) in enumerate(zip(slots, lens)):
             seq_len = int(seq_len)
             row_slots = r2t[slot, :seq_len]
+            # The sigma record grows by whole blocks as the prefix arrives, one
+            # chunk per extend step, and continues only from the state this
+            # backend built up to exactly this chunk's prefix. A slot reused for
+            # a new request, or a prefix it never saw (a prefix-cache hit),
+            # starts over: rows whose key it never wrote score +inf and stay
+            # kept.
+            prefix_len = int(prefix_lens[i]) if prefix_lens is not None else 0
+            cl = self._close_state.get((slot, lid))
+            if cl is None or cl.get("seq") != prefix_len:
+                cl = {
+                    "closed": 0,
+                    "sigmaed": 0,
+                    "seq": prefix_len,
+                    "sigma": torch.zeros(0, dtype=torch.float32, device=r2t.device),
+                }
+                self._close_state[(slot, lid)] = cl
+            self._advance_sigma(slot, lid, cl, seq_len, kbuf)
+            cl["seq"] = seq_len
             kept = self._arm_aware_kept(
-                row_slots, kbuf, seq_len, layer.v_head_dim, lid=lid
+                row_slots, kbuf, seq_len, layer.v_head_dim, lid=lid, sigma=cl["sigma"]
             )
             n = kept.numel()
             self._kept_buf[lid][slot, :n] = kept.to(self._kept_buf[lid].dtype)
             self._kept_len[lid][slot] = n
-            # Arm decode-time closes: the prefix counts as closed, and its
-            # sigma record seeds the global rebalance (recomputed here rather
-            # than plumbed out of _arm_aware_kept; prefill-path cost). Below
-            # the activation threshold nothing is closed yet -- the first
-            # decode-time close past it closes the whole prefix in one pass.
-            closed0 = (
+            # Arm decode-time closes: the prefix counts as closed (ranked).
+            # Below the activation threshold nothing is closed yet -- the first
+            # decode-time close past it ranks the whole prefix in one pass, from
+            # the sigma record that kept growing meanwhile.
+            cl["closed"] = (
                 (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
                 if seq_len >= self.config.activation_min_tokens
                 else 0
             )
-            self._close_state[(slot, lid)] = {
-                "closed": closed0,
-                "sigma": self._block_sigma(kbuf, row_slots[:closed0], lid=lid),
-            }
             # Host-side upper bound on kept_len, so the per-step CSR pack needs
             # no `int(lens.max())` readback. Exact by construction: every decode
             # step appends one row to every active request, so bumping the bound
@@ -1131,7 +1166,7 @@ class VestigeKVMLABackend(AttentionBackend):
             if lid in self._fetch_len:
                 self._fetch_len[lid][slot] = 0
                 self._fetch_ovf[lid][slot] = 0
-            self._maybe_prefill_build(slot=slot, lid=lid, seq_len=seq_len, closed=closed0)
+            self._maybe_prefill_build(slot=slot, lid=lid, seq_len=seq_len, closed=cl["closed"])
             # Deliberately NOT built here: under chunked prefill seq_lens is the
             # running total, not the request length, so "is this the last chunk?"
             # is not decidable from the ForwardBatch (measured: the obvious
@@ -1290,44 +1325,104 @@ class VestigeKVMLABackend(AttentionBackend):
         path = envs.SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG.get()
         return bool(path) and os.path.exists(path)
 
-    def write_salience(self, *, layer_id: int, loc: torch.Tensor, key: torch.Tensor):
-        """Store this forward's salience keys at their tokens' KV rows."""
-        if key.shape[0] != loc.shape[0]:
+    def write_salience(self, *, layer_id: int, forward_batch, key: torch.Tensor):
+        """Store this forward's salience keys in their requests' rings, by token
+        position. Addressed by position rather than by KV row because the ring
+        holds only the open span, and a position's key is dead once its block
+        has been scored."""
+        positions = forward_batch.positions
+        if key.shape[0] != positions.shape[0]:
             raise ValueError(
-                f"salience keys ({key.shape[0]}) and cache slots ({loc.shape[0]}) "
+                f"salience keys ({key.shape[0]}) and positions ({positions.shape[0]}) "
                 "disagree; hidden states must be one row per token of the batch"
             )
-        loc = loc.to(torch.int64)
+        slots = forward_batch.req_pool_indices.to(torch.int64)
+        if not forward_batch.forward_mode.is_decode():
+            slots = torch.repeat_interleave(
+                slots, forward_batch.extend_seq_lens.to(torch.int64)
+            )
+        pos = positions.to(torch.int64)
+        ring = self._side_ring_size
+        flat = slots * ring + pos % ring
+        # Stamped before the key: _ring_sigma trusts a row only when the stamp
+        # says this exact position wrote it, so a stale row can never be read
+        # as a fresh one.
+        self._side_stamp[layer_id].view(-1).index_copy_(0, flat, pos.to(torch.int32))
         if self._side_fp8:
             from sglang.srt.layers.attention.vestigekv.salience import quantize_salience
 
             q, scale = quantize_salience(key)
             # byte view: index_copy_ has no fp8 kernel on every device
-            self._side_pool[layer_id].view(torch.uint8).index_copy_(
-                0, loc, q.view(torch.uint8)
-            )
-            self._side_scale[layer_id].index_copy_(0, loc, scale)
+            self._side_ring[layer_id].view(-1, self.geom.sigma_dim).view(
+                torch.uint8
+            ).index_copy_(0, flat, q.view(torch.uint8))
+            self._side_ring_scale[layer_id].view(-1).index_copy_(0, flat, scale)
             return
-        self._side_pool[layer_id].index_copy_(0, loc, key.to(torch.bfloat16))
-
-    def _block_sigma(self, kbuf, slots, *, lid):
-        """Tier-1 sigma over the closed blocks of `slots`, from the geometry's
-        salience channel."""
-        g = self.geom
-        if g.sigma_in_row:
-            return blockwise_sigma_from_pool(
-                kbuf, slots, D.CLOSE_BLOCK, offset=g.sigma_offset, dim=g.sigma_dim
-            )
-        return blockwise_sigma_from_pool(
-            self._side_pool[lid],
-            slots,
-            D.CLOSE_BLOCK,
-            offset=0,
-            dim=g.sigma_dim,
-            scale=self._side_scale.get(lid),
+        self._side_ring[layer_id].view(-1, self.geom.sigma_dim).index_copy_(
+            0, flat, key.to(torch.bfloat16)
         )
 
-    def _arm_aware_kept(self, row_slots, kbuf, seq_len, v_dim, lid=None):
+    def _block_sigma(self, kbuf, slots, *, lid):
+        """Tier-1 sigma over the closed blocks of `slots` (pool rows), from the
+        latent row's own salience branch. In-row geometries only."""
+        g = self.geom
+        if not g.sigma_in_row:
+            raise RuntimeError(
+                "this geometry keeps its salience keys per request (ring), not "
+                "per pool row; use _ring_sigma"
+            )
+        return blockwise_sigma_from_pool(
+            kbuf, slots, D.CLOSE_BLOCK, offset=g.sigma_offset, dim=g.sigma_dim
+        )
+
+    def _ring_sigma(self, slot, lid, c0, c1):
+        """Tier-1 sigma of positions [c0, c1) (whole blocks) from the slot's key
+        ring. A position whose key the ring does not hold -- a prefix-cache hit,
+        a reused slot -- scores +inf: it stays kept, so this can over-keep but
+        never under-recall."""
+        ring = self._side_ring[lid][slot]
+        pos = torch.arange(c0, c1, dtype=torch.int64, device=ring.device)
+        idx = pos % self._side_ring_size
+        sigma = blockwise_sigma_from_pool(
+            ring,
+            idx,
+            D.CLOSE_BLOCK,
+            offset=0,
+            dim=self.geom.sigma_dim,
+            scale=self._side_ring_scale[lid][slot] if self._side_fp8 else None,
+        )
+        valid = self._side_stamp[lid][slot][idx] == pos.to(torch.int32)
+        return torch.where(valid, sigma, sigma.new_full((), float("inf")))
+
+    def _advance_sigma(self, slot, lid, cl, seq_len, kbuf):
+        """Extend the request's sigma record over every block that completed
+        below seq_len.
+
+        This is what keeps prefill linear. Recomputing sigma over the whole
+        prefix on every chunk makes the total (n_chunks + 1)/2 times the
+        necessary work, which is invisible at a 4096-token chunk (4.5x at 32k)
+        and is 32.5x at the 512-token chunk a rope-less MLA is forced onto --
+        measured as +5.8 s of TTFT on a 32k prompt, scaling with the square of
+        the context. Each block is transformed exactly once, at close, and its
+        sigma is immutable, so growing the record is exact rather than an
+        approximation.
+
+        Runs per prefill chunk and per decode step, so a key is always scored
+        before its ring row is reused.
+        """
+        target = (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
+        if target <= cl["sigmaed"]:
+            return
+        c0 = cl["sigmaed"]
+        if self.geom.sigma_in_row:
+            rows = self.req_to_token_pool.req_to_token[slot, c0:target].to(torch.int64)
+            sigma = self._block_sigma(kbuf, rows, lid=lid)
+        else:
+            sigma = self._ring_sigma(slot, lid, c0, target)
+        cl["sigma"] = torch.cat([cl["sigma"], sigma])
+        cl["sigmaed"] = target
+
+    def _arm_aware_kept(self, row_slots, kbuf, seq_len, v_dim, lid=None, sigma=None):
         # The kept row set for one request, shared by the bs==1 kept-table build
         # and the bs>1 tier-2 build so both honor the same arm. Benchmark arm
         # switch, read per prefill: /tmp/vestige_full present -> FULL prefix (arm
@@ -1362,8 +1457,12 @@ class VestigeKVMLABackend(AttentionBackend):
         # The mixed flavor only ever survived until the first decode close
         # (the 64-dim global rebalance replaces it), and recall covered the
         # difference, but the paper's sigma is the branch. One flavor now.
-        sigma = self._block_sigma(kbuf, row_slots, lid=lid)
-        keep = select_kept(sigma, rho=self.rho, closed=closed, sinks=D.SINKS)
+        # The caller passes the request's running sigma record; only a caller
+        # that has none (a test, an in-row geometry with no record yet) pays for
+        # a whole-prefix transform here.
+        if sigma is None:
+            sigma = self._block_sigma(kbuf, row_slots, lid=lid)
+        keep = select_kept(sigma[:closed], rho=self.rho, closed=closed, sinks=D.SINKS)
         kept_closed = row_slots[:closed][keep.nonzero(as_tuple=True)[0]]
         return torch.cat([kept_closed, row_slots[closed:]])
 
@@ -1857,6 +1956,14 @@ class VestigeKVMLABackend(AttentionBackend):
                 cl = self._close_state.get((slot, lid))
                 if cl is None:
                     continue
+                # Score every block this step completed BEFORE the ring reuses
+                # its rows: the ring holds one unfinished block plus a prefill
+                # step, so a key survives exactly until its block is scored.
+                kb = self.token_to_kv_pool.get_key_buffer(lid)
+                self._advance_sigma(
+                    slot, lid, cl, seq_len, kb.reshape(-1, kb.shape[-1])
+                )
+                cl["seq"] = seq_len
                 # Below ACTIVATION_MIN_TOKENS the request runs dense
                 # (no closes, no index). On the step that crosses it the
                 # whole prefix closes here in one pass: per-block sigma is
@@ -1875,14 +1982,16 @@ class VestigeKVMLABackend(AttentionBackend):
         r2t = self.req_to_token_pool.req_to_token
         c0 = cl["closed"]
         c1 = c0 + D.CLOSE_BLOCK
-        block_slots = r2t[slot, c0:c1].to(torch.int64)
-        sigma = self._block_sigma(kbuf, block_slots, lid=lid)
-        cl["sigma"] = torch.cat([cl["sigma"], sigma])
+        # The record is advanced by the caller, and by the prefill path, so by
+        # here this block's sigma is already in it; this only has to catch a
+        # record that has not reached c1 yet (the pass that crosses the
+        # activation threshold closes a whole prefix at once).
+        self._advance_sigma(slot, lid, cl, c1, kbuf)
         cl["closed"] = c1
         # global rebalance over every closed row
         m = max(1, round(self.rho * c1))
-        keep = torch.zeros(c1, dtype=torch.bool, device=sigma.device)
-        keep[cl["sigma"].topk(min(m, c1)).indices] = True
+        keep = torch.zeros(c1, dtype=torch.bool, device=cl["sigma"].device)
+        keep[cl["sigma"][:c1].topk(min(m, c1)).indices] = True
         keep[: D.SINKS] = True
         closed_slots = r2t[slot, :c1].to(torch.int64)
         kept_slots = closed_slots[keep]
