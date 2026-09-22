@@ -185,6 +185,13 @@ def _scan_batched_kernel(
         tl.store(counts_ptr + p * nb + b, cnt)
 
 
+def _n_arch(t) -> int:
+    # Archive size off the index table; a tier without the closed-prefix
+    # caches (a test double) still carries the selection.
+    idx = getattr(t, "_arch_idx", None)
+    return int(idx.shape[0] if idx is not None else t.arch.shape[0])
+
+
 class BatchedScanPack:
     """The (layer, slot) pairs of one captured step, stacked and padded.
 
@@ -439,10 +446,15 @@ class BatchedScanPack:
         )
         return (
             n_ok
-            and max(t.kept_rows.shape[0] for t in tiers) <= self.nkm
-            and sum(t.arch.shape[0] for t in tiers) <= self.arena
+            and max(self._n_kept(t) for t in tiers) <= self.nkm
+            and sum(_n_arch(t) for t in tiers) <= self.arena
             and all(t.r == self.rank and t.geom == self.geom for t in tiers)
         )
+
+    def _n_kept(self, t) -> int:
+        # Snapshot mode copies the row table anyway; pool mode must not touch
+        # it (kept_rows is a lazily gathered view of the pool on a real tier).
+        return int(t.kept_rows.shape[0] if self.kslot is None else t.kept_slots.shape[0])
 
     def update(self, pairs, tiers):
         """Point the pack at a new set of tiers IN PLACE.
@@ -470,7 +482,7 @@ class BatchedScanPack:
         offs, run = [], 0
         for t in tiers:
             offs.append(run)
-            run += t.arch.shape[0]
+            run += _n_arch(t)
         if run > self.arena:
             raise RuntimeError(
                 f"archive arena overflow: {run} rows needed, {self.arena} "
@@ -482,7 +494,7 @@ class BatchedScanPack:
             )
         csk_refs, rows = [], 0
         for i, t in enumerate(tiers):
-            nk, av = t.kept_rows.shape[0], t.arch.shape[0]
+            nk, av = self._n_kept(t), _n_arch(t)
             if nk > self.nkm:
                 raise RuntimeError(
                     f"kept-row overflow: pair {i} keeps {nk} rows, capacity is "
@@ -544,7 +556,14 @@ class BatchedScanPack:
             else:
                 self.csk[o : o + av] = t.csk
                 self.rho[o : o + av] = t.rho
-            self.arch[o : o + av] = t.arch
+            if has_caches:
+                # arch is a selection over _pos_all; select straight into the
+                # arena rather than materialising it on the tier first.
+                torch.index_select(
+                    t._pos_all, 0, t._arch_idx.to(torch.int64), out=self.arch[o : o + av]
+                )
+            else:
+                self.arch[o : o + av] = t.arch
             self.a_len[i] = av
             self.nk_len[i] = nk
             self.thr[i, 0] = t.thr_g

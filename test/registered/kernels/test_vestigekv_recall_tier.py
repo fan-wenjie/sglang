@@ -190,6 +190,91 @@ class TestLazyKeptRows(CustomTestCase):
         self.assertTrue(torch.equal(t.kept_rows, kbuf[slots[nk2]]))
 
 
+class TestIndexTablesAreTheStore(CustomTestCase):
+    """The per-request tax the tier carries for the request's life is the
+    closed-prefix caches plus one int32 row-id table; arch is a selection
+    over it and the pack reads lengths off the index tables.
+
+    Regression: fits()/update() read `t.kept_rows.shape[0]` and
+    `t.arch.shape[0]`, gathering [nk, 576] bf16 rows and the archive ids to
+    learn two integers, once per pair per epoch, and then dropped them.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_pos_all_stays_int32_across_build_close_and_refresh(self):
+        t, kbuf, slots, keep, D = _mk(6000, 51)
+        self.assertEqual(t._pos_all.dtype, torch.int32)
+        n = slots.numel()
+        g = torch.Generator(device="cuda").manual_seed(4)
+        more = torch.randperm(POOL, device="cuda", generator=g)[: n + 2048]
+        more[:n] = slots
+        _backfill(t, kbuf, more)  # int64 slots in: a mixed-dtype cat upcasts
+        self.assertEqual(t._pos_all.dtype, torch.int32, "close upcast _pos_all")
+        self.assertTrue(torch.equal(t._pos_all.to(torch.int64), more))
+        nk2 = torch.zeros(n + 2048, dtype=torch.bool, device="cuda")
+        nk2[torch.randperm(n + 2048, device="cuda", generator=g)[: n // 32]] = True
+        t.refresh_membership(nk2, kbuf)
+        arch_idx = (~nk2).nonzero().flatten()
+        self.assertIsNone(t._arch_mat, "refresh re-materialised arch")
+        self.assertTrue(torch.equal(t.arch, more[arch_idx].to(torch.int32)))
+        self.assertEqual(t.arch.dtype, torch.int32)
+        self.assertEqual(t.n_arch, int(arch_idx.numel()))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_drop_arch_re_derives_the_same_ids(self):
+        t, kbuf, slots, keep, D = _mk(6000, 52)
+        before = t.arch.clone()
+        t.drop_arch()
+        self.assertIsNone(t._arch_mat)
+        self.assertTrue(torch.equal(t.arch, before))
+        self.assertTrue(torch.equal(t.arch, slots[(~keep).nonzero().flatten()].to(torch.int32)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_pool_mode_pack_update_gathers_no_row_table(self):
+        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
+
+        t, kbuf, slots, keep, D = _mk(6000, 53)
+        t.drop_kept_rows()
+        t.drop_arch()
+        t.drop_operands()
+        L, R1, W = 1, 3, 512
+        qbuf = torch.zeros(L, R1, H, 576, device="cuda")
+        fetch = torch.zeros(L, R1, W, dtype=torch.int64, device="cuda")
+        flen = torch.zeros(L, R1, dtype=torch.int64, device="cuda")
+        pack = BatchedScanPack.at_capacity(
+            2,
+            1024,
+            8192,
+            R,
+            H,
+            qbuf,
+            fetch,
+            flen,
+            torch.zeros_like(flen, dtype=torch.int32),
+            torch.zeros(L, dtype=torch.int32, device="cuda"),
+            R1 - 1,
+            pool_bases=[kbuf.data_ptr()],
+            pool_row=kbuf.shape[1],
+            pool_rows=kbuf.shape[0],
+            side_from_pool=True,
+            csk_from_tier=True,
+        )
+        pairs = [(0, 0)]
+        self.assertTrue(pack.fits(pairs, [t]))
+        pack.update(pairs, [t])
+        self.assertIsNone(t._kept_mat, "update gathered the kept rows to read a length")
+        self.assertIsNone(t._arch_mat, "update materialised arch on the tier")
+        self.assertIsNone(t._csk_mat)
+        nk, av = t.kept_slots.numel(), t.n_arch
+        self.assertEqual(int(pack.nk_len[0]), nk)
+        self.assertEqual(int(pack.a_len[0]), av)
+        self.assertTrue(torch.equal(pack.kslot[0, :nk], t.kept_slots))
+        arch_idx = (~keep).nonzero().flatten()
+        self.assertTrue(torch.equal(pack.arch[:av], slots[arch_idx].to(torch.int32)))
+        self.assertTrue(torch.equal(pack.aidx[:av], arch_idx.to(torch.int32)))
+        self.assertTrue(torch.equal(pack.rho[:av], t._rho_all[arch_idx]))
+
+
 class TestClosedPrefixWatermark(CustomTestCase):
     """The backfill watermark must never run ahead of the caches.
 

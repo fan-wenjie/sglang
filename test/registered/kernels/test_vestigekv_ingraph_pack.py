@@ -29,6 +29,8 @@ def _mk_tier(nk, a, seed, zp, thr_g):
     rnd = lambda *s: torch.randn(*s, device="cuda", generator=g)  # noqa: E731
     t = RecallTier(r=R)
     t.r, t.scale, t.zp, t.thr_g, t.built = R, 192**-0.5, zp, thr_g, True
+    # The pack reads lengths off the index (kept_slots), never the row table.
+    t.kept_slots = torch.arange(nk, dtype=torch.int32, device="cuda")
     t.kept_rows = rnd(nk, 576).to(torch.bfloat16)
     t.V = rnd(R, 512)
     t.side = rnd(a, 64).to(torch.bfloat16)
