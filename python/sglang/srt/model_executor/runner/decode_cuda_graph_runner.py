@@ -1109,6 +1109,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             variant_label,
                             attention_variant,
                         )
+                    if attention_variant is not None and get_parallel().tp_rank == 0:
+                        # Variants share the graph pool; what one leaves live
+                        # is what the next one cannot reuse.
+                        logger.info(
+                            "Captured bs=%d variant=%s: avail mem=%.2f GB",
+                            bs,
+                            attention_variant,
+                            get_available_gpu_memory(
+                                self.model_runner.device,
+                                self.model_runner.gpu_id,
+                                empty_cache=False,
+                            ),
+                        )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(

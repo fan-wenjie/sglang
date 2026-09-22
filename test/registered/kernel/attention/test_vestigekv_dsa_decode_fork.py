@@ -83,16 +83,16 @@ class TestDsaDecodeFork(CustomTestCase):
         vk = _rows(gen, nk=37, nf=5)
         slot = int(vk.slots[0])
         rows = torch.cat([vk.kept_buf[slot, :37], vk.fetch_buf[slot, :5]])
-        # poison the shared partial buffers first: an unwritten split must not leak
+        # poison the partial buffers first: an unwritten split must not leak
         from sglang.kernels.ops.attention.dsa import triton_sparse_mla_decode as m
+        from sglang.srt.layers.attention.vestigekv import dsa_decode_fork as f
 
-        m._get_splitk_bufs(1, 64, 16, DV, q.device)
-        lse_buf, acc_buf = m._splitk_bufs[q.device]
-        lse_buf.fill_(float("nan"))
-        acc_buf.fill_(float("nan"))
+        for buf in f._vk_splitk_bufs(1, 64, 16, DV, q.device):
+            buf.fill_(float("nan"))
         b = self._fork(q, kv, vk, 64, 0.0442)
-        lse_buf.fill_(float("nan"))
-        acc_buf.fill_(float("nan"))
+        m._get_splitk_bufs(1, 64, 16, DV, q.device)
+        for buf in m._splitk_bufs[q.device]:
+            buf.fill_(float("nan"))
         a = _dsa(q, kv, rows, 64, 0.0442)
         torch.cuda.synchronize()
         self.assertFalse(bool(torch.isnan(b).any()), "an empty split leaked a stale partial")
@@ -117,6 +117,24 @@ class TestDsaDecodeFork(CustomTestCase):
         b = self._fork(q, kv, vk, 32, 0.0442)
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(a, b))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_split_q_reads_the_parts_in_place(self):
+        # The model hands the DSA-side backend q as latent + rope parts; the
+        # fork reads both where they are (no concat) and the result is the
+        # concatenated call's, bit for bit. The rope part is a strided view,
+        # as the model's split of the projected q is.
+        from sglang.srt.layers.attention.vestigekv.dsa_decode_fork import vk_dsa_decode
+
+        gen, kv, q = self._setup(7)
+        vk = _rows(gen, nk=1500, nf=100)
+        wide = torch.randn(1, H, DV + 64, dtype=torch.bfloat16, device="cuda", generator=gen)
+        q_nope, q_rope = wide[:, :, :DV], wide[:, :, DV:]
+        want = self._fork(wide, kv, vk, 16, 0.0442)
+        out = torch.zeros(1, H, DV, dtype=torch.bfloat16, device="cuda")
+        vk_dsa_decode(q_nope, kv, out, vk, 0.0442, d_v=DV, kv_splits=16, q_rope=q_rope)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(want, out))
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_the_fork_files_q_into_qbuf(self):

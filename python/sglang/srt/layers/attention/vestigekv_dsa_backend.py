@@ -1703,6 +1703,18 @@ class VestigeKVDSABackend(AttentionBackend):
             topk = topk[:, : self._dsa_topk + self._dsa_kpool - 1]
         else:
             topk = None
+        # The model hands a DSA-model decode its q and k as latent + rope
+        # parts (FORWARD_ABSORB_CORE_ATTENTION_BACKENDS). The captured step
+        # takes them as they are; the base's kernel and its KV write take the
+        # concatenated form, which only eager steps and routerless arms reach.
+        q_rope = kwargs.pop("q_rope", None)
+        k_rope = kwargs.pop("k_rope", None)
+        split_step = (
+            q_rope is not None and get_is_capture_mode() and self._router is not None
+        )
+        if q_rope is not None and not split_step:
+            q = torch.cat([q, q_rope], dim=-1)
+            k = torch.cat([k, k_rope], dim=-1)
         # In-graph: record this step's expanded query into the fixed-address
         # qbuf so the NEXT step's out-graph recall scan can read it
         # (stale-by-one recall; fixed-shape index_copy_, capture-safe). Padded
@@ -1783,6 +1795,10 @@ class VestigeKVDSABackend(AttentionBackend):
                 # them with the selection now, so an eager step attends the
                 # same rows a captured one does.
                 self._patch_fenced_rows_eager(lid, forward_batch, bs, topk)
+        if split_step:
+            return self._forward_decode_split(
+                q, q_rope, k, k_rope, layer, forward_batch, save_kv_cache
+            )
         if self._router is not None:
             self._router.current_layer = lid
         saved = (fm.kv_indptr, fm.kv_indices)
@@ -1793,6 +1809,38 @@ class VestigeKVDSABackend(AttentionBackend):
             )
         finally:
             fm.kv_indptr, fm.kv_indices = saved
+
+    def _forward_decode_split(
+        self, q_nope, q_rope, k_nope, k_rope, layer, forward_batch, save_kv_cache
+    ):
+        # The captured step of a DSA model, as DSA's own decode does it: the
+        # pool's two-tensor write files the latent and rope parts (no concat,
+        # no index_put), and the fork reads q's parts in place. The base's
+        # forward_decode is not involved: its write is the concatenated
+        # index_put, and everything else it does serves its own kernel.
+        from sglang.srt.layers.attention.vestigekv.dsa_decode_fork import vk_dsa_decode
+
+        if save_kv_cache:
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer, forward_batch.out_cache_loc, k_nope, k_rope
+            )
+        bs = q_nope.shape[0]
+        heads, d_v = layer.tp_q_head_num, layer.v_head_dim
+        q_nope = q_nope.view(bs, heads, d_v)
+        q_rope = q_rope.view(bs, heads, layer.qk_head_dim - d_v)
+        o = q_nope.new_empty((bs, heads, d_v))
+        kb = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kb = kb.view(kb.shape[0], 1, -1) if kb.dim() != 3 else kb
+        vk_dsa_decode(
+            q_nope,
+            kb,
+            o,
+            self._router.rows[layer.layer_id],
+            layer.scaling,
+            d_v=d_v,
+            q_rope=q_rope,
+        )
+        return o.view(bs, heads * d_v)
 
     def _dsa_attended(self, seq):
         # dsa/utils.compute_dsa_seqlens: whole index pools clamped to the
