@@ -660,6 +660,7 @@ def _compact_write_kernel(
     out_len_ptr,
     out_ovf_ptr,  # [n_li, NSLOT] int32: 1 where the fire exceeded W this step
     ovf_count_ptr,  # [n_li] int32: running overflow count per layer
+    total_other_ptr,  # SHARDED: [P] int32, the fired counts of the OTHER ranks
     li_ptr,
     slot_ptr,
     total_ptr,
@@ -669,6 +670,7 @@ def _compact_write_kernel(
     W,
     NSLOT,
     BLOCK_A: tl.constexpr,
+    SHARDED: tl.constexpr,
 ):
     p = tl.program_id(1)
     pid = tl.program_id(0)
@@ -680,9 +682,17 @@ def _compact_write_kernel(
         # fetch_len is consumed every step, even by an empty pair, so its
         # write cannot ride on bucket 0 existing in the (capped) grid.
         t = tl.load(total_ptr + p)
+        # The buffer is per request and the count is per rank, so the
+        # comparison is against the union: several ranks can each stay under W
+        # while together they exceed it, and then nothing fences where the
+        # whole fire should have. out_len stays local -- a rank writes only
+        # rows it holds.
+        g = t
+        if SHARDED:
+            g = t + tl.load(total_other_ptr + p)
         tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
-        tl.store(out_ovf_ptr + li * NSLOT + slot, (t > W).to(tl.int32))
-        if t > W:
+        tl.store(out_ovf_ptr + li * NSLOT + slot, (g > W).to(tl.int32))
+        if g > W:
             tl.atomic_add(ovf_count_ptr + li, 1)
     alen = tl.load(a_len_ptr + p)
     live = tl.minimum(nb, (alen + BLOCK_A - 1) // BLOCK_A)
@@ -714,6 +724,7 @@ def compact_fired(
     scratch,
     am_grid,
     p_live=None,
+    total_other=None,
 ):
     """Deterministic fired-row compaction. scratch: (counts, offsets, total)
     int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W]; fetch_len/fetch_ovf
@@ -724,6 +735,12 @@ def compact_fired(
     bounds the sum). Rows are addressed as a_off[p] + i, masked by a_len[p].
     A pair firing more than W rows keeps the first W in position order,
     raises its fetch_ovf flag and counts once in ovf_count[li].
+
+    `total_other` [P] int32 is the fired counts of the other ranks when the
+    archive is sharded. The buffer width is per request and a count is per
+    rank, so the overflow comparison has to be against the union: without it
+    several ranks each stay under W while together they exceed it and nothing
+    fences. fetch_len stays local -- a rank writes only the rows it holds.
     """
     Am = am_grid
     P = p_live if p_live is not None else a_len.shape[0]
@@ -748,6 +765,7 @@ def compact_fired(
         fetch_len,
         fetch_ovf,
         ovf_count,
+        total if total_other is None else total_other,
         li,
         slot,
         total,
@@ -757,4 +775,5 @@ def compact_fired(
         W,
         fetch_buf.shape[1],
         BLOCK_A=BLOCK_A,
+        SHARDED=total_other is not None,
     )
