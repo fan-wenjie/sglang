@@ -13,6 +13,8 @@ import unittest
 
 import torch
 
+from sglang.srt.layers.attention.vestigekv import defaults as _vk_defaults
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -168,7 +170,7 @@ class TestVestigeScanKernel(CustomTestCase):
 
 
 class TestOverflowPredicateIsGlobal(CustomTestCase):
-    BLOCK_A = 1024
+    BLOCK_A = _vk_defaults.SCAN_BUCKET  # the compaction bucket, one scan program unit
 
     def _compact(self, n_hit, W, total_other=None, A=2048):
         import triton
