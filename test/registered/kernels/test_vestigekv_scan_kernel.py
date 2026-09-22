@@ -155,6 +155,87 @@ class TestVestigeScanKernel(CustomTestCase):
             self.assertTrue(bool(boundary[i]), f"non-boundary row {i} flipped")
         self.assertGreater(int(ref.sum()), 0)
 
+
+
+# ---------------------------------------------------------------------------
+# The overflow predicate under sharding.
+#
+# The fetch buffer is per request and a fired count is per rank, so the
+# comparison has to be against the union: several ranks can each stay under W
+# while together they exceed it, and then nothing fences where the whole fire
+# should have (docs/context-parallel.md).
+# ---------------------------------------------------------------------------
+
+
+class TestOverflowPredicateIsGlobal(CustomTestCase):
+    BLOCK_A = 1024
+
+    def _compact(self, n_hit, W, total_other=None, A=2048):
+        import triton
+
+        from sglang.srt.layers.attention.vestigekv.fused_prologue import compact_fired
+
+        dev, P = "cuda", 1
+        NB = triton.cdiv(A, self.BLOCK_A)
+        hit = torch.zeros(P, A, dtype=torch.int8, device=dev)
+        hit[0, :n_hit] = 1
+        counts = torch.zeros(P, NB, dtype=torch.int32, device=dev)
+        for b in range(NB):
+            counts[0, b] = int(hit[0, b * self.BLOCK_A : (b + 1) * self.BLOCK_A].sum())
+        scratch = (
+            counts,
+            torch.zeros(P, NB, dtype=torch.int32, device=dev),
+            torch.zeros(P, dtype=torch.int32, device=dev),
+        )
+        state = dict(
+            fetch_buf=torch.zeros(1, 1, W, dtype=torch.int64, device=dev),
+            fetch_len=torch.zeros(1, 1, dtype=torch.int32, device=dev),
+            fetch_ovf=torch.zeros(1, 1, dtype=torch.int32, device=dev),
+            ovf_count=torch.zeros(1, dtype=torch.int32, device=dev),
+        )
+        kw = {}
+        if total_other is not None:
+            kw["total_other"] = torch.tensor(
+                [total_other], dtype=torch.int32, device=dev
+            )
+        compact_fired(
+            hit,
+            torch.arange(A, dtype=torch.int64, device=dev),
+            torch.tensor([A], dtype=torch.int64, device=dev),
+            torch.tensor([0], dtype=torch.int64, device=dev),
+            torch.zeros(P, dtype=torch.int64, device=dev),
+            torch.zeros(P, dtype=torch.int64, device=dev),
+            state["fetch_buf"],
+            state["fetch_len"],
+            state["fetch_ovf"],
+            state["ovf_count"],
+            scratch,
+            A,
+            **kw,
+        )
+        torch.cuda.synchronize()
+        return int(state["fetch_len"][0, 0]), int(state["fetch_ovf"][0, 0])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_unsharded_is_unchanged(self):
+        self.assertEqual(self._compact(5, 8), (5, 0))
+        self.assertEqual(self._compact(12, 8), (8, 1))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_a_union_over_the_width_fences_every_rank(self):
+        # The case the fix exists for: 5 fired here is comfortably under 8, and
+        # the request still has to fence because the other rank fired 6.
+        self.assertEqual(self._compact(5, 8, total_other=2), (5, 0))
+        self.assertEqual(self._compact(5, 8, total_other=6), (5, 1))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_the_written_length_stays_local(self):
+        # A rank writes only rows it holds, so the length is its own even when
+        # the flag is the union's -- a fenced lane does not read the buffer.
+        length, ovf = self._compact(5, 8, total_other=100)
+        self.assertEqual((length, ovf), (5, 1))
+
+
 if __name__ == "__main__":
     unittest.main()
 
