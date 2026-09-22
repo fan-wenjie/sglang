@@ -228,6 +228,54 @@ class TestSlotReuseInvalidation(CustomTestCase):
         self.assertEqual(int(be._fetch_ovf[LID][0]), 0)
 
 
+class TestKeptTableCapacity(CustomTestCase):
+    """The kept table is sized for the compressed arm, not max_context_len.
+
+    Derived bound: a request keeps at most the whole prefix below the
+    activation threshold, else rho * closed + sinks + a tail under
+    CLOSE_BLOCK; the FULL arm keeps every row, and its flag FILE can appear
+    after allocation, so a configured flag PATH must size for it. Every
+    host-side writer goes through _write_kept, which refuses to serve short.
+    """
+
+    def _mk(self, activation, cap_rows=None):
+        from sglang.srt.environ import envs
+
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.config = SimpleNamespace(activation_min_tokens=activation)
+        if cap_rows is not None:
+            be._kept_buf = {LID: torch.zeros(2, cap_rows, dtype=torch.int32)}
+            be._kept_len = {LID: torch.zeros(2, dtype=torch.int32)}
+        return be, envs
+
+    def test_compressed_arm_bound_is_below_max_context(self):
+        be, envs = self._mk(activation=8192)
+        with envs.SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG.override(None):
+            cap = be._kept_cap(131072)
+        nkm = int(D.RHO * 131072) + 3 * D.CLOSE_BLOCK
+        self.assertEqual(cap, max(8192, nkm) + D.CLOSE_BLOCK)
+        self.assertLess(cap, 131072)
+        # a threshold above the compressed bound keeps the whole prefix dense
+        be, _ = self._mk(activation=60000)
+        with envs.SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG.override(None):
+            self.assertEqual(be._kept_cap(131072), 60000 + D.CLOSE_BLOCK)
+            self.assertEqual(be._kept_cap(4096), 4096, "never above max_context_len")
+
+    def test_configured_full_arm_flag_sizes_for_dense(self):
+        be, envs = self._mk(activation=8192)
+        with envs.SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG.override("/nonexistent/flag"):
+            self.assertEqual(be._kept_cap(131072), 131072)
+
+    def test_writer_refuses_a_row_set_past_the_capacity(self):
+        be, _ = self._mk(activation=8192, cap_rows=16)
+        n = be._write_kept(LID, 1, torch.arange(16, dtype=torch.int64))
+        self.assertEqual(n, 16)
+        self.assertEqual(int(be._kept_len[LID][1]), 16)
+        self.assertTrue(torch.equal(be._kept_buf[LID][1], torch.arange(16, dtype=torch.int32)))
+        with self.assertRaisesRegex(RuntimeError, "kept table holds 16 rows"):
+            be._write_kept(LID, 0, torch.arange(17, dtype=torch.int64))
+
+
 class TestRowInvariantCheck(CustomTestCase):
     """SGLANG_DEBUG_VESTIGEKV_ROWS semantics: the check runs before this step's
     append, so the FULL arm requires kept_len >= seq_len - 1; the VESTIGE arm

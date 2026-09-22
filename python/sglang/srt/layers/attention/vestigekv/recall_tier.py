@@ -102,10 +102,10 @@ class RecallTier:
         self._kept_mat = None  # lazily materialised; see `kept_rows`
         self._csk_mat = self._rho_mat = None  # selections over the _all caches
         self._arch_idx = None  # positions of the archive in the closed prefix
+        self._arch_mat = None  # lazily materialised; see `arch`
         # Index tables. These are what the tier STORES; the row tables
-        # (side, kept_rows) and the archive selections (csk, rho) are
+        # (side, kept_rows) and the archive selections (csk, rho, arch) are
         # properties over them.
-        self.arch = None  # pool row ids of the archive
         self.kept_slots = None  # pool row ids tier-1 keeps
         self._kbuf = None  # the layer's pool buffer, to re-read from
         self.version = 0  # bumped on in-place membership refresh (pack sync key)
@@ -154,6 +154,37 @@ class RecallTier:
         """Release the materialised archive selections; the properties
         re-derive them from the closed-prefix caches."""
         self._csk_mat = self._rho_mat = None
+
+    @property
+    def arch(self):
+        """Pool row ids of the archive, [A] int32 -- a selection over _pos_all,
+        on the same terms as `csk`: the in-graph pack holds its own copy in
+        the arena, so the tier keeps only the index it is derived from."""
+        if self._arch_mat is None:
+            if self._pos_all is None or self._arch_idx is None:
+                raise RuntimeError(
+                    "arch is not populated; build()/refresh_membership() must "
+                    "record the closed prefix before the archive can be selected"
+                )
+            self._arch_mat = self._pos_all.index_select(
+                0, self._arch_idx.to(torch.int64)
+            ).to(torch.int32)
+        return self._arch_mat
+
+    @arch.setter
+    def arch(self, v):
+        self._arch_mat = v
+
+    @property
+    def n_arch(self) -> int:
+        """Archive size without materialising the selection."""
+        if self._arch_idx is not None:
+            return int(self._arch_idx.shape[0])
+        return int(self.arch.shape[0])
+
+    def drop_arch(self):
+        """Release the materialised archive row ids; the property re-derives them."""
+        self._arch_mat = None
 
     @property
     def kept_rows(self):
@@ -312,7 +343,7 @@ class RecallTier:
                 f"{None if donor_pos is None else donor_pos.numel()} rows vs "
                 f"{int(row_slots.numel())} here"
             )
-            assert torch.equal(donor_pos, row_slots), (
+            assert torch.equal(donor_pos, row_slots.to(donor_pos.dtype)), (
                 "operand reuse from a tier holding a different prefix row-set"
             )
             self.V = V = operands_from.V
@@ -349,10 +380,13 @@ class RecallTier:
                 # arithmetic; ~1 ulp reduction-order difference vs cuBLAS,
                 # gated by fire-set stability + retrieval. Per row, so the
                 # values on the archived subset do not depend on the row set.
-                self._csk_all, self._rho_all, _side = build_operands_fused(
-                    kbuf, row_slots, V, kv=self.geom.kv_lora_rank, side_dim=self.geom.side_dim
+                # side_dim=0: the kernel's sidecar store is gated by that
+                # constexpr, and the tier never keeps the sidecar (it is the
+                # pool row's own tail); writing it was a [closed, 64] bf16
+                # transient at every build.
+                self._csk_all, self._rho_all, _ = build_operands_fused(
+                    kbuf, row_slots, V, kv=self.geom.kv_lora_rank, side_dim=0
                 )
-                del _side
             else:
                 # Storage precision (gated): side at bf16 is BIT-EXACT relative to the
                 # bf16 pool it is copied from (the old fp32 store was an uninformative
@@ -381,12 +415,16 @@ class RecallTier:
         # close path. Everything below (calibration included) reads the row
         # tables and the archive selections through these.
         self._kbuf = kbuf
-        self._pos_all = row_slots
-        # int32 throughout: a pool row id indexes a pool with far fewer
-        # than 2^31 slots, and these two are 15.5 B/token at int64 --
-        # 9% of the whole index.
+        # int32 throughout: a pool row id indexes kbuf, so it is below
+        # kbuf.shape[0]; the check is host-side and free, and it is what keeps
+        # the narrowing from wrapping silently. _pos_all is the one per-row
+        # table the tier keeps for the request's life besides csk/rho; arch is
+        # a selection over it, and no kernel reads either (the pack copies
+        # into its own dtype-checked int32 arenas).
+        assert kbuf.shape[0] < 2**31, "pool row ids do not fit int32"
+        self._pos_all = row_slots.to(torch.int32)
         self._arch_idx = arch_idx.to(torch.int32)
-        self.arch = row_slots.index_select(0, arch_idx).to(torch.int32)
+        self._arch_mat = None
         # Pool row ids for the kept set, and nothing else: a latent row is
         # written once when its token enters the pool and never rewritten, so
         # a consumer that can address the pool wants these 4 bytes, not the
@@ -643,9 +681,9 @@ class RecallTier:
             # projection (rounded here AND at calibration, so zp covers it).
             self._qside_t = qe.new_empty(self.geom.side_dim, H, dtype=torch.bfloat16)
             self._qsk_t = qe.new_empty(self.r, H, dtype=torch.float16)
-            self._hit_buf = torch.empty(
-                self.side.shape[0], dtype=torch.int32, device=qe.device
-            )
+            # Sized off the index table: self.side.shape[0] would gather the
+            # whole [A, 64] sidecar to read one integer.
+            self._hit_buf = torch.empty(self.n_arch, dtype=torch.int32, device=qe.device)
             self._inf = qe.new_full((), float("inf"))
         self._qside_t.copy_(qe[:, self.geom.kv_lora_rank :].T)
         self._qsk_t.copy_(qsk.T)
@@ -731,7 +769,7 @@ class RecallTier:
         """
         if self._csk_all is None:
             dev = new_rows.device
-            self._pos_all = torch.zeros(0, dtype=torch.int64, device=dev)
+            self._pos_all = torch.zeros(0, dtype=torch.int32, device=dev)
             self._csk_all = torch.zeros(0, self.r, device=dev, dtype=torch.float16)
             self._rho_all = torch.zeros(0, device=dev)
         Cf = new_rows.float()
@@ -743,7 +781,7 @@ class RecallTier:
         # (layer, request) at 64k, and it grows with the context.
         self._csk_all = torch.cat([self._csk_all, csk.half()])
         self._rho_all = torch.cat([self._rho_all, rho])
-        self._pos_all = torch.cat([self._pos_all, new_slots])
+        self._pos_all = torch.cat([self._pos_all, new_slots.to(torch.int32)])
 
     @ieee_fp32
     @torch.inference_mode()
@@ -764,10 +802,9 @@ class RecallTier:
         # archive is a selection over them.
         idx = (~keep).nonzero().flatten()
         self._arch_idx = idx.to(torch.int32)
-        self.arch = self._pos_all.index_select(0, idx).to(torch.int32)
         self.kept_slots = self._pos_all[keep].to(torch.int32)
         self._kbuf = kbuf
         self._side_mat = self._kept_mat = None  # re-read from the pool on use
-        self._csk_mat = self._rho_mat = None  # re-selected from the caches
+        self._csk_mat = self._rho_mat = self._arch_mat = None  # re-selected from the caches
         self._qside_t = self._qsk_t = self._hit_buf = None  # re-size lazily
         self.version += 1

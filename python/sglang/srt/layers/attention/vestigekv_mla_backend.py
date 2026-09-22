@@ -1133,7 +1133,7 @@ class VestigeKVMLABackend(AttentionBackend):
         r2t = self.req_to_token_pool.req_to_token
         if lid not in self._kept_buf:
             max_reqs = r2t.shape[0]
-            cap = self.base.max_context_len
+            cap = self._kept_cap(self.base.max_context_len)
             dev = r2t.device
             self._ensure_kept_stacks(max_reqs, cap, dev)
             self._alloc_recall_bufs(lid, max_reqs, dev)
@@ -1172,9 +1172,7 @@ class VestigeKVMLABackend(AttentionBackend):
             kept = self._arm_aware_kept(
                 row_slots, kbuf, seq_len, layer.v_head_dim, lid=lid, sigma=cl["sigma"]
             )
-            n = kept.numel()
-            self._kept_buf[lid][slot, :n] = kept.to(self._kept_buf[lid].dtype)
-            self._kept_len[lid][slot] = n
+            n = self._write_kept(lid, slot, kept)
             # Arm decode-time closes: the prefix counts as closed (ranked).
             # Below the activation threshold nothing is closed yet -- the first
             # decode-time close past it ranks the whole prefix in one pass, from
@@ -1306,6 +1304,41 @@ class VestigeKVMLABackend(AttentionBackend):
             "qpos": [],
             "target": D.N_CAL_START,
         }
+
+    def _nkm(self, max_ctx: int) -> int:
+        # Kept rows are bounded by tier-1's keep rate plus the un-closed tail
+        # (blocks close every CLOSE_BLOCK); the slack absorbs close latency.
+        return int(D.RHO * max_ctx) + 3 * D.CLOSE_BLOCK
+
+    def _kept_cap(self, max_ctx: int) -> int:
+        # Capacity of one kept-table row. The compressed arm never holds more
+        # than the larger of: the whole prefix below the activation threshold,
+        # or rho * closed + sinks + a tail under CLOSE_BLOCK (the in-graph
+        # append adds one row per step and the close every CLOSE_BLOCK steps
+        # cuts it back); one more block of slack covers the step the close
+        # runs on. The FULL arm keeps every row, and its flag file can appear
+        # after this allocation, so a configured flag path sizes for it.
+        # _write_kept enforces the bound on every host-side writer.
+        if envs.SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG.get():
+            return max_ctx
+        bound = max(self.config.activation_min_tokens, self._nkm(max_ctx)) + D.CLOSE_BLOCK
+        return min(max_ctx, bound)
+
+    def _write_kept(self, lid, slot, rows) -> int:
+        # The one host-side writer of a kept-table row; the in-graph CSR
+        # append is the other and is bounded by the close cadence (_kept_cap).
+        buf = self._kept_buf[lid]
+        n = rows.numel()
+        if n > buf.shape[1]:
+            raise RuntimeError(
+                f"VestigeKV: kept table holds {buf.shape[1]} rows per request, "
+                f"{n} requested (layer {lid}, slot {slot}); the table was sized "
+                "for the compressed arm -- set the FULL-arm flag path at launch "
+                "to serve dense row sets"
+            )
+        buf[slot, :n] = rows.to(buf.dtype)
+        self._kept_len[lid][slot] = n
+        return n
 
     def _ensure_kept_stacks(self, max_reqs, cap, dev):
         # Stacked kept tables ([L, R1, CAP] etc.) with the per-lid dict
@@ -1627,7 +1660,7 @@ class VestigeKVMLABackend(AttentionBackend):
         fm = self.base.forward_metadata
         r2t = self.req_to_token_pool.req_to_token
         max_reqs, max_ctx = r2t.shape[0], self.base.max_context_len
-        self._ensure_kept_stacks(max_reqs, max_ctx, r2t.device)
+        self._ensure_kept_stacks(max_reqs, self._kept_cap(max_ctx), r2t.device)
         nl = len(self._local_mla_lids)
         rows = max_reqs * max_ctx
         pool_tokens = getattr(self.token_to_kv_pool, "size", None)
@@ -1691,9 +1724,7 @@ class VestigeKVMLABackend(AttentionBackend):
         maxbs = max(self._graph_max_bs, 1)
         self._ensure_stage(maxbs, dev)
         max_ctx = self.base.max_context_len
-        # Kept rows are bounded by tier-1's keep rate plus the un-closed tail
-        # (blocks close every CLOSE_BLOCK); the slack absorbs close latency.
-        nkm = int(D.RHO * max_ctx) + 3 * D.CLOSE_BLOCK
+        nkm = self._nkm(max_ctx)
         # Archive rows are the tokens tier-1 did NOT keep, so per layer their
         # sum over the running batch is bounded by the KV pool itself, not by
         # max_bs x max_context -- a batch cannot hold more tokens than the pool
@@ -1907,9 +1938,10 @@ class VestigeKVMLABackend(AttentionBackend):
                     for t in tiers:
                         t.drop_side()
                 for t in tiers:
-                    # csk/rho are selections over the closed-prefix caches and
-                    # the pack now holds its own copy; the selection can go.
+                    # csk/rho/arch are selections over the closed-prefix caches
+                    # and the pack now holds its own copy; the selection can go.
                     t.drop_operands()
+                    t.drop_arch()
                 if self._ingraph_pack.kr is None:
                     # Same for the kept rows: the prologue scores them out of
                     # the pool through kslot, so the tier's copy is dead here.
@@ -1925,7 +1957,9 @@ class VestigeKVMLABackend(AttentionBackend):
         # A tier outgrew the capacity pack -- impossible under the sizing
         # invariant, so treat it as a defect signal, but stay CORRECT: the
         # baked kernels keep replaying, so silence every pair and fall back to
-        # serving each live request its dense row set through kept_buf.
+        # serving each live request its dense row set through kept_buf. The
+        # kept table is sized for the compressed arm (_kept_cap), so a dense
+        # set past that bound raises in _write_kept rather than serving short.
         import logging
 
         logging.getLogger(__name__).error(
@@ -1944,10 +1978,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 continue
             for i in range(real):
                 slot, n = reqs[i], int(lens[i])
-                self._kept_buf[lid][slot, :n] = r2t[slot, :n].to(
-                    self._kept_buf[lid].dtype
-                )
-                self._kept_len[lid][slot] = n
+                self._write_kept(lid, slot, r2t[slot, :n])
 
     def _recall_step(self, lid, forward_batch, reqs):
         # Per-step recall: a required part of the algorithm, with no switch.
@@ -2054,9 +2085,7 @@ class VestigeKVMLABackend(AttentionBackend):
         kept_slots = closed_slots[keep]
         tail_slots = r2t[slot, c1:seq_len].to(torch.int64)
         new_kept = torch.cat([kept_slots, tail_slots])
-        n = new_kept.shape[0]
-        self._kept_buf[lid][slot, :n] = new_kept.to(self._kept_buf[lid].dtype)
-        self._kept_len[lid][slot] = n
+        n = self._write_kept(lid, slot, new_kept)
         # exact host-side bound: the close is the one place kept_len is fully
         # known on the host again, so the +1-per-step estimate resets here
         self._kmax[lid] = max(self._kmax.get(lid, 0), n)
