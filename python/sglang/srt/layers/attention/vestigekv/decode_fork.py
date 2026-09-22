@@ -383,6 +383,12 @@ def _vk_fwd_grouped_kernel_stage1(
         off_qpe = (
             cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
         )
+    else:
+        # Rope-less (GLM-5.3-Flash): BLOCK_DPE is 0, tl.arange(0, 0) is not a
+        # legal range, and the row loop takes mask_dpe as a positional argument
+        # regardless. It never reads it -- every use is under the same guard --
+        # so the name only has to exist.
+        mask_dpe = mask_d
 
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
@@ -396,9 +402,22 @@ def _vk_fwd_grouped_kernel_stage1(
 
     # Hoist loop-invariant base offsets
     base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
-    # Both always defined: the row loop takes them as arguments now, so a
-    # definition under a constexpr guard would not be in scope at the call.
-    base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe[:, None]
+    # The row loop takes these as arguments, so both names have to exist at the
+    # call even where one of them is meaningless. offs_dpe cannot simply be
+    # hoisted out of its guard to achieve that: at the rope-less geometry
+    # BLOCK_DPE is 0 and tl.arange(0, 0) is not a legal Triton range. So the
+    # rope-less case aliases the nope offsets, which the loop never reads --
+    # every use of base_offs_kpe there sits under the same `if BLOCK_DPE > 0`.
+    #
+    # The comment this replaces asserted both were always defined. They were
+    # not, and nothing caught it: BLOCK_DPE is 0 only for GLM-5.3-Flash, the
+    # operator tests all run at Kimi geometry where the guard is taken, and a
+    # Triton kernel is not compiled until it is launched -- so the NameError
+    # surfaced as a server that would not start, one model load into a run.
+    if BLOCK_DPE > 0:
+        base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe[:, None]
+    else:
+        base_offs_kpe = base_offs_k
     base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
 
     if split_kv_end > split_kv_start:
@@ -418,6 +437,8 @@ def _vk_fwd_grouped_kernel_stage1(
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
             )
+        else:
+            qpe = q_k  # same reason as mask_dpe above: passed, never read
         if AFFINE and vk_fenced:
             acc, e_sum, e_max = _vk_row_loop(
                 acc,
