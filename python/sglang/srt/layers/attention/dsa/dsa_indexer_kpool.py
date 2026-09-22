@@ -59,6 +59,23 @@ def _vestigekv_decode_backend():
     return vestigekv_backend_of(get_attn_backend())
 
 
+def _vestigekv_lean_step() -> bool:
+    """A vestigekv_dsa decode step that needs no selection: the key is filed
+    and the index cache written, scoring and top-k are skipped. Inside a
+    capture the graph variant decides (graph_variants.VK_LEAN); eager steps
+    read the backend's stale-by-one flag."""
+    from sglang.srt.layers.attention.graph_variants import VK_LEAN
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+        get_is_capture_mode,
+    )
+
+    if get_is_capture_mode():
+        return get_capture_attention_variant() == VK_LEAN
+    vk = _vestigekv_decode_backend()
+    return vk is not None and getattr(vk, "lean_step", False)
+
+
 class IndexerKPool(MultiPlatformOp):
     def __init__(
         self,
@@ -1466,6 +1483,25 @@ class IndexerKPool(MultiPlatformOp):
                 enable_dual_stream=enable_dual_stream,
                 return_indices=return_indices,
             )
+
+        if forward_batch.forward_mode.is_decode_or_idle() and _vestigekv_lean_step():
+            # vestigekv_dsa, lean variant: the key still has to reach the
+            # index cache (a later top-k reads it) and VestigeKV's ring, but
+            # nothing attends the selection this step, so the scoring GEMMs,
+            # the paged-MQA logits and the top-k are not run.
+            key = self._get_k_bf16(x, positions)
+            vk = _vestigekv_decode_backend()
+            if vk is not None:
+                vk.write_salience(layer_id=layer_id, forward_batch=forward_batch, key=key)
+            self._compress_write(
+                x=x,
+                key=key,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                metadata=metadata,
+            )
+            return None
 
         skip_logits_computation = False
         if forward_batch.forward_mode.is_extend_without_speculative():

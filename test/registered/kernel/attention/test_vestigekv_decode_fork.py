@@ -141,6 +141,32 @@ class TestDecodeForkRowSource(CustomTestCase):
         self.assertTrue(torch.equal(a_lse, b_lse), f"att_lse differs (seq={seq}, K={K})")
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_the_fork_files_q_into_qbuf(self):
+        """VK_QBUF: the kernel writes this step's query into the slot's row of
+        qbuf (the next step's recall input), replacing a per-layer index_copy_.
+        Every head, both the nope and the pe part, exactly the loaded q."""
+        import msgspec
+
+        gen = torch.Generator(device="cuda").manual_seed(41)
+        pool = torch.randn(POOL, 1, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+        q = torch.randn(1, H, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+        vk = _rows(gen)
+        qbuf = torch.zeros(R1, H, LK, dtype=torch.bfloat16, device="cuda")
+        vk = msgspec.structs.replace(vk, qbuf=qbuf)
+        slot = int(vk.slots[0])
+        nk, nf = int(vk.kept_len[slot]), int(vk.fetch_len[slot])
+        indices = torch.cat([vk.kept_buf[slot, :nk], vk.fetch_buf[slot, :nf]]).to(torch.int64)
+        indptr = torch.tensor([0, indices.numel()], dtype=torch.int32, device="cuda")
+        a_out, a_lse = _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=False)
+        b_out, b_lse = _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=True)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(a_out, b_out) and torch.equal(a_lse, b_lse))
+        self.assertTrue(torch.equal(qbuf[slot], q[0]), "qbuf row is not the query")
+        others = torch.ones(R1, dtype=torch.bool, device="cuda")
+        others[slot] = False
+        self.assertEqual(float(qbuf[others].abs().sum()), 0.0, "another slot was written")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_a_fenced_lane_attends_the_dsa_selection(self):
         # seq past the budget: exactly K selected rows, none of the page table
         self._topk_case(seq=777, K=256)

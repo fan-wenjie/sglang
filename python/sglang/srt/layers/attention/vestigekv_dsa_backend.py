@@ -133,6 +133,9 @@ class VestigeKVDSABackend(AttentionBackend):
     _dbg_tail_steps = 0
     _mem_dir = None  # SGLANG_DEBUG_VESTIGEKV_MEM_DIR; class default for __new__ fakes
     _dsa = None  # the split pair's DSA prefill backend, driven for decode metadata
+    lean_step = False  # this step needs no selection (graph_variants.VK_LEAN)
+    _ovf_probe = None  # (device scalar, pinned host scalar, event) of the overflow counter
+    _ovf_last = 0
     _model_runner = None  # bound in __init__; None on __new__ fakes
     _graph_state_args = None
     _dsa_topk = 0  # its index_topk; the fenced arm's row budget on DSA models
@@ -192,7 +195,7 @@ class VestigeKVDSABackend(AttentionBackend):
         # whole redirection is this assignment and nothing upstream is edited;
         # a layer with no entry in `rows` falls through to the base's own
         # function, which is how eager steps keep the CSR path.
-        from sglang.srt.layers.attention.vestigekv.tier_decode import TierDecodeRouter
+        from sglang.srt.layers.attention.vestigekv.tier_decode import DsaTierDecodeRouter
 
         # The AFFINE fenced arm addresses a request's rows as base + offset,
         # which holds only when its slots are one contiguous run -- true at
@@ -204,7 +207,9 @@ class VestigeKVDSABackend(AttentionBackend):
                 "VestigeKV's affine fenced capture assumes page_size 1; "
                 f"the pool is paged at {page_size}"
             )
-        self._router = TierDecodeRouter(
+        # DSA's split-K decode over the tiers (dsa_decode_fork.py): 9 us per
+        # layer per step against the MLA fork's 20 us on the same rows.
+        self._router = DsaTierDecodeRouter(
             inner=base.decode_attention_fwd, page_size=page_size
         )
         base.decode_attention_fwd = self._router
@@ -308,6 +313,13 @@ class VestigeKVDSABackend(AttentionBackend):
                     self._side_ring_scale[lid] = torch.zeros(
                         n_slots, self._side_ring_size, dtype=torch.float32, device=dev
                     )
+        # Per-step graph variant (graph_variants.VestigeKVDsaGraphVariants):
+        # lean unless the overflow counter moved since the last readback.
+        from sglang.srt.layers.attention.graph_variants import (
+            set_vestigekv_variant_source,
+        )
+
+        set_vestigekv_variant_source(self._variant_for_step)
         # Fixed fetch-buffer width: graph capture needs a fixed WIDTH, not a
         # cap. A fire past it raises the pair's overflow flag; the pack then
         # fences that step to the full row set (config.overflow_fallback) or
@@ -348,6 +360,41 @@ class VestigeKVDSABackend(AttentionBackend):
             self._stats[_k] = 0.0
 
     # ---- metadata / cuda-graph / properties: delegate to base ----
+
+    def _variant_for_step(self, forward_batch) -> str:
+        """graph_variants source: VK_LEAN when no lane overflowed since the
+        last readback, else VK_TOPK. The readback is the previous step's probe
+        (issued in the replay prep, stream-ordered after that step's graph):
+        stale by one to two steps, which the fence tolerates -- a lane that
+        overflows on a lean step attends its page table for that step, the
+        pre-selection fallback, and the next steps run the full indexer."""
+        from sglang.srt.layers.attention.graph_variants import VK_LEAN, VK_TOPK
+
+        probe = self._ovf_probe
+        if probe is None or self._dsa is None or self._full_arm():
+            self.lean_step = False
+            return VK_TOPK
+        dev, host, event = probe
+        if event.query():
+            cur = int(host)
+            self.lean_step = cur == self._ovf_last
+            self._ovf_last = cur
+        return VK_LEAN if self.lean_step else VK_TOPK
+
+    def _probe_overflow(self):
+        # Enqueue this step's readback of the overflow counter (sum over
+        # layers); read next step by _variant_for_step. A pinned host scalar
+        # and an event: no sync on the decode path.
+        if self._ovf_count_stack is None:
+            return
+        if self._ovf_probe is None:
+            dev = torch.zeros((), dtype=torch.int32, device=self._ovf_count_stack.device)
+            host = torch.zeros((), dtype=torch.int32, pin_memory=True)
+            self._ovf_probe = (dev, host, torch.cuda.Event())
+        dev, host, event = self._ovf_probe
+        torch.sum(self._ovf_count_stack, out=dev)
+        host.copy_(dev, non_blocking=True)
+        event.record()
 
     def _dsa_sibling(self):
         """The DSA backend of the split pair this backend decodes for, or None.
@@ -442,6 +489,8 @@ class VestigeKVDSABackend(AttentionBackend):
         dsa = self._dsa_sibling()
         if dsa is not None and forward_batch.forward_mode.is_decode_or_idle():
             dsa.init_forward_metadata_out_graph(forward_batch, in_capture)
+        if not in_capture and forward_batch.forward_mode.is_decode():
+            self._probe_overflow()
         if (
             not in_capture
             and self._ingraph_pack is not None
@@ -1492,8 +1541,6 @@ class VestigeKVDSABackend(AttentionBackend):
                 slots, forward_batch.extend_seq_lens.to(torch.int64)
             )
         pos = positions.to(torch.int64)
-        ring = self._side_ring_size
-        flat = slots * ring + pos % ring
         if not getattr(self, "_salience_seen", False):
             self._salience_seen = True
             logger.info(
@@ -1507,23 +1554,21 @@ class VestigeKVDSABackend(AttentionBackend):
             # only when the sibling's indexer runs (see _dsa_sibling).
             self._salience_decode_seen = True
             logger.info("VestigeKV salience: first DECODE keys filed (layer %s)", layer_id)
-        # Stamped before the key: _ring_sigma trusts a row only when the stamp
-        # says this exact position wrote it, so a stale row can never be read
-        # as a fresh one.
-        self._side_stamp[layer_id].view(-1).index_copy_(0, flat, pos.to(torch.int32))
-        if self._side_fp8:
-            from sglang.srt.layers.attention.vestigekv.salience import quantize_salience
+        # One launch: stamp, quantise (DSA's act_quant math) and file the key
+        # and its scale (vestigekv/ring_write.py). This ran as seven torch
+        # launches per layer per step and was the largest term of the decode
+        # gap against DSA.
+        from sglang.srt.layers.attention.vestigekv.ring_write import ring_write
 
-            q, scale = quantize_salience(key)
-            # byte view: index_copy_ has no fp8 kernel on every device
-            self._side_ring[layer_id].view(-1, self.geom.sigma_dim).view(
-                torch.uint8
-            ).index_copy_(0, flat, q.view(torch.uint8))
-            self._side_ring_scale[layer_id].view(-1).index_copy_(0, flat, scale)
-            return
-        self._side_ring[layer_id].view(-1, self.geom.sigma_dim).index_copy_(
-            0, flat, key.to(torch.bfloat16)
+        ring_write(
+            key,
+            pos,
+            slots,
+            self._side_ring[layer_id],
+            self._side_stamp[layer_id],
+            self._side_ring_scale.get(layer_id) if self._side_fp8 else None,
         )
+        return
 
     def _block_sigma(self, kbuf, slots, *, lid):
         """Tier-1 sigma over the closed blocks of `slots` (pool rows), from the
@@ -1667,9 +1712,18 @@ class VestigeKVDSABackend(AttentionBackend):
         # not pay for the recall query copy -- otherwise the A/B baseline is
         # polluted by the compressed arm's machinery (measured: FULL 123.7 ->
         # 72.8 tok/s with this copy unconditionally enabled).
-        if lid in self._qbuf and not self._full_arm():
+        qbuf_in_fork = (
+            lid in self._qbuf
+            and not self._full_arm()
+            and self._router is not None
+            and get_is_capture_mode()
+        )
+        if lid in self._qbuf and not self._full_arm() and not qbuf_in_fork:
             # q arrives already in the absorbed expanded form
             # [bs, H, kv_lora_rank + rope] (see the base's qk_head_dim view).
+            # On the captured path the fork writes it (VK_QBUF): it loads q
+            # anyway, and the separate index_copy_ was one launch per layer
+            # per step.
             bs_q = forward_batch.seq_lens.shape[0]
             slots_q = forward_batch.req_pool_indices[:bs_q].to(torch.int64)
             q_exp = q.view(bs_q, self._q_heads, self._q_dim)
@@ -1702,6 +1756,8 @@ class VestigeKVDSABackend(AttentionBackend):
                 self._router.rows[lid].topk = topk
                 self._router.rows[lid].topk_k = self._dsa_topk
                 self._router.rows[lid].kpool = self._dsa_kpool
+                if qbuf_in_fork:
+                    self._router.rows[lid].qbuf = self._qbuf[lid]
         else:
             # Eager step: the metadata hook packed this step's CSR into the
             # same buffers the graphs read. Sized for the whole request

@@ -121,6 +121,42 @@ class TierDecodeRouter(msgspec.Struct, dict=True):
         return o
 
 
+class DsaTierDecodeRouter(TierDecodeRouter):
+    """The DSA-model router: stage 1 and 2 are DSA's own split-K decode over
+    the tiers (vestigekv/dsa_decode_fork.py) instead of the MLA-decode fork.
+    Layers without rows still fall through to the base's function."""
+
+    def __call__(
+        self,
+        q,
+        k_buffer,
+        v_buffer,
+        o,
+        kv_indptr,
+        kv_indices,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        max_kv_splits,
+        sm_scale,
+        k_descale=None,
+        v_descale=None,
+        **kw,
+    ):
+        vk = self.rows.get(self.current_layer)
+        if vk is None:
+            return self.inner(
+                q, k_buffer, v_buffer, o, kv_indptr, kv_indices, attn_logits,
+                attn_lse, num_kv_splits, max_kv_splits, sm_scale, k_descale,
+                v_descale, **kw,
+            )
+        from sglang.srt.layers.attention.vestigekv.dsa_decode_fork import vk_dsa_decode
+
+        kb = k_buffer.view(k_buffer.shape[0], 1, -1) if k_buffer.dim() != 3 else k_buffer
+        vk_dsa_decode(q, kb, o, vk, sm_scale, d_v=o.shape[-1])
+        return o
+
+
 def _blend_omitted_mass(o, attn_lse, num_kv_splits, logm_buf, mu_buf, slots):
     """Put back the softmax denominator the scan never attended.
 
