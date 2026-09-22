@@ -469,6 +469,9 @@ class DeepseekSparseAttnBackend(
                 "--dsa-decode-backend flashmla_kv."
             )
 
+        if self.dsa_prefill_impl == "triton" and not skip_prefill:
+            self._warmup_triton_sparse_prefill()
+
         # Q8KV8 per-call device-tensor caches, populated lazily on the first
         # Q8KV8 dispatch (no-ops for other backends).
         self._q8kv8_identity_scale: Optional[torch.Tensor] = None
@@ -550,6 +553,29 @@ class DeepseekSparseAttnBackend(
         else:
             self.workspace_buffer = None
             self._multi_ctas_kv_counter_buffer = None
+
+    def _warmup_triton_sparse_prefill(self) -> None:
+        # The Triton sparse prefill kernel autotunes 27 configs at its first
+        # launch, loading and benchmarking every cubin then. At serving that
+        # launch is the first prefill chunk past the dense window, after the
+        # pools and graphs have left the driver under 1 GiB, and the sweep
+        # dies in the launch with CUDA OOM (GLM-5.3-Flash at MEM_FRAC 0.955,
+        # every vestigekv_dsa job of 2026-09-22). Tune and load it here on a
+        # dummy problem with the serving autotune key: topk, heads, the KV
+        # dtype and the short-sequence bucket (a chunk is never 32k rows).
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+            triton_sparse_mla_fwd,
+        )
+
+        rows, d_v = 1024, self.kv_lora_rank
+        kv = torch.zeros(1, 1, self.kv_cache_dim, dtype=self.kv_cache_dtype, device=self.device)
+        q_nope = torch.zeros(rows, self.num_q_heads, d_v, dtype=kv.dtype, device=self.device)
+        q_rope = torch.zeros(
+            rows, self.num_q_heads, self.kv_cache_dim - d_v, dtype=kv.dtype, device=self.device
+        )
+        indices = torch.zeros(rows, 1, self.dsa_index_topk, dtype=torch.int32, device=self.device)
+        triton_sparse_mla_fwd(q_nope, q_rope, kv, indices, 1.0, d_v=d_v)
+        torch.cuda.synchronize()
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,

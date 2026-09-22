@@ -217,6 +217,12 @@ def _prune_configs(configs, named_args, **kwargs):
         c
         for c in candidates
         if c.kwargs["BLOCK_N"] <= topk and c.kwargs["BLOCK_N"] <= max_block_n
+        # One-warp configs spill, and a launch's local-memory reservation is
+        # kept by the driver for the life of the context: benchmarking them
+        # cost 644 + 766 MiB of device memory that never came back and ran
+        # 7-9 ms against 0.8 for the winner (RTX PRO 6000, bf16, topk 2048,
+        # 32 heads, 2026-09-22). They have never been selected; drop them.
+        and c.num_warps >= 2
     ]
     return keep or [candidates[0]]
 
