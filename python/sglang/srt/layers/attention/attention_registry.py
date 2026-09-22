@@ -118,17 +118,27 @@ def create_vestigekv_mla_backend(runner):
                 "vestigekv_mla on GLM-5.3 requires a rope-less MLA "
                 f"(qk_rope_head_dim == 0, got {_glm.qk_rope_head_dim})."
             )
-        if is_deepseek_dsa(_glm):
+        if is_deepseek_dsa(_glm) and not (
+            runner.prefill_attention_backend_str == "dsa"
+            and runner.decode_attention_backend_str == "vestigekv_mla"
+        ):
+            # As the sole backend VestigeKV would receive DSA's top-k on a dense
+            # base and attend densely at prefill anyway (measured: +5.6 s TTFT
+            # at 32k against DSA's sparse prefill). The supported shape keeps
+            # DSA on the prefill side and VestigeKV on decode.
             raise ValueError(
-                "vestigekv_mla replaces DSA: switch the indexer's top-k off with "
-                "--json-model-override-args '{\"text_config\": {\"index_topk\": null}}'."
+                "vestigekv_mla with DSA on: use --prefill-attention-backend dsa "
+                "--decode-attention-backend vestigekv_mla, or switch the indexer's "
+                "top-k off with --json-model-override-args "
+                "'{\"text_config\": {\"index_topk\": null}}'."
             )
-    if (runner.page_size or 1) != 1:
-        raise ValueError(
-            f"vestigekv_mla requires --page-size 1 (resolved page_size="
-            f"{runner.page_size}): its kept-index tables address token "
-            "slots, not pages."
-        )
+    # Any page size. The kept and fetch tables hold token slots, and both the
+    # fork and upstream's stage 1 derive page and offset from a slot
+    # (kv_loc // PAGE_SIZE, kv_loc % PAGE_SIZE), so a paged pool changes only
+    # the strides the fork is launched with. DSA resolves the pool to 64 and
+    # the split pair has to live there; the refusal this replaces was the
+    # single-backend era's caution, and the affine fenced capture is the one
+    # thing it protected (guarded at the router now).
     if get_spec().speculative_algorithm is not None:
         raise ValueError(
             "vestigekv_mla does not support speculative decoding yet: the "

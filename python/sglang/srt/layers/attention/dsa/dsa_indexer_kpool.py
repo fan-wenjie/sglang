@@ -51,6 +51,14 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+
+def _vestigekv_decode_backend():
+    from sglang.srt.layers.attention.vestigekv.salience import vestigekv_backend_of
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    return vestigekv_backend_of(get_attn_backend())
+
+
 class IndexerKPool(MultiPlatformOp):
     def __init__(
         self,
@@ -1262,6 +1270,13 @@ class IndexerKPool(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         key = self._get_k_bf16(x, positions)
+        # Rope-less MLA under a split pair (DSA prefill, VestigeKV decode): this
+        # un-rotated key is VestigeKV's tier-1 salience channel, computed here
+        # anyway, so it is filed rather than recomputed by a second module.
+        # No VestigeKV backend means a plain DSA run and nothing is written.
+        vk = _vestigekv_decode_backend()
+        if vk is not None:
+            vk.write_salience(layer_id=layer_id, forward_batch=forward_batch, key=key)
         self._compress_write(
             x=x,
             key=key,

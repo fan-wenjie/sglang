@@ -207,9 +207,17 @@ class HybridAttnBackend(AttentionBackend):
         **kwargs,
     ):
         backend = self._select_backend(forward_batch.forward_mode)
-        return backend.forward_extend(
+        out = backend.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
+        # The model-level hybrid wrapper calls forward_extend here directly,
+        # not forward, so the decode side has to be told about the prefill on
+        # this path too (see forward). Rows are in the shared pool by now.
+        if backend is self.prefill_backend and backend is not self.decode_backend:
+            observe = getattr(self.decode_backend, "observe_prefill_extend", None)
+            if observe is not None and q is not None:
+                observe(layer, forward_batch, q=q, **kwargs)
+        return out
 
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
@@ -236,7 +244,7 @@ class HybridAttnBackend(AttentionBackend):
     ):
         """Delegate forward to the appropriate backend based on forward mode."""
         backend = self._select_backend(forward_batch.forward_mode)
-        return backend.forward(
+        out = backend.forward(
             q=q,
             k=k,
             v=v,
@@ -245,3 +253,13 @@ class HybridAttnBackend(AttentionBackend):
             save_kv_cache=save_kv_cache,
             **kwargs,
         )
+        # A decode backend that keeps per-request state built at prefill
+        # (VestigeKV's kept table and sigma record) has to see every prefill
+        # even when the prefill side computes the attention. The KV pool is
+        # shared, so after the prefill side returns the rows are in place.
+        if backend is self.prefill_backend and backend is not self.decode_backend:
+            observe = getattr(self.decode_backend, "observe_prefill_extend", None)
+            if observe is not None and q is not None:
+                observe(layer, forward_batch, q=q, **kwargs)
+        return out
+

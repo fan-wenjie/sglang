@@ -76,12 +76,24 @@ def vestigekv_backend_of(backend):
     """The VestigeKV backend serving full-attention layers, or None. Hybrid
     models hand the model a HybridLinearAttnBackend whose full-attention half
     is the one VestigeKV wraps."""
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
     )
 
-    if isinstance(backend, HybridLinearAttnBackend):
-        backend = backend.full_attn_backend
+    # Either nesting order, to a fixed point. The engine composes the
+    # prefill/decode pair from unwrapped backends and applies the linear
+    # wrapper once outside, so the split pair on a hybrid model arrives as
+    # HybridLinear(full=HybridAttn(...)); a single-backend hybrid arrives as
+    # HybridLinear(full=VestigeKV); unwrapping in one fixed order met the
+    # wrong layer first and returned None, silently, for every prefill hook.
+    for _ in range(4):
+        if isinstance(backend, HybridAttnBackend):
+            backend = backend.decode_backend
+        elif isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.full_attn_backend
+        else:
+            break
     return backend if isinstance(backend, VestigeKVMLABackend) else None
 
 
@@ -200,7 +212,19 @@ class VestigeKVMLABackend(AttentionBackend):
         # function, which is how eager steps keep the CSR path.
         from sglang.srt.layers.attention.vestigekv.tier_decode import TierDecodeRouter
 
-        self._router = TierDecodeRouter(inner=base.decode_attention_fwd)
+        # The AFFINE fenced arm addresses a request's rows as base + offset,
+        # which holds only when its slots are one contiguous run -- true at
+        # page 1, not once the pool is paged. The per-row page-table read is
+        # correct at any page size, so a paged pool simply keeps AFFINE off.
+        page_size = getattr(base, "page_size", 1) or 1
+        if page_size != 1 and self._affine_capture:
+            raise ValueError(
+                "VestigeKV's affine fenced capture assumes page_size 1; "
+                f"the pool is paged at {page_size}"
+            )
+        self._router = TierDecodeRouter(
+            inner=base.decode_attention_fwd, page_size=page_size
+        )
         base.decode_attention_fwd = self._router
         # Pool handles shared with the base (the latent rows VestigeKV compresses).
         self.token_to_kv_pool = base.token_to_kv_pool
@@ -1076,6 +1100,27 @@ class VestigeKVMLABackend(AttentionBackend):
         self._build_gpu_state(layer, forward_batch)
         return out
 
+    def observe_prefill_extend(self, layer, forward_batch, q=None, **kwargs):
+        """The prefill-side bookkeeping, for a prefill whose attention was
+        computed by another backend.
+
+        Under a split pair the prefill side is DSA and its sparse kernels never
+        pass through this object, so nothing here would run: no kept table, no
+        sigma record, no prefill-time build, and decode would start on a slot
+        with no state. The KV pool is shared, so by the time the composite
+        calls this the rows are written and the same build that forward_extend
+        does can run unchanged."""
+        if not getattr(self, "_observe_seen", False):
+            self._observe_seen = True
+            logger.info(
+                "VestigeKV observe: first prefill observed (layer %s, slots %s, seq_lens %s)",
+                layer.layer_id,
+                forward_batch.req_pool_indices.tolist(),
+                (forward_batch.seq_lens_cpu.tolist()
+                 if forward_batch.seq_lens_cpu is not None else "?"),
+            )
+        self._build_gpu_state(layer, forward_batch)
+
     def _build_gpu_state(self, layer, forward_batch):
         # Prefill-time build (sync here is off the decode critical path): the
         # sidecar-residual kept set for every request in this extend batch.
@@ -1207,6 +1252,12 @@ class VestigeKVMLABackend(AttentionBackend):
             absorbed = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
             qe = torch.cat([absorbed, rows[..., nope:].to(absorbed.dtype)], dim=-1).float()
             pc = self._pcal[key]
+            if not getattr(self, "_cal_seen", False):
+                self._cal_seen = True
+                logger.info(
+                    "VestigeKV calibration: first queries recorded (layer %s, %d rows)",
+                    layer_id, len(pick),
+                )
             for j, m in enumerate(pick):
                 pc["q"].append(qe[j].clone())
                 pc["pos"].append(p0 + m)
@@ -1344,6 +1395,12 @@ class VestigeKVMLABackend(AttentionBackend):
         pos = positions.to(torch.int64)
         ring = self._side_ring_size
         flat = slots * ring + pos % ring
+        if not getattr(self, "_salience_seen", False):
+            self._salience_seen = True
+            logger.info(
+                "VestigeKV salience: first keys filed (layer %s, %d rows)",
+                layer_id, int(pos.numel()),
+            )
         # Stamped before the key: _ring_sigma trusts a row only when the stamp
         # says this exact position wrote it, so a stale row can never be read
         # as a fresh one.

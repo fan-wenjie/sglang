@@ -1863,7 +1863,7 @@ class DeepseekV2AttentionMLA(
                 k_norm_type=getattr(config, "index_k_norm_type", None) or "layer",
                 prefix=add_prefix("salience", prefix),
             )
-        elif index_head_dim and not is_nextn:
+        elif index_head_dim and not is_nextn and not self.use_dsa:
             # Say why, once per layer, because the alternative is a run that
             # looks identical and scores an all-zero salience channel: sigma is
             # then constant, the top-m degenerates to the first m row ids, and

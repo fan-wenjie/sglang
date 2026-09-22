@@ -1259,6 +1259,16 @@ class HybridLinearAttnBackend(AttentionBackend):
             **kwargs,
         )
 
+    def observe_prefill_extend(self, layer, forward_batch, q=None, **kwargs):
+        # A decode-side observer of a prefill computed elsewhere (see
+        # HybridAttnBackend.forward). Only full-attention layers have state to
+        # observe; the linear layers' state lives in the shared mamba pool.
+        if not self._is_full_attn(layer, kwargs.get("layer_id")):
+            return
+        observe = getattr(self.full_attn_backend, "observe_prefill_extend", None)
+        if observe is not None:
+            observe(layer, forward_batch, q=q, **kwargs)
+
     def forward_extend(
         self,
         layer: RadixAttention,
