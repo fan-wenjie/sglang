@@ -349,6 +349,8 @@ class TestBatchedEmptyKept(CustomTestCase):
             pass
 
         def mk():
+            from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR
+
             t = T()
             t.kept_rows = torch.zeros(0, D.LATENT_DIM, device=dev, dtype=torch.bfloat16)
             t.V = torch.linalg.qr(torch.randn(D.KV_LORA_RANK, 16, device=dev))[
@@ -364,6 +366,10 @@ class TestBatchedEmptyKept(CustomTestCase):
             t.scale = 1.0 / (D.LATENT_DIM**0.5)
             t.r = 16
             t.version = 0
+            # BatchedScanPack reads the geometry off its first tier; the stub
+            # predates that and the test has been red since, which is how a
+            # crash-regression guard stops guarding anything.
+            t.geom = KIMI_LINEAR
             return t
 
         tiers = [mk(), mk()]
