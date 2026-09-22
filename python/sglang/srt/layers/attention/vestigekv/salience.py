@@ -79,6 +79,7 @@ def vestigekv_backend_of(backend):
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
     )
+    from sglang.srt.layers.attention.vestigekv_dsa_backend import VestigeKVDSABackend
     from sglang.srt.layers.attention.vestigekv_mla_backend import VestigeKVMLABackend
 
     # A split pair (--prefill-attention-backend dsa --decode-attention-backend
@@ -98,4 +99,8 @@ def vestigekv_backend_of(backend):
             backend = backend.full_attn_backend
         else:
             break
-    return backend if isinstance(backend, VestigeKVMLABackend) else None
+    return (
+        backend
+        if isinstance(backend, (VestigeKVMLABackend, VestigeKVDSABackend))
+        else None
+    )

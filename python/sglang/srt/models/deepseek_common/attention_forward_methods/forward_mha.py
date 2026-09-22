@@ -33,7 +33,7 @@ from sglang.srt.utils import BumpAllocator, next_power_of_2
 def _vestigekv_prefill_queries(layer, q, forward_batch):
     # VestigeKV prefill calibration: hand the rotated extend queries and the
     # absorbed key weight to the backend (a no-op for every other backend).
-    from sglang.srt.layers.attention.vestigekv_mla_backend import vestigekv_backend_of
+    from sglang.srt.layers.attention.vestigekv.salience import vestigekv_backend_of
 
     backend = vestigekv_backend_of(get_attn_backend())
     if backend is None:
