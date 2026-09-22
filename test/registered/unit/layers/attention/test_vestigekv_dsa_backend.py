@@ -63,3 +63,7 @@ class TestOverflowProbe(CustomTestCase):
 class _Pending:
     def query(self):
         return False
+
+
+if __name__ == "__main__":
+    unittest.main()
