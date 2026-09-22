@@ -1428,6 +1428,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             fused_cat_dim = 0
 
         params_dict = dict(self.named_parameters())
+        # VestigeKV keeps only the indexer's wk / k_norm, under `salience`; the
+        # indexer's other weights then find no parameter and are skipped below.
+        has_salience = any(".salience." in n for n in params_dict)
         weight_names = []
         for name, loaded_weight in weights:
             is_visual_weight = "visual" in name
@@ -1440,6 +1443,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 name = name.replace("language_model.", "")
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
+            if has_salience and ".self_attn.indexer." in name:
+                name = name.replace(".indexer.", ".salience.")
 
             if "visual" in name:
                 name = name.replace("attn.qkv.", "attn.qkv_proj.")

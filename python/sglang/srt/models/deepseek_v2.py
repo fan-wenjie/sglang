@@ -1842,6 +1842,39 @@ class DeepseekV2AttentionMLA(
                     indexer_kwargs["skip_rope"] = skip_rope
                 self.indexer = indexer_cls(**indexer_kwargs)
 
+        # Rope-less MLA under VestigeKV: the latent row has no un-roped branch
+        # to rank rows by, so the DSA indexer's key -- never rotated when rope
+        # is absent -- is the tier-1 salience channel. Built only when the
+        # indexer's own top-k is off (use_dsa False), where those weights would
+        # otherwise be skipped at load.
+        self.salience = None
+        index_head_dim = getattr(config, "index_head_dim", None)
+        if (
+            not self.use_dsa
+            and not is_nextn
+            and index_head_dim
+            and get_exec().kernel.attention_backend == "vestigekv_mla"
+        ):
+            from sglang.srt.layers.attention.vestigekv.salience import SalienceKey
+
+            self.salience = SalienceKey(
+                hidden_size=hidden_size,
+                head_dim=index_head_dim,
+                k_norm_type=getattr(config, "index_k_norm_type", None) or "layer",
+                prefix=add_prefix("salience", prefix),
+            )
+        elif index_head_dim and not is_nextn:
+            # Say why, once per layer, because the alternative is a run that
+            # looks identical and scores an all-zero salience channel: sigma is
+            # then constant, the top-m degenerates to the first m row ids, and
+            # tier 1 is index order wearing salience's name.
+            logger.info(
+                "VestigeKV salience NOT built for layer %s: use_dsa=%s backend=%s",
+                layer_id,
+                self.use_dsa,
+                get_exec().kernel.attention_backend,
+            )
+
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -2057,6 +2090,26 @@ class DeepseekV2AttentionMLA(
         )
         return self.forward_core(s)
 
+    def _write_salience(self, hidden_states, forward_batch: ForwardBatch):
+        # One key per token of this forward, filed in the request's ring by the
+        # token's position (the backend owns the ring's geometry).
+        if isinstance(hidden_states, tuple):
+            raise NotImplementedError(
+                "vestigekv salience key needs bf16 hidden states, got a quantized tuple"
+            )
+        from sglang.srt.layers.attention.vestigekv.salience import vestigekv_backend_of
+
+        backend = vestigekv_backend_of(get_attn_backend())
+        if backend is None:
+            raise RuntimeError(
+                "salience module built but the attention backend is not vestigekv_mla"
+            )
+        backend.write_salience(
+            layer_id=self.layer_id,
+            forward_batch=forward_batch,
+            key=self.salience(hidden_states),
+        )
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -2090,6 +2143,8 @@ class DeepseekV2AttentionMLA(
                 )
                 return hidden_states, None, forward_batch, None
 
+        if self.salience is not None:
+            self._write_salience(hidden_states, forward_batch)
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
