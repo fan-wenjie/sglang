@@ -282,6 +282,9 @@ def _vk_fwd_grouped_kernel_stage1(
     vk_seq,  # [bs] int64 rows of a fenced lane
     vk_loc_ptr,  # [bs] int64 this step's appended pool row
     vk_topk,  # VK_TOPK>0: [bs, VK_TOPK] int32 DSA-selected pool rows, -1 padded
+    vk_qbuf,  # VK_QBUF: [R1, H, Lk] q dtype; this step's query filed by slot
+    qbuf_stride_s,
+    qbuf_stride_h,
     Att_Out,
     Att_Lse,
     num_kv_splits,
@@ -320,6 +323,7 @@ def _vk_fwd_grouped_kernel_stage1(
     VK_TOPK: tl.constexpr = 0,  # row stride of vk_topk (index_topk + kpool - 1)
     VK_TOPK_K: tl.constexpr = 0,  # the indexer's pooled budget (index_topk)
     VK_KPOOL: tl.constexpr = 1,  # index cache pooling; tail tokens ride outside the budget
+    VK_QBUF: tl.constexpr = False,  # file q into vk_qbuf (the recall scan's input)
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
@@ -449,6 +453,13 @@ def _vk_fwd_grouped_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
+        if VK_QBUF:
+            # The next step's recall scan reads this step's query from qbuf;
+            # writing it here replaces a per-layer index_copy_ launch. One
+            # split writes, every head tile writes its own heads.
+            if split_kv_id == 0:
+                offs_qb = vk_slot * qbuf_stride_s + cur_head[:, None] * qbuf_stride_h + offs_d[None, :]
+                tl.store(vk_qbuf + offs_qb, q, mask=(mask_h[:, None]) & (mask_d[None, :]))
         # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
         # dim K>=128 (verified K=64 ok, K>=128 broken; bf16 fine at all K). The MLA
         # nope QK dot has K=512, so an fp8 KV cache MUST NOT be consumed as an fp8 dot
@@ -464,6 +475,10 @@ def _vk_fwd_grouped_kernel_stage1(
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
             )
+            if VK_QBUF:
+                if split_kv_id == 0:
+                    offs_qbpe = vk_slot * qbuf_stride_s + cur_head[:, None] * qbuf_stride_h + offs_dpe[None, :]
+                    tl.store(vk_qbuf + offs_qbpe, qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]))
         else:
             qpe = q_k  # same reason as mask_dpe above: passed, never read
         if AFFINE and vk_fenced:
@@ -640,6 +655,7 @@ class VestigeKVRows(msgspec.Struct):
     topk: object = None
     topk_k: int = 0  # index_topk: the pooled budget the count formula clamps to
     kpool: int = 1  # index_kpool
+    qbuf: object = None  # [R1, H, Lk]: when set, the kernel files q here (VK_QBUF)
 
 
 def decode_grouped_att_m_fwd(
@@ -743,6 +759,9 @@ def decode_grouped_att_m_fwd(
         vk.seq,
         vk.loc,
         vk.topk if vk.topk is not None else vk.seq,
+        vk.qbuf if vk.qbuf is not None else q,
+        vk.qbuf.stride(0) if vk.qbuf is not None else 0,
+        vk.qbuf.stride(1) if vk.qbuf is not None else 0,
         att_out,
         att_lse,
         num_kv_splits,
@@ -782,6 +801,7 @@ def decode_grouped_att_m_fwd(
         VK_TOPK=vk.topk.shape[1] if vk.topk is not None else 0,
         VK_TOPK_K=vk.topk_k if vk.topk is not None else 0,
         VK_KPOOL=max(1, vk.kpool) if vk.topk is not None else 1,
+        VK_QBUF=vk.qbuf is not None and vk.tiers,  # the CSR build has no lane slot
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         IS_GFX1250=_is_gfx1250,

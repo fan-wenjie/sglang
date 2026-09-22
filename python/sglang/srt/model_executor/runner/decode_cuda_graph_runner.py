@@ -311,7 +311,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
-            create_attention_graph_variants(model_runner.model_config.hf_config)
+            create_attention_graph_variants(
+                model_runner.model_config.hf_config,
+                decode_backend=model_runner.decode_attention_backend_str,
+            )
             or create_dsv41_candidate_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
             )
