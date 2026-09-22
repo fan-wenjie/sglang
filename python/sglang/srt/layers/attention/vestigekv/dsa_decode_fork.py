@@ -34,7 +34,6 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _G,
     LOG2E,
     _cu_count,
-    _get_splitk_bufs,
     _kv_splits_heuristic,
     _sparse_mla_decode_reduce_kernel,
 )
@@ -290,16 +289,50 @@ def _vk_dsa_decode_split_kernel(
         )
 
 
-def vk_dsa_decode(q, kv, out, vk, sm_scale, *, d_v=512, kv_splits=None, max_rows=None):
-    """q [bs, H, D_V + D_TAIL] bf16 (the absorbed query); kv [pool, 1, KV_DIM]
-    bf16; out [bs, H, D_V] bf16, written; vk: VestigeKVRows; sm_scale: the
-    layer's scaling (LOG2E is applied here, as DSA does). `max_rows` bounds
-    a lane's row count (kept capacity + fetch width, or the selection width)
-    and sizes the split count; it is a capture-time constant."""
+_vk_splitk = {}
+
+
+def _vk_splitk_bufs(bs, kv_splits, h_padded, d_v, device):
+    # DSA's _get_splitk_bufs reserves for a batch of 128 at the split count of
+    # the first call; the tiers' split count is up to three times DSA's
+    # (max_rows is the kept capacity plus the fetch width), and that
+    # reservation was 0.4 GB of the graph pool at bs=1 on GLM-5.3-Flash. The
+    # partials are scratch within one launch, so a buffer sized to the largest
+    # call so far serves every graph.
+    needed_lse = bs * kv_splits * h_padded
+    needed_acc = needed_lse * d_v
+    bufs = _vk_splitk.get(device)
+    if bufs is None or bufs[0].numel() < needed_lse or bufs[1].numel() < needed_acc:
+        bufs = (
+            torch.empty(needed_lse, dtype=torch.float32, device=device),
+            torch.empty(needed_acc, dtype=torch.bfloat16, device=device),
+        )
+        _vk_splitk[device] = bufs
+    lse = bufs[0][:needed_lse].view(bs, kv_splits, h_padded)
+    acc = bufs[1][:needed_acc].view(bs, kv_splits, h_padded, d_v)
+    return lse, acc
+
+
+def vk_dsa_decode(
+    q, kv, out, vk, sm_scale, *, d_v=512, kv_splits=None, max_rows=None, q_rope=None
+):
+    """q [bs, H, D_V + D_TAIL] bf16 (the absorbed query), or with `q_rope`
+    [bs, H, D_TAIL] given, q is the [bs, H, D_V] latent part and the two are
+    read in place, as DSA's own decode reads the model's split q; kv
+    [pool, 1, KV_DIM] bf16; out [bs, H, D_V] bf16, written; vk:
+    VestigeKVRows; sm_scale: the layer's scaling (LOG2E is applied here, as
+    DSA does). `max_rows` bounds a lane's row count (kept capacity + fetch
+    width, or the selection width) and sizes the split count; it is a
+    capture-time constant."""
     bs, H, dim = q.shape
-    d_tail = dim - d_v
-    q_nope = q[:, :, :d_v]
-    q_rope = q[:, :, d_v:]
+    if q_rope is None:
+        d_tail = dim - d_v
+        q_nope = q[:, :, :d_v]
+        q_rope = q[:, :, d_v:]
+    else:
+        assert dim == d_v, f"split q: latent width {dim} != d_v {d_v}"
+        d_tail = q_rope.shape[-1]
+        q_nope = q
     kv_dim = kv.shape[-1]
     if kv.dtype != torch.bfloat16 or q.dtype != torch.bfloat16:
         raise NotImplementedError("vk_dsa_decode serves the bf16 latent pool")
@@ -331,7 +364,7 @@ def vk_dsa_decode(q, kv, out, vk, sm_scale, *, d_v=512, kv_splits=None, max_rows
         kv_splits = min(kv_splits, max_kv_splits)
     kv_splits = max(1, kv_splits)
     qk_scale = float(sm_scale) * LOG2E
-    lse_partial, acc_partial = _get_splitk_bufs(bs, kv_splits, h_padded, d_v, q.device)
+    lse_partial, acc_partial = _vk_splitk_bufs(bs, kv_splits, h_padded, d_v, q.device)
     topk = vk.topk
     qbuf = vk.qbuf if (vk.qbuf is not None and vk.tiers) else None
     grid_split = (bs, n_head_blocks, kv_splits)

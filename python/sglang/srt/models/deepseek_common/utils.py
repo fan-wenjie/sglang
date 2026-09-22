@@ -67,6 +67,7 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa4",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
+    "vestigekv_dsa",  # decode half of the DSA split pair; takes split q/k like dsa
     "flashinfer",
     "trtllm_mla",
     "cutedsl_mla",
