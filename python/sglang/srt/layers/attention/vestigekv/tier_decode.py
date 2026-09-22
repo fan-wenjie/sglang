@@ -35,6 +35,10 @@ class TierDecodeRouter(msgspec.Struct, dict=True):
     needs that the base's call site does not pass."""
 
     inner: object  # the base's original function, for layers this backend skips
+    # The base's page size, forwarded to the fork so its K/V page and token
+    # strides match the pool. Hard-coding 1 here was invisible for as long as
+    # every deployment ran at page 1; DSA resolves the pool to page 64.
+    page_size: int = 1
     rows: dict = {}  # layer id -> VestigeKVRows, refreshed per step by the backend
     current_layer: int = -1
     blend: dict = {}  # layer id -> (logm [B,H], mu [B,Lv]); omitted-mass arm only
@@ -97,6 +101,7 @@ class TierDecodeRouter(msgspec.Struct, dict=True):
             sm_scale,
             kw.get("logit_cap", 0.0),
             has_mla=kw.get("has_mla", True),
+            page_size=self.page_size,
         )
         _decode_softmax_reducev_fwd(
             attn_logits,
