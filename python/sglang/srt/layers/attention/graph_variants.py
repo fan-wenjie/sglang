@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+
+from sglang.srt.environ import envs
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 
@@ -78,7 +80,7 @@ def create_attention_graph_variants(
     # The registry admits vestigekv_dsa only on a rope-less DSA model, so the
     # backend name is the whole condition (the outer GLM config does not
     # answer is_deepseek_dsa; its text config does).
-    if decode_backend == "vestigekv_dsa":
+    if decode_backend == "vestigekv_dsa" and envs.SGLANG_ENABLE_VESTIGEKV_LEAN_GRAPH.get():
         logger.info(
             "[vestigekv_dsa] dual-graph enabled: capturing topk (full indexer) + "
             "lean (key only) decode graphs; dispatch on last step's overflow."

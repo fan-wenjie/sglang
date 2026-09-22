@@ -600,6 +600,13 @@ class Envs:
     # batch-independent cost. The production path; False falls back to the
     # separately captured scan graph (kill-switch A/B).
     SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN = EnvBool(True)
+    # vestigekv_dsa: capture a second, lean decode graph (key filed, no
+    # indexer scoring/top-k) and replay it on steps after one with no recall
+    # overflow. Off: a lane that overflows on a lean step attends its page
+    # table, not the selection, so quality is not bit-identical to the
+    # single-graph tree; and on GLM-5.3-Flash 2-3 layers overflow on most
+    # steps (VKSTATS 2026-09-22: lean 20-23% of steps), so it buys ~0.08 ms.
+    SGLANG_ENABLE_VESTIGEKV_LEAN_GRAPH = EnvBool(False)
 
     SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG = EnvStr(None)
 
