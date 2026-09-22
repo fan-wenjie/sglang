@@ -180,6 +180,37 @@ class TestPackCsrParity(CustomTestCase):
 
 
 
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_topk_bounds_a_fenced_lane_to_the_indexer_budget(self):
+        """DSA fallback: a fenced lane's packed segment holds min(seq, TOPK)
+        rows (placeholders the layer overwrites with the selection), never its
+        whole page table; unfenced lanes are untouched by the budget."""
+        from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
+
+        slots = torch.tensor([2, 5, 0, TRASH], dtype=torch.int64, device="cuda")
+        loc = torch.arange(4, device="cuda", dtype=torch.int32) + 90000
+        fetch_ovf, seq, r2t = _mk_fence(4, slots, loc)
+        TOPK = 16
+        seq = torch.tensor([3, 200, 16, 40], dtype=torch.int64, device="cuda")
+        plain = _mk_state(4)
+        pack_csr_all_layers(slots, loc, *plain, seq=seq, fetch_ovf=fetch_ovf, req_to_token=r2t)
+        bounded = _mk_state(4)
+        pack_csr_all_layers(
+            slots, loc, *bounded, seq=seq, fetch_ovf=fetch_ovf, req_to_token=r2t,
+            topk=TOPK, kpool=4,
+        )
+        ip_plain, ip_b = plain[5][:, : slots.numel() + 1], bounded[5][:, : slots.numel() + 1]
+        len_plain = (ip_plain[:, 1:] - ip_plain[:, :-1]).cpu()
+        len_b = (ip_b[:, 1:] - ip_b[:, :-1]).cpu()
+        fenced = (fetch_ovf[:, slots] != 0).cpu()
+        tail = seq.cpu() % 4
+        attended = torch.clamp(seq.cpu() - tail, max=TOPK) + tail  # 3, 16, 16, 16
+        want = torch.where(fenced, attended[None, :].expand_as(len_plain), len_plain)
+        self.assertTrue(torch.equal(len_b, want), f"fenced lanes not bounded:\n{len_b}\n{want}")
+        # kept-table append and lengths are the same step either way
+        self.assertTrue(torch.equal(plain[1], bounded[1]))
+        self.assertTrue(torch.equal(plain[0], bounded[0]))
+
 
 # ---------------------------------------------------------------------------
 # The sharded form: this rank holds positions off, off+stride, ... of every

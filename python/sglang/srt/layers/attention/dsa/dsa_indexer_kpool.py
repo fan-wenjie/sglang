@@ -1765,6 +1765,13 @@ class IndexerKPool(MultiPlatformOp):
             precompute_compress_gate=precompute_compress_gate,
             precompute_head_gate=enable_dual_stream and return_indices,
         )
+        # Rope-less MLA under a split pair: this key is VestigeKV's tier-1
+        # salience channel on every prefill chunk past index_topk and on every
+        # decode step (the short-prefill path files it in
+        # _forward_cuda_skip_logits). No VestigeKV backend means a plain DSA run.
+        vk = _vestigekv_decode_backend()
+        if vk is not None:
+            vk.write_salience(layer_id=layer_id, forward_batch=forward_batch, key=key)
 
         has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
         is_prefill = forward_batch.forward_mode.is_extend_without_speculative()

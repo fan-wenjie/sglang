@@ -156,6 +156,12 @@ class VestigeKVMLABackend(AttentionBackend):
     _dbg_tail_bad = None  # TAIL check: per-layer mismatch counters (+ lanes checked)
     _dbg_tail_steps = 0
     _mem_dir = None  # SGLANG_DEBUG_VESTIGEKV_MEM_DIR; class default for __new__ fakes
+    _dsa = None  # the split pair's DSA prefill backend, driven for decode metadata
+    _model_runner = None  # bound in __init__; None on __new__ fakes
+    _graph_state_args = None
+    _dsa_topk = 0  # its index_topk; the fenced arm's row budget on DSA models
+    _dsa_kpool = 1  # its index_kpool; the selection carries seq % kpool tail rows too
+    _dsa_resolved = False
     _mem_reqs = 0
     _fetch_hist = None
     _stat_acc = None
@@ -235,12 +241,24 @@ class VestigeKVMLABackend(AttentionBackend):
         self._graph_bufs: dict = {}
         self._graph_max_bs = 0
         self._num_layers = model_runner.model_config.num_hidden_layers
+        self._model_runner = model_runner  # for the split pair's sibling, set after us
+        self._graph_state_args = None
         # The text config normalises the checkpoint's layer list (1-indexed on
         # Kimi Linear, 0-indexed on GLM-5.3-Flash) to 0-indexed layer ids.
         text_cfg = kimi_linear_config(model_runner.model_config) or glm5_next_config(
             model_runner.model_config
         )
         self._mla_lids_static = set(text_cfg.full_attention_layer_ids)
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        # A DSA model's indexer budget: what a fenced lane attends on this
+        # geometry (see _dsa_sibling). 0 on every other model.
+        self._text_cfg_index_topk = (
+            int(text_cfg.index_topk) if is_deepseek_dsa(text_cfg) else 0
+        )
+        self._text_cfg_index_kpool = (
+            int(text_cfg.index_kpool) if is_deepseek_dsa(text_cfg) else 1
+        )
         # this PP rank's MLA layers, from the hybrid pool's authoritative map
         # (HybridLinearKVPool.full_attention_layer_id_mapping)
         self._local_mla_lids = sorted(
@@ -355,8 +373,64 @@ class VestigeKVMLABackend(AttentionBackend):
 
     # ---- metadata / cuda-graph / properties: delegate to base ----
 
+    def _dsa_sibling(self):
+        """The DSA backend of the split pair this backend decodes for, or None.
+
+        Under `--prefill-attention-backend dsa --decode-attention-backend
+        vestigekv_mla` the model's indexer asks the ACTIVE backend for its
+        metadata; at decode that is this backend, whose base knows no indexer,
+        so the indexer used to return None: no top-k, no index-cache write and
+        no salience key for any decoded token, and none for a prefill chunk
+        past index_topk either. This backend therefore drives the sibling's
+        decode metadata itself and answers the indexer with it, so DSA's
+        selection exists every step -- the fenced arm attends it, and the
+        salience channel is filed from the same key.
+        """
+        if self._dsa_resolved:
+            return self._dsa
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        # The runner binds the composed backend after constructing its halves;
+        # until then there is nothing to resolve against, and the answer has
+        # to be known before graph capture (a graph captured without the
+        # sibling's metadata records no indexer launch and replays none).
+        if self._model_runner is None:
+            return None  # a test fake: no pair to resolve
+        outer = getattr(self._model_runner, "attn_backend", None)
+        if outer is None:
+            return None  # not bound yet; resolve on a later call
+        pair = outer
+        if isinstance(pair, HybridLinearAttnBackend):
+            pair = pair.full_attn_backend
+        if isinstance(pair, HybridAttnBackend) and pair.decode_backend is self:
+            from sglang.srt.layers.attention.dsa_backend import (
+                DeepseekSparseAttnBackend,
+            )
+
+            prefill = pair.prefill_backend
+            if isinstance(prefill, DeepseekSparseAttnBackend) and self._text_cfg_index_topk:
+                self._dsa = prefill
+                self._dsa_topk = self._text_cfg_index_topk
+                self._dsa_kpool = max(1, self._text_cfg_index_kpool)
+                if self._graph_state_args is not None:
+                    # Graph state was sized before the pair was bound.
+                    prefill.init_cuda_graph_state(*self._graph_state_args)
+                logger.info(
+                    "VestigeKV: DSA sibling drives decode metadata; fenced lanes "
+                    "attend the indexer's top-%d rows",
+                    self._dsa_topk,
+                )
+        self._dsa_resolved = True
+        return self._dsa
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.base.init_forward_metadata(forward_batch)
+        dsa = self._dsa_sibling()
+        if dsa is not None and forward_batch.forward_mode.is_decode_or_idle():
+            dsa.init_forward_metadata(forward_batch)
         if forward_batch.forward_mode.is_decode():
             self._eager_decode_step(forward_batch)
 
@@ -389,6 +463,9 @@ class VestigeKVMLABackend(AttentionBackend):
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
+        dsa = self._dsa_sibling()
+        if dsa is not None and forward_batch.forward_mode.is_decode_or_idle():
+            dsa.init_forward_metadata_out_graph(forward_batch, in_capture)
         if (
             not in_capture
             and self._ingraph_pack is not None
@@ -1039,6 +1116,9 @@ class VestigeKVMLABackend(AttentionBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.base.init_forward_metadata_in_graph(forward_batch)
+        dsa = self._dsa_sibling()
+        if dsa is not None and forward_batch.forward_mode.is_decode_or_idle():
+            dsa.init_forward_metadata_in_graph(forward_batch)
         if self._ingraph_pack is not None and forward_batch.forward_mode.is_decode():
             self._ingraph_device_step(forward_batch.seq_lens.shape[0])
         # NOTE: there used to be a bs==1 in-graph kept-table append here from
@@ -1054,6 +1134,13 @@ class VestigeKVMLABackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.base.init_cuda_graph_state(max_bs, max_num_tokens)
         self._graph_max_bs = max_bs
+        # The hybrid wrapper sizes graph state for its decode backend only; the
+        # sibling's decode metadata is captured too, so it needs its own (now,
+        # or when the pair is bound -- see _dsa_sibling).
+        self._graph_state_args = (max_bs, max_num_tokens)
+        dsa = self._dsa_sibling()
+        if dsa is not None:
+            dsa.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.base.get_cuda_graph_seq_len_fill_value()
@@ -1065,6 +1152,9 @@ class VestigeKVMLABackend(AttentionBackend):
         return self.base.shared_read_ends(fm)
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        dsa = self._dsa_sibling()
+        if dsa is not None and forward_batch.forward_mode.is_decode_or_idle():
+            return dsa.get_indexer_metadata(layer_id, forward_batch)
         return self.base.get_indexer_metadata(layer_id, forward_batch)
 
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
@@ -1434,6 +1524,13 @@ class VestigeKVMLABackend(AttentionBackend):
                 "VestigeKV salience: first keys filed (layer %s, %d rows)",
                 layer_id, int(pos.numel()),
             )
+        if forward_batch.forward_mode.is_decode() and not getattr(
+            self, "_salience_decode_seen", False
+        ):
+            # The evidence line for the split pair: decode keys reach the ring
+            # only when the sibling's indexer runs (see _dsa_sibling).
+            self._salience_decode_seen = True
+            logger.info("VestigeKV salience: first DECODE keys filed (layer %s)", layer_id)
         # Stamped before the key: _ring_sigma trusts a row only when the stamp
         # says this exact position wrote it, so a stale row can never be read
         # as a fresh one.
@@ -1576,6 +1673,15 @@ class VestigeKVMLABackend(AttentionBackend):
         # sized it (>= the compressed length -> correct, empty splits merge out).
         fm = self.base.forward_metadata
         lid = layer.layer_id
+        # The indexer's selection for this step (DSA models, sibling-driven):
+        # the fenced arm's rows. The base's decode signature has no such
+        # keyword, so it is taken off here whether or not it is used.
+        topk = kwargs.pop("topk_indices", None)
+        if topk is not None and self._dsa_topk:
+            # [bs, index_topk + kpool - 1]: pooled budget plus the unpooled tail
+            topk = topk[:, : self._dsa_topk + self._dsa_kpool - 1]
+        else:
+            topk = None
         # In-graph: record this step's expanded query into the fixed-address
         # qbuf so the NEXT step's out-graph recall scan can read it
         # (stale-by-one recall; fixed-shape index_copy_, capture-safe). Padded
@@ -1614,6 +1720,12 @@ class VestigeKVMLABackend(AttentionBackend):
                     self._stage_seq[:bs],
                     self._stage_loc[:bs],
                 )
+                # Captured as a pointer: the indexer writes this buffer inside
+                # the same graph every replay, so the fork reads that step's
+                # selection. None keeps the page-table fence (non-DSA models).
+                self._router.rows[lid].topk = topk
+                self._router.rows[lid].topk_k = self._dsa_topk
+                self._router.rows[lid].kpool = self._dsa_kpool
         else:
             # Eager step: the metadata hook packed this step's CSR into the
             # same buffers the graphs read. Sized for the whole request
@@ -1633,6 +1745,12 @@ class VestigeKVMLABackend(AttentionBackend):
             # cannot express (a slot with no compressed state for this layer
             # attends its full row set), and they are off the hot path anyway.
             self._router.rows.pop(lid, None)
+            if topk is not None:
+                # The eager pack ran before this layer's indexer; its fenced
+                # segments hold placeholder rows sized min(seq, TOPK). Fill
+                # them with the selection now, so an eager step attends the
+                # same rows a captured one does.
+                self._patch_fenced_rows_eager(lid, forward_batch, bs, topk)
         if self._router is not None:
             self._router.current_layer = lid
         saved = (fm.kv_indptr, fm.kv_indices)
@@ -1643,6 +1761,36 @@ class VestigeKVMLABackend(AttentionBackend):
             )
         finally:
             fm.kv_indptr, fm.kv_indices = saved
+
+    def _dsa_attended(self, seq):
+        # dsa/utils.compute_dsa_seqlens: whole index pools clamped to the
+        # budget, plus the unpooled tail; the selection is compact up to this.
+        tail = seq % self._dsa_kpool
+        return torch.clamp(seq - tail, max=self._dsa_topk) + tail
+
+    def _patch_fenced_rows_eager(self, lid, forward_batch, bs, topk):
+        real = forward_batch.out_cache_loc.shape[0]
+        slots = forward_batch.req_pool_indices[:real].to(torch.int64)
+        reqs = slots.tolist()
+        unseen = [self._close_state.get((r, lid)) is None for r in reqs]
+        fenced = torch.tensor(unseen, dtype=torch.bool, device=slots.device)
+        if self.config.overflow_fallback and lid in self._fetch_ovf:
+            fenced |= self._fetch_ovf[lid].gather(0, slots) != 0
+        if not bool(fenced.any()):
+            return
+        bufs = self._graph_bufs[lid]
+        K = self._dsa_topk + self._dsa_kpool - 1
+        seq = forward_batch.seq_lens[:real].to(torch.int64)
+        n = self._dsa_attended(seq)
+        starts = bufs["indptr"][:real].to(torch.int64)
+        col = torch.arange(K, device=slots.device)
+        live = fenced[:, None] & (col[None, :] < n[:, None])
+        trash = bufs["indices"].shape[0] - 1
+        dst = torch.where(live, starts[:, None] + col[None, :], trash)
+        rows = topk[:real, :K].to(torch.int64).clamp_min(0)
+        bufs["indices"].scatter_(
+            0, dst.reshape(-1), rows.reshape(-1).to(bufs["indices"].dtype)
+        )
 
     # ---- VestigeKV core: tier-1 sidecar-residual eviction over the latent pool ----
 
@@ -1824,6 +1972,8 @@ class VestigeKVMLABackend(AttentionBackend):
             seq=self._stage_seq[:bs] if fence else None,
             fetch_ovf=self._fetch_ovf_stack if fence else None,
             req_to_token=self.req_to_token_pool.req_to_token if fence else None,
+            topk=self._dsa_topk,
+            kpool=self._dsa_kpool,
         )
 
     def _ensure_stage(self, n, dev):
@@ -2554,6 +2704,11 @@ class VestigeKVMLABackend(AttentionBackend):
         if fence:
             fenced |= self._fetch_ovf[lid].gather(0, slots) != 0
         seq = forward_batch.seq_lens[:real].to(torch.int64)
+        if self._dsa_topk:
+            # DSA fallback: the lane attends what DSA attends; the page-table
+            # rows packed here are placeholders the layer's forward_decode
+            # overwrites (_patch_fenced_rows_eager).
+            seq = self._dsa_attended(seq)
         cache = self._dense_cache
         if cache is None or cache[0] is not forward_batch:
             seqmax = int(self._seq_lens_host(forward_batch)[:real].max())

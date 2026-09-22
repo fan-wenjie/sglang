@@ -702,7 +702,7 @@ class RecallTier:
                 self.csk,
                 self.rho,
                 sc_,
-                self.zp * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5,
+                self.zp * sc_ / (self.geom.kv_lora_rank - self.r) ** 0.5,
                 out=self._hit_buf,
             )
             != 0

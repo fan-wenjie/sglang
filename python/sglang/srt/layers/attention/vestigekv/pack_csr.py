@@ -54,6 +54,8 @@ def _pack_csr_prep_kernel(
     MAXBS1,
     FENCE: tl.constexpr,
     SHARDED: tl.constexpr,
+    TOPK: tl.constexpr = 0,
+    KPOOL: tl.constexpr = 1,
 ):
     # One program PER LAYER (layers share no state), three passes each
     # reading only PRE-STEP state:
@@ -79,6 +81,11 @@ def _pack_csr_prep_kernel(
                 seq = tl.load(seq_ptr + i).to(tl.int64)
                 if SHARDED:
                     seq = tl.cdiv(seq - sh_off, sh_stride)
+                if TOPK > 0:
+                    # DSA fallback: a fenced lane attends what DSA attends
+                    # (dsa/utils.compute_dsa_seqlens), not its whole page table.
+                    tail = seq % KPOOL
+                    seq = tl.minimum(seq - tail, TOPK) + tail
                 n = tl.where(fenced, seq, n)
             run += n
             tl.store(indptr_ptr + li * MAXBS1 + i + 1, run)
@@ -131,6 +138,8 @@ def _pack_csr_gather_kernel(
     BLOCK: tl.constexpr,
     FENCE: tl.constexpr,
     SHARDED: tl.constexpr,
+    TOPK: tl.constexpr = 0,
+    KPOOL: tl.constexpr = 1,
 ):
     li = tl.program_id(0)
     lane = tl.program_id(1)
@@ -152,6 +161,11 @@ def _pack_csr_gather_kernel(
         rows = seq
         if SHARDED:
             rows = tl.cdiv(seq - sh_off, sh_stride)
+        if TOPK > 0:
+            # Placeholder page-table rows within the indptr segment the prep
+            # sized; the fork reads the indexer's rows instead (VK_TOPK).
+            tail = rows % KPOOL
+            rows = tl.minimum(rows - tail, TOPK) + tail
         for i in range(tl.cdiv(rows, BLOCK)):
             j = i * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
             m = j < rows
@@ -201,6 +215,8 @@ def pack_csr_all_layers(
     req_to_token=None,
     own=None,
     shard=None,
+    topk=0,
+    kpool=1,
 ):
     """Two launches for every layer's CSR. Stacked tensors: kept_buf
     [L, R1, CAP], kept_len/fetch_len [L, R1], fetch_buf [L, R1, FW],
@@ -249,6 +265,8 @@ def pack_csr_all_layers(
         indptr.shape[1],
         FENCE=fence,
         SHARDED=sharded,
+        TOPK=topk,
+        KPOOL=max(1, kpool),
     )
     _pack_csr_gather_kernel[(L, bs)](
         slots,
@@ -273,4 +291,6 @@ def pack_csr_all_layers(
         BLOCK=512,
         FENCE=fence,
         SHARDED=sharded,
+        TOPK=topk,
+        KPOOL=max(1, kpool),
     )
