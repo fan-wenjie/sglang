@@ -28,6 +28,7 @@ def _be(n_layers=3):
     be.lean_step = False
     be._dsa = SimpleNamespace()  # a resolved sibling
     be._full_arm = lambda: False
+    be._stats = {"lean": 0, "topk": 0}
     return be
 
 

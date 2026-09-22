@@ -353,6 +353,7 @@ class VestigeKVDSABackend(AttentionBackend):
         self._needs_recapture = False  # an install awaits its coalesced recapture
         self._stats["replays"] = self._stats["n_build"] = 0
         self._stats["n_capture"] = 0
+        self._stats["lean"] = self._stats["topk"] = 0
         self._stats["t_build"] = self._stats["t_capture"] = 0.0
         for _k in ("t_replay", "t_replay_host", "t_eager"):
             self._stats[_k] = 0.0
@@ -379,6 +380,7 @@ class VestigeKVDSABackend(AttentionBackend):
             cur = int(host)
             self.lean_step = cur == self._ovf_last
             self._ovf_last = cur
+        self._stats["lean" if self.lean_step else "topk"] += 1
         return VK_LEAN if self.lean_step else VK_TOPK
 
     def _probe_overflow(self):
@@ -1009,7 +1011,7 @@ class VestigeKVDSABackend(AttentionBackend):
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
             "pack=%.2fms/step "
             "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
-            "attended_frac=%.4f",
+            "attended_frac=%.4f variant[lean=%d topk=%d] ovf_by_layer=%s",
             st["steps"],
             len(self._mla_lids),
             100.0 * st["replays"] / n,
@@ -1035,6 +1037,9 @@ class VestigeKVDSABackend(AttentionBackend):
             st["kept"] / c,
             st["seq"] / c,
             (st["fetched"] + st["kept"]) / max(st["seq"], 1),
+            st["lean"],
+            st["topk"],
+            self._ovf_count_stack.tolist() if self._ovf_count_stack is not None else [],
         )
 
     def _overflow_total(self) -> int:
