@@ -151,6 +151,37 @@ class TestDecodeForkRowSource(CustomTestCase):
         self._topk_case(seq=100, K=256)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_a_pad_inside_the_count_contributes_nothing(self):
+        """DSA's decode kernel masks `slot >= 0` per entry rather than trusting
+        a compact layout; the fenced arm does the same, so a -1 inside the
+        counted span equals the CSR over the valid rows only."""
+        import msgspec
+
+        gen = torch.Generator(device="cuda").manual_seed(29)
+        pool = torch.randn(POOL, 1, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+        q = torch.randn(1, H, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+        vk = _rows(gen)
+        slot = int(vk.slots[0])
+        vk.fetch_ovf[slot] = 1
+        vk.seq[0] = 777
+        K = 256
+        topk = torch.randperm(POOL, device="cuda", generator=gen)[:K].to(torch.int32)[None, :]
+        topk[0, 5] = -1
+        topk[0, 200] = -1
+        vk = msgspec.structs.replace(vk, topk=topk, topk_k=K, kpool=1)
+        keep = topk[0] >= 0
+        indices = topk[0][keep].to(torch.int64)
+        indptr = torch.tensor([0, indices.numel()], dtype=torch.int32, device="cuda")
+        a_out, a_lse = _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=False)
+        vk_indptr = torch.tensor([0, K], dtype=torch.int32, device="cuda")
+        b_out, b_lse = _run(q, pool, pool[:, :, :LV], vk_indptr, indices, vk, tiers=True)
+        torch.cuda.synchronize()
+        # The split schedule sees K vs K-2 rows, so the reduction order can
+        # differ by a split boundary: compare the merged result to 1 ulp.
+        self.assertTrue(torch.allclose(a_lse, b_lse, atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.allclose(a_out, b_out, atol=1e-4, rtol=1e-4))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_a_pooled_index_adds_the_tail_outside_the_budget(self):
         # GLM's 4:1 index pool: 777 = 194 pools + 1 tail -> 256 + 1 rows
         self._topk_case(seq=777, K=256, kpool=4)

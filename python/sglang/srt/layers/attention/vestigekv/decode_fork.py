@@ -113,6 +113,7 @@ def _vk_row_loop(
     site. The SASS is unchanged against the two hand-duplicated loops."""
     for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
+        row_ok = offs_n < split_kv_end
         if AFFINE:
             # AFFINE: the page table of this request is one contiguous run, so a
             # fenced row id is base + offs_n and the K address is affine in the
@@ -156,6 +157,10 @@ def _vk_row_loop(
                         mask=live & vk_fenced,
                         other=0,
                     )
+                    # DSA's own decode kernel gathers by slot and masks
+                    # `slot >= 0` per entry (triton_sparse_mla_decode); the same
+                    # here, so a pad inside the count contributes nothing.
+                    row_ok = row_ok & ((rid >= 0) | (not vk_fenced))
                     fenced_row = tl.maximum(rid, 0)
                 else:
                     rid = tl.load(
@@ -177,7 +182,7 @@ def _vk_row_loop(
             )
         k = tl.load(
             K_Buffer + offs_buf_k,
-            mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+            mask=row_ok[None, :] & (mask_d[:, None]),
             other=0.0,
         )
         if IS_GFX1250:
@@ -195,7 +200,7 @@ def _vk_row_loop(
                 )
             kpe = tl.load(
                 K_Buffer + offs_buf_kpe,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                mask=row_ok[None, :] & (mask_dpe[:, None]),
                 other=0.0,
             )
             qk += tl.dot(qpe, kpe.to(qpe.dtype))
@@ -214,16 +219,14 @@ def _vk_row_loop(
                 offs_n[None, :],
                 cur_batch,
                 cur_head[:, None],
-                mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                mask_h[:, None] & row_ok[None, :],
                 Aux0,
                 aux0_stride_t,
                 aux0_stride_h,
                 aux0_len,
             )
 
-        qk = tl.where(
-            mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
-        )
+        qk = tl.where(mask_h[:, None] & row_ok[None, :], qk, float("-inf"))
         if HAS_MLA:
             v = tl.trans(k)
         else:
@@ -237,7 +240,7 @@ def _vk_row_loop(
                 )
             v = tl.load(
                 V_Buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                mask=row_ok[:, None] & (mask_dv[None, :]),
                 other=0.0,
             )
 
