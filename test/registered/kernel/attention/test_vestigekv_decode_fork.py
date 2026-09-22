@@ -231,5 +231,100 @@ class TestDecodeForkRegisters(CustomTestCase):
             self.assertLess(u["REG"], 255, f"fence={fence} is at the ceiling: {u}")
 
 
+
+
+# ---------------------------------------------------------------------------
+# The cross-rank merge: two ranks holding a lane's rows must produce the
+# attention of the union (docs/context-parallel.md).
+#
+# Stage 1 writes a per-split output and a per-split LSE; stage 2 reduces them
+# and stores only the output, so each rank's combined LSE has to be recovered
+# from the same buffer stage 2 read. These cases pin both halves of that: the
+# recovery, and the merge it feeds.
+# ---------------------------------------------------------------------------
+
+
+class TestCrossRankMerge(CustomTestCase):
+    def _fixture(self, seed):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        pool = torch.randn(POOL, 1, LK, dtype=torch.bfloat16, device="cuda",
+                           generator=gen)
+        q = torch.randn(1, H, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+        vk = _rows(gen)
+        slot = int(vk.slots[0])
+        nk, nf = int(vk.kept_len[slot]), int(vk.fetch_len[slot])
+        ids = torch.cat([vk.kept_buf[slot, :nk], vk.fetch_buf[slot, :nf]])
+        return vk, q, pool, ids.to(torch.int64)
+
+    def _stage2(self, mid_o, mid_lse, q, nks, vb, indptr):
+        from sglang.kernels.ops.attention.decode_attention import (
+            _decode_softmax_reducev_fwd,
+        )
+
+        bs = q.shape[0]
+        o = torch.zeros(bs, H, LV, dtype=torch.float32, device="cuda")
+        # stage 2 reads a lane's length from here; zeros make every lane empty
+        # and the normalisation divides by zero, which shows up as nan rather
+        # than as an error.
+        _decode_softmax_reducev_fwd(
+            mid_o, mid_lse, q, o, 1.0, vb, indptr, nks, SPLITS
+        )
+        return o
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_two_ranks_reproduce_the_whole_row_set(self):
+        from sglang.srt.layers.attention.vestigekv.tier_decode import (
+            combined_lse,
+            merge_across_ranks,
+        )
+
+        vk, q, pool, indices = self._fixture(11)
+        n = indices.numel()
+        cut = n // 2
+        kb, vb = pool, pool[:, :, :LV]
+        indptr = torch.tensor([0, n], dtype=torch.int32, device="cuda")
+        nks = torch.full((q.shape[0],), SPLITS, dtype=torch.int32, device="cuda")
+
+        whole = self._stage2(*_run(q, kb, vb, indptr, indices, vk, tiers=False), q, nks, vb, indptr)
+
+        parts = []
+        for lo, hi in ((0, cut), (cut, n)):
+            ip = torch.tensor([0, hi - lo], dtype=indptr.dtype, device="cuda")
+            ix = indices[lo:hi].contiguous()
+            mid_o, mid_lse = _run(q, kb, vb, ip, ix, vk, tiers=False)
+            parts.append((self._stage2(mid_o, mid_lse, q, nks, vb, ip),
+                          combined_lse(mid_lse, nks, SPLITS)))
+
+        merged, _ = merge_across_ranks(parts)
+        self.assertTrue(
+            torch.allclose(merged, whole, atol=2e-3, rtol=2e-3),
+            f"max |diff| {(merged - whole).abs().max().item():.3e}",
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_dropping_a_rank_is_caught(self):
+        # The comparison above is only worth running if it can fail: one rank's
+        # half is not the union's answer.
+        from sglang.srt.layers.attention.vestigekv.tier_decode import (
+            combined_lse,
+            merge_across_ranks,
+        )
+
+        vk, q, pool, indices = self._fixture(11)
+        n = indices.numel()
+        kb, vb = pool, pool[:, :, :LV]
+        indptr = torch.tensor([0, n], dtype=torch.int32, device="cuda")
+        nks = torch.full((q.shape[0],), SPLITS, dtype=torch.int32, device="cuda")
+        whole = self._stage2(*_run(q, kb, vb, indptr, indices, vk, tiers=False), q, nks, vb, indptr)
+
+        ip = torch.tensor([0, n // 2], dtype=indptr.dtype, device="cuda")
+        mid_o, mid_lse = _run(q, kb, vb, ip, indices[: n // 2].contiguous(), vk,
+                              tiers=False)
+        one, _ = merge_across_ranks(
+            [(self._stage2(mid_o, mid_lse, q, nks, vb, ip), combined_lse(mid_lse, nks, SPLITS))]
+        )
+        self.assertGreater((one - whole).abs().max().item(), 1e-2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

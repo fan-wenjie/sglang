@@ -186,6 +186,44 @@ def _blend_omitted_mass(o, attn_lse, num_kv_splits, logm_buf, mu_buf, slots):
     view.copy_(view.float() * sigma + mu.float() * (1.0 - sigma))
 
 
+def combined_lse(attn_lse, num_kv_splits, max_kv_splits):
+    """This rank's log-sum-exp over the rows it holds, for a cross-rank merge.
+
+    Upstream's stage 1 stores one LSE per split -- `e_max + log(e_sum)` for the
+    rows that split covered -- and stage 2 reduces them while writing only
+    `acc / e_sum` to the output. So a rank's combined LSE exists nowhere after
+    stage 2 and has to be taken from the same buffer stage 2 read: the reduction
+    is log-sum-exp over the valid splits, which is what stage 2 does internally.
+
+    Computing it here rather than making stage 2 emit it keeps upstream
+    untouched, which is the whole reason the router redirects one call instead
+    of forking the launcher.
+
+    attn_lse is [bs, H, max_kv_splits] and only the first num_kv_splits[b] of
+    each row are written; the rest are whatever the buffer held, so they are
+    masked to -inf rather than trusted to be small.
+    """
+    idx = torch.arange(max_kv_splits, device=attn_lse.device)
+    valid = idx.view(1, 1, -1) < num_kv_splits.view(-1, 1, 1)
+    return torch.logsumexp(attn_lse.masked_fill(~valid, float("-inf")), dim=-1)
+
+
+def merge_across_ranks(parts):
+    """Combine per-rank (output, lse) into the attention of the union.
+
+    parts: [(o, lse)] with o [bs, H, Lv] and lse [bs, H]. Softmax's own
+    associativity: the union's output is the lse-weighted average of the
+    ranks', which is what upstream's merge_state computes pairwise. A rank
+    holding no rows carries lse -inf and drops out on its own.
+    """
+    from sglang.srt.layers.attention.merge_state import merge_state
+
+    o, lse = parts[0]
+    for o_next, lse_next in parts[1:]:
+        o, lse = merge_state(o, lse, o_next, lse_next)
+    return o, lse
+
+
 def rows_for_layer(backend, lid, slots, seq, loc) -> VestigeKVRows:
     """The arrays the fork reads for one layer of this step. Views, not copies:
     every one of them is a fixed-address buffer the graph already writes."""
