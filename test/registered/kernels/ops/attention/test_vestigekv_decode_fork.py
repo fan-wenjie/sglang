@@ -176,10 +176,20 @@ class TestDecodeForkRowSource(CustomTestCase):
         vk_indptr = torch.tensor([0, K], dtype=torch.int32, device="cuda")
         b_out, b_lse = _run(q, pool, pool[:, :, :LV], vk_indptr, indices, vk, tiers=True)
         torch.cuda.synchronize()
-        # The split schedule sees K vs K-2 rows, so the reduction order can
-        # differ by a split boundary: compare the merged result to 1 ulp.
-        self.assertTrue(torch.allclose(a_lse, b_lse, atol=1e-5, rtol=1e-5))
-        self.assertTrue(torch.allclose(a_out, b_out, atol=1e-4, rtol=1e-4))
+        # The two runs partition the rows into splits differently (K lanes vs
+        # K-2), so the per-split partials are not comparable; what stage 2
+        # produces from them is. Merge the way it does and compare at the
+        # precision the P.V dot carries (p is cast to bf16 per split).
+
+        def merge(o, l):
+            m = l.max(-1, keepdim=True).values
+            w = torch.exp(l - m)
+            return (o * w[..., None]).sum(2) / w.sum(-1, keepdim=True), m.squeeze(-1) + torch.log(w.sum(-1))
+
+        ao, al = merge(a_out, a_lse)
+        bo, bl = merge(b_out, b_lse)
+        self.assertTrue(torch.allclose(al, bl, atol=1e-5, rtol=1e-5), "merged lse differs")
+        self.assertTrue(torch.allclose(ao, bo, atol=2e-3, rtol=2e-3), "merged output differs")
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_a_pooled_index_adds_the_tail_outside_the_budget(self):
