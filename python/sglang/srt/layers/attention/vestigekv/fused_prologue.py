@@ -210,7 +210,11 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0,
         EMIT_MST=mst is not None,
         BLOCK_D=D.d_block_for_rank(R),
         THR_LSE=bool(thr_lse),
-        num_warps=4,
+        # 8 warps: bit-identical to 4 (the ieee dot is a per-element FMA
+        # chain, so the warp split changes no summation order; checked on
+        # random operands 2026-09-22) and 4x faster on the one-program-per-
+        # pair grid, which is latency-bound at every context length.
+        num_warps=8,
     )
     return max1g, qside_t, qsk_t, qres
 
@@ -623,7 +627,11 @@ def fused_prologue_split(
         QD=QD,
         BLOCK_D=D.d_block_for_rank(R),
         THR_LSE=bool(thr_lse),
-        num_warps=4,
+        # 8 warps: bit-identical to 4 (the ieee dot is a per-element FMA
+        # chain, so the warp split changes no summation order; checked on
+        # random operands 2026-09-22) and 4x faster on the one-program-per-
+        # pair grid, which is latency-bound at every context length.
+        num_warps=8,
     )
     return max1g, qside_t, qsk_t, qres
 
@@ -744,7 +752,7 @@ def compact_fired(
     """
     Am = am_grid
     P = p_live if p_live is not None else a_len.shape[0]
-    BLOCK_A = 1024
+    BLOCK_A = D.SCAN_BUCKET
     NB = triton.cdiv(Am, BLOCK_A)
     counts, offsets, total = scratch
     # counts arrive pre-filled by the scan kernel's fused per-block

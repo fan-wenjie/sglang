@@ -150,6 +150,16 @@ covers the buckets with SCAN_GRID_CAP programs per pair: same worst-case
 coverage, ~8x smaller dispatch floor, and real work (which is bandwidth-bound)
 is unaffected."""
 
+SCAN_BUCKET = 256
+"""Archive rows per compact bucket: one scan program's unit of work and the
+granularity of the two-phase compaction's counts. The compacted order is the
+archive order whatever the bucket size (bucket prefix + in-bucket position),
+so this changes no fetched row. Measured at 1024 (node-level nsys, GLM-5.3-
+Flash, bs=1): the scan took 36 us/step at 4k AND at 32k -- it was the serial
+16-block loop per program, not bandwidth (22 programs live at 4k). 256 gives
+4x the programs and a 4-block loop; at capacity the SCAN_GRID_CAP grid-stride
+covers the same worst case."""
+
 SCAN_CAPTURE_AFTER = 8
 """Decode steps one scan shape must hold before it is captured, so a short
 generation does not pay for a graph it replays a handful of times."""

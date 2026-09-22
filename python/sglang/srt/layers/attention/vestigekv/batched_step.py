@@ -279,7 +279,7 @@ class BatchedScanPack:
         self.pm = torch.zeros(P, _NSPLIT, H, device=dev)
         self.ps = torch.zeros(P, _NSPLIT, H, device=dev)
         self.pt = torch.zeros(P, _NSPLIT, H, device=dev)
-        NB = (Am + 1023) // 1024
+        NB = (Am + D.SCAN_BUCKET - 1) // D.SCAN_BUCKET
         self.c_counts = torch.zeros(P, NB, dtype=torch.int32, device=dev)
         self.c_offsets = torch.zeros(P, NB, dtype=torch.int32, device=dev)
         self.c_total = torch.zeros(P, dtype=torch.int32, device=dev)
@@ -424,7 +424,7 @@ class BatchedScanPack:
         self.pm = torch.zeros(P, _NSPLIT, H, device=dev)
         self.ps = torch.zeros(P, _NSPLIT, H, device=dev)
         self.pt = torch.zeros(P, _NSPLIT, H, device=dev)
-        NB = (Am + 1023) // 1024
+        NB = (Am + D.SCAN_BUCKET - 1) // D.SCAN_BUCKET
         self.c_counts = torch.zeros(P, NB, dtype=torch.int32, device=dev)
         self.c_offsets = torch.zeros(P, NB, dtype=torch.int32, device=dev)
         self.c_total = torch.zeros(P, dtype=torch.int32, device=dev)
@@ -657,7 +657,7 @@ class BatchedScanPack:
         Am = self.am_grid
         P = P_eff
         _scan_batched_kernel[
-            (min(triton.cdiv(Am, D.SCAN_BLOCK_A * 16), D.SCAN_GRID_CAP), P)
+            (min(triton.cdiv(Am, D.SCAN_BUCKET), D.SCAN_GRID_CAP), P)
         ](
             qside_t,
             qsk_t,
@@ -687,7 +687,7 @@ class BatchedScanPack:
             KV_OFF=self.geom.kv_lora_rank,
             POOL_ROWS=self._pool_rows or 1,
             BLOCK_A=D.SCAN_BLOCK_A,
-            MULTI=16,  # 16 x BLOCK_A(64) = one 1024-row compact bucket
+            MULTI=D.SCAN_BUCKET // D.SCAN_BLOCK_A,  # blocks per compact bucket
             num_warps=D.SCAN_NUM_WARPS,
         )
         # Deterministic two-phase Triton compaction: the torch chain's int64
