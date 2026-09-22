@@ -241,3 +241,87 @@ class TestClosedPrefixWatermark(CustomTestCase):
         )
         self.assertTrue(torch.equal(t.rho, t._rho_all.index_select(0, arch_idx)))
         self.assertTrue(torch.equal(t.arch, slots[arch_idx]), "arch must be pool ids")
+
+
+# ---------------------------------------------------------------------------
+# Calibrating zp when the archive is split across ranks.
+#
+# zp is fitted on the best ARCHIVED row per calibration query, and that best is
+# a max over the archive. A rank's own max is at or below the union's, so left
+# alone every rank calibrates against a worse row than the one that exists, zp
+# comes out too small, and the certificate fires too little. That is a recall
+# failure, which is the direction that matters (docs/context-parallel.md).
+# ---------------------------------------------------------------------------
+
+
+class TestZpAcrossShards(CustomTestCase):
+    def test_every_query_is_owned_by_exactly_one_rank(self):
+        from sglang.srt.layers.attention.vestigekv.recall_tier import (
+            owned_calibration_queries,
+        )
+
+        bests = [
+            torch.tensor([5.0, 1.0, 3.0, 9.0]),
+            torch.tensor([2.0, 7.0, 3.0, 4.0]),
+            torch.tensor([5.0, 0.0, 1.0, 9.0]),
+        ]
+        masks = [
+            owned_calibration_queries(b, bests, r, len(bests))
+            for r, b in enumerate(bests)
+        ]
+        counts = sum(m.int() for m in masks)
+        self.assertTrue(
+            bool((counts == 1).all()),
+            f"a query owned {counts.tolist()} times; ties must break to one rank",
+        )
+
+    def test_the_owner_is_the_rank_holding_the_best_row(self):
+        from sglang.srt.layers.attention.vestigekv.recall_tier import (
+            owned_calibration_queries,
+        )
+
+        bests = [torch.tensor([5.0, 1.0]), torch.tensor([2.0, 7.0])]
+        m0 = owned_calibration_queries(bests[0], bests, 0, 2)
+        m1 = owned_calibration_queries(bests[1], bests, 1, 2)
+        self.assertEqual(m0.tolist(), [True, False])
+        self.assertEqual(m1.tolist(), [False, True])
+
+    def test_the_quantile_is_taken_on_the_union(self):
+        # A per-rank quantile of a per-rank sample guarantees nothing about the
+        # union, and the two differ: this sample's union quantile is not either
+        # half's.
+        from sglang.srt.layers.attention.vestigekv.recall_tier import zp_from_pooled
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+
+        # n has to clear min_hard (18) or the k-th order statistic does not
+        # exist -- which is what the caller's need_more_hard guard is for.
+        a = torch.linspace(0.1, 0.4, 32)
+        b = torch.linspace(5.0, 8.0, 32)
+        pooled = zp_from_pooled([a, b], 64, D.RECALL_TARGET)
+        only_a = zp_from_pooled([a], 32, D.RECALL_TARGET)
+        self.assertNotAlmostEqual(pooled, only_a, places=3)
+        self.assertGreaterEqual(pooled, only_a)
+
+    def test_an_empty_shard_contributes_nothing(self):
+        # A rank that owns no query still calls this; an empty tensor in the
+        # concatenation must not shift the order statistic.
+        from sglang.srt.layers.attention.vestigekv.recall_tier import zp_from_pooled
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+
+        a = torch.linspace(1.0, 4.0, 32)
+        self.assertEqual(
+            zp_from_pooled([a, torch.empty(0)], 32, D.RECALL_TARGET),
+            zp_from_pooled([a], 32, D.RECALL_TARGET),
+        )
+
+    def test_a_miscounted_union_is_refused(self):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.recall_tier import zp_from_pooled
+
+        a = torch.linspace(1.0, 4.0, 32)
+        with self.assertRaises(ValueError):
+            zp_from_pooled([a], 64, D.RECALL_TARGET)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
