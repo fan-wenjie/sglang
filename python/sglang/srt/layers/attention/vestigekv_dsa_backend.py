@@ -136,6 +136,7 @@ class VestigeKVDSABackend(AttentionBackend):
     lean_step = False  # this step needs no selection (graph_variants.VK_LEAN)
     _ovf_probe = None  # (device scalar, pinned host scalar, event) of the overflow counter
     _ovf_last = 0
+    _lean_graph = False
     _model_runner = None  # bound in __init__; None on __new__ fakes
     _graph_state_args = None
     _dsa_topk = 0  # its index_topk; the fenced arm's row budget on DSA models
@@ -319,7 +320,9 @@ class VestigeKVDSABackend(AttentionBackend):
             set_vestigekv_variant_source,
         )
 
-        set_vestigekv_variant_source(self._variant_for_step)
+        self._lean_graph = envs.SGLANG_ENABLE_VESTIGEKV_LEAN_GRAPH.get()
+        if self._lean_graph:
+            set_vestigekv_variant_source(self._variant_for_step)
         # Fixed fetch-buffer width: graph capture needs a fixed WIDTH, not a
         # cap. A fire past it raises the pair's overflow flag; the pack then
         # fences that step to the full row set (config.overflow_fallback) or
@@ -491,7 +494,7 @@ class VestigeKVDSABackend(AttentionBackend):
         dsa = self._dsa_sibling()
         if dsa is not None and forward_batch.forward_mode.is_decode_or_idle():
             dsa.init_forward_metadata_out_graph(forward_batch, in_capture)
-        if not in_capture and forward_batch.forward_mode.is_decode():
+        if self._lean_graph and not in_capture and forward_batch.forward_mode.is_decode():
             self._probe_overflow()
         if (
             not in_capture
