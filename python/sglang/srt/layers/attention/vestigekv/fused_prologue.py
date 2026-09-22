@@ -210,11 +210,10 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0,
         EMIT_MST=mst is not None,
         BLOCK_D=D.d_block_for_rank(R),
         THR_LSE=bool(thr_lse),
-        # 8 warps: bit-identical to 4 (the ieee dot is a per-element FMA
-        # chain, so the warp split changes no summation order; checked on
-        # random operands 2026-09-22) and 4x faster on the one-program-per-
-        # pair grid, which is latency-bound at every context length.
-        num_warps=8,
+        # 8 warps is bit-identical (per-element FMA chains) but measured
+        # slower in the served graph: 35.8 vs 30.6 us/step (32k, bs=1, GLM-5.3-
+        # Flash, node-level nsys 2026-09-22); a synthetic timing said otherwise.
+        num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
 
@@ -627,11 +626,10 @@ def fused_prologue_split(
         QD=QD,
         BLOCK_D=D.d_block_for_rank(R),
         THR_LSE=bool(thr_lse),
-        # 8 warps: bit-identical to 4 (the ieee dot is a per-element FMA
-        # chain, so the warp split changes no summation order; checked on
-        # random operands 2026-09-22) and 4x faster on the one-program-per-
-        # pair grid, which is latency-bound at every context length.
-        num_warps=8,
+        # 8 warps is bit-identical (per-element FMA chains) but measured
+        # slower in the served graph: 35.8 vs 30.6 us/step (32k, bs=1, GLM-5.3-
+        # Flash, node-level nsys 2026-09-22); a synthetic timing said otherwise.
+        num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
 
