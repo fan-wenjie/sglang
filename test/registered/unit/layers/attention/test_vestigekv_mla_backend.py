@@ -228,6 +228,70 @@ class TestSlotReuseInvalidation(CustomTestCase):
         self.assertEqual(int(be._fetch_ovf[LID][0]), 0)
 
 
+class TestDsaFallback(CustomTestCase):
+    """Under the split pair a fenced lane attends the indexer's selection.
+
+    Regression: the fenced arm read the page table (dense attention on a
+    DSA-trained model, which scores below DSA) because the indexer never ran
+    at decode -- the active backend answered its metadata query with None.
+    The decode side now drives the DSA sibling's metadata and patches eager
+    fenced segments with the selection the layer received.
+    """
+
+    def _be(self, topk=8):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.config = SimpleNamespace(overflow_fallback=True)
+        be._dsa_topk = topk
+        be._dsa_kpool = 4
+        be._close_state = {(0, LID): {}, (2, LID): {}}  # slot 1 unseen
+        be._fetch_ovf = {LID: torch.tensor([1, 0, 0], dtype=torch.int32)}  # slot 0 overflowed
+        be._graph_bufs = {
+            LID: {
+                "indptr": torch.tensor([0, 10, 13, 16, 16], dtype=torch.int64),
+                "indices": torch.full((40,), -7, dtype=torch.int64),
+            }
+        }
+        return be
+
+    def test_eager_fenced_segments_take_the_selection(self):
+        be = self._be()
+        fb = SimpleNamespace(
+            out_cache_loc=torch.tensor([100, 101, 102]),
+            req_pool_indices=torch.tensor([0, 1, 2]),
+            seq_lens=torch.tensor([50, 3, 20]),
+        )
+        # width index_topk + kpool - 1 = 11; lane 0: seq 50 = 12 pools + 2 tail
+        # -> min(48, 8) + 2 = 10 rows; lane 1: seq 3 = 0 pools + 3 tail -> 3
+        topk = torch.full((3, 11), -1, dtype=torch.int32)
+        topk[0, :10] = torch.arange(10) + 500
+        topk[1, :3] = torch.tensor([9, 8, 7])
+        topk[2] = torch.arange(11) + 900
+        be._patch_fenced_rows_eager(LID, fb, 3, topk)
+        idx = be._graph_bufs[LID]["indices"]
+        self.assertEqual(idx[0:10].tolist(), (torch.arange(10) + 500).tolist())
+        self.assertEqual(idx[10:13].tolist(), [9, 8, 7])
+        # lane 2: neither overflowed nor unseen -> its segment untouched
+        self.assertTrue(bool((idx[13:16] == -7).all()))
+        self.assertEqual(int(be._dsa_attended(torch.tensor([50]))), 10)
+
+    def test_indexer_metadata_comes_from_the_sibling_at_decode_only(self):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._dsa_resolved = True
+        be._dsa = SimpleNamespace(get_indexer_metadata=lambda lid, fb: "dsa")
+        be.base = SimpleNamespace(get_indexer_metadata=lambda lid, fb: None)
+        decode = SimpleNamespace(forward_mode=SimpleNamespace(is_decode_or_idle=lambda: True))
+        extend = SimpleNamespace(forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False))
+        self.assertEqual(be.get_indexer_metadata(LID, decode), "dsa")
+        self.assertIsNone(be.get_indexer_metadata(LID, extend))
+
+    def test_no_sibling_keeps_the_base_answer(self):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._dsa_resolved = True
+        be.base = SimpleNamespace(get_indexer_metadata=lambda lid, fb: None)
+        fb = SimpleNamespace(forward_mode=SimpleNamespace(is_decode_or_idle=lambda: True))
+        self.assertIsNone(be.get_indexer_metadata(LID, fb))
+
+
 class TestKeptTableCapacity(CustomTestCase):
     """The kept table is sized for the compressed arm, not max_context_len.
 

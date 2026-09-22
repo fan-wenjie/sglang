@@ -104,6 +104,8 @@ def _vk_row_loop(
     VK_FW: tl.constexpr,
     VK_R2T: tl.constexpr,
     AFFINE: tl.constexpr,
+    vk_topk=None,
+    VK_TOPK: tl.constexpr = 0,
 ):
     """One pass over a lane's rows. AFFINE picks where a row id comes from and is
     the only difference between the two arms; the attention math below it is the
@@ -144,11 +146,23 @@ def _vk_row_loop(
                     mask=live & (offs_n >= vk_nk) & (not vk_fenced),
                     other=0,
                 )
-                rid = tl.load(
-                    vk_r2t + vk_slot * VK_R2T + offs_n, mask=live & vk_fenced, other=0
-                )
+                if VK_TOPK > 0:
+                    # DSA fallback: a fenced lane attends the rows the model's
+                    # own indexer selected this step (pool row ids, -1 padded
+                    # past min(seq, TOPK); the lane length stops before the
+                    # pad). The step's new row is among them when it scored.
+                    rid = tl.load(
+                        vk_topk + cur_batch * VK_TOPK + offs_n,
+                        mask=live & vk_fenced,
+                        other=0,
+                    )
+                    fenced_row = tl.maximum(rid, 0)
+                else:
+                    rid = tl.load(
+                        vk_r2t + vk_slot * VK_R2T + offs_n, mask=live & vk_fenced, other=0
+                    )
+                    fenced_row = tl.where(offs_n == vk_last, vk_loc.to(rid.dtype), rid)
                 tier = tl.where(offs_n < vk_nk, kept, fired)
-                fenced_row = tl.where(offs_n == vk_last, vk_loc.to(rid.dtype), rid)
                 kv_loc = tl.where(vk_fenced, fenced_row, tier).to(tl.int64)
         # Page-aware KV address math (see _fwd_kernel_stage1).
         if PAGE_SIZE == 1:
@@ -264,6 +278,7 @@ def _vk_fwd_grouped_kernel_stage1(
     vk_r2t,  # [R1 - 1, VK_R2T] int32 page table
     vk_seq,  # [bs] int64 rows of a fenced lane
     vk_loc_ptr,  # [bs] int64 this step's appended pool row
+    vk_topk,  # VK_TOPK>0: [bs, VK_TOPK] int32 DSA-selected pool rows, -1 padded
     Att_Out,
     Att_Lse,
     num_kv_splits,
@@ -299,6 +314,9 @@ def _vk_fwd_grouped_kernel_stage1(
     ROW_SRC: tl.constexpr,
     FENCE: tl.constexpr = True,
     AFFINE: tl.constexpr = False,
+    VK_TOPK: tl.constexpr = 0,  # row stride of vk_topk (index_topk + kpool - 1)
+    VK_TOPK_K: tl.constexpr = 0,  # the indexer's pooled budget (index_topk)
+    VK_KPOOL: tl.constexpr = 1,  # index cache pooling; tail tokens ride outside the budget
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
@@ -348,6 +366,12 @@ def _vk_fwd_grouped_kernel_stage1(
         if FENCE:
             vk_fenced = tl.load(vk_fetch_ovf + vk_slot) != 0
         vk_seq = tl.load(vk_seq + cur_batch).to(tl.int64)
+        if VK_TOPK > 0:
+            # DSA's own attended count (dsa/utils.compute_dsa_seqlens): whole
+            # pools clamped to the budget plus the unpooled tail; the selection
+            # is compact, -1 only past this count.
+            vk_tail = vk_seq % VK_KPOOL
+            vk_seq = tl.minimum(vk_seq - vk_tail, VK_TOPK_K) + vk_tail
         cur_batch_seq_len = tl.where(
             vk_fenced, vk_seq, vk_nk + tl.load(vk_fetch_len + vk_slot).to(tl.int64)
         )
@@ -554,6 +578,8 @@ def _vk_fwd_grouped_kernel_stage1(
                 VK_FW=VK_FW,
                 VK_R2T=VK_R2T,
                 AFFINE=False,
+                vk_topk=vk_topk,
+                VK_TOPK=VK_TOPK,
             )
         offs_mid_o = (
             cur_batch * stride_mid_ob
@@ -606,6 +632,11 @@ class VestigeKVRows(msgspec.Struct):
     tiers: bool = True
     fence: bool = True
     affine: bool = False
+    # DSA models: the indexer's selection for this step, [bs, TOPK] int32 pool
+    # rows (-1 padded); a fenced lane attends these instead of its page table.
+    topk: object = None
+    topk_k: int = 0  # index_topk: the pooled budget the count formula clamps to
+    kpool: int = 1  # index_kpool
 
 
 def decode_grouped_att_m_fwd(
@@ -708,6 +739,7 @@ def decode_grouped_att_m_fwd(
         vk.r2t,
         vk.seq,
         vk.loc,
+        vk.topk if vk.topk is not None else vk.seq,
         att_out,
         att_lse,
         num_kv_splits,
@@ -744,6 +776,9 @@ def decode_grouped_att_m_fwd(
         ROW_SRC=SRC_TIERS if vk.tiers else SRC_CSR,
         FENCE=vk.fence,
         AFFINE=vk.affine,
+        VK_TOPK=vk.topk.shape[1] if vk.topk is not None else 0,
+        VK_TOPK_K=vk.topk_k if vk.topk is not None else 0,
+        VK_KPOOL=max(1, vk.kpool) if vk.topk is not None else 1,
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         IS_GFX1250=_is_gfx1250,

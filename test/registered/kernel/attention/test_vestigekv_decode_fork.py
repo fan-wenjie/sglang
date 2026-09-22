@@ -111,6 +111,51 @@ class TestDecodeForkRowSource(CustomTestCase):
     def test_a_fenced_lane_equals_its_page_table_as_a_csr(self):
         self._case(fenced=True)
 
+    def _topk_case(self, seq, K, kpool=1):
+        """A fenced lane on a DSA model attends the indexer's selection: the
+        first compute_dsa_seqlens(seq) entries of a [bs, K + kpool - 1] int32
+        row table (whole pools clamped to K, plus the seq % kpool tail), -1
+        past them. Must equal upstream's CSR over exactly those rows."""
+        import msgspec
+
+        gen = torch.Generator(device="cuda").manual_seed(11 + seq)
+        pool = torch.randn(
+            POOL, 1, LK, dtype=torch.bfloat16, device="cuda", generator=gen
+        )
+        q = torch.randn(1, H, LK, dtype=torch.bfloat16, device="cuda", generator=gen)
+        vk = _rows(gen)
+        slot = int(vk.slots[0])
+        vk.fetch_ovf[slot] = 1
+        vk.seq[0] = seq
+        tail = seq % kpool
+        n = min(seq - tail, K) + tail
+        topk = torch.full((1, K + kpool - 1), -1, dtype=torch.int32, device="cuda")
+        topk[0, :n] = torch.randperm(POOL, device="cuda", generator=gen)[:n].to(torch.int32)
+        vk = msgspec.structs.replace(vk, topk=topk, topk_k=K, kpool=kpool)
+        indices = topk[0, :n].to(torch.int64)
+        indptr = torch.tensor([0, n], dtype=torch.int32, device="cuda")
+        a_out, a_lse = _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=False)
+        b_out, b_lse = _run(q, pool, pool[:, :, :LV], indptr, indices, vk, tiers=True)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(a_out, b_out), f"att_out differs (seq={seq}, K={K})")
+        self.assertTrue(torch.equal(a_lse, b_lse), f"att_lse differs (seq={seq}, K={K})")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_a_fenced_lane_attends_the_dsa_selection(self):
+        # seq past the budget: exactly K selected rows, none of the page table
+        self._topk_case(seq=777, K=256)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_a_short_fenced_lane_stops_before_the_pad(self):
+        # seq below the budget: min(seq, K) rows, the -1 pad never addressed
+        self._topk_case(seq=100, K=256)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_a_pooled_index_adds_the_tail_outside_the_budget(self):
+        # GLM's 4:1 index pool: 777 = 194 pools + 1 tail -> 256 + 1 rows
+        self._topk_case(seq=777, K=256, kpool=4)
+        self._topk_case(seq=103, K=256, kpool=4)  # 25 pools + 3 tail = 103
+
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_affine_equals_the_page_table_when_it_is_contiguous(self):
         # The affine arm computes a fenced row id as base + offs_n instead of
