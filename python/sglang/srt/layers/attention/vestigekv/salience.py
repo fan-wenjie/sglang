@@ -75,11 +75,27 @@ def vestigekv_backend_of(backend):
     Hybrid models hand the model a HybridLinearAttnBackend whose full-attention
     half is the one VestigeKV wraps.
     """
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
     )
     from sglang.srt.layers.attention.vestigekv_mla_backend import VestigeKVMLABackend
 
-    if isinstance(backend, HybridLinearAttnBackend):
-        backend = backend.full_attn_backend
+    # A split pair (--prefill-attention-backend dsa --decode-attention-backend
+    # vestigekv_mla) arrives as a HybridAttnBackend; VestigeKV is its decode
+    # side, and that is the side the prefill-time writers (salience keys,
+    # calibration queries) must reach, whichever side is computing attention.
+    # Either nesting order, to a fixed point. The engine composes the
+    # prefill/decode pair from unwrapped backends and applies the linear
+    # wrapper once outside, so the split pair on a hybrid model arrives as
+    # HybridLinear(full=HybridAttn(...)); a single-backend hybrid arrives as
+    # HybridLinear(full=VestigeKV); unwrapping in one fixed order met the
+    # wrong layer first and returned None, silently, for every prefill hook.
+    for _ in range(4):
+        if isinstance(backend, HybridAttnBackend):
+            backend = backend.decode_backend
+        elif isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.full_attn_backend
+        else:
+            break
     return backend if isinstance(backend, VestigeKVMLABackend) else None

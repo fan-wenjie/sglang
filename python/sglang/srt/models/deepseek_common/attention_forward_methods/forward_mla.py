@@ -394,6 +394,27 @@ class DeepseekMLAForwardMixin:
                 else:
                     q = self.q_b_proj_forward(q)
 
+                # VestigeKV prefill calibration on the absorb path. The MHA
+                # path hands its rotated per-head query to the backend
+                # (forward_mha._vestigekv_prefill_queries); a DSA prefill never
+                # takes that path, so under a split pair (DSA prefill,
+                # VestigeKV decode) no calibration queries arrived, no
+                # calibrated index was built, and recall had nothing to recall
+                # with -- measured as a needle miss the single-backend shape
+                # does not have. Rope-less only: here q's pe slice is not yet
+                # rotated, and on a rope-less model there is nothing to rotate,
+                # so this q is exactly the [tokens, H, qk_head_dim] the writer
+                # expects. A roped model keeps the MHA-path hook.
+                if (
+                    self.qk_rope_head_dim == 0
+                    and forward_batch.forward_mode.is_extend()
+                ):
+                    from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
+                        _vestigekv_prefill_queries,
+                    )
+
+                    _vestigekv_prefill_queries(self, q, forward_batch)
+
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
                 if fuse_bmm_attention:
