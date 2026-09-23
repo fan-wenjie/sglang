@@ -2501,7 +2501,7 @@ class VestigeKVDSABackend(AttentionBackend):
                         threshold=self.config.recall_threshold,
                         geom=self.geom,
                     )
-                    tier._audit_lid = lid
+                    tier._audit_lid = job["lid"]
                     stats = tier.build(
                         kbuf,
                         job["row_slots"],
@@ -2549,11 +2549,15 @@ class VestigeKVDSABackend(AttentionBackend):
             if job["error"] is not None:
                 import logging
 
+                # The worker swallows the exception and the slot never retries,
+                # so a coding error here degrades every request silently;
+                # the traceback is the only trace it leaves.
                 logging.getLogger(__name__).warning(
-                    "VestigeKV: async calibrated build failed (%s); the "
+                    "VestigeKV: async calibrated build failed (%r); the "
                     "provisional index keeps serving (over-fetches, never "
                     "under-recalls)",
                     job["error"],
+                    exc_info=job["error"],
                 )
                 st["qcal"] = st["qpos"] = None
                 continue
