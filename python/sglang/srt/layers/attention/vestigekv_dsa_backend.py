@@ -265,6 +265,7 @@ class VestigeKVDSABackend(AttentionBackend):
         self._build_worker = None
         self._build_stream = None
         self._qbuf_stack = self._fetch_stack = self._fetch_len_stack = None
+        self._eager_steps = 0  # eager decode steps; _stats["steps"] counts replays
         self._fetch_ovf_stack = self._ovf_count_stack = None
         self._li_map: dict = {}
         # ---- recall tier (REQUIRED component; no production off-switch) ----
@@ -465,6 +466,11 @@ class VestigeKVDSABackend(AttentionBackend):
         for lid in self._local_mla_lids:
             self._recall_step(lid, forward_batch, reqs)
             self._refresh_graph_bufs(lid, forward_batch, reqs)
+        # The eager step never reaches _account_step, so the recall audit's
+        # host read has to be issued from here or it is never issued at all.
+        self._eager_steps += 1
+        if self._eager_steps % 50 == 0:
+            self._dump_recall_audit()
 
     def _decode_prologue(self, forward_batch):
         # Host-side bookkeeping every decode step runs ahead of its recall,
@@ -989,6 +995,15 @@ class VestigeKVDSABackend(AttentionBackend):
         if st["steps"] % 50 == 0:
             self._dump_stats()
 
+    def _dump_recall_audit(self):
+        # The audit accumulates on the device inside the step; this is its
+        # one host read, and every tier's ring is read whether the step that
+        # filled it was a replay or an eager scan.
+        for (_slot, _lid), _st in self._recall.items():
+            _t = _st.get("tier")
+            if _t is not None and _t._audit is not None:
+                _t._audit.dump(lid=_lid)
+
     def _dump_stats(self):
         import logging
 
@@ -996,13 +1011,8 @@ class VestigeKVDSABackend(AttentionBackend):
         n = max(st["steps"], 1)
         c = max(st["scan_calls"], 1)
         overflow = self._overflow_total()
-        # The recall audit accumulates on the device inside the captured step;
-        # this is its one host read, on the same cadence as the cost stats so
-        # quality and cost land in the log side by side.
-        for (_slot, _lid), _st in self._recall.items():
-            _t = _st.get("tier")
-            if _t is not None and _t._audit is not None:
-                _t._audit.dump(lid=_lid)
+        # Same cadence as the cost stats so quality and cost land side by side.
+        self._dump_recall_audit()
         hist = self._fetch_hist.tolist() if self._fetch_hist is not None else []
         if self._stat_acc is not None:  # the only readback of the per-scan sums
             st["fetched"], st["kept"], st["seq"] = self._stat_acc.tolist()
