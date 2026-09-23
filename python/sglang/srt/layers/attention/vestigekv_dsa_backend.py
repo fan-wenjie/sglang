@@ -996,6 +996,13 @@ class VestigeKVDSABackend(AttentionBackend):
         n = max(st["steps"], 1)
         c = max(st["scan_calls"], 1)
         overflow = self._overflow_total()
+        # The recall audit accumulates on the device inside the captured step;
+        # this is its one host read, on the same cadence as the cost stats so
+        # quality and cost land in the log side by side.
+        for (_slot, _lid), _st in self._recall.items():
+            _t = _st.get("tier")
+            if _t is not None and _t._audit is not None:
+                _t._audit.dump(lid=_lid)
         hist = self._fetch_hist.tolist() if self._fetch_hist is not None else []
         if self._stat_acc is not None:  # the only readback of the per-scan sums
             st["fetched"], st["kept"], st["seq"] = self._stat_acc.tolist()

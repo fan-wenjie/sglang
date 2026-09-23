@@ -75,18 +75,53 @@ class TestStepRecall(CustomTestCase):
 
 
 class TestAudit(CustomTestCase):
-    def test_reports_per_layer_and_counts_steps_below_target(self):
+    """Per-step work is device-only so it captures; the host reads once."""
+
+    def test_a_sequence_no_longer_than_the_budget_is_not_recorded(self):
+        a = RecallAudit(target=0.9, every=4)
+        a.observe(arch=torch.zeros(0, D), q=torch.zeros(1, D), thr=torch.zeros(1),
+                  fired=torch.zeros(0, dtype=torch.bool), lid=3)
+        self.assertIsNone(a.ring)
+
+    def test_observe_touches_no_host_state(self):
+        # the ring and the counter are the only things observe may write;
+        # anything host-side would run once at capture and never again
         arch, q, thr = _case()
-        a = RecallAudit(target=0.9, every=2)
+        a = RecallAudit(target=0.9, every=4)
+        fired = torch.zeros(A, dtype=torch.bool); fired[12:] = True
+        a.observe(arch=arch, q=q, thr=thr, fired=fired, lid=7)
+        self.assertEqual(int(a.count), 1)
+        self.assertEqual(a.reported, 0)
+
+    def test_dump_reports_only_steps_since_the_last_report(self):
+        arch, q, thr = _case()
+        a = RecallAudit(target=0.9, every=8)
         good = torch.zeros(A, dtype=torch.bool); good[12:] = True
         bad = torch.zeros(A, dtype=torch.bool); bad[14:] = True
-        with self.assertLogs(
-            "sglang.srt.layers.attention.vestigekv.recall_audit", "INFO"
-        ) as cm:
+        with self.assertLogs("sglang.srt.layers.attention.vestigekv.recall_audit", "INFO") as cm:
             a.observe(arch=arch, q=q, thr=thr, fired=good, lid=7)
             a.observe(arch=arch, q=q, thr=thr, fired=bad, lid=7)
-        self.assertIn("layer=7", cm.output[0])
+            a.dump(lid=7)
+            a.observe(arch=arch, q=q, thr=thr, fired=good, lid=7)
+            a.dump(lid=7)
+        self.assertEqual(len(cm.output), 2)
+        self.assertIn("n=2", cm.output[0])
         self.assertIn("below_target=0.500", cm.output[0])
+        self.assertIn("base=2 n=1", cm.output[1])
+        self.assertIn("below_target=0.000", cm.output[1])
+
+    def test_the_ring_keeps_the_newest_steps_when_it_wraps(self):
+        arch, q, thr = _case()
+        a = RecallAudit(target=0.9, every=2)
+        bad = torch.zeros(A, dtype=torch.bool); bad[14:] = True
+        good = torch.zeros(A, dtype=torch.bool); good[12:] = True
+        for f in (bad, bad, good, good, good):
+            a.observe(arch=arch, q=q, thr=thr, fired=f, lid=3)
+        with self.assertLogs("sglang.srt.layers.attention.vestigekv.recall_audit", "INFO") as cm:
+            a.dump(lid=3)
+        # five observed, ring of two: only the last two survive, both good
+        self.assertIn("n=2", cm.output[0])
+        self.assertIn("achieved_mean=1.0000", cm.output[0])
 
 
 if __name__ == "__main__":
