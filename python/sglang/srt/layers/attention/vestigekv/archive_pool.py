@@ -21,6 +21,22 @@ a quarter of the scan traffic. Pooling loses per-row precision and the freed
 bandwidth buys back more than it costs, which is why the budget rises with the
 ratio rather than staying put.
 
+MEASURED LIMIT, read this before enabling the pool. The recall numbers above
+are a RANKING result: they take a top-k by pooled score, which is what DSA
+does. Tier 2 does not rank, it fires against a threshold with a soundness
+bound, and that bound does not survive pooling. On real csk from the
+calibration dumps the within-group deviation is the size of the group mean
+itself (spread / ||mean|| = 1.00 prose, 0.73 RULER), because adjacent rows are
+uncorrelated in this space -- the same fact the 1.03 clustering factor reports.
+So the Cauchy-Schwarz term fires 99.6% of groups on prose where 1.8% truly
+hold a fired row, and 66.6% on RULER where 0.04% do. Sound and vacuous.
+
+The consequence is structural, not a tuning matter: DSA can pool because it
+takes a fixed top-k, and tier 2 cannot because it certifies a threshold.
+Pooling the archive therefore requires tier 2 to change its fire rule to a
+fixed budget first, which trades the per-row certificate for a weaker
+contract. That is a design decision, not a flag.
+
 The rule is the plain mean. Weighting by the stored row norm was measured too
 (prose 0.5126 against 0.5090, RULER 0.5168 against 0.5454 -- better on one
 corpus, worse on the other) and a max-norm delegate is clearly worse (0.479 /

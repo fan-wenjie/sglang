@@ -43,6 +43,8 @@ def _scan_batched_kernel(
     aidx_ptr,  # CSK_TIER>0: [arena] int32 row of the tier's closed-prefix cache
     cbase_ptr,  # CSK_TIER>0: [P] int64 base of that cache, per pair
     rho_ptr,  # [P, Amax] fp32
+    sp_ptr,  # [P, Amax] fp32: pooling spread (unused when HAS_SPREAD is 0)
+    qskn_ptr,  # [P, H] fp32: ||q|| in the sketch basis, the spread's partner
     a_len_ptr,  # [P] int64: real archive rows of this pair
     a_off_ptr,  # [P] int64 arena offset per pair
     cc_ptr,  # [P] fp32: zp * sc / sqrt(kv_lora - R)
@@ -53,6 +55,7 @@ def _scan_batched_kernel(
     H: tl.constexpr,
     DD: tl.constexpr,
     R: tl.constexpr,
+    HAS_SPREAD: tl.constexpr,  # archive pooled: carry the Cauchy-Schwarz term
     SIDE_POOL: tl.constexpr,  # 0 packed table, 1 indirect load, 2 TMA gather
     CSK_TIER: tl.constexpr,  # same, for the sketch projections
     CSK_ROWS: tl.constexpr,  # rows in the tier cache, for the TMA descriptor
@@ -177,6 +180,14 @@ def _scan_batched_kernel(
             else:
                 acc = tl.dot(c, qk).to(tl.float32)
             score = acc * sc + cc * rh[:, None] * qr[None, :]
+            if HAS_SPREAD:
+                # pooled entry: a row can beat its group's mean by up to
+                # ||c_i - m|| ||q||. Cauchy-Schwarz, not conformal -- always
+                # valid, no zp, and the reason a pooled certificate is sound
+                # and not merely still calibrated (vestigekv/archive_pool.py).
+                sp = tl.load(sp_ptr + abase + offs, mask=m, other=0.0)
+                qn = tl.load(qskn_ptr + p * H + h)
+                score += sc * sp[:, None] * qn[None, :]
             fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
             tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
             cnt += tl.sum(tl.where(m, fired, 0), 0)
@@ -249,6 +260,11 @@ class BatchedScanPack:
         self.side = torch.zeros(arena, g.side_dim, device=dev, dtype=torch.bfloat16)
         self.csk = torch.zeros(arena, r, device=dev, dtype=torch.float16)
         self.rho = torch.zeros(arena, device=dev)
+        # pooled archive only; a zero arena leaves the unpooled path
+        # bit-identical because the kernel never loads it under the flag
+        self.spread = torch.zeros(arena, device=dev)
+        self.qskn = torch.zeros(P, self.q_heads, device=dev)
+        self.has_spread = False
         self.a_off = torch.arange(P, dtype=torch.int64, device=dev) * Am
         # int32: archive entries are pool row indices, bounded by max_total_tokens
         # (~2M), and the fetch buffer they land in is already the stock
@@ -397,6 +413,11 @@ class BatchedScanPack:
         self._csk_rows = 0
         self._csk_refs = []  # keeps the tiers' caches alive while cbase points at them
         self.rho = torch.zeros(arena, device=dev)
+        # pooled archive only; a zero arena leaves the unpooled path
+        # bit-identical because the kernel never loads it under the flag
+        self.spread = torch.zeros(arena, device=dev)
+        self.qskn = torch.zeros(P, self.q_heads, device=dev)
+        self.has_spread = False
         self.a_off = torch.zeros(P, dtype=torch.int64, device=dev)
         # int32: archive entries are pool row indices, bounded by max_total_tokens
         # (~2M), and the fetch buffer they land in is already the stock
@@ -670,6 +691,8 @@ class BatchedScanPack:
             self.aidx,
             self.cbase,
             self.rho,
+            self.spread,
+            self.qskn,
             self.a_len,
             self.a_off,
             self.cc,
@@ -680,6 +703,7 @@ class BatchedScanPack:
             H=self.q_heads,
             DD=self.geom.side_dim,
             R=self.v.shape[1],
+            HAS_SPREAD=self.has_spread,
             SIDE_POOL=0 if self.side is not None else self.side_mode,
             CSK_TIER=0 if self.csk is not None else self.csk_mode,
             CSK_ROWS=self._csk_rows or 1,
