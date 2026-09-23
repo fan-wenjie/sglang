@@ -374,6 +374,12 @@ class VestigeKVDSABackend(AttentionBackend):
         pre-selection fallback, and the next steps run the full indexer."""
         from sglang.srt.layers.attention.graph_variants import VK_LEAN, VK_TOPK
 
+        if not self.config.overflow_fallback and self._dsa is not None:
+            # No fence: a lane attends its own kept + fetched rows whatever
+            # the fire count, so no step needs the indexer's selection.
+            self.lean_step = True
+            self._stats["lean"] += 1
+            return VK_LEAN
         probe = self._ovf_probe
         if probe is None or self._dsa is None or self._full_arm():
             self.lean_step = False
@@ -1678,7 +1684,10 @@ class VestigeKVDSABackend(AttentionBackend):
         # a whole-prefix transform here.
         if sigma is None:
             sigma = self._block_sigma(kbuf, row_slots, lid=lid)
-        keep = select_kept(sigma[:closed], rho=self.rho, closed=closed, sinks=D.SINKS)
+        keep = select_kept(
+            sigma[:closed], rho=self.rho, closed=closed, sinks=D.SINKS,
+            m_fixed=min(max(1, round(self.rho * closed)), D.KEPT_CAP),
+        )
         kept_closed = row_slots[:closed][keep.nonzero(as_tuple=True)[0]]
         return torch.cat([kept_closed, row_slots[closed:]])
 
@@ -2315,7 +2324,7 @@ class VestigeKVDSABackend(AttentionBackend):
         self._advance_sigma(slot, lid, cl, c1, kbuf)
         cl["closed"] = c1
         # global rebalance over every closed row
-        m = max(1, round(self.rho * c1))
+        m = min(max(1, round(self.rho * c1)), D.KEPT_CAP)
         keep = torch.zeros(c1, dtype=torch.bool, device=cl["sigma"].device)
         keep[cl["sigma"][:c1].topk(min(m, c1)).indices] = True
         keep[: D.SINKS] = True

@@ -38,6 +38,13 @@ the tier-2 comparison lives on the same scale as attention's own logits."""
 # ---- tier 1: sidecar-residual eviction (frozen at prefill) ----
 
 RHO = 1 / 32
+KEPT_CAP = 2048
+"""Absolute cap on tier-1's closed-row keep budget (DSA-model backend only).
+rho * closed grows with the context and so does everything that touches the
+kept set every step (the certificate's kept-row sweep, the attention); against
+DSA's fixed top-2048 that growth is the whole gap at long context
+(docs/glm53-line.md, "No crossover against DSA"). 2048 = index_topk on
+GLM-5.3-Flash: the kept set never holds more rows than the baseline attends."""
 """Fraction of the prefix kept by anomaly rank. Sets the compression ratio."""
 
 SINKS = 4

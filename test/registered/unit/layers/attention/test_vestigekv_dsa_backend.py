@@ -29,6 +29,7 @@ def _be(n_layers=3):
     be._dsa = SimpleNamespace()  # a resolved sibling
     be._full_arm = lambda: False
     be._stats = {"lean": 0, "topk": 0}
+    be.config = SimpleNamespace(overflow_fallback=True)
     return be
 
 
@@ -59,6 +60,22 @@ class TestOverflowProbe(CustomTestCase):
         host = torch.zeros((), dtype=torch.int32, pin_memory=True)
         be._ovf_probe = (dev, host, _Pending())
         self.assertEqual(be._variant_for_step(None), VK_TOPK)
+
+
+class TestFenceOffIsLeanEverywhere(CustomTestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_no_fence_no_probe_lean_every_step(self):
+        # With the fallback off a lane attends its own rows whatever the fire
+        # count, so the indexer's selection is never needed: lean without a
+        # probe, even right after an overflow.
+        from sglang.srt.layers.attention.graph_variants import VK_LEAN
+
+        be = _be()
+        be.config = SimpleNamespace(overflow_fallback=False)
+        be._ovf_count_stack[0] += 3
+        self.assertEqual(be._variant_for_step(None), VK_LEAN)
+        self.assertIsNone(be._ovf_probe)
+        self.assertEqual(be._stats["lean"], 1)
 
 
 class _Pending:
