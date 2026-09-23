@@ -196,6 +196,16 @@ def _scan_batched_kernel(
         tl.store(counts_ptr + p * nb + b, cnt)
 
 
+def _csk_dtype():
+    from sglang.srt.environ import envs
+
+    return (
+        torch.float8_e4m3fn
+        if envs.SGLANG_VESTIGEKV_CSK_FP8.get()
+        else torch.float16
+    )
+
+
 def _n_arch(t) -> int:
     # Archive size off the index table; a tier without the closed-prefix
     # caches (a test double) still carries the selection.
@@ -258,7 +268,9 @@ class BatchedScanPack:
         self.am_grid = Am
         self.arena = arena
         self.side = torch.zeros(arena, g.side_dim, device=dev, dtype=torch.bfloat16)
-        self.csk = torch.zeros(arena, r, device=dev, dtype=torch.float16)
+        # Follows the tier's sketch storage: the arena is a staged copy of
+        # t.csk, so an fp16 arena rejects an fp8 tier outright.
+        self.csk = torch.zeros(arena, r, device=dev, dtype=_csk_dtype())
         self.rho = torch.zeros(arena, device=dev)
         # pooled archive only; a zero arena leaves the unpooled path
         # bit-identical because the kernel never loads it under the flag
@@ -406,7 +418,7 @@ class BatchedScanPack:
 
             self.csk_mode = _pool_read_mode(dev)
         else:
-            self.csk = torch.zeros(arena, r, device=dev, dtype=torch.float16)
+            self.csk = torch.zeros(arena, r, device=dev, dtype=_csk_dtype())
             self.aidx = self.cbase = None
             self.csk_mode = 0
         self.rank = r

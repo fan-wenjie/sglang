@@ -607,6 +607,11 @@ class Envs:
     # single-graph tree; and on GLM-5.3-Flash 2-3 layers overflow on most
     # steps (VKSTATS 2026-09-22: lean 20-23% of steps), so it buys ~0.08 ms.
     SGLANG_ENABLE_VESTIGEKV_LEAN_GRAPH = EnvBool(False)
+    # Store the tier-2 sketch as fp8 e4m3 with one power-of-two scale per
+    # tier instead of fp16, halving the scan's dominant load. The dot becomes
+    # fp8 x fp8 (Triton has no mixed fp8 dot on SM120), so the query is
+    # rounded the same way and zp is calibrated on those operands.
+    SGLANG_VESTIGEKV_CSK_FP8 = EnvBool(False)
     # Rows per archived tier-2 entry, the A/B over the parity rule: DSA scans
     # its index cache 4:1 pooled, so the archive does too. 1 keeps the
     # per-row archive. Pooling is only sound once the scan carries the group
