@@ -36,8 +36,17 @@ from sglang.srt.layers.attention.vestigekv import defaults as D
 
 def pool_operands(
     csk: torch.Tensor, rho: torch.Tensor, pool_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pool [T, r] scores and [T] norms into [G, r] and [G], G = T // pool_size.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool [T, r] scores and [T] norms into [G, r], [G], [G].
+
+    The third return is the pooling SPREAD, max_i ||c_i - m|| over the group.
+    A group is scanned by its mean, so a row whose score sits far above the
+    mean would be skipped silently; |c_i . q - m . q| <= ||c_i - m|| ||q||
+    makes that gap bounded rather than hoped-for, and the scan inflates the
+    pooled score by it exactly as it already inflates by the rank-truncation
+    residual. Without this term the certificate is unsound the moment the
+    archive is pooled -- it would still be calibrated, and it would still be
+    wrong.
 
     The mean is exact under the projection: csk is content @ V.T, which is
     linear in content, so pooling the projections equals projecting the pooled
@@ -50,15 +59,21 @@ def pool_operands(
     denominator into a score the certificate compares against a threshold.
     """
     if pool_size <= 1:
-        return csk, rho
+        return csk, rho, torch.zeros_like(rho)
     g = csk.shape[0] // pool_size
     if g == 0:
-        return csk[:0], rho[:0]
+        return csk[:0], rho[:0], rho[:0]
     n = g * pool_size
-    pooled = csk[:n].view(g, pool_size, csk.shape[1]).mean(dim=1).to(csk.dtype)
+    grp = csk[:n].view(g, pool_size, csk.shape[1]).float()
+    mean = grp.mean(dim=1)
+    spread = (grp - mean.unsqueeze(1)).norm(dim=2).amax(dim=1)
     # the norm pools by max: it bounds the group's largest row, which is what a
     # conservative certificate needs, while the mean would understate it
-    return pooled, rho[:n].view(g, pool_size).amax(dim=1)
+    return (
+        mean.to(csk.dtype),
+        rho[:n].view(g, pool_size).amax(dim=1),
+        spread.to(rho.dtype),
+    )
 
 
 def expand_groups(group_ids: torch.Tensor, pool_size: int) -> torch.Tensor:
@@ -91,8 +106,11 @@ def pooled_capacity(capacity: int, pool_size: int) -> int:
 def archive_bytes_per_token(rank: int, pool_size: int) -> float:
     """Scan traffic the archive costs per token of context per layer.
 
-    fp16 scores plus one fp32 norm per entry, spread over the tokens the entry
-    covers. At rank 64, pool 4 this is 33 B/token, which is what DSA's pooled
-    index cache costs -- the point of the parity rule.
+    fp16 scores, one fp32 norm and, when pooled, one fp32 spread per entry,
+    spread over the tokens the entry covers. At rank 64, pool 4 this is 34
+    B/token against DSA's 33 for its pooled index cache -- the point of the
+    parity rule, with the soundness term the pooling itself makes necessary.
     """
-    return (rank * 2 + 4) / max(1, pool_size)
+    if pool_size <= 1:
+        return float(rank * 2 + 4)
+    return (rank * 2 + 4 + 4) / pool_size
