@@ -57,6 +57,61 @@ def step_stats(
     )
 
 
+def far_region_stats(
+    rows: torch.Tensor,
+    q: torch.Tensor,
+    selected: torch.Tensor,
+    sigma: torch.Tensor,
+    n_far: int,
+    topk: int,
+) -> torch.Tensor:
+    """[4]: DSA's and tier 1's recall of the oracle in the far region, the
+    oracle's far size, and the shared budget.
+
+    The comparison is confined to rows older than the close block, and
+    budget-matched, because neither of those is optional. Both selectors force
+    the tail -- DSA by index_kpool_always_select_tail, tier 1 by keeping close
+    blocks whole -- so the whole-sequence number mostly measures an agreement
+    that was never in question. And tier 1 keeps far more rows than DSA's
+    fixed budget, so an unmatched comparison rewards it for spending more.
+
+    Tier 1 keeps HIGH sigma, so its picks are the top of the score.
+    """
+    score = (rows @ q.T).amax(dim=1)
+    k = min(topk, score.shape[0])
+    oracle = score.topk(k).indices
+    far_oracle = oracle[oracle < n_far]
+    sel_far = selected[selected < n_far]
+    budget = min(int(sel_far.numel()), n_far)
+    if far_oracle.numel() == 0 or budget == 0:
+        return torch.zeros(14, device=score.device)
+    hit_dsa = torch.zeros(n_far, dtype=torch.bool, device=score.device)
+    hit_dsa[sel_far] = True
+    # Tier 1's picks in ITS OWN rank order, so a prefix of them is what a
+    # budget-Delta supplement would actually attend.
+    order = sigma[:n_far].topk(budget).indices
+    hit_dsa_o = hit_dsa[far_oracle]
+    # oracle mass, shifted by the oracle's floor so the ratio stays in [0, 1]
+    w = score[far_oracle]
+    w = w - w.min()
+    tot_w = w.sum().clamp_min(1e-9)
+    in_oracle = torch.zeros(n_far, dtype=torch.bool, device=score.device)
+    in_oracle[far_oracle] = True
+    # rank of each oracle row inside tier 1's order, or budget if absent
+    rank = torch.full((n_far,), budget, dtype=torch.long, device=score.device)
+    rank[order] = torch.arange(budget, device=score.device)
+    r_o = rank[far_oracle]
+    out = [hit_dsa_o.float().mean()]
+    for delta in (64, 128, 256, 512, budget):
+        got = hit_dsa_o | (r_o < delta)
+        out.append(got.float().mean())
+        out.append((w * got).sum() / tot_w)
+    out.append((w * hit_dsa_o).sum() / tot_w)
+    out.append(torch.tensor(float(far_oracle.numel()), device=score.device))
+    out.append(torch.tensor(float(budget), device=score.device))
+    return torch.stack(out)
+
+
 class SelectRecallTelemetry:
     """Per-layer running record of DSA's selection against the oracle."""
 
@@ -65,7 +120,7 @@ class SelectRecallTelemetry:
         self.rec: dict[int, dict] = {}
 
     def _layer(self, lid: int) -> dict:
-        return self.rec.setdefault(lid, {"pending": [], "base": 0})
+        return self.rec.setdefault(lid, {"pending": [], "far": [], "base": 0})
 
     def observe(
         self,
@@ -74,12 +129,18 @@ class SelectRecallTelemetry:
         q: torch.Tensor,
         selected: torch.Tensor,
         lid: int,
+        sigma: torch.Tensor = None,
+        n_far: int = 0,
     ) -> None:
         if rows.ndim != 2 or rows.shape[0] <= self.topk:
             # a sequence no longer than the budget has nothing to select
             return
         r = self._layer(lid)
         r["pending"].append(step_stats(rows, q, selected, self.topk))
+        if sigma is not None and n_far > 0:
+            r["far"].append(
+                far_region_stats(rows, q, selected, sigma, n_far, self.topk)
+            )
         if len(r["pending"]) >= self.every:
             self.dump(lid=lid)
 
@@ -90,6 +151,20 @@ class SelectRecallTelemetry:
         got = torch.stack(r["pending"]).cpu()  # the one read
         n = got.shape[0]
         base, r["base"], r["pending"] = r["base"], r["base"] + n, []
+        if r["far"]:
+            f = torch.stack(r["far"]).cpu()
+            r["far"] = []
+            logger.info(
+                "VKSELFAR layer=%d base=%d n=%d dsa=%.4f dsa_mass=%.4f "
+                "d64=%.4f m64=%.4f d128=%.4f m128=%.4f d256=%.4f m256=%.4f "
+                "d512=%.4f m512=%.4f dfull=%.4f mfull=%.4f "
+                "oracle_far=%.0f budget=%.0f (union of DSA with tier 1's top-Delta; "
+                "d=count, m=oracle mass)",
+                lid, base, f.shape[0],
+                float(f[:, 0].mean()), float(f[:, 11].mean()),
+                *[float(f[:, i].mean()) for i in range(1, 11)],
+                float(f[:, 12].mean()), float(f[:, 13].mean()),
+            )
         logger.info(
             "VKSELREC layer=%d base=%d n=%d count_mean=%.4f count_min=%.4f "
             "mass_mean=%.4f mass_min=%.4f oracle=%d "

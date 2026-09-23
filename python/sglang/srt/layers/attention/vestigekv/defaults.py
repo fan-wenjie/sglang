@@ -64,6 +64,14 @@ INDEX_RANK = 64
 """Sketch rank r. Trades scan bytes (2*r floats per archived row) against how
 often the residual certificate has to inflate a score to stay sound."""
 
+ARCHIVE_POOL = 4
+"""Rows per archived entry, matching DSA's index_kpool so anything sized by the
+sequence is scanned at the same ratio. 1 disables pooling. Pooling costs
+per-row precision and repays it in budget: measured at ~10.6k, the pooled
+archive attending 4096 rows beats the unpooled one attending 2048 (0.755 vs
+0.738 prose, 0.756 vs 0.679 RULER) for a quarter of the scan traffic
+(vestigekv/archive_pool.py)."""
+
 RECALL_TARGET = 0.90
 """tau: the single quality parameter of the recall tier. Everything below that
 used to be a separate knob is DERIVED from it -- see the functions at the end
