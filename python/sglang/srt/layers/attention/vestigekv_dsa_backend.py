@@ -251,6 +251,16 @@ class VestigeKVDSABackend(AttentionBackend):
         # KDA layers here), learned at prefill; every decode step's calibration
         # and recall loop over these.
         self._mla_lids: set = set()
+        # Static per-layer roles (SGLANG_VESTIGEKV_DSA_LAYERS). A layer in
+        # here is pure DSA: the indexer runs, its fence flag is held on so the
+        # fork attends the indexer's top-k, and no tier is ever built for it.
+        # Every other layer is pure VestigeKV: the indexer files its key and
+        # skips scoring and top-k, so a fenced lane there has no selection to
+        # attend and falls back to its own page table (exact, and rare by
+        # construction -- the set is chosen from the layers that fence).
+        self.dsa_only_layers: frozenset = frozenset(
+            int(x) for x in envs.SGLANG_VESTIGEKV_DSA_LAYERS.get() if x
+        )
         # GPU-side per-(pool-slot, layer) kept-index tables: built at prefill
         # (one sync there is free); decode refresh is then pure GPU ops, no
         # host sync on the critical path.
@@ -1296,9 +1306,6 @@ class VestigeKVDSABackend(AttentionBackend):
         # Every request passes through extend before decode, so decode can
         # assume the slot state exists (slot reuse re-extends).
         lid = layer.layer_id
-        # Registered here, not at graph capture: an eager decode step (CUDA
-        # graph off) collects calibration and recalls only for these layers.
-        self._mla_lids.add(lid)
         r2t = self.req_to_token_pool.req_to_token
         if lid not in self._kept_buf:
             max_reqs = r2t.shape[0]
@@ -1306,6 +1313,15 @@ class VestigeKVDSABackend(AttentionBackend):
             dev = r2t.device
             self._ensure_kept_stacks(max_reqs, cap, dev)
             self._alloc_recall_bufs(lid, max_reqs, dev)
+        if lid in self.dsa_only_layers:
+            # Pure DSA for this layer: no sigma record, no kept table, no tier,
+            # so none of the decode-time chain runs for it. The fork still
+            # serves it, through the fence flag armed with the buffers, and
+            # attends the indexer's top-k the way a fenced lane does.
+            return
+        # Registered here, not at graph capture: an eager decode step (CUDA
+        # graph off) collects calibration and recalls only for these layers.
+        self._mla_lids.add(lid)
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)
         kbuf = kbuf.reshape(-1, kbuf.shape[-1])
         slots = forward_batch.req_pool_indices.tolist()
@@ -1571,6 +1587,21 @@ class VestigeKVDSABackend(AttentionBackend):
         self._fetch_buf[lid] = self._fetch_stack[li]
         self._fetch_len[lid] = self._fetch_len_stack[li]
         self._fetch_ovf[lid] = self._fetch_ovf_stack[li]
+        self._arm_dsa_only_fence()
+
+    def _arm_dsa_only_fence(self):
+        """Hold the fence flag on for every pure-DSA layer, for the process.
+
+        The flag is what the fork reads to attend the indexer's selection
+        instead of the kept-plus-recalled set, and those layers have neither:
+        no tier is built for them, so nothing ever writes the flag back down
+        either. Re-armed wherever the stack is cleared."""
+        if not self.dsa_only_layers or self._fetch_ovf_stack is None:
+            return
+        for lid in self.dsa_only_layers:
+            li = self._li_map.get(lid)
+            if li is not None:
+                self._fetch_ovf_stack[li].fill_(1)
 
     def _full_arm(self) -> bool:
         # Benchmark-only A/B switch (SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG names a
@@ -1796,7 +1827,8 @@ class VestigeKVDSABackend(AttentionBackend):
             # (pre-filled outside capture by the in_capture out-graph hook; any
             # copy or sync here would invalidate stream capture). One uniform
             # binding for every bs: the packed (kept + fetched) CSR buffers.
-            self._mla_lids.add(lid)
+            if lid not in self.dsa_only_layers:
+                self._mla_lids.add(lid)
             bs = forward_batch.seq_lens.shape[0]
             bufs = self._graph_bufs[lid]
             indptr, indices = bufs["indptr"][: bs + 1], bufs["indices"]
@@ -2199,6 +2231,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 self._ingraph_pack.update([], [])
                 self._fetch_len_stack.zero_()
                 self._fetch_ovf_stack.zero_()
+                self._arm_dsa_only_fence()
                 self._ingraph_full_armed = True
         elif (
             self._pack_epoch != self._pack_epoch_synced or self._ingraph_full_armed
@@ -2259,6 +2292,7 @@ class VestigeKVDSABackend(AttentionBackend):
         self._ingraph_pack.update([], [])
         self._fetch_len_stack.zero_()
         self._fetch_ovf_stack.zero_()
+        self._arm_dsa_only_fence()
         r2t = self.req_to_token_pool.req_to_token
         lens = self._seq_lens_host(forward_batch)
         real = forward_batch.out_cache_loc.shape[0]
@@ -2274,7 +2308,7 @@ class VestigeKVDSABackend(AttentionBackend):
         # Stale-by-one: scans with the PREVIOUS step's query recorded in-graph
         # into qbuf; fired pool rows land in the fixed-address fetch_buf that
         # the packed CSR splices next.
-        if lid not in self._qbuf or self._full_arm():
+        if lid not in self._qbuf or self._full_arm() or lid in self.dsa_only_layers:
             return
         real = forward_batch.out_cache_loc.shape[0]
         for i in range(real):
