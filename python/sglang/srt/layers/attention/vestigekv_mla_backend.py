@@ -164,6 +164,7 @@ class VestigeKVMLABackend(AttentionBackend):
     _dsa_resolved = False
     _mem_reqs = 0
     _fetch_hist = None
+    _spectrum = None  # SGLANG_DEBUG_VESTIGEKV_SPECTRUM telemetry, or None
     _stat_acc = None
     _router = None  # TierDecodeRouter when the fork serves stage 1, else None
     _affine_capture = False  # the AFFINE constexpr a capture baked; see decode_fork
@@ -351,6 +352,16 @@ class VestigeKVMLABackend(AttentionBackend):
         if self._mem_dir is not None:
             torch.cuda.memory._record_memory_history(max_entries=200000)
         self._fetch_hist = None  # stats only: [W + 1] int64 device histogram
+        _spec_every = envs.SGLANG_DEBUG_VESTIGEKV_SPECTRUM.get()
+        if _spec_every:
+            from sglang.srt.layers.attention.vestigekv.spectrum import SpectrumTelemetry
+
+            self._spectrum = SpectrumTelemetry(D.LOWPASS_KAPPA, every=_spec_every)
+            logger.info(
+                "VestigeKV spectrum telemetry on: one rFFT per closing block per "
+                "layer, reported as VKSPECTRUM every %d blocks; nothing reads it back",
+                _spec_every,
+            )
         self._stat_acc = None  # stats only: [fetched, kept, seq] int64 device sums
         self._scan_graph = None
         self._scan_key_cur = self._scan_key_seen = None
@@ -1562,6 +1573,22 @@ class VestigeKVMLABackend(AttentionBackend):
             kbuf, slots, D.CLOSE_BLOCK, offset=g.sigma_offset, dim=g.sigma_dim
         )
 
+    def _observe_spectrum(self, slot, lid, kbuf, c0, c1):
+        """Telemetry (SGLANG_DEBUG_VESTIGEKV_SPECTRUM): the closing blocks'
+        above-cutoff peak. Reads the same branch sigma just read; nothing
+        downstream consumes it (vestigekv/spectrum.py)."""
+        g = self.geom
+        if g.sigma_in_row:
+            rows = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
+            side = kbuf.index_select(0, rows)[:, g.sigma_offset : g.sigma_offset + g.sigma_dim]
+        else:
+            ring = self._side_ring[lid][slot]
+            pos = torch.arange(c0, c1, dtype=torch.int64, device=ring.device)
+            side = ring[pos % self._side_ring_size].float()
+            if self._side_fp8:
+                side = side * self._side_ring_scale[lid][slot][pos % self._side_ring_size][:, None]
+        self._spectrum.observe(side, D.CLOSE_BLOCK, lid=lid)
+
     def _ring_sigma(self, slot, lid, c0, c1):
         """Tier-1 sigma of positions [c0, c1) (whole blocks) from the slot's key
         ring. A position whose key the ring does not hold -- a prefix-cache hit,
@@ -1606,6 +1633,8 @@ class VestigeKVMLABackend(AttentionBackend):
             sigma = self._block_sigma(kbuf, rows, lid=lid)
         else:
             sigma = self._ring_sigma(slot, lid, c0, target)
+        if self._spectrum is not None:
+            self._observe_spectrum(slot, lid, kbuf, c0, target)
         cl["sigma"] = torch.cat([cl["sigma"], sigma])
         cl["sigmaed"] = target
 
