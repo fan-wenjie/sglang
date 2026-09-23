@@ -63,6 +63,11 @@ class TestBlockSpectrum(CustomTestCase):
         tel = SpectrumTelemetry(KAPPA, every=10**9)
         tel.observe(torch.cat([one, one, one[: T // 2]]), T, lid=3)
         tel.observe(one, T, lid=7)
+        # the per-block statistics stay on the device until a report is due,
+        # so the counts land at the dump and not at observe()
+        self.assertEqual(len(tel.rec[3]["pending"]), 2)
+        tel.dump(lid=3)
+        tel.dump(lid=7)
         self.assertEqual(tel.rec[3]["n"], 2)
         self.assertEqual(tel.rec[3]["bins"], {71: 2})
         # per layer, so one layer's blocks never land in another's record
