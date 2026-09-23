@@ -21,7 +21,12 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vestigekv import defaults as D
+from sglang.srt.layers.attention.vestigekv.archive_pool import (
+    expand_groups,
+    pool_operands,
+)
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR, Geometry
 from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
@@ -98,6 +103,13 @@ class RecallTier:
         # close backfills them (extend_closed); _pos_all doubles as the fill
         # watermark read by the close path.
         self._pos_all = self._csk_all = self._rho_all = None
+        # Pooled view of the closed-prefix caches, the scan's unit when
+        # pool_size > 1 (vestigekv/archive_pool.py). Kept BESIDE the per-row
+        # caches rather than replacing them: the close path backfills by row,
+        # the pack addresses pool rows, and tier 1 re-decides membership per
+        # row, so the row form stays the store and pooling is a second view.
+        self._csk_pool = self._rho_pool = self._spread_pool = None
+        self.pool_size = envs.SGLANG_VESTIGEKV_ARCHIVE_POOL.get()
         self._side_mat = None  # lazily materialised; see the `side` property
         self._kept_mat = None  # lazily materialised; see `kept_rows`
         self._csk_mat = self._rho_mat = None  # selections over the _all caches
@@ -174,6 +186,61 @@ class RecallTier:
     @arch.setter
     def arch(self, v):
         self._arch_mat = v
+
+    # ---- the scan's unit: a row when pool_size == 1, a group when it is not ----
+
+    def refresh_pool(self) -> None:
+        """(Re)build the pooled view from the closed-prefix caches.
+
+        Pools the WHOLE closed prefix, not the archive selection. Grouping has
+        to be the same grouping DSA uses -- group g is closed-prefix rows
+        g*P .. g*P+P-1 -- or a fired group cannot be mapped back to rows; a
+        selection compacted first would group rows that are not adjacent and
+        the mapping would be to the wrong tokens. With rho = 1/32 nearly every
+        group holds an evicted row anyway, so scanning all of them costs
+        almost nothing over scanning only those that do.
+        """
+        if self.pool_size <= 1 or self._csk_all is None:
+            self._csk_pool = self._rho_pool = self._spread_pool = None
+            return
+        self._csk_pool, self._rho_pool, self._spread_pool = pool_operands(
+            self._csk_all, self._rho_all, self.pool_size
+        )
+
+    @property
+    def scan_operands(self):
+        """(csk, rho, spread, n) the scan runs over.
+
+        Unpooled this is the archive selection and spread is None, which is
+        the current path bit for bit. Pooled it is every group of the closed
+        prefix, and spread is what the certificate must inflate by -- a scan
+        that ignores it is calibrated and wrong.
+        """
+        if self.pool_size <= 1:
+            return self.csk, self.rho, None, self.n_arch
+        if self._csk_pool is None:
+            self.refresh_pool()
+        return (
+            self._csk_pool,
+            self._rho_pool,
+            self._spread_pool,
+            int(self._csk_pool.shape[0]),
+        )
+
+    def scan_rows(self, fired) -> torch.Tensor:
+        """Pool row ids for the entries the scan fired, [N] int32.
+
+        Unpooled, `fired` indexes the archive directly. Pooled, it indexes
+        groups, and each one expands to its P closed-prefix positions, which
+        _pos_all turns into pool row ids. Rows tier 1 already keeps come back
+        here too -- they are attended regardless, so dropping them is the
+        caller's dedupe, not a correctness matter.
+        """
+        if self.pool_size <= 1:
+            return self.arch.index_select(0, fired.to(torch.int64))
+        pos = expand_groups(fired.to(torch.int64), self.pool_size)
+        pos = pos[pos < self._pos_all.shape[0]]
+        return self._pos_all.index_select(0, pos).to(torch.int32)
 
     @property
     def n_arch(self) -> int:
