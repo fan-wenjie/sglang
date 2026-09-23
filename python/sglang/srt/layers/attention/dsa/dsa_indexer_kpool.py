@@ -78,7 +78,7 @@ def _vestigekv_lean_step(layer_id: int) -> bool:
     )
 
     vk = _vestigekv_decode_backend()
-    if isinstance(vk, VestigeKVDSABackend) and vk.dsa_only_layers:
+    if isinstance(vk, VestigeKVDSABackend) and vk.layer_roles_static:
         # Captured path only. A fenced lane on a layer with no selection
         # attends its page table instead, which the fork sizes from the row
         # count at runtime but the CSR pack sizes from DSA's budget -- so the
