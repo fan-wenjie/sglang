@@ -30,6 +30,8 @@ def _vestige_scan_kernel(
     side_ptr,  # [A, D]   bf16 storage, promoted to fp32 in-register
     csk_ptr,  # [A, R]    fp16 storage, promoted to fp32 in-register
     rho_ptr,  # [A]       fp32: per-row residual norm
+    sp_ptr,  # [A]        fp32: pooling spread, max_i ||c_i - m|| (0 when unpooled)
+    qskn_ptr,  # [H]      fp32: ||q|| inside the sketch basis, the spread's partner
     hit_ptr,  # [A]       int32 out
     A,
     sc,  # attention scale
@@ -37,6 +39,7 @@ def _vestige_scan_kernel(
     H: tl.constexpr,
     D: tl.constexpr,
     R: tl.constexpr,
+    HAS_SPREAD: tl.constexpr,
     BLOCK_A: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK_A + tl.arange(0, BLOCK_A)
@@ -66,22 +69,45 @@ def _vestige_scan_kernel(
     else:
         acc = tl.dot(c, qk).to(tl.float32)
     score = acc * sc + cc * rh[:, None] * tl.load(qres_ptr + h)[None, :]
+    if HAS_SPREAD:
+        # A pooled entry is scored by its group's mean, so a row inside the
+        # group can beat that mean by up to ||c_i - m|| ||q||. Unlike the
+        # residual term above this is Cauchy-Schwarz, not conformal: it is
+        # always valid, carries no zp, and is what keeps the certificate sound
+        # once the archive is pooled rather than merely still calibrated.
+        sp = tl.load(sp_ptr + offs, mask=m, other=0.0)
+        score += sc * sp[:, None] * tl.load(qskn_ptr + h)[None, :]
     fired = tl.max((score > tl.load(max1g_ptr + h)[None, :]).to(tl.int32), 1)
     tl.store(hit_ptr + offs, fired, mask=m)
 
 
-def vestige_scan(qside_t, qsk_t, qres, max1g, side, csk, rho, sc, cc, out=None):
+def vestige_scan(
+    qside_t, qsk_t, qres, max1g, side, csk, rho, sc, cc, out=None, spread=None
+):
     """Fired-row mask over the archive. All inputs fp32 and contiguous;
     `qside_t` is [D, H] and `qsk_t` is [R, H] (transposed for the dot).
 
     Returns an int32 [A] tensor, 1 where at least one head's certified upper
     bound beats that head's best kept-row score. Bit-identical to the eager
     formulation on every case tested (0 disagreements over 3 archive sizes).
+
+    `spread` is the pooled archive's per-entry deviation bound; None leaves the
+    scan on the per-row path with no extra load, which is what the A/B needs.
     """
     A, D = side.shape
     R, H = qsk_t.shape
     if out is None:
         out = torch.empty(A, dtype=torch.int32, device=side.device)
+    has_spread = spread is not None
+    if has_spread:
+        # ||q|| inside the sketch basis, the partner of the spread in
+        # Cauchy-Schwarz. qsk_t is [R, H], so the norm runs down the rank.
+        qskn = qsk_t.float().norm(dim=0).contiguous()
+    else:
+        # a one-element placeholder: the kernel never loads it under the
+        # constexpr, and Triton still wants a pointer
+        spread = qres[:1]
+        qskn = qres[:1]
     # 64 rows/block: 128 and 256 measured the same or ran out of registers.
     block = SCAN_BLOCK_A
     _vestige_scan_kernel[(triton.cdiv(A, block),)](
@@ -92,6 +118,8 @@ def vestige_scan(qside_t, qsk_t, qres, max1g, side, csk, rho, sc, cc, out=None):
         side,
         csk,
         rho,
+        spread,
+        qskn,
         out,
         A,
         sc,
@@ -99,6 +127,7 @@ def vestige_scan(qside_t, qsk_t, qres, max1g, side, csk, rho, sc, cc, out=None):
         H=H,
         D=D,
         R=R,
+        HAS_SPREAD=has_spread,
         BLOCK_A=block,
         num_warps=SCAN_NUM_WARPS,
     )
