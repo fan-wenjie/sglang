@@ -48,6 +48,8 @@ def _scan_batched_kernel(
     cc_ptr,  # [P] fp32: zp * sc / sqrt(kv_lora - R)
     hit_ptr,  # [P, Amax] int8 out (0/1 fired flag)
     counts_ptr,  # [P, NB] int32 fused compact-count out (NB = ceil(Amax/1024))
+    rad_ptr,  # POOL_RAD: [arena] fp32 sketch radius of a pooled row (else unused)
+    qkn_ptr,  # POOL_RAD: [P, H] fp32 |qsk| per head (else unused)
     Amax,
     sc,
     H: tl.constexpr,
@@ -61,6 +63,7 @@ def _scan_batched_kernel(
     POOL_ROWS: tl.constexpr,  # pool row count, for the TMA descriptor
     BLOCK_A: tl.constexpr,
     MULTI: tl.constexpr,
+    POOL_RAD: tl.constexpr = False,  # archive rows are 4-token pools with a radius
 ):
     p = tl.program_id(1)
     al = tl.load(a_len_ptr + p)
@@ -97,6 +100,8 @@ def _scan_batched_kernel(
     cc = tl.load(cc_ptr + p)
     qr = tl.load(qres_ptr + p * H + h)
     m1 = tl.load(max1g_ptr + p * H + h)
+    if POOL_RAD:
+        qkn = tl.load(qkn_ptr + p * H + h)
     if SIDE_POOL and DD > 0:
         kbase = tl.load(kbase_ptr + p).to(tl.pointer_type(tl.bfloat16))
     if CSK_TIER:
@@ -176,6 +181,13 @@ def _scan_batched_kernel(
                 acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
             else:
                 acc = tl.dot(c, qk).to(tl.float32)
+            if POOL_RAD:
+                # A pool's sketch is its members' mean: a member's score is
+                # at most the pool's plus |csk_i - csk_pool| |qsk|, so the
+                # radius makes the pool's score an upper bound on every
+                # member's, and a fired pool is a certified fetch of all four.
+                rad = tl.load(rad_ptr + abase + offs, mask=m, other=0.0)
+                acc = acc + rad[:, None] * qkn[None, :]
             score = acc * sc + cc * rh[:, None] * qr[None, :]
             fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
             tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
@@ -187,7 +199,10 @@ def _scan_batched_kernel(
 
 def _n_arch(t) -> int:
     # Archive size off the index table; a tier without the closed-prefix
-    # caches (a test double) still carries the selection.
+    # caches (a test double) still carries the selection. None is a
+    # placeholder pair (a lane with no tier in a fixed-count layout): empty.
+    if t is None:
+        return 0
     idx = getattr(t, "_arch_idx", None)
     return int(idx.shape[0] if idx is not None else t.arch.shape[0])
 
@@ -205,6 +220,10 @@ class BatchedScanPack:
     # costs ~30-55 ms -- the dominant per-request fixed cost once builds went
     # async.
     HEADROOM = 1.05
+    # Pooled archive (DSA-model redesign): per-row sketch radius and the
+    # per-pair |qsk| the scan adds to it; None = per-token archive, no term.
+    rad = None
+    qkn = None
 
     def __init__(
         self, pairs, tiers, qbuf, fetch_buf, fetch_len, fetch_ovf, ovf_count, q_heads,
@@ -448,12 +467,14 @@ class BatchedScanPack:
             n_ok
             and max(self._n_kept(t) for t in tiers) <= self.nkm
             and sum(_n_arch(t) for t in tiers) <= self.arena
-            and all(t.r == self.rank and t.geom == self.geom for t in tiers)
+            and all(t is None or (t.r == self.rank and t.geom == self.geom) for t in tiers)
         )
 
     def _n_kept(self, t) -> int:
         # Snapshot mode copies the row table anyway; pool mode must not touch
         # it (kept_rows is a lazily gathered view of the pool on a real tier).
+        if t is None:
+            return 0
         return int(t.kept_rows.shape[0] if self.kslot is None else t.kept_slots.shape[0])
 
     def update(self, pairs, tiers):
@@ -495,6 +516,22 @@ class BatchedScanPack:
         csk_refs, rows = [], 0
         for i, t in enumerate(tiers):
             nk, av = self._n_kept(t), _n_arch(t)
+            if t is None:
+                # Placeholder: nothing kept, nothing archived; the scan fires
+                # nothing and compact writes fetch_len[li, slot] = 0. The
+                # per-layer launch (run_range) needs every layer to own a
+                # fixed run of pair slots, so lanes without a tier hold one.
+                self.a_len[i] = 0
+                self.nk_len[i] = 0
+                self.thr[i, 0] = 0.0
+                self.thr_flat[i] = 0.0
+                self.cc[i] = 0.0
+                if self.kslot is not None:
+                    self.kslot[i] = 0
+                    self.kbase[i] = self._pool_bases[pairs[i][0]]
+                else:
+                    self.kr[i] = 0
+                continue
             if nk > self.nkm:
                 raise RuntimeError(
                     f"kept-row overflow: pair {i} keeps {nk} rows, capacity is "
@@ -615,7 +652,17 @@ class BatchedScanPack:
         clipped to p_live sees every live pair; capacity-tail placeholders
         beyond it are never launched at all. Measured: the placeholder tax
         was +0.32 ms/step at --cuda-graph-max-bs 16 serving bs=1."""
-        P_eff = p_live if p_live is not None else self.li.shape[0]
+        self.run_range(0, p_live if p_live is not None else self.li.shape[0])
+
+    @ieee_fp32
+    def run_range(self, lo, hi):
+        """The recall step for pair slots [lo, hi): with pairs laid out
+        layer-major at a fixed count per layer, one layer's lanes -- launched
+        from inside that layer's attention so the scan reads the step's own
+        query (qbuf row written just before), not last step's. Every
+        pair-indexed tensor is sliced, so the kernels see pair 0..hi-lo and
+        the same math; run() is run_range(0, p_live)."""
+        sl = slice(lo, hi)
         sc = self.scale
         # Fused prologue: skept/softmax/entropy/gate/qsk/qres/max1g and the
         # transpose-casts in ONE kernel (see fused_prologue.py). Replaces the
@@ -623,29 +670,34 @@ class BatchedScanPack:
         # dominated the captured graph (VKSTATS S-sweep). Empty tier-1 pairs
         # (nk_len==0) come back with max1g=-inf: whole archive fires, full
         # attention, never under-recall.
+        kr = None if self.kr is None else self.kr[sl]
+        kslot = None if self.kslot is None else self.kslot[sl]
+        kbase = None if self.kbase is None else self.kbase[sl]
+        cbase = None if self.cbase is None else self.cbase[sl]
         fused_prologue_split(
             self.qbuf,
-            self.li,
-            self.slot,
-            self.kr,
-            self.v,
-            self.nk_len,
-            self.thr_flat,
+            self.li[sl],
+            self.slot[sl],
+            kr,
+            self.v[sl],
+            self.nk_len[sl],
+            self.thr_flat[sl],
             sc,
-            out=(self.max1g, self.qside_t, self.qsk_t, self.qres),
+            out=(self.max1g[sl], self.qside_t[sl], self.qsk_t[sl], self.qres[sl]),
+            qkn=None if self.qkn is None else self.qkn[sl],
             margin=self.margin,
             thr_lse=self.thr_lse,
-            partials=(self.pm, self.ps, self.pt),
-            kslot=self.kslot,
-            kbase=self.kbase,
+            partials=(self.pm[sl], self.ps[sl], self.pt[sl]),
+            kslot=kslot,
+            kbase=kbase,
             nkm=self.nkm,
             row=self.pool_row,
             pool_rows=self._pool_rows,
             mode=self.pool_mode,
-            a_len=self.a_len,
+            a_len=self.a_len[sl],
             kv=self.geom.kv_lora_rank,
         )
-        qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
+        qside_t, qsk_t, qres, max1g = self.qside_t[sl], self.qsk_t[sl], self.qres[sl], self.max1g[sl]
         # Grid covers the LARGEST per-pair archive, not the arena: programs
         # past a pair's a_len do no work, so a grid sized for the arena would
         # waste 1/P of its blocks on every pair. am_grid is baked at capture
@@ -655,7 +707,7 @@ class BatchedScanPack:
         # over the 1024-row buckets: same worst-case coverage, much smaller
         # dispatch floor at short context (defaults.SCAN_GRID_CAP).
         Am = self.am_grid
-        P = P_eff
+        P = hi - lo
         _scan_batched_kernel[
             (min(triton.cdiv(Am, D.SCAN_BUCKET), D.SCAN_GRID_CAP), P)
         ](
@@ -665,16 +717,18 @@ class BatchedScanPack:
             max1g,
             self.side,
             self.arch,
-            self.kbase,
+            kbase,
             self.csk,
             self.aidx,
-            self.cbase,
+            cbase,
             self.rho,
-            self.a_len,
-            self.a_off,
-            self.cc,
-            self.hit,
-            self.c_counts,
+            self.a_len[sl],
+            self.a_off[sl],
+            self.cc[sl],
+            self.hit,  # arena-indexed (a_off per pair), like rho/arch/aidx: never sliced
+            self.c_counts[sl],
+            self.rad if self.rad is not None else self.rho,
+            self.qkn[sl] if self.qkn is not None else self.qres[sl],
             Am,
             sc,
             H=self.q_heads,
@@ -688,6 +742,7 @@ class BatchedScanPack:
             POOL_ROWS=self._pool_rows or 1,
             BLOCK_A=D.SCAN_BLOCK_A,
             MULTI=D.SCAN_BUCKET // D.SCAN_BLOCK_A,  # blocks per compact bucket
+            POOL_RAD=self.rad is not None,
             num_warps=D.SCAN_NUM_WARPS,
         )
         # Deterministic two-phase Triton compaction: the torch chain's int64
@@ -695,14 +750,14 @@ class BatchedScanPack:
         compact_fired(
             self.hit,
             self.arch,
-            self.a_len,
-            self.a_off,
-            self.li,
-            self.slot,
+            self.a_len[sl],
+            self.a_off[sl],
+            self.li[sl],
+            self.slot[sl],
             self.fetch_buf,
             self.fetch_len,
             self.fetch_ovf,
             self.ovf_count,
-            (self.c_counts, self.c_offsets, self.c_total),
+            (self.c_counts[sl], self.c_offsets[sl], self.c_total[sl]),
             self.am_grid,
         )

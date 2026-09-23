@@ -137,6 +137,27 @@ class TestDsaDecodeFork(CustomTestCase):
         self.assertTrue(torch.equal(want, out))
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_pooled_fetch_entries_expand_to_consecutive_rows(self):
+        # Pooled archive (DSA-model redesign): a fetched entry is the base row
+        # of a 4-token pool whose members sit at consecutive rows. The fork
+        # attends kept + 4 rows per entry, and equals DSA on that row list.
+        import msgspec
+
+        gen, kv, q = self._setup(8)
+        vk = _rows(gen, nk=1200, nf=90)
+        slot = int(vk.slots[0])
+        bases = (torch.randperm(POOL // 4, device="cuda", generator=gen)[:90] * 4).to(torch.int32)
+        vk.fetch_buf[slot, :90] = bases
+        vk = msgspec.structs.replace(vk, fpool=4)
+        expanded = (bases[:, None] + torch.arange(4, device="cuda", dtype=torch.int32)[None, :]).reshape(-1)
+        rows = torch.cat([vk.kept_buf[slot, :1200], expanded])
+        for splits in (1, 16):
+            a = _dsa(q, kv, rows, splits, 0.0442)
+            b = self._fork(q, kv, vk, splits, 0.0442)
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(a, b), f"differs at kv_splits={splits}")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_the_fork_files_q_into_qbuf(self):
         import msgspec
 

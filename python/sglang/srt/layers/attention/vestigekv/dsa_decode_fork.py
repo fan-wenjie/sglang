@@ -83,6 +83,7 @@ def _vk_dsa_decode_split_kernel(
     VK_TOPK_K: tl.constexpr,
     VK_KPOOL: tl.constexpr,
     VK_QBUF: tl.constexpr,
+    VK_FPOOL: tl.constexpr = 1,  # rows per fetched entry (a 4-token pool's base row)
 ):
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -113,7 +114,7 @@ def _vk_dsa_decode_split_kernel(
         fenced_n = tl.minimum(seq_t - tail, VK_TOPK_K) + tail
     else:
         fenced_n = seq_t
-    n_t = tl.where(fenced, fenced_n, nk + nf)
+    n_t = tl.where(fenced, fenced_n, nk + nf * VK_FPOOL)
     loc_t = tl.load(vk_loc_ptr + t)
 
     qn_base = q_nope_ptr + t * STRIDE_QN_T
@@ -194,11 +195,17 @@ def _vk_dsa_decode_split_kernel(
             mask=valid & (k_pos < nk) & (not fenced),
             other=-1,
         )
+        # A fetched entry is a row id, or with VK_FPOOL > 1 the base row of a
+        # pool whose members sit at consecutive rows (pools are 4-aligned in
+        # position and never cross a 64-row page).
+        f_idx = (k_pos - nk) // VK_FPOOL
         fired = tl.load(
-            vk_fetch_buf + slot_t * VK_FW + (k_pos - nk),
+            vk_fetch_buf + slot_t * VK_FW + f_idx,
             mask=valid & (k_pos >= nk) & (not fenced),
             other=-1,
         )
+        if VK_FPOOL > 1:
+            fired = tl.where(fired >= 0, fired + (k_pos - nk) % VK_FPOOL, fired)
         slot = tl.where(fenced, sel, tl.where(k_pos < nk, kept, fired))
         valid = valid & (slot >= 0)
         page = tl.where(valid, slot, 0).to(tl.int64)
@@ -345,7 +352,7 @@ def vk_dsa_decode(
     assert d_v % 128 == 0, f"d_v must be divisible by 128, got {d_v}"
     num_groups = d_v // 128
     if max_rows is None:
-        max_rows = vk.kept_buf.shape[1] + vk.fetch_buf.shape[1]
+        max_rows = vk.kept_buf.shape[1] + vk.fetch_buf.shape[1] * vk.fpool
         if vk.topk is not None:
             max_rows = max(max_rows, vk.topk.shape[1])
     max_kv_splits = max(1, max_rows // _PREFERRED_BLOCK_K)
@@ -405,6 +412,7 @@ def vk_dsa_decode(
             BLOCK_K=BLOCK_K,
             VK_CAP=vk.kept_buf.shape[1],
             VK_FW=vk.fetch_buf.shape[1],
+            VK_FPOOL=vk.fpool,
             VK_R2T=vk.r2t.shape[1],
             FENCE=vk.fence,
             VK_TOPK=topk.shape[1] if topk is not None else 0,

@@ -650,6 +650,9 @@ class VestigeKVRows(msgspec.Struct):
     tiers: bool = True
     fence: bool = True
     affine: bool = False
+    # Rows per fetched entry: 1 (row ids) or the pool size when the archive is
+    # pooled (DSA-model redesign); the MLA fork serves fpool == 1 only.
+    fpool: int = 1
     # DSA models: the indexer's selection for this step, [bs, TOPK] int32 pool
     # rows (-1 padded); a fenced lane attends these instead of its page table.
     topk: object = None

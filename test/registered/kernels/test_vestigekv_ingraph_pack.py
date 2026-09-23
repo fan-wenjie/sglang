@@ -121,6 +121,44 @@ class TestCapacityPack(CustomTestCase):
             )
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_layer_ranges_with_placeholders_equal_one_launch(self):
+        # Per-layer launches (run_range over layer-major pair slots, lanes
+        # without a tier held by None placeholders) must fetch exactly what
+        # the one all-pairs launch fetches, and a placeholder writes only the
+        # trash row. This is the launch shape of the DSA-model backend's
+        # in-layer, current-query recall.
+        qbuf, fetch, flen, tiers = _mk_state()
+        lanes = [2, 5, TRASH]  # a fixed lane count per layer: two live, one placeholder
+        pairs = [(li, s) for li in range(L) for s in lanes]
+        tl = [tiers.get((li, s)) for li, s in pairs]
+
+        ref_fetch, ref_flen = fetch.clone(), flen.clone()
+        one = _capacity_pack(qbuf, ref_fetch, ref_flen)
+        self.assertTrue(one.fits(pairs, tl))
+        one.update(pairs, tl)
+        one.run(p_live=len(pairs))
+
+        sentinel = 777
+        flen.fill_(sentinel)
+        per = _capacity_pack(qbuf, fetch, flen)
+        per.update(pairs, tl)
+        n = len(lanes)
+        for li in range(L):
+            per.run_range(li * n, (li + 1) * n)
+        torch.cuda.synchronize()
+
+        for (li, s), t in zip(pairs, tl):
+            if t is None:
+                self.assertEqual(int(flen[li, s]), 0, "placeholder must write 0")
+                continue
+            a, b = int(flen[li, s]), int(ref_flen[li, s])
+            self.assertEqual(a, b, f"pair {(li, s)} count")
+            self.assertTrue(torch.equal(fetch[li, s, :a], ref_fetch[li, s, :b]), f"pair {(li, s)}")
+        # lanes no pair named keep their sentinel: a range launch stays inside its slots
+        untouched = [s for s in range(MAX_REQS) if s not in lanes]
+        self.assertTrue((flen[:, untouched] == sentinel).all().item())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_placeholders_write_only_trash(self):
         qbuf, fetch, flen, tiers = _mk_state()
         sentinel = 12345

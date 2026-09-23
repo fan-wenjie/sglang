@@ -607,6 +607,12 @@ class Envs:
     # single-graph tree; and on GLM-5.3-Flash 2-3 layers overflow on most
     # steps (VKSTATS 2026-09-22: lean 20-23% of steps), so it buys ~0.08 ms.
     SGLANG_ENABLE_VESTIGEKV_LEAN_GRAPH = EnvBool(False)
+    # vestigekv_dsa, fence off: run the recall step per MLA layer inside that
+    # layer's attention on the step's own query (the indexer's cadence)
+    # instead of once per step on last step's. Measured +0.68 ms/step at 4k,
+    # bs=1 (five launches per layer), so off; the step-level scan is the
+    # default of the fence-off arm.
+    SGLANG_ENABLE_VESTIGEKV_PERLAYER_SCAN = EnvBool(False)
 
     SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG = EnvStr(None)
 

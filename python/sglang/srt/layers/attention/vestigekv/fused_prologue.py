@@ -355,6 +355,7 @@ def _prologue_merge_kernel(
     qside_t_ptr,
     qsk_t_ptr,
     qres_ptr,
+    qkn_ptr,  # WRITE_QKN: [P, H] fp32 |qsk| per head, for the pooled scan's radius
     NSPLIT: tl.constexpr,
     H: tl.constexpr,
     R: tl.constexpr,
@@ -363,6 +364,7 @@ def _prologue_merge_kernel(
     QD: tl.constexpr,
     BLOCK_D: tl.constexpr,
     THR_LSE: tl.constexpr = False,  # margin from the kept log-sum-exp, not the max
+    WRITE_QKN: tl.constexpr = False,
 ):
     p = tl.program_id(0)
     if tl.load(a_len_ptr + p) == 0:
@@ -397,6 +399,8 @@ def _prologue_merge_kernel(
         qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
         tl.trans(qsk).to(tl.float16),
     )
+    if WRITE_QKN:
+        tl.store(qkn_ptr + p * H + h, tl.sqrt(tl.sum(qsk * qsk, 1)))
     sp = tl.arange(0, NSPLIT)
     base = p * NSPLIT * H
     m = tl.load(pm_ptr + base + sp[:, None] * H + h[None, :])
@@ -535,6 +539,7 @@ def fused_prologue_split(
     margin=0.0,
     thr_lse=False,
     kv=D.KV_LORA_RANK,
+    qkn=None,
 ):
     """Split-NK prologue reading queries in place from the stacked qbuf.
 
@@ -618,6 +623,7 @@ def fused_prologue_split(
         qside_t,
         qsk_t,
         qres,
+        qres if qkn is None else qkn,
         NSPLIT=_NSPLIT,
         H=H,
         R=R,
@@ -626,6 +632,7 @@ def fused_prologue_split(
         QD=QD,
         BLOCK_D=D.d_block_for_rank(R),
         THR_LSE=bool(thr_lse),
+        WRITE_QKN=qkn is not None,
         # 8 warps is bit-identical (per-element FMA chains) but measured
         # slower in the served graph: 35.8 vs 30.6 us/step (32k, bs=1, GLM-5.3-
         # Flash, node-level nsys 2026-09-22); a synthetic timing said otherwise.

@@ -95,6 +95,26 @@ def _refuse_sharded_sequence():
     )
 
 
+def _recall_percentiles(hist):
+    """(n, p10, p50, p90) of the fenced-lane recall histogram (percent bins);
+    the low tail is the number that matters, so p10 is reported, not p99."""
+    if hist is None:
+        return 0, "-", "-", "-"
+    h = hist.tolist()
+    n = sum(h)
+    if n == 0:
+        return 0, "-", "-", "-"
+    out = []
+    for q in (0.10, 0.50, 0.90):
+        acc, target = 0, q * n
+        for b, c in enumerate(h):
+            acc += c
+            if acc >= target:
+                out.append(f"{b / 100:.2f}")
+                break
+    return (n, *out)
+
+
 class VestigeKVDSABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.
 
@@ -144,6 +164,7 @@ class VestigeKVDSABackend(AttentionBackend):
     _dsa_resolved = False
     _mem_reqs = 0
     _fetch_hist = None
+    _recall_hist = None
     _stat_acc = None
     _router = None  # TierDecodeRouter when the fork serves stage 1, else None
     _affine_capture = False  # the AFFINE constexpr a capture baked; see decode_fork
@@ -321,6 +342,13 @@ class VestigeKVDSABackend(AttentionBackend):
         )
 
         self._lean_graph = envs.SGLANG_ENABLE_VESTIGEKV_LEAN_GRAPH.get()
+        # Redesign (docs/glm53-line.md, 'No crossover against DSA'): with the
+        # fence off the recall step runs per layer, inside that layer's
+        # attention, on the step's own query -- the indexer's cadence.
+        self._perlayer_scan = (
+            not self.config.overflow_fallback
+            and envs.SGLANG_ENABLE_VESTIGEKV_PERLAYER_SCAN.get()
+        )
         if self._lean_graph:
             set_vestigekv_variant_source(self._variant_for_step)
         # Fixed fetch-buffer width: graph capture needs a fixed WIDTH, not a
@@ -342,6 +370,7 @@ class VestigeKVDSABackend(AttentionBackend):
         if self._mem_dir is not None:
             torch.cuda.memory._record_memory_history(max_entries=200000)
         self._fetch_hist = None  # stats only: [W + 1] int64 device histogram
+        self._recall_hist = None  # stats only: [101] recall of the fired set on fenced lanes
         self._stat_acc = None  # stats only: [fetched, kept, seq] int64 device sums
         self._scan_graph = None
         self._scan_key_cur = self._scan_key_seen = None
@@ -1000,8 +1029,48 @@ class VestigeKVDSABackend(AttentionBackend):
                     self._fetch_hist += torch.bincount(
                         fetched.clamp_(0, self._fetch_w), minlength=self._fetch_w + 1
                     )
+        self._account_overflow_recall(forward_batch, slots)
         if st["steps"] % 50 == 0:
             self._dump_stats()
+
+    def _account_overflow_recall(self, forward_batch, slots):
+        # Fence on: an overflowed lane attends the indexer's selection instead
+        # of what the certificate fired. How much of the fired set that
+        # selection covers is the recall the fallback delivers. Read from the
+        # last replay's buffers (the pack's hit flags, the router's topk
+        # pointer) before this step's replay overwrites them; stats only.
+        pack = self._ingraph_pack
+        if (
+            not self.config.overflow_fallback
+            or pack is None
+            or self._router is None
+            or not pack.pairs
+        ):
+            return
+        if self._recall_hist is None:
+            self._recall_hist = torch.zeros(101, dtype=torch.int64, device=slots.device)
+        W = self._fetch_w
+        for i, (li, slot) in enumerate(pack.pairs):
+            lid = self._local_mla_lids[li]
+            rows = self._router.rows.get(lid)
+            if rows is None or rows.topk is None:
+                continue
+            lanes = (slots == slot).nonzero(as_tuple=True)[0]
+            if lanes.numel() == 0:
+                continue
+            a = int(pack.a_len[i])
+            if a == 0:
+                continue
+            o = int(pack.a_off[i])
+            hit = pack.hit[o : o + a].bool()  # arena-indexed
+            n_fired = int(hit.sum())
+            if n_fired <= W:
+                continue  # not fenced: the certified set was attended in full
+            fired = pack.arch[o : o + a][hit]
+            sel = rows.topk[int(lanes[0])]
+            sel = sel[sel >= 0]
+            rec = torch.isin(fired, sel).float().mean()
+            self._recall_hist[(rec * 100).round().long().clamp_(0, 100)] += 1
 
     def _dump_stats(self):
         import logging
@@ -1020,7 +1089,7 @@ class VestigeKVDSABackend(AttentionBackend):
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
             "pack=%.2fms/step "
             "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
-            "attended_frac=%.4f variant[lean=%d topk=%d] ovf_by_layer=%s",
+            "attended_frac=%.4f variant[lean=%d topk=%d] ovf_by_layer=%s fenced_recall[n=%d p10=%s p50=%s p90=%s]",
             st["steps"],
             len(self._mla_lids),
             100.0 * st["replays"] / n,
@@ -1049,6 +1118,7 @@ class VestigeKVDSABackend(AttentionBackend):
             st["lean"],
             st["topk"],
             self._ovf_count_stack.tolist() if self._ovf_count_stack is not None else [],
+            *_recall_percentiles(self._recall_hist),
         )
 
     def _overflow_total(self) -> int:
@@ -1746,8 +1816,11 @@ class VestigeKVDSABackend(AttentionBackend):
             and not self._full_arm()
             and self._router is not None
             and get_is_capture_mode()
+            and not self._perlayer_scan
         )
-        if lid in self._qbuf and not self._full_arm() and not qbuf_in_fork:
+        if self._perlayer_scan:
+            pass  # the layer's own scan files q below, on the step's lanes
+        elif lid in self._qbuf and not self._full_arm() and not qbuf_in_fork:
             # q arrives already in the absorbed expanded form
             # [bs, H, kv_lora_rank + rope] (see the base's qk_head_dim view).
             # On the captured path the fork writes it (VK_QBUF): it loads q
@@ -1787,6 +1860,28 @@ class VestigeKVDSABackend(AttentionBackend):
                 self._router.rows[lid].kpool = self._dsa_kpool
                 if qbuf_in_fork:
                     self._router.rows[lid].qbuf = self._qbuf[lid]
+                if (
+                    self._perlayer_scan
+                    and lid in self._qbuf
+                    and self._ingraph_pack is not None
+                    and not self._ingraph_dead
+                    and not self._full_arm()
+                ):
+                    # The recall step of THIS layer on THIS step's query: file
+                    # q into the layer's qbuf rows (padded lanes hit the trash
+                    # slot) and run prologue + scan + compact over the layer's
+                    # pair slots; the fork below reads the fetch it wrote.
+                    qb = self._qbuf[lid]
+                    if q.shape[-1] != qb.shape[-1]:
+                        raise RuntimeError(
+                            f"vestigekv per-layer scan: q width {q.shape[-1]} is not "
+                            f"the qbuf row width {qb.shape[-1]} (layer {lid})"
+                        )
+                    qb.index_copy_(
+                        0, self._stage_slots[:bs], q.reshape(bs, qb.shape[1], qb.shape[2])
+                    )
+                    li = self._li_map[lid]
+                    self._ingraph_pack.run_range(li * bs, (li + 1) * bs)
         else:
             # Eager step: the metadata hook packed this step's CSR into the
             # same buffers the graphs read. Sized for the whole request
@@ -2048,7 +2143,8 @@ class VestigeKVDSABackend(AttentionBackend):
         # Runs inside run_once during capture, so the whole recall step --
         # scan + fetch + the all-layer CSR pack -- replays as nodes of the
         # ONE decode graph launch. No host code runs here at replay time.
-        self._ingraph_pack.run(p_live=len(self._local_mla_lids) * bs)
+        if not self._perlayer_scan:
+            self._ingraph_pack.run(p_live=len(self._local_mla_lids) * bs)
         self._pack_all_layers(bs)
 
     def _pack_all_layers(self, bs):
@@ -2163,15 +2259,21 @@ class VestigeKVDSABackend(AttentionBackend):
         ) and not self._ingraph_dead:
             self._ingraph_full_armed = False
             pairs, tiers = [], []
+            bs_g = forward_batch.seq_lens.shape[0]
             for lid in self._local_mla_lids:
-                if lid not in self._qbuf:
+                if lid not in self._qbuf and not self._perlayer_scan:
                     continue
-                for i in range(real):
-                    st = self._recall.get((reqs[i], lid))
+                for i in range(bs_g if self._perlayer_scan else real):
+                    st = self._recall.get((reqs[i], lid)) if i < real else None
                     tier = st.get("tier") if st is not None else None
                     if tier is not None:
                         pairs.append((self._li_map[lid], reqs[i]))
                         tiers.append(tier)
+                    elif self._perlayer_scan:
+                        # Layer li owns pair slots [li * bs, (li + 1) * bs):
+                        # a lane without a tier holds its slot as a placeholder.
+                        pairs.append((self._li_map[lid], self._trash_slot))
+                        tiers.append(None)
             if not self._ingraph_pack.fits(pairs, tiers):
                 self._ingraph_disable(forward_batch, reqs)
             else:
