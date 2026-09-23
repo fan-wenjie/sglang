@@ -16,13 +16,18 @@ its own kernel:
     pack arena refresh, aidx/rho/arch     ~12 B/token/layer
     tier-1 kept set, latent rows           32 B/token/layer
 
-and a microbenchmark of the archive scan (2026-09-23) shows each pass carries
-a launch floor: the kernel takes ~15 us whether the archive holds 32k rows or
-131k, so its time does not track its bytes at all in this range. That is the
-measurement that retired three attempts in a row -- 4:1 pooling, halving the
-rank, and fp8 storage all shrank the bytes of ONE pass and moved the decode
-slope by 2.9% or less. Shrinking bytes cannot pay when the cost is a fixed
-floor per pass, multiplied by the number of passes.
+What is established is the outcome, not yet the mechanism. Three attempts in
+a row -- 4:1 pooling, halving the rank, fp8 storage -- each shrank the bytes
+of ONE pass, and each moved the decode slope by 2.9% or less. So the bytes of
+that pass are not what the slope is made of.
+
+A Python-timed microbenchmark suggested the scan carries a ~15 us floor
+independent of archive size, which would explain it, but that timing includes
+Triton's host-side launch path and the served scan is captured in a CUDA
+graph where none of that exists. Treat the floor as unverified until the
+per-kernel GPU time says so; the conclusion it was offered for -- that the
+scan's bytes do not drive the slope -- rests on the three null results and
+stands without it.
 
 So the target is the format, not any single term's size: one interleaved
 record per token holding DSA's indexer key, VestigeKV's rank-r sketch, its
