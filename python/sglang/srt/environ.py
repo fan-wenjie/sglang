@@ -617,6 +617,10 @@ class Envs:
     # tier instead of fp16, halving the scan's dominant load. The dot becomes
     # fp8 x fp8 (Triton has no mixed fp8 dot on SM120), so the query is
     # rounded the same way and zp is calibrated on those operands.
+    # Measured over a 4k-to-116k sweep: decode slope 0.224 -> 0.175 ms per 100k
+    # tokens, a 22% cut, with the gain monotone in context and absent below
+    # ~32k. An earlier run read 2.9% because the KV pool truncated it at 78k,
+    # entirely below where the gain appears.
     SGLANG_VESTIGEKV_CSK_FP8 = EnvBool(False)
     # Rows per archived tier-2 entry, the A/B over the parity rule: DSA scans
     # its index cache 4:1 pooled, so the archive does too. 1 keeps the
