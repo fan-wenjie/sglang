@@ -55,6 +55,7 @@ def _scan_batched_kernel(
     H: tl.constexpr,
     DD: tl.constexpr,
     R: tl.constexpr,
+    CSK_FP8: tl.constexpr,  # sketch stored as fp8: type the indirect pointer
     HAS_SPREAD: tl.constexpr,  # archive pooled: carry the Cauchy-Schwarz term
     SIDE_POOL: tl.constexpr,  # 0 packed table, 1 indirect load, 2 TMA gather
     CSK_TIER: tl.constexpr,  # same, for the sketch projections
@@ -109,7 +110,14 @@ def _scan_batched_kernel(
         # The cache is reallocated by torch.cat at every block close, which is
         # why its address is read from a device table refreshed by update()
         # rather than baked into the graph.
-        cbase = tl.load(cbase_ptr + p).to(tl.pointer_type(tl.float16))
+        # The element type has to follow the tier's storage, not be assumed:
+        # hardcoding fp16 here left the indirect path loading an fp8 cache as
+        # fp16, and Triton rejected the dot for a dtype mismatch it reported
+        # against the query rather than the cache.
+        if CSK_FP8:
+            cbase = tl.load(cbase_ptr + p).to(tl.pointer_type(tl.float8e4nv))
+        else:
+            cbase = tl.load(cbase_ptr + p).to(tl.pointer_type(tl.float16))
     if CSK_TIER == 2:
         cdesc = tl.make_tensor_descriptor(
             cbase,
@@ -735,6 +743,10 @@ class BatchedScanPack:
             H=self.q_heads,
             DD=self.geom.side_dim,
             R=self.v.shape[1],
+            # from the same authority every other site reads: self.csk is None
+            # on the indirect path, where the tier's cache is addressed by
+            # pointer and no arena copy exists
+            CSK_FP8=_csk_dtype() == torch.float8_e4m3fn,
             HAS_SPREAD=self.has_spread,
             SIDE_POOL=0 if self.side is not None else self.side_mode,
             CSK_TIER=0 if self.csk is not None else self.csk_mode,
