@@ -120,7 +120,15 @@ def create_vestigekv_mla_backend(runner):
     # degrading quality.
     _kimi = kimi_linear_config(runner.model_config)
     _glm = glm5_next_config(runner.model_config)
-    if _kimi is None and _glm is None:
+    _hf = runner.model_config.hf_config
+    _deepseek_rope_mla = (
+        _kimi is None
+        and _glm is None
+        and getattr(_hf, "model_type", None) in ("deepseek_v2", "deepseek_v3")
+        and int(getattr(_hf, "qk_rope_head_dim", 0) or 0) > 0
+        and not getattr(_hf, "index_topk", None)
+    )
+    if _kimi is None and _glm is None and not _deepseek_rope_mla:
         raise ValueError(
             "vestigekv_mla is validated only for NoPE-MLA models (Kimi Linear "
             "family; GLM-5.3-Flash with the DSA indexer's top-k switched off). "

@@ -1863,6 +1863,23 @@ class DeepseekV2AttentionMLA(
                 k_norm_type=getattr(config, "index_k_norm_type", None) or "layer",
                 prefix=add_prefix("salience", prefix),
             )
+        elif (
+            not self.use_dsa
+            and not is_nextn
+            and not index_head_dim
+            and getattr(config, "qk_rope_head_dim", 0) > 0
+            and not getattr(config, "mla_use_nope", False)
+            and get_exec().kernel.attention_backend == "vestigekv_mla"
+        ):
+            # RoPE-MLA (DeepSeek family): the salience channel is the decoupled
+            # key before rotation, read off the layer's own kv_a projection.
+            from sglang.srt.layers.attention.vestigekv.salience import RopeSalienceKey
+
+            if hasattr(self, "fused_qkv_a_proj_with_mqa"):
+                proj, off = self.fused_qkv_a_proj_with_mqa, self.q_lora_rank + self.kv_lora_rank
+            else:
+                proj, off = self.kv_a_proj_with_mqa, self.kv_lora_rank
+            self.salience = RopeSalienceKey(proj=proj, offset=off, dim=self.qk_rope_head_dim)
         elif index_head_dim and not is_nextn and not self.use_dsa:
             # Say why, once per layer, because the alternative is a run that
             # looks identical and scores an all-zero salience channel: sigma is

@@ -248,7 +248,14 @@ class VestigeKVMLABackend(AttentionBackend):
         text_cfg = kimi_linear_config(model_runner.model_config) or glm5_next_config(
             model_runner.model_config
         )
-        self._mla_lids_static = set(text_cfg.full_attention_layer_ids)
+        if text_cfg is None:
+            # A plain MLA model (DeepSeek family): every layer is an MLA layer
+            # and the config is the checkpoint's own.
+            text_cfg = model_runner.model_config.hf_config
+        full_ids = getattr(text_cfg, "full_attention_layer_ids", None)
+        self._mla_lids_static = set(
+            full_ids if full_ids is not None else range(self._num_layers)
+        )
         from sglang.srt.configs.model_config import is_deepseek_dsa
 
         # A DSA model's indexer budget: what a fenced lane attends on this
@@ -261,8 +268,9 @@ class VestigeKVMLABackend(AttentionBackend):
         )
         # this PP rank's MLA layers, from the hybrid pool's authoritative map
         # (HybridLinearKVPool.full_attention_layer_id_mapping)
+        layer_map = getattr(base.token_to_kv_pool, "full_attention_layer_id_mapping", None)
         self._local_mla_lids = sorted(
-            base.token_to_kv_pool.full_attention_layer_id_mapping
+            layer_map if layer_map is not None else range(self._num_layers)
         )
         # MLA layer ids actually routed to this backend (the hybrid never sends
         # KDA layers here), learned at prefill; every decode step's calibration

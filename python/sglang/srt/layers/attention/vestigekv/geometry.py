@@ -45,12 +45,18 @@ class Geometry(msgspec.Struct, frozen=True, kw_only=True):
     def from_hf_config(cls, cfg) -> Geometry:
         side = int(cfg.qk_rope_head_dim)
         if side > 0:
+            # The decoupled branch is the salience channel. Kimi Linear leaves
+            # it unrotated (mla_use_nope), so the row tail itself is scored;
+            # a RoPE-MLA model (DeepSeek) rotates it by position, so the
+            # pre-rotation copy the model files (RopeSalienceKey) is held in
+            # a per-layer side pool and scored there. The certificate reads
+            # the rotated tail off the row in both cases: that is the logit.
             return cls(
                 kv_lora_rank=int(cfg.kv_lora_rank),
                 side_dim=side,
                 qk_head_dim=int(cfg.qk_nope_head_dim) + side,
                 sigma_dim=side,
-                sigma_in_row=True,
+                sigma_in_row=bool(getattr(cfg, "mla_use_nope", False)),
             )
         # Rope-less MLA: the DSA indexer key (never rotated when rope is absent)
         # is the salience channel, held in its own per-layer pool.

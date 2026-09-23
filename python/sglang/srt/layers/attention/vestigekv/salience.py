@@ -45,6 +45,24 @@ class SalienceKey(nn.Module):
         return self.k_norm(key)
 
 
+class RopeSalienceKey(nn.Module):
+    """The decoupled key BEFORE its rotation, for a RoPE-MLA model (DeepSeek
+    family). The latent row stores k_pe rotated by position, which is why the
+    in-row sidecar collapses as an eviction signal there (measured 0.89 -> 0.08
+    needle retrieval); the same 64 dims straight out of the kv_a projection are
+    position-free, exactly Kimi Linear's un-roped branch. Re-reads the layer's
+    own projection (no weights of its own), sliced to the rope columns."""
+
+    def __init__(self, *, proj: nn.Module, offset: int, dim: int):
+        super().__init__()
+        self.proj = proj  # the layer's kv_a (or fused qkv_a) projection, shared
+        self.offset, self.dim = offset, dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.proj(x)
+        return out[..., self.offset : self.offset + self.dim]
+
+
 FP8_MAX = 448.0  # e4m3 range act_quant clamps to
 
 
