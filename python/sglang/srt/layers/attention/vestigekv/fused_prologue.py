@@ -22,6 +22,16 @@ import torch
 import triton
 import triton.language as tl
 
+
+def _qsk_fp8() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_VESTIGEKV_CSK_FP8.get())
+
+
+def _qsk_dtype():
+    return torch.float8_e4m3fn if _qsk_fp8() else torch.float16
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
@@ -38,13 +48,15 @@ def _fused_prologue_kernel(
     max1g_ptr,  # [P, H] fp32 out: max kept score, +inf closed gate, -inf empty
     mst_ptr,  # EMIT_MST: [P, H, 3] fp32 out -- the online (max, sum, t) triple
     qside_t_ptr,  # [P, DD, H] bf16 out
-    qsk_t_ptr,  # [P, R, H] fp16 out
+    qsk_t_ptr,  # [P, R, H] out, fp16 or fp8 per QSK_FP8
+    qsk_scale_ptr,  # [P] fp32 out: the fp8 scale, 1.0 when fp16
     qres_ptr,  # [P, H] fp32 out
     sc,  # attention scale
     margin,  # recall margin subtracted from the kept max (fp32 scalar)
     NKm,
     H: tl.constexpr,
     R: tl.constexpr,
+    QSK_FP8: tl.constexpr,
     KV: tl.constexpr,  # content width
     DD: tl.constexpr,  # sidecar width (0 = rope-less MLA, no sidecar)
     QD: tl.constexpr,  # expanded query / latent row width (KV + DD)
@@ -128,10 +140,24 @@ def _fused_prologue_kernel(
             qside_t_ptr + p * DD * H + dd[:, None] * H + h[None, :],
             tl.trans(qside).to(tl.bfloat16),
         )
-    tl.store(
-        qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
-        tl.trans(qsk).to(tl.float16),
-    )
+    if QSK_FP8:
+        # fp8 has no headroom, so the scale is computed here from this pair's
+        # own projection and written out for the scan to fold in. Doing it on
+        # device keeps the value inside the captured graph; a host-side scale
+        # would be baked at capture and stale on every replay.
+        qs_amax = tl.max(tl.abs(qsk))
+        qs_scale = tl.maximum(qs_amax, 1e-9) / 448.0
+        tl.store(qsk_scale_ptr + p, qs_scale)
+        tl.store(
+            qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
+            (tl.trans(qsk) / qs_scale).to(tl.float8e4nv),
+        )
+    else:
+        tl.store(qsk_scale_ptr + p, 1.0)
+        tl.store(
+            qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
+            tl.trans(qsk).to(tl.float16),
+        )
 
 
 def combine_kept_stats(parts, thr, margin=0.0, thr_lse=False):
@@ -183,10 +209,11 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0,
     if out is None:
         max1g = q.new_empty(P, H)
         qside_t = q.new_empty(P, dd, H, dtype=torch.bfloat16)
-        qsk_t = q.new_empty(P, R, H, dtype=torch.float16)
+        qsk_t = q.new_empty(P, R, H, dtype=_qsk_dtype())
         qres = q.new_empty(P, H)
+        qsk_scale = q.new_empty(P)
     else:
-        max1g, qside_t, qsk_t, qres = out
+        max1g, qside_t, qsk_t, qres, qsk_scale = out
     _fused_prologue_kernel[(P,)](
         q,
         kr,
@@ -197,12 +224,14 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0,
         max1g if mst is None else mst,
         qside_t,
         qsk_t,
+        qsk_scale,
         qres,
         sc,
         float(margin),
         NKm,
         H=H,
         R=R,
+        QSK_FP8=_qsk_fp8(),
         KV=kv,
         DD=dd,
         QD=QD,
@@ -215,7 +244,7 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0,
         # Flash, node-level nsys 2026-09-22); a synthetic timing said otherwise.
         num_warps=4,
     )
-    return max1g, qside_t, qsk_t, qres
+    return max1g, qside_t, qsk_t, qres, qsk_scale
 
 
 # ---- split-NK variant: flash-decoding style parallelism over kept rows ----
@@ -354,10 +383,12 @@ def _prologue_merge_kernel(
     v_ptr,
     qside_t_ptr,
     qsk_t_ptr,
+    qsk_scale_ptr,  # [P] fp32 out: the fp8 scale, 1.0 when fp16
     qres_ptr,
     NSPLIT: tl.constexpr,
     H: tl.constexpr,
     R: tl.constexpr,
+    QSK_FP8: tl.constexpr,
     KV: tl.constexpr,
     DD: tl.constexpr,
     QD: tl.constexpr,
@@ -393,10 +424,24 @@ def _prologue_merge_kernel(
             qside_t_ptr + p * DD * H + dd[:, None] * H + h[None, :],
             tl.trans(qside).to(tl.bfloat16),
         )
-    tl.store(
-        qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
-        tl.trans(qsk).to(tl.float16),
-    )
+    if QSK_FP8:
+        # fp8 has no headroom, so the scale is computed here from this pair's
+        # own projection and written out for the scan to fold in. Doing it on
+        # device keeps the value inside the captured graph; a host-side scale
+        # would be baked at capture and stale on every replay.
+        qs_amax = tl.max(tl.abs(qsk))
+        qs_scale = tl.maximum(qs_amax, 1e-9) / 448.0
+        tl.store(qsk_scale_ptr + p, qs_scale)
+        tl.store(
+            qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
+            (tl.trans(qsk) / qs_scale).to(tl.float8e4nv),
+        )
+    else:
+        tl.store(qsk_scale_ptr + p, 1.0)
+        tl.store(
+            qsk_t_ptr + p * R * H + r[:, None] * H + h[None, :],
+            tl.trans(qsk).to(tl.float16),
+        )
     sp = tl.arange(0, NSPLIT)
     base = p * NSPLIT * H
     m = tl.load(pm_ptr + base + sp[:, None] * H + h[None, :])
@@ -573,7 +618,7 @@ def fused_prologue_split(
     R = v.shape[1]
     QD = qbuf.shape[-1]
     dd = QD - kv
-    max1g, qside_t, qsk_t, qres = out
+    max1g, qside_t, qsk_t, qres, qsk_scale = out
     pm, ps, pt = partials
     _prologue_scores_kernel[(P, _NSPLIT)](
         qbuf,
@@ -617,10 +662,12 @@ def fused_prologue_split(
         v,
         qside_t,
         qsk_t,
+        qsk_scale,
         qres,
         NSPLIT=_NSPLIT,
         H=H,
         R=R,
+        QSK_FP8=_qsk_fp8(),
         KV=kv,
         DD=dd,
         QD=QD,
@@ -631,7 +678,7 @@ def fused_prologue_split(
         # Flash, node-level nsys 2026-09-22); a synthetic timing said otherwise.
         num_warps=4,
     )
-    return max1g, qside_t, qsk_t, qres
+    return max1g, qside_t, qsk_t, qres, qsk_scale
 
 
 # ---- deterministic two-phase compaction: replaces the torch cumsum chain ----
