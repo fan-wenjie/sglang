@@ -133,6 +133,16 @@ class RecallTier:
         self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
         # fixed-address staging for the fused scan (capturable)
         self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
+        # Achieved-recall audit (SGLANG_DEBUG_VESTIGEKV_RECALL_AUDIT); None in
+        # production. VKSTATS is cost only, so without this nothing on the
+        # serving path observes whether the certificate met its target.
+        self._audit = None
+        self._audit_lid = 0
+        _every = envs.SGLANG_DEBUG_VESTIGEKV_RECALL_AUDIT.get()
+        if _every:
+            from sglang.srt.layers.attention.vestigekv.recall_audit import RecallAudit
+
+            self._audit = RecallAudit(target=recall_target, every=_every)
 
     @property
     def csk_dtype(self):
@@ -863,6 +873,17 @@ class RecallTier:
             )
             != 0
         )
+        if self._audit is not None:
+            # max1g already carries the gate as +inf, so a closed head cannot
+            # make a row "true" here either: the audit and the scan compare
+            # against the same thresholds.
+            self._audit.observe(
+                arch=self._kbuf[self.arch][:, : self.geom.kv_lora_rank].float(),
+                q=qe[:, : self.geom.kv_lora_rank],
+                thr=max1g / sc_,
+                fired=hit,
+                lid=self._audit_lid,
+            )
         W = out.shape[1]
         total = hit.sum()  # [] int64 on device
         n = total.clamp(max=W)
