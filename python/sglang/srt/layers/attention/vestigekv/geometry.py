@@ -56,7 +56,12 @@ class Geometry(msgspec.Struct, frozen=True, kw_only=True):
                 side_dim=side,
                 qk_head_dim=int(cfg.qk_nope_head_dim) + side,
                 sigma_dim=side,
-                sigma_in_row=bool(getattr(cfg, "mla_use_nope", False)),
+                # DeepSeek-family configs rotate the branch; Kimi Linear's is
+                # NoPE unless its config says otherwise (mla_use_nope=False).
+                sigma_in_row=(
+                    getattr(cfg, "model_type", None) not in ("deepseek_v2", "deepseek_v3")
+                    and getattr(cfg, "mla_use_nope", True) is not False
+                ),
             )
         # Rope-less MLA: the DSA indexer key (never rotated when rope is absent)
         # is the salience channel, held in its own per-layer pool.
