@@ -174,7 +174,11 @@ class RecallTier:
         if not self._csk_fp8:
             return c.half()
         q = c / self.csk_scale
-        torch._assert_async((q.abs().amax() < 448.0).to(torch.bool))
+        # <=, not <: the scale is 2**ceil(log2(amax / 448)), so a value whose
+        # amax/448 lands exactly on a power of two divides to exactly 448.
+        # 448 is e4m3's largest finite value, so it is in range; a strict
+        # bound rejected it and killed the r=128 arm (2026-09-23).
+        torch._assert_async((q.abs().amax() <= 448.0).to(torch.bool))
         return q.to(torch.float8_e4m3fn)
 
     def _deq_csk(self, c: torch.Tensor) -> torch.Tensor:

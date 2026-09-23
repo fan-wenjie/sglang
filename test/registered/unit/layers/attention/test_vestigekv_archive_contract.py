@@ -121,5 +121,25 @@ class TestSketchScale(CustomTestCase):
         self.assertEqual(t.csk_scale, 1.0)
 
 
+class TestSketchScaleBoundary(CustomTestCase):
+    """448 is in range, not out of it.
+
+    Bug regression: the scale is 2**ceil(log2(amax / 448)), so an amax whose
+    quotient lands exactly on a power of two divides to exactly 448, e4m3's
+    largest finite value. A strict bound rejected it and the served r=128 arm
+    died on the range assert while r=64 merely never landed on the boundary.
+    """
+
+    def test_an_amax_on_the_power_of_two_boundary_quantises(self):
+        with envs.SGLANG_VESTIGEKV_CSK_FP8.override(True):
+            t = RecallTier(r=R)
+        c = torch.full((4, R), 448.0)  # amax/448 == 1.0, a power of two
+        t._set_csk_scale(c)
+        self.assertEqual(t.csk_scale, 1.0)
+        q = t._q_csk(c)
+        self.assertTrue(bool(torch.isfinite(q.float()).all()))
+        self.assertAlmostEqual(float(q.float().abs().max()), 448.0, places=3)
+
+
 if __name__ == "__main__":
     unittest.main()
