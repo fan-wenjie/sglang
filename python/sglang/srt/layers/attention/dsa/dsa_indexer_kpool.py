@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -113,6 +114,16 @@ class IndexerKPool(MultiPlatformOp):
         self.index_kpool = config.index_kpool
         self.index_kpool_always_select_tail = config.index_kpool_always_select_tail
         self.index_kpool_compress = config.index_kpool_compress
+
+        # Telemetry only (SGLANG_DEBUG_DSA_TOPK_THRESHOLD); None in production.
+        self.topk_threshold_telemetry = None
+        every = envs.SGLANG_DEBUG_DSA_TOPK_THRESHOLD.get()
+        if every:
+            from sglang.srt.layers.attention.dsa.topk_threshold_telemetry import (
+                TopkThresholdTelemetry,
+            )
+
+            self.topk_threshold_telemetry = TopkThresholdTelemetry(every=every)
 
         assert (
             self.index_kpool > 1
@@ -682,6 +693,16 @@ class IndexerKPool(MultiPlatformOp):
             topk_offsets = topk_offsets[:n_rows]
         if page_table_row_index is not None and page_table_row_index.shape[0] != n_rows:
             page_table_row_index = page_table_row_index[:n_rows]
+
+        if self.topk_threshold_telemetry is not None and n_rows <= 8:
+            # n_rows <= 8 is the decode shape; a prefill chunk arrives with one
+            # row per token and has no per-step cut to track.
+            self.topk_threshold_telemetry.observe(
+                logits,
+                pool_lens[0],
+                self.index_topk // self.index_kpool,
+                lid=self.layer_id,
+            )
 
         return topk_from_pooled_history_logits(
             logits=logits,

@@ -1629,6 +1629,11 @@ class Envs:
     )
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
+    # Telemetry only: decode steps between VKTOPKTH reports per layer (0 = off).
+    # Records the indexer's top-k cut value per layer per step so a study can
+    # tell whether a pivot is predictable across steps and layers
+    # (dsa/topk_threshold_telemetry.py). Nothing downstream reads it.
+    SGLANG_DEBUG_DSA_TOPK_THRESHOLD = EnvInt(0)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
