@@ -607,6 +607,12 @@ class Envs:
     # single-graph tree; and on GLM-5.3-Flash 2-3 layers overflow on most
     # steps (VKSTATS 2026-09-22: lean 20-23% of steps), so it buys ~0.08 ms.
     SGLANG_ENABLE_VESTIGEKV_LEAN_GRAPH = EnvBool(False)
+    # Rows per archived tier-2 entry, the A/B over the parity rule: DSA scans
+    # its index cache 4:1 pooled, so the archive does too. 1 keeps the
+    # per-row archive. Pooling is only sound once the scan carries the group
+    # spread term, so this stays at 1 until that lands (see
+    # vestigekv/archive_pool.py for the measurements).
+    SGLANG_VESTIGEKV_ARCHIVE_POOL = EnvInt(1)
     # Telemetry only: blocks between VKSPECTRUM reports per layer (0 = off).
     # At each block close, where the salience branch puts its above-cutoff
     # energy (vestigekv/spectrum.py): one rFFT per block per layer, off the
