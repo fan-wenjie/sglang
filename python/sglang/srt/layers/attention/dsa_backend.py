@@ -351,6 +351,18 @@ class DeepseekSparseAttnBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
+        # Telemetry only (SGLANG_DEBUG_DSA_SELECT_RECALL); None in production.
+        self.select_recall_telemetry = None
+        every = envs.SGLANG_DEBUG_DSA_SELECT_RECALL.get()
+        if every:
+            from sglang.srt.layers.attention.dsa.select_recall_telemetry import (
+                SelectRecallTelemetry,
+            )
+
+            self.select_recall_telemetry = SelectRecallTelemetry(
+                topk=self.dsa_index_topk, every=every
+            )
+
         self.use_mha: bool = False
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
@@ -2196,6 +2208,40 @@ class DeepseekSparseAttnBackend(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
             )
 
+    def _observe_select_recall(self, q, topk_indices, forward_batch, lid):
+        """Score every row of lane 0 with its own decode query and compare the
+        oracle top-k against what the indexer picked.
+
+        Lane 0 only: the question is how much headroom a supplement has, and
+        one lane answers it without making a dense scoring pass per request.
+        The selection carries -1 padding for a short sequence, which must not
+        index the hit mask as a tail row.
+        """
+        seq = int(forward_batch.seq_lens[0])
+        if seq <= self.dsa_index_topk:
+            return
+        slots = self.req_to_token[int(forward_batch.req_pool_indices[0]), :seq]
+        kbuf = self.token_to_kv_pool.get_key_buffer(lid)
+        rows = kbuf.reshape(kbuf.shape[0], -1).index_select(0, slots.to(torch.int64))
+        sel = topk_indices[0].reshape(-1)
+        sel = sel[sel >= 0].to(torch.int64)
+        # topk_indices are pool slots and the oracle is indexed by position in
+        # the request, so invert the slot list by scatter. Not searchsorted:
+        # a paged allocator does not promise the slots rise with position, and
+        # a binary search over unsorted keys answers silently and wrongly.
+        inv = torch.full(
+            (kbuf.shape[0],), -1, dtype=torch.int64, device=slots.device
+        )
+        inv[slots.to(torch.int64)] = torch.arange(seq, device=slots.device)
+        pos = inv[sel]
+        pos = pos[pos >= 0]
+        self.select_recall_telemetry.observe(
+            rows=rows.float(),
+            q=q.reshape(-1, rows.shape[1]).float(),
+            selected=pos,
+            lid=lid,
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2220,6 +2266,9 @@ class DeepseekSparseAttnBackend(
 
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
+
+        if self.select_recall_telemetry is not None and topk_indices is not None:
+            self._observe_select_recall(q, topk_indices, forward_batch, layer.layer_id)
 
         if attn_sink is not None and dsa_impl != "flashmla_sparse":
             raise RuntimeError(

@@ -1629,6 +1629,12 @@ class Envs:
     )
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
+    # Telemetry only: decode steps between VKSELREC reports per layer (0 = off).
+    # How much of the oracle top-k (dense scoring of every row by the decode
+    # query) DSA's selection already holds, which bounds what a supplement
+    # could add (dsa/select_recall_telemetry.py). Computing the oracle is the
+    # dense work the sparse path exists to avoid, so this is a study flag.
+    SGLANG_DEBUG_DSA_SELECT_RECALL = EnvInt(0)
     # Telemetry only: decode steps between VKTOPKTH reports per layer (0 = off).
     # Records the indexer's top-k cut value per layer per step so a study can
     # tell whether a pivot is predictable across steps and layers
