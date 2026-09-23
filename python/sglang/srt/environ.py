@@ -617,10 +617,12 @@ class Envs:
     # tier instead of fp16, halving the scan's dominant load. The dot becomes
     # fp8 x fp8 (Triton has no mixed fp8 dot on SM120), so the query is
     # rounded the same way and zp is calibrated on those operands.
-    # Measured over a 4k-to-116k sweep: decode slope 0.224 -> 0.175 ms per 100k
-    # tokens, a 22% cut, with the gain monotone in context and absent below
-    # ~32k. An earlier run read 2.9% because the KV pool truncated it at 78k,
-    # entirely below where the gain appears.
+    # Measured over a 4k-to-116k sweep with the calibrated certificate serving:
+    # decode slope 0.233 -> 0.211 ms per 100k tokens (DSA: 0.113), a 9.6% cut,
+    # visible only above ~32k. A run that read 22% had the async calibrated
+    # build failing in both arms (071e001491), so the provisional certificate
+    # fired the whole archive and fp8 was halving a scan far larger than the
+    # real one; a run that read 2.9% was truncated at 78k by the KV pool.
     SGLANG_VESTIGEKV_CSK_FP8 = EnvBool(False)
     # Rows per archived tier-2 entry, the A/B over the parity rule: DSA scans
     # its index cache 4:1 pooled, so the archive does too. 1 keeps the
