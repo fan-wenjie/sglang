@@ -625,12 +625,17 @@ class Envs:
     # certificate. Empty (the default) is the dynamic behaviour: both chains
     # run on every layer.
     #
+    # "none" is the empty set with the split ON: no layer runs the indexer at
+    # decode, and every fenced lane reads its page table -- exact attention,
+    # and on GLM-5.3-Flash at 32k the fastest of the three (mean ITL 11.27 ms
+    # against 11.53 for both chains on every layer and 11.31 for DSA alone).
+    # The dense fallback costs bandwidth that grows with the context while a
+    # named set costs a second selection chain that does not, so a long-context
+    # deployment may still want one.
+    #
     # The set is a process constant so that the decision is a Python branch
     # at capture time and costs nothing at replay; per-step per-layer
     # dispatch measured +0.68 ms/step, more than the whole DSA chain.
-    # Measured on GLM-5.3-Flash at 32k: layers 23, 39, 27, 3, 19 overflow
-    # the certificate on 33-99% of steps (so they were already attending
-    # DSA's selection through the fence), every other layer under 2%.
     SGLANG_VESTIGEKV_DSA_LAYERS = EnvTuple(tuple())
     # Store the tier-2 sketch as fp8 e4m3 with one power-of-two scale per
     # tier instead of fp16, halving the scan's dominant load. The dot becomes
