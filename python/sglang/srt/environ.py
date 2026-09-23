@@ -618,6 +618,20 @@ class Envs:
     # the per-step overflow pattern across layers can be replayed offline
     # (which layers fence together; what a static per-layer split would buy).
     SGLANG_DEBUG_VESTIGEKV_OVF_TRACE = EnvStr(None)
+    # Static per-layer roles: the MLA layer ids that stay pure DSA, as a
+    # comma-separated list. Those layers run the indexer and attend its
+    # top-k every step (the fence flag is held on); every other layer skips
+    # the indexer's scoring and top-k for good and serves from the
+    # certificate. Empty (the default) is the dynamic behaviour: both chains
+    # run on every layer.
+    #
+    # The set is a process constant so that the decision is a Python branch
+    # at capture time and costs nothing at replay; per-step per-layer
+    # dispatch measured +0.68 ms/step, more than the whole DSA chain.
+    # Measured on GLM-5.3-Flash at 32k: layers 23, 39, 27, 3, 19 overflow
+    # the certificate on 33-99% of steps (so they were already attending
+    # DSA's selection through the fence), every other layer under 2%.
+    SGLANG_VESTIGEKV_DSA_LAYERS = EnvTuple(tuple())
     # Store the tier-2 sketch as fp8 e4m3 with one power-of-two scale per
     # tier instead of fp16, halving the scan's dominant load. The dot becomes
     # fp8 x fp8 (Triton has no mixed fp8 dot on SM120), so the query is

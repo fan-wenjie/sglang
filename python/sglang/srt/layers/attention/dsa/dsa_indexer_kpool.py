@@ -60,20 +60,34 @@ def _vestigekv_decode_backend():
     return vestigekv_backend_of(get_attn_backend())
 
 
-def _vestigekv_lean_step() -> bool:
-    """A vestigekv_dsa decode step that needs no selection: the key is filed
-    and the index cache written, scoring and top-k are skipped. Inside a
-    capture the graph variant decides (graph_variants.VK_LEAN); eager steps
-    read the backend's stale-by-one flag."""
+def _vestigekv_lean_step(layer_id: int) -> bool:
+    """A vestigekv_dsa decode step that needs no selection on THIS layer: the
+    key is filed and the index cache written, scoring and top-k are skipped.
+
+    With static per-layer roles (SGLANG_VESTIGEKV_DSA_LAYERS) the answer is a
+    property of the layer alone, so it is the same Python branch at capture
+    and at replay and the graph bakes it. Otherwise the step-global rule
+    applies: inside a capture the graph variant decides
+    (graph_variants.VK_LEAN), eager steps read the backend's stale-by-one flag.
+    """
     from sglang.srt.layers.attention.graph_variants import VK_LEAN
+    from sglang.srt.layers.attention.vestigekv_dsa_backend import VestigeKVDSABackend
     from sglang.srt.model_executor.runner_utils.capture_mode import (
         get_capture_attention_variant,
         get_is_capture_mode,
     )
 
+    vk = _vestigekv_decode_backend()
+    if isinstance(vk, VestigeKVDSABackend) and vk.dsa_only_layers:
+        # Captured path only. A fenced lane on a layer with no selection
+        # attends its page table instead, which the fork sizes from the row
+        # count at runtime but the CSR pack sizes from DSA's budget -- so the
+        # eager path, the one that serves through the CSR, keeps the indexer.
+        if get_is_capture_mode():
+            return layer_id not in vk.dsa_only_layers
+        return False
     if get_is_capture_mode():
         return get_capture_attention_variant() == VK_LEAN
-    vk = _vestigekv_decode_backend()
     return vk is not None and getattr(vk, "lean_step", False)
 
 
@@ -1505,7 +1519,9 @@ class IndexerKPool(MultiPlatformOp):
                 return_indices=return_indices,
             )
 
-        if forward_batch.forward_mode.is_decode_or_idle() and _vestigekv_lean_step():
+        if forward_batch.forward_mode.is_decode_or_idle() and _vestigekv_lean_step(
+            layer_id
+        ):
             # vestigekv_dsa, lean variant: the key still has to reach the
             # index cache (a later top-k reads it) and VestigeKV's ring, but
             # nothing attends the selection this step, so the scoring GEMMs,
