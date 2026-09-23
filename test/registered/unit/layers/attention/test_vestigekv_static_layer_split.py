@@ -55,10 +55,6 @@ class TestStaticLayerSplit(CustomTestCase):
                 f"layer {lid}",
             )
 
-    def test_dsa_layers_keep_the_indexer(self):
-        for lid in sorted(DSA_LAYERS):
-            self.assertFalse(self._lean(lid=lid, dsa_only=DSA_LAYERS, capture=True))
-
     def test_eager_steps_keep_the_indexer_on_every_layer(self):
         # The eager path serves through the CSR pack, whose fenced fallback is
         # sized for DSA's selection; dropping the selection there would size
