@@ -267,6 +267,8 @@ class VestigeKVDSABackend(AttentionBackend):
         self._qbuf_stack = self._fetch_stack = self._fetch_len_stack = None
         self._eager_steps = 0  # eager decode steps; _stats["steps"] counts replays
         self._fetch_ovf_stack = self._ovf_count_stack = None
+        # per-step snapshots of _ovf_count_stack (SGLANG_DEBUG_VESTIGEKV_OVF_TRACE)
+        self._ovf_trace_ring, self._ovf_trace_i, self._ovf_trace_flushed = None, 0, 0
         self._li_map: dict = {}
         # ---- recall tier (REQUIRED component; no production off-switch) ----
         # Expanded-query dims from the model config (q_nope@W_kc | q_rope).
@@ -1003,6 +1005,41 @@ class VestigeKVDSABackend(AttentionBackend):
             _t = _st.get("tier")
             if _t is not None and _t._audit is not None:
                 _t._audit.dump(lid=_lid)
+        if envs.SGLANG_DEBUG_VESTIGEKV_OVF_TRACE.get() is not None:
+            self._ovf_trace_flush()
+
+    _OVF_TRACE_RING = 4096
+
+    def _ovf_trace_step(self):
+        # One device copy per step, no sync: the counters are cumulative, so
+        # consecutive snapshots differ by that step's per-layer overflow.
+        if self._ovf_count_stack is None:
+            return
+        if self._ovf_trace_ring is None:
+            self._ovf_trace_ring = torch.zeros(
+                self._OVF_TRACE_RING, self._ovf_count_stack.numel(),
+                dtype=torch.int32, device=self._ovf_count_stack.device,
+            )
+        self._ovf_trace_ring[self._ovf_trace_i % self._OVF_TRACE_RING].copy_(self._ovf_count_stack)
+        self._ovf_trace_i += 1
+
+    def _ovf_trace_flush(self):
+        if self._ovf_trace_ring is None:
+            return
+        n_new = min(self._ovf_trace_i - self._ovf_trace_flushed, self._OVF_TRACE_RING)
+        if n_new <= 0:
+            return
+        idx = [(self._ovf_trace_i - n_new + i) % self._OVF_TRACE_RING for i in range(n_new)]
+        rows = self._ovf_trace_ring[idx].cpu().tolist()  # the one sync
+        base = self._ovf_trace_i - n_new
+        path = envs.SGLANG_DEBUG_VESTIGEKV_OVF_TRACE.get()
+        with open(f"{path}.tp{get_parallel().tp_rank}", "a") as f:
+            if self._ovf_trace_flushed == 0:
+                # column order is _li_map's, i.e. the local layer list
+                f.write("# step " + " ".join(f"lid{l}" for l in self._local_mla_lids) + "\n")
+            for i, r in enumerate(rows):
+                f.write(f"{base + i} " + " ".join(map(str, r)) + "\n")
+        self._ovf_trace_flushed = self._ovf_trace_i
 
     def _dump_stats(self):
         import logging
@@ -2149,6 +2186,8 @@ class VestigeKVDSABackend(AttentionBackend):
         if envs.SGLANG_DEBUG_VESTIGEKV_TAIL.get():
             self._check_tail_append(forward_batch, reqs)
         self._stage_step(forward_batch, forward_batch.seq_lens.shape[0])
+        if envs.SGLANG_DEBUG_VESTIGEKV_OVF_TRACE.get() is not None:
+            self._ovf_trace_step()
         if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
             self._stats["steps"] += 1
             self._account_step(forward_batch)
