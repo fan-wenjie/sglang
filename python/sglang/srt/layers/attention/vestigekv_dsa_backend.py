@@ -282,39 +282,20 @@ class VestigeKVDSABackend(AttentionBackend):
         # KV pool. RING covers the widest span that can be open at once: an
         # unfinished block plus one prefill step.
         #
-        # The pool-aligned table this replaces cost 132 B per cached token per
-        # layer, which on this deployment is 894 MiB against a 6.78 GiB pool and
-        # carries the whole gap between 1+alpha = 1.28 and 1.16; the ring is 52
-        # MiB and, being sized by slots rather than tokens, does not grow with
-        # context at all.
-        self._side_ring: dict = {}  # lid -> [slots, RING, sigma_dim]
-        self._side_ring_scale: dict = {}  # fp8 ring only: [slots, RING] fp32
-        self._side_stamp: dict = {}  # lid -> [slots, RING] int32 position, -1 empty
-        self._side_fp8 = config.side_pool_dtype == "fp8"
-        self._side_ring_size = 0
+        # Out-of-row geometries read their salience keys straight out of DSA's
+        # index-k cache (vestigekv/dsa_index_view.py): the indexer key IS the
+        # salience channel here, DSA stores it per token per layer quantised by
+        # the same act_quant math, and it is written before this backend runs
+        # in the same layer forward. The 52 MiB slot-indexed ring this replaces
+        # held a second copy of those bytes and cost a write per token per
+        # layer per step to keep current.
+        self._index_head_dim = 0
+        self._index_quant_block = 0
+        self._salience_seen = False
         if not self.geom.sigma_in_row:
-            dev = model_runner.device
-            sched = get_schedule()
-            step = sched.chunked_prefill_size
-            if step is None or step <= 0:
-                step = sched.max_prefill_tokens
-            self._side_ring_size = D.CLOSE_BLOCK + int(step)
-            n_slots = base.req_to_token_pool.req_to_token.shape[0] + 1
-            for lid in self._local_mla_lids:
-                self._side_ring[lid] = torch.zeros(
-                    n_slots,
-                    self._side_ring_size,
-                    self.geom.sigma_dim,
-                    dtype=torch.float8_e4m3fn if self._side_fp8 else torch.bfloat16,
-                    device=dev,
-                )
-                self._side_stamp[lid] = torch.full(
-                    (n_slots, self._side_ring_size), -1, dtype=torch.int32, device=dev
-                )
-                if self._side_fp8:
-                    self._side_ring_scale[lid] = torch.zeros(
-                        n_slots, self._side_ring_size, dtype=torch.float32, device=dev
-                    )
+            pool = base.token_to_kv_pool
+            self._index_head_dim = pool.index_head_dim
+            self._index_quant_block = pool.quant_block_size
         # Per-step graph variant (graph_variants.VestigeKVDsaGraphVariants):
         # lean unless the overflow counter moved since the last readback.
         from sglang.srt.layers.attention.graph_variants import (
@@ -1544,50 +1525,24 @@ class VestigeKVDSABackend(AttentionBackend):
         return bool(path) and os.path.exists(path)
 
     def write_salience(self, *, layer_id: int, forward_batch, key: torch.Tensor):
-        """Store this forward's salience keys in their requests' rings, by token
-        position. Addressed by position rather than by KV row because the ring
-        holds only the open span, and a position's key is dead once its block
-        has been scored."""
-        positions = forward_batch.positions
-        if key.shape[0] != positions.shape[0]:
+        """Nothing to store: the salience key is DSA's own indexer key, and the
+        indexer has already written it to the index-k cache by the time this
+        runs (dsa_indexer_kpool hands it over from the same forward).
+
+        The indexer calls this unconditionally for whichever VestigeKV backend
+        is bound, and the MLA backend still files a ring, so the hook stays.
+        Filing a second copy here cost a write per token per layer per step."""
+        if key.shape[0] != forward_batch.positions.shape[0]:
             raise ValueError(
-                f"salience keys ({key.shape[0]}) and positions ({positions.shape[0]}) "
-                "disagree; hidden states must be one row per token of the batch"
+                f"salience keys ({key.shape[0]}) and positions "
+                f"({forward_batch.positions.shape[0]}) disagree; hidden states "
+                "must be one row per token of the batch"
             )
-        slots = forward_batch.req_pool_indices.to(torch.int64)
-        if not forward_batch.forward_mode.is_decode():
-            slots = torch.repeat_interleave(
-                slots, forward_batch.extend_seq_lens.to(torch.int64)
-            )
-        pos = positions.to(torch.int64)
-        if not getattr(self, "_salience_seen", False):
+        if not self._salience_seen:
             self._salience_seen = True
             logger.info(
-                "VestigeKV salience: first keys filed (layer %s, %d rows)",
-                layer_id, int(pos.numel()),
+                "VestigeKV salience: reading DSA's index-k cache (layer %s)", layer_id
             )
-        if forward_batch.forward_mode.is_decode() and not getattr(
-            self, "_salience_decode_seen", False
-        ):
-            # The evidence line for the split pair: decode keys reach the ring
-            # only when the sibling's indexer runs (see _dsa_sibling).
-            self._salience_decode_seen = True
-            logger.info("VestigeKV salience: first DECODE keys filed (layer %s)", layer_id)
-        # One launch: stamp, quantise (DSA's act_quant math) and file the key
-        # and its scale (vestigekv/ring_write.py). This ran as seven torch
-        # launches per layer per step and was the largest term of the decode
-        # gap against DSA.
-        from sglang.srt.layers.attention.vestigekv.ring_write import ring_write
-
-        ring_write(
-            key,
-            pos,
-            slots,
-            self._side_ring[layer_id],
-            self._side_stamp[layer_id],
-            self._side_ring_scale.get(layer_id) if self._side_fp8 else None,
-        )
-        return
 
     def _block_sigma(self, kbuf, slots, *, lid):
         """Tier-1 sigma over the closed blocks of `slots` (pool rows), from the
@@ -1596,7 +1551,7 @@ class VestigeKVDSABackend(AttentionBackend):
         if not g.sigma_in_row:
             raise RuntimeError(
                 "this geometry keeps its salience keys per request (ring), not "
-                "per pool row; use _ring_sigma"
+                "per pool row; use _index_sigma"
             )
         return blockwise_sigma_from_pool(
             kbuf, slots, D.CLOSE_BLOCK, offset=g.sigma_offset, dim=g.sigma_dim
@@ -1611,31 +1566,36 @@ class VestigeKVDSABackend(AttentionBackend):
             rows = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
             side = kbuf.index_select(0, rows)[:, g.sigma_offset : g.sigma_offset + g.sigma_dim]
         else:
-            ring = self._side_ring[lid][slot]
-            pos = torch.arange(c0, c1, dtype=torch.int64, device=ring.device)
-            side = ring[pos % self._side_ring_size].float()
-            if self._side_fp8:
-                side = side * self._side_ring_scale[lid][slot][pos % self._side_ring_size][:, None]
+            from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+                index_key_views,
+            )
+
+            keys, scale = index_key_views(
+                self.token_to_kv_pool.get_index_k_with_scale_buffer(lid),
+                index_head_dim=self._index_head_dim,
+                quant_block_size=self._index_quant_block,
+            )
+            rows = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
+            side = keys[rows][:, : self._index_head_dim].float() * scale[rows][:, None]
         self._spectrum.observe(side, D.CLOSE_BLOCK, lid=lid)
 
-    def _ring_sigma(self, slot, lid, c0, c1):
-        """Tier-1 sigma of positions [c0, c1) (whole blocks) from the slot's key
-        ring. A position whose key the ring does not hold -- a prefix-cache hit,
-        a reused slot -- scores +inf: it stays kept, so this can over-keep but
-        never under-recall."""
-        ring = self._side_ring[lid][slot]
-        pos = torch.arange(c0, c1, dtype=torch.int64, device=ring.device)
-        idx = pos % self._side_ring_size
-        sigma = blockwise_sigma_from_pool(
-            ring,
-            idx,
-            D.CLOSE_BLOCK,
-            offset=0,
-            dim=self.geom.sigma_dim,
-            scale=self._side_ring_scale[lid][slot] if self._side_fp8 else None,
+    def _index_sigma(self, slot, lid, c0, c1):
+        """Tier-1 sigma of positions [c0, c1) (whole blocks) from DSA's index-k
+        cache.
+
+        Every live position is present, so unlike the ring this replaces there
+        is no missing-key case to score +inf and no stamp to check: DSA cannot
+        attend a row whose index key it does not hold."""
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_sigma
+
+        slots = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
+        return index_sigma(
+            buf=self.token_to_kv_pool.get_index_k_with_scale_buffer(lid),
+            slots=slots,
+            index_head_dim=self._index_head_dim,
+            quant_block_size=self._index_quant_block,
+            block=D.CLOSE_BLOCK,
         )
-        valid = self._side_stamp[lid][slot][idx] == pos.to(torch.int32)
-        return torch.where(valid, sigma, sigma.new_full((), float("inf")))
 
     def _advance_sigma(self, slot, lid, cl, seq_len, kbuf):
         """Extend the request's sigma record over every block that completed
@@ -1661,7 +1621,7 @@ class VestigeKVDSABackend(AttentionBackend):
             rows = self.req_to_token_pool.req_to_token[slot, c0:target].to(torch.int64)
             sigma = self._block_sigma(kbuf, rows, lid=lid)
         else:
-            sigma = self._ring_sigma(slot, lid, c0, target)
+            sigma = self._index_sigma(slot, lid, c0, target)
         if self._spectrum is not None:
             self._observe_spectrum(slot, lid, kbuf, c0, target)
         cl["sigma"] = torch.cat([cl["sigma"], sigma])
