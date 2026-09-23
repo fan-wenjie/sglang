@@ -64,7 +64,10 @@ def pool_operands(
     if g == 0:
         return csk[:0], rho[:0], rho[:0]
     n = g * pool_size
-    grp = csk[:n].view(g, pool_size, csk.shape[1]).float()
+    # promote, never demote: csk is fp16 in production and fp32 accumulation is
+    # the point, but a float64 caller must not be silently rounded to fp32
+    acc = torch.promote_types(csk.dtype, torch.float32)
+    grp = csk[:n].view(g, pool_size, csk.shape[1]).to(acc)
     mean = grp.mean(dim=1)
     spread = (grp - mean.unsqueeze(1)).norm(dim=2).amax(dim=1)
     # the norm pools by max: it bounds the group's largest row, which is what a
