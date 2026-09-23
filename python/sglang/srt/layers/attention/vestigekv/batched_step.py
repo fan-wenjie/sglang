@@ -758,6 +758,7 @@ class BatchedScanPack:
             MULTI=D.SCAN_BUCKET // D.SCAN_BLOCK_A,  # blocks per compact bucket
             num_warps=D.SCAN_NUM_WARPS,
         )
+
         # Deterministic two-phase Triton compaction: the torch chain's int64
         # cumsum alone cost 157 us/step at 128k (nsys, 1.5x the scan kernel).
         compact_fired(
