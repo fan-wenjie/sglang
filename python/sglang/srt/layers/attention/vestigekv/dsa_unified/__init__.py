@@ -29,14 +29,34 @@ per-kernel GPU time says so; the conclusion it was offered for -- that the
 scan's bytes do not drive the slope -- rests on the three null results and
 stands without it.
 
-So the target is the format, not any single term's size: one interleaved
-record per token holding DSA's indexer key, VestigeKV's rank-r sketch, its
-residual norm and tier 1's keep flag, read once front to back with every
-consumer taking its slice from registers. That also collapses the two address
-spaces -- DSA addresses pool slots, the archive addresses position within the
-request -- whose mapping needs a scatter today and silently produced wrong
-rows when it was written as a binary search.
+WHAT THE TRACE THEN SAID, and why nothing here is wired yet. A marker-anchored
+decode window at 4k and at 32k gives, per step:
 
-The cache layout is upstream's, which is exactly why this is a fork: merging
-the sketch into the record is not something a backend beside DSA can do.
+    _prologue_scores   57.50 us   +37.85 growth   tier 1's kept-set scoring
+    _scan_batched      37.21 us    +1.15 growth   the archive scan, one launch
+    DSA logits         39.89 us    +7.14 growth   eleven launches
+    DSA top-k          90.12 us   +19.80 growth   eleven launches
+
+Four facts follow, and together they retire the merge this package was forked
+for:
+
+1. The scan is ALREADY one launch covering every layer. The "four passes"
+   framing that motivated the fork counted it as one of four; it is in fact the
+   one structure that already does what the single-pass principle asks.
+2. The two passes are at opposite ends of the step. The scan sits at the top,
+   before any layer overwrites qbuf, which is what keeps stale-by-one sound;
+   DSA's indexer runs per layer throughout. The whole model forward separates
+   them, so co-locating their bytes cannot help -- L2 is long gone.
+3. Merging them in TIME would split the scan's single launch into eleven, the
+   opposite of the goal.
+4. The logits kernel has three backends -- deepgemm, cutedsl, aiter -- and none
+   is Triton, so a fused kernel would mean reimplementing a tuned fp8 GEMM,
+   which is the failure this repo's fork rule exists to prevent.
+
+The layout module stays because it is correct and tested, and because the
+interleaved shape may serve a different consumer later. The growth is in
+_prologue_scores, which is tier 1's kept set scored densely at rho*S rows;
+scoring it by the sketch instead was measured and fails on all three of its
+uses (the max, the entropy and the gate). So the slope's remaining lever is
+rho itself.
 """
