@@ -613,6 +613,11 @@ class Envs:
     # archive densely is the work the sparse path avoids, so this is a study
     # flag (vestigekv/recall_audit.py).
     SGLANG_DEBUG_VESTIGEKV_RECALL_AUDIT = EnvInt(0)
+    # Path of a text file receiving one line per in-graph decode step: the
+    # cumulative per-layer overflow counters (ovf_by_layer) at that step, so
+    # the per-step overflow pattern across layers can be replayed offline
+    # (which layers fence together; what a static per-layer split would buy).
+    SGLANG_DEBUG_VESTIGEKV_OVF_TRACE = EnvStr(None)
     # Store the tier-2 sketch as fp8 e4m3 with one power-of-two scale per
     # tier instead of fp16, halving the scan's dominant load. The dot becomes
     # fp8 x fp8 (Triton has no mixed fp8 dot on SM120), so the query is
