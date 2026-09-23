@@ -1621,8 +1621,13 @@ class VestigeKVDSABackend(AttentionBackend):
             )
         slots = forward_batch.req_pool_indices.to(torch.int64)
         if not forward_batch.forward_mode.is_decode():
+            # output_size keeps this capture-safe: without it the output
+            # shape is read off the device (a sync), which a prefill graph
+            # capture refuses (DeepSeek-V2-Lite: cudaErrorStreamCaptureUnsupported).
             slots = torch.repeat_interleave(
-                slots, forward_batch.extend_seq_lens.to(torch.int64)
+                slots,
+                forward_batch.extend_seq_lens.to(torch.int64),
+                output_size=positions.shape[0],
             )
         pos = positions.to(torch.int64)
         if not getattr(self, "_salience_seen", False):
