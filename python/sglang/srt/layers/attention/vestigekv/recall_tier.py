@@ -19,6 +19,8 @@ and the gate is open; fetch top-j fired archived rows.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from sglang.srt.environ import envs
@@ -110,6 +112,13 @@ class RecallTier:
         # row, so the row form stays the store and pooling is a second view.
         self._csk_pool = self._rho_pool = self._spread_pool = None
         self.pool_size = envs.SGLANG_VESTIGEKV_ARCHIVE_POOL.get()
+        # Sketch storage precision. fp8 halves the scan's dominant load; the
+        # dot is fp8 x fp8 because Triton has no mixed fp8 dot on SM120
+        # (verified 2026-09-23), so the query is rounded the same way. One
+        # power-of-two scale per tier keeps the dequantisation a scalar the
+        # kernel folds into the attention scale instead of a per-row load.
+        self._csk_fp8 = envs.SGLANG_VESTIGEKV_CSK_FP8.get()
+        self.csk_scale = 1.0
         self._side_mat = None  # lazily materialised; see the `side` property
         self._kept_mat = None  # lazily materialised; see `kept_rows`
         self._csk_mat = self._rho_mat = None  # selections over the _all caches
@@ -124,6 +133,45 @@ class RecallTier:
         self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
         # fixed-address staging for the fused scan (capturable)
         self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
+
+    @property
+    def csk_dtype(self):
+        return torch.float8_e4m3fn if self._csk_fp8 else torch.float16
+
+    def _set_csk_scale(self, c: torch.Tensor) -> None:
+        """Fix the tier's sketch scale from its first built chunk.
+
+        A power of two so the quantisation is a pure exponent shift and the
+        scale round-trips exactly. It is fixed for the tier's life because
+        extend_closed appends later blocks into the same cache, and a rescale
+        would leave the rows already stored on a different footing.
+        """
+        if not self._csk_fp8:
+            self.csk_scale = 1.0
+            return
+        amax = float(c.abs().amax())
+        self.csk_scale = 2.0 ** math.ceil(math.log2(max(amax, 1e-9) / 448.0))
+
+    def _q_csk(self, c: torch.Tensor) -> torch.Tensor:
+        if not self._csk_fp8:
+            return c.half()
+        q = c / self.csk_scale
+        torch._assert_async((q.abs().amax() < 448.0).to(torch.bool))
+        return q.to(torch.float8_e4m3fn)
+
+    def _deq_csk(self, c: torch.Tensor) -> torch.Tensor:
+        """Stored sketch as fp32 in the ORIGINAL units, for the torch paths
+        that fit and check the certificate. The kernel never calls this: it
+        folds the scale into the attention scale instead."""
+        return c.float() * self.csk_scale if self._csk_fp8 else c.float()
+
+    def _q_query(self, qsk: torch.Tensor):
+        """(rounded query, scale). Rounded to the sketch's storage dtype so zp
+        is calibrated on exactly the operands the kernel multiplies."""
+        if not self._csk_fp8:
+            return qsk.half(), 1.0
+        s = 2.0 ** math.ceil(math.log2(max(float(qsk.abs().amax()), 1e-9) / 448.0))
+        return (qsk / s).to(torch.float8_e4m3fn), s
 
     def _from_all(self, name, cache):
         """Select the archive's rows out of a closed-prefix cache."""
@@ -451,9 +499,16 @@ class RecallTier:
                 # constexpr, and the tier never keeps the sidecar (it is the
                 # pool row's own tail); writing it was a [closed, 64] bf16
                 # transient at every build.
-                self._csk_all, self._rho_all, _ = build_operands_fused(
+                _fused_csk, self._rho_all, _ = build_operands_fused(
                     kbuf, row_slots, V, kv=self.geom.kv_lora_rank, side_dim=0
                 )
+                # The fused kernel emits fp16. Requantising here rather than
+                # teaching it the dtype keeps one quantisation rule for both
+                # build paths; an fp16 lhs against the fp8 query is a dot
+                # Triton refuses outright, which is how the split was found.
+                self._set_csk_scale(_fused_csk)
+                self._csk_all = self._q_csk(_fused_csk.float())
+                del _fused_csk
             else:
                 # Storage precision (gated): side at bf16 is BIT-EXACT relative to the
                 # bf16 pool it is copied from (the old fp32 store was an uninformative
@@ -464,7 +519,7 @@ class RecallTier:
                 # Scan traffic drops 516 -> 260 B/row: slope ratio 0.475 -> 0.256.
                 # Accumulation everywhere stays fp32/ieee (the tf32 lesson).
                 T = int(row_slots.numel())
-                self._csk_all = torch.empty(T, self.r, device=dev, dtype=torch.float16)
+                self._csk_all = torch.empty(T, self.r, device=dev, dtype=self.csk_dtype)
                 self._rho_all = torch.empty(T, device=dev, dtype=torch.float32)
                 for a0 in range(0, T, D.BUILD_ROW_CHUNK):
                     a1 = min(a0 + D.BUILD_ROW_CHUNK, T)
@@ -474,7 +529,9 @@ class RecallTier:
                     torch._assert_async(
                         (c.abs().amax() < 6e4).to(torch.bool)
                     )  # fp16 range guard: a violation here is a model-scale anomaly
-                    self._csk_all[a0:a1] = c.half()
+                    if a0 == 0:
+                        self._set_csk_scale(c)
+                    self._csk_all[a0:a1] = self._q_csk(c)
                     self._rho_all[a0:a1] = (content - c @ V).norm(dim=-1)
                     del blk, content, c
         # Index tables in place, and the closed-prefix caches now cover the
@@ -627,7 +684,7 @@ class RecallTier:
             # products, so zp is calibrated on exactly what the kernel scores.
             idxs_t = (
                 qh[:, self.geom.kv_lora_rank :].to(torch.bfloat16).float() * tgt_side.float()
-            ).sum(-1) + (qskh.half().float() * tgt_csk.float()).sum(-1)
+            ).sum(-1) + (self._q_query(qskh)[0].float() * self._deq_csk(tgt_csk)).sum(-1)
             idxs_t = idxs_t * sc_
             cert_t = (
                 qresh * tgt_rho * sc_ / (self.geom.kv_lora_rank - self.r) ** 0.5
@@ -675,7 +732,7 @@ class RecallTier:
         A = self.arch.shape[0]
         qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
         qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
-        idxs = (qsk.half().float() @ self.csk.float().T) * sc_
+        idxs = (self._q_query(qsk)[0].float() @ self._deq_csk(self.csk).T) * sc_
         if D.SIDECAR_DIM:
             idxs = idxs + (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16).float() @ self.side.float().T) * sc_
         cert = (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
@@ -747,13 +804,19 @@ class RecallTier:
             # the sidecar branch (exact -- qbuf is bf16), fp16 for the sketch
             # projection (rounded here AND at calibration, so zp covers it).
             self._qside_t = qe.new_empty(self.geom.side_dim, H, dtype=torch.bfloat16)
-            self._qsk_t = qe.new_empty(self.r, H, dtype=torch.float16)
+            self._qsk_t = qe.new_empty(self.r, H, dtype=self.csk_dtype)
             # Sized off the index table: self.side.shape[0] would gather the
             # whole [A, 64] sidecar to read one integer.
             self._hit_buf = torch.empty(self.n_arch, dtype=torch.int32, device=qe.device)
             self._inf = qe.new_full((), float("inf"))
         self._qside_t.copy_(qe[:, self.geom.kv_lora_rank :].T)
-        self._qsk_t.copy_(qsk.T)
+        qsk_q, q_scale = self._q_query(qsk)
+        self._qsk_t.copy_(qsk_q.T)
+        # The dot runs on the STORED operands, so its product carries both
+        # quantisation scales; folding them into the attention scale keeps the
+        # kernel's arithmetic unchanged and costs no per-row load. The
+        # certificate's own term is in original units and uses sc_ untouched.
+        sc_dot = sc_ * self.csk_scale * q_scale
         # Fold the gate into the threshold: a closed head can never fire, so
         # +inf makes it lose every comparison and the kernel needs no second
         # predicate. Scores stay in registers -- see scan_kernel for why
@@ -768,7 +831,7 @@ class RecallTier:
                 self.side,
                 self.csk,
                 self.rho,
-                sc_,
+                sc_dot,
                 self.zp * sc_ / (self.geom.kv_lora_rank - self.r) ** 0.5,
                 out=self._hit_buf,
             )
@@ -819,7 +882,7 @@ class RecallTier:
         qres = (qe[:, : self.geom.kv_lora_rank] - qsk @ self.V).norm(dim=-1)
         idxs = (
             (qe[:, self.geom.kv_lora_rank :].to(torch.bfloat16) @ self.side.T).float()
-            + (qsk.half() @ self.csk.T).float()
+            + (self._q_query(qsk)[0].float() @ self._deq_csk(self.csk).T)
         ) * sc_
         cert = (
             (qres[:, None] * self.rho[None, :]) * sc_ / (self.geom.kv_lora_rank - self.r) ** 0.5
@@ -846,7 +909,7 @@ class RecallTier:
         # and _pos_all already names every closed row, so carrying a [closed,64]
         # bf16 copy alongside is storing what the pool still holds -- 8 MiB per
         # (layer, request) at 64k, and it grows with the context.
-        self._csk_all = torch.cat([self._csk_all, csk.half()])
+        self._csk_all = torch.cat([self._csk_all, self._q_csk(csk)])
         self._rho_all = torch.cat([self._rho_all, rho])
         self._pos_all = torch.cat([self._pos_all, new_slots.to(torch.int32)])
 

@@ -1919,6 +1919,12 @@ class VestigeKVDSABackend(AttentionBackend):
             bufs["indptr"][bs + 1 :].fill_(fm.kv_indptr[bs])
             if n > 0:
                 bufs["indices"][:n].copy_(fm.kv_indices[:n])
+        # The per-lane staging buffers are read by forward_decode on BOTH
+        # paths, so they cannot be allocated only inside _build_ingraph_pack:
+        # with the in-graph scan switched off nothing allocated them and the
+        # decode dereferenced None. That made a documented kill-switch
+        # unusable, which is the one thing a kill-switch must not be.
+        self._ensure_stage(max(self._graph_max_bs, 1), self._qbuf_stack.device)
         if (
             envs.SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN.get()
             and self._ingraph_pack is None
