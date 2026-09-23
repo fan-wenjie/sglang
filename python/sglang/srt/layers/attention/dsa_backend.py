@@ -2235,11 +2235,32 @@ class DeepseekSparseAttnBackend(
         inv[slots.to(torch.int64)] = torch.arange(seq, device=slots.device)
         pos = inv[sel]
         pos = pos[pos >= 0]
+
+        # Tier 1 scored in THIS arm, off DSA's own index-k cache: since the
+        # salience ring went away sigma needs nothing but that cache, so both
+        # selectors can be compared on one step rather than across two runs.
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_sigma
+
+        sigma, n_far = None, 0
+        n_sigma = (seq // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
+        n_far = ((seq - D.CLOSE_BLOCK) // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
+        if n_far > 0:
+            pool = self.token_to_kv_pool
+            sigma = index_sigma(
+                buf=pool.get_index_k_with_scale_buffer(lid),
+                slots=slots[:n_sigma].to(torch.int64),
+                index_head_dim=pool.index_head_dim,
+                quant_block_size=pool.quant_block_size,
+                block=D.CLOSE_BLOCK,
+            )
         self.select_recall_telemetry.observe(
             rows=rows.float(),
             q=q.reshape(-1, rows.shape[1]).float(),
             selected=pos,
             lid=lid,
+            sigma=sigma,
+            n_far=n_far,
         )
 
     def forward_decode(

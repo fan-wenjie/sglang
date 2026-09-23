@@ -89,5 +89,80 @@ class TestTelemetry(CustomTestCase):
         self.assertIn("count_mean=1.0000", cm.output[0])
 
 
+class TestFarRegionStats(CustomTestCase):
+    """The far-region comparison must be budget-matched and close-block-free."""
+
+    def test_budget_is_taken_from_dsa_so_tier1_cannot_win_by_spending_more(self):
+        from sglang.srt.layers.attention.dsa.select_recall_telemetry import (
+            far_region_stats,
+        )
+
+        rows, q = _rows_and_q()
+        rows[:, 0] = -rows[:, 0]  # oracle now lands in the far region
+        n_far = 32
+        # DSA picks 4 far rows; tier 1 must be scored at 4, not at its own size
+        sel = torch.tensor([0, 1, 2, 3, 40, 50])
+        sigma = torch.arange(S, dtype=torch.float32)
+        r = far_region_stats(rows, q, sel, sigma, n_far, K)
+        d, n_or, budget = r[0], r[12], r[13]
+        self.assertEqual(int(budget), 4)
+        self.assertEqual(int(n_or), K)
+        self.assertAlmostEqual(float(d), 4 / K, places=5)
+
+    def test_only_rows_older_than_the_close_block_are_compared(self):
+        from sglang.srt.layers.attention.dsa.select_recall_telemetry import (
+            far_region_stats,
+        )
+
+        rows, q = _rows_and_q()
+        # the oracle top-K is rows 56..63, all inside the close region
+        r = far_region_stats(
+            rows, q, torch.arange(S - K, S), torch.arange(S, dtype=torch.float32), 32, K
+        )
+        d, n_or = r[0], r[12]
+        self.assertEqual(int(n_or), 0)
+        self.assertEqual(float(d), 0.0)
+
+    def test_tier1_reads_high_sigma_as_kept(self):
+        from sglang.srt.layers.attention.dsa.select_recall_telemetry import (
+            far_region_stats,
+        )
+
+        rows, q = _rows_and_q()
+        n_far = 32
+        # make the far oracle rows 24..31 and give them the highest sigma
+        rows2 = rows.clone()
+        rows2[:, 0] = 0.0
+        rows2[24:32, 0] = torch.arange(1, 9, dtype=torch.float32)
+        sigma = torch.zeros(S)
+        sigma[24:32] = torch.arange(1, 9, dtype=torch.float32)
+        r = far_region_stats(rows2, q, torch.arange(0, 8), sigma, n_far, K)
+        t1, budget = r[9], r[13]
+        self.assertEqual(int(budget), 8)
+        self.assertAlmostEqual(float(t1), 1.0, places=5)
+
+    def test_the_union_separates_complementary_from_redundant_selectors(self):
+        from sglang.srt.layers.attention.dsa.select_recall_telemetry import (
+            far_region_stats,
+        )
+
+        rows, q = _rows_and_q()
+        rows[:, 0] = -rows[:, 0]  # oracle is far rows 0..7
+        sigma = torch.zeros(S)
+        # redundant: tier 1 picks exactly what DSA already has
+        sigma[0:4] = torch.arange(4, 0, -1, dtype=torch.float32)
+        sel = torch.arange(0, 4)
+        r = far_region_stats(rows, q, sel, sigma, 32, K)
+        d, u = r[0], r[9]
+        self.assertAlmostEqual(float(u), float(d), places=5)
+        # complementary: tier 1 picks oracle rows DSA missed
+        sigma2 = torch.zeros(S)
+        sigma2[4:8] = torch.arange(4, 0, -1, dtype=torch.float32)
+        r2 = far_region_stats(rows, q, sel, sigma2, 32, K)
+        d2, u2 = r2[0], r2[9]
+        # every tier-1 pick is an oracle row DSA missed, so the union gains all 4
+        self.assertAlmostEqual(float(u2), float(d2) + 4 / K, places=5)
+
+
 if __name__ == "__main__":
     unittest.main()
