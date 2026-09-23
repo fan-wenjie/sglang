@@ -258,8 +258,13 @@ class VestigeKVDSABackend(AttentionBackend):
         # skips scoring and top-k, so a fenced lane there has no selection to
         # attend and falls back to its own page table (exact, and rare by
         # construction -- the set is chosen from the layers that fence).
+        # "none" is the empty set WITH the split on: no layer runs the
+        # indexer at decode, so every fenced lane reads its page table. The
+        # bare default is the set being unset, i.e. the split off.
+        _roles = tuple(x.strip() for x in envs.SGLANG_VESTIGEKV_DSA_LAYERS.get() if x.strip())
+        self.layer_roles_static: bool = bool(_roles)
         self.dsa_only_layers: frozenset = frozenset(
-            int(x) for x in envs.SGLANG_VESTIGEKV_DSA_LAYERS.get() if x
+            int(x) for x in _roles if x != "none"
         )
         # GPU-side per-(pool-slot, layer) kept-index tables: built at prefill
         # (one sync there is free); decode refresh is then pure GPU ops, no

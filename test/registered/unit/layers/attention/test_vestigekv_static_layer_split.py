@@ -23,19 +23,22 @@ DSA_LAYERS = frozenset({3, 19, 23, 27, 39})
 ALL_LAYERS = [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43]
 
 
-def _backend(dsa_only):
+def _backend(dsa_only, static):
     # No engine: the predicate reads one attribute off the backend, and
     # building a real one needs a model runner and a KV pool.
     vk = object.__new__(VestigeKVDSABackend)
     vk.dsa_only_layers = dsa_only
+    vk.layer_roles_static = static
     vk.lean_step = False
     return vk
 
 
 class TestStaticLayerSplit(CustomTestCase):
-    def _lean(self, *, lid, dsa_only, capture):
+    def _lean(self, *, lid, dsa_only, capture, static=True):
         with mock.patch.object(
-            kpool, "_vestigekv_decode_backend", return_value=_backend(dsa_only)
+            kpool,
+            "_vestigekv_decode_backend",
+            return_value=_backend(dsa_only, static),
         ), mock.patch(
             "sglang.srt.model_executor.runner_utils.capture_mode.get_is_capture_mode",
             return_value=capture,
@@ -63,12 +66,22 @@ class TestStaticLayerSplit(CustomTestCase):
         for lid in ALL_LAYERS:
             self.assertFalse(self._lean(lid=lid, dsa_only=DSA_LAYERS, capture=False))
 
-    def test_empty_set_leaves_the_dynamic_rule(self):
+    def test_unset_leaves_the_dynamic_rule(self):
         # Default: the step-global rule decides, so an eager step reads the
         # backend's stale-by-one flag (False on this stub) rather than the
         # layer id.
         for lid in ALL_LAYERS:
-            self.assertFalse(self._lean(lid=lid, dsa_only=frozenset(), capture=False))
+            self.assertFalse(
+                self._lean(lid=lid, dsa_only=frozenset(), capture=False, static=False)
+            )
+
+    def test_none_is_an_empty_set_with_the_split_on(self):
+        # "none": no layer runs the indexer, so every layer is lean and a
+        # fenced lane reads its page table.
+        for lid in ALL_LAYERS:
+            self.assertTrue(
+                self._lean(lid=lid, dsa_only=frozenset(), capture=True, static=True)
+            )
 
 
 if __name__ == "__main__":
