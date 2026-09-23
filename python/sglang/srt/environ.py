@@ -607,6 +607,12 @@ class Envs:
     # single-graph tree; and on GLM-5.3-Flash 2-3 layers overflow on most
     # steps (VKSTATS 2026-09-22: lean 20-23% of steps), so it buys ~0.08 ms.
     SGLANG_ENABLE_VESTIGEKV_LEAN_GRAPH = EnvBool(False)
+    # Telemetry only: blocks between VKSPECTRUM reports per layer (0 = off).
+    # At each block close, where the salience branch puts its above-cutoff
+    # energy (vestigekv/spectrum.py): one rFFT per block per layer, off the
+    # per-step path, and nothing reads it back. Off in production -- it is an
+    # operator's window, not an input to any decision.
+    SGLANG_DEBUG_VESTIGEKV_SPECTRUM = EnvInt(0)
     # vestigekv_dsa, fence off: run the recall step per MLA layer inside that
     # layer's attention on the step's own query (the indexer's cadence)
     # instead of once per step on last step's. Measured +0.68 ms/step at 4k,
