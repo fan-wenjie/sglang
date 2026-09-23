@@ -607,6 +607,12 @@ class Envs:
     # single-graph tree; and on GLM-5.3-Flash 2-3 layers overflow on most
     # steps (VKSTATS 2026-09-22: lean 20-23% of steps), so it buys ~0.08 ms.
     SGLANG_ENABLE_VESTIGEKV_LEAN_GRAPH = EnvBool(False)
+    # Decode steps between VKRECALL reports per layer (0 = off). The recall
+    # the certificate ACHIEVES on the live query, which VKSTATS does not
+    # observe -- it reports fire count, fetch and fence, all cost. Scoring the
+    # archive densely is the work the sparse path avoids, so this is a study
+    # flag (vestigekv/recall_audit.py).
+    SGLANG_DEBUG_VESTIGEKV_RECALL_AUDIT = EnvInt(0)
     # Store the tier-2 sketch as fp8 e4m3 with one power-of-two scale per
     # tier instead of fp16, halving the scan's dominant load. The dot becomes
     # fp8 x fp8 (Triton has no mixed fp8 dot on SM120), so the query is

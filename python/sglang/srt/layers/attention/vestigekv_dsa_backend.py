@@ -2494,6 +2494,7 @@ class VestigeKVDSABackend(AttentionBackend):
                         threshold=self.config.recall_threshold,
                         geom=self.geom,
                     )
+                    tier._audit_lid = lid
                     stats = tier.build(
                         kbuf,
                         job["row_slots"],
@@ -2723,6 +2724,7 @@ class VestigeKVDSABackend(AttentionBackend):
             threshold=self.config.recall_threshold,
             geom=self.geom,
         )
+        tier._audit_lid = lid
         stats = tier.build(
             kbuf,
             row_slots,
