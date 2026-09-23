@@ -186,8 +186,15 @@ def d_block_for_rank(r: int, base: int = 64) -> int:
     slice of the sketch basis on chip. The tiles were tuned at rank 64; a
     larger rank keeps the on-chip footprint by shrinking the chunk in
     proportion (never below the 16-wide tensor-core minimum), so rank 64 is
-    untouched and ranks 128/256 fit the shared-memory limit."""
-    return max(16, base * D_BLOCK_RANK_BASE // r)
+    untouched and ranks 128/256 fit the shared-memory limit.
+
+    The chunk is CAPPED at the tuned value rather than growing below rank 64.
+    The proportional rule read the other way hands rank 16 a 256-wide chunk,
+    and the prologue's other on-chip slices are [H, chunk] rather than
+    [rank, chunk], so they grow with it: --vestigekv-index-rank 16 died at
+    CUDA-graph capture needing 131088 B of shared memory against SM120's
+    101376 (2026-09-23). Ranks 64 and above are unaffected by the cap."""
+    return max(16, min(base, base * D_BLOCK_RANK_BASE // r))
 
 
 def a_block_for_rank(r: int) -> int:
