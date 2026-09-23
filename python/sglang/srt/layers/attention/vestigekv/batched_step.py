@@ -51,7 +51,7 @@ def _scan_batched_kernel(
     hit_ptr,  # [P, Amax] int8 out (0/1 fired flag)
     counts_ptr,  # [P, NB] int32 fused compact-count out (NB = ceil(Amax/1024))
     Amax,
-    sc,
+    sc_ptr,  # [P] fp32: attention scale times both quantisation scales
     H: tl.constexpr,
     DD: tl.constexpr,
     R: tl.constexpr,
@@ -172,6 +172,7 @@ def _scan_batched_kernel(
                     other=0.0,
                 )
             rh = tl.load(rho_ptr + abase + offs, mask=m, other=0.0)
+            sc_p = tl.load(sc_ptr + p)
             # ieee, not tf32: the fast path disagreed with the eager fire set on
             # 6 rows in 58900, a silent change to which rows the model attends.
             # native-dtype tensor-core dots, fp32 accumulation (scan_kernel.py)
@@ -179,7 +180,7 @@ def _scan_batched_kernel(
                 acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
             else:
                 acc = tl.dot(c, qk).to(tl.float32)
-            score = acc * sc + cc * rh[:, None] * qr[None, :]
+            score = acc * sc_p + cc * rh[:, None] * qr[None, :]
             if HAS_SPREAD:
                 # pooled entry: a row can beat its group's mean by up to
                 # ||c_i - m|| ||q||. Cauchy-Schwarz, not conformal -- always
@@ -187,7 +188,7 @@ def _scan_batched_kernel(
                 # and not merely still calibrated (vestigekv/archive_pool.py).
                 sp = tl.load(sp_ptr + abase + offs, mask=m, other=0.0)
                 qn = tl.load(qskn_ptr + p * H + h)
-                score += sc * sp[:, None] * qn[None, :]
+                score += sc_p * sp[:, None] * qn[None, :]
             fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
             tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
             cnt += tl.sum(tl.where(m, fired, 0), 0)
@@ -301,7 +302,13 @@ class BatchedScanPack:
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
         self.qside_t = torch.zeros(P, g.side_dim, H, device=dev, dtype=torch.bfloat16)
-        self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=torch.float16)
+        self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=_csk_dtype())
+        # [P] fp32: the prologue writes this pair's fp8 query scale here (1.0
+        # when fp16). Device-side because a host scale would bake at capture.
+        self.qsk_scale = torch.ones(P, device=dev)
+        # [P] fp32: the tier's own sketch scale, refreshed in update()
+        self.csk_scale_arr = torch.ones(P, device=dev)
+        self._sc_arr = torch.ones(P, device=dev)
         self.qres = torch.zeros(P, H, device=dev)
         self.thr_flat = torch.zeros(P, device=dev)
         self.pm = torch.zeros(P, _NSPLIT, H, device=dev)
@@ -451,7 +458,13 @@ class BatchedScanPack:
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
         self.qside_t = torch.zeros(P, g.side_dim, H, device=dev, dtype=torch.bfloat16)
-        self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=torch.float16)
+        self.qsk_t = torch.zeros(P, r, H, device=dev, dtype=_csk_dtype())
+        # [P] fp32: the prologue writes this pair's fp8 query scale here (1.0
+        # when fp16). Device-side because a host scale would bake at capture.
+        self.qsk_scale = torch.ones(P, device=dev)
+        # [P] fp32: the tier's own sketch scale, refreshed in update()
+        self.csk_scale_arr = torch.ones(P, device=dev)
+        self._sc_arr = torch.ones(P, device=dev)
         self.qres = torch.zeros(P, H, device=dev)
         self.thr_flat = torch.zeros(P, device=dev)
         self.pm = torch.zeros(P, _NSPLIT, H, device=dev)
@@ -602,6 +615,7 @@ class BatchedScanPack:
             self.thr[i, 0] = t.thr_g
             self.thr_flat[i] = t.thr_g
             self.cc[i] = t.zp * t.scale / (self.geom.kv_lora_rank - t.r) ** 0.5
+            self.csk_scale_arr[i] = t.csk_scale
         if self.csk is None:
             # Hold the caches alive: cbase is a raw address, and a tier going
             # out of scope would free the memory the graph still points at.
@@ -665,7 +679,7 @@ class BatchedScanPack:
             self.nk_len,
             self.thr_flat,
             sc,
-            out=(self.max1g, self.qside_t, self.qsk_t, self.qres),
+            out=(self.max1g, self.qside_t, self.qsk_t, self.qres, self.qsk_scale),
             margin=self.margin,
             thr_lse=self.thr_lse,
             partials=(self.pm, self.ps, self.pt),
@@ -689,6 +703,12 @@ class BatchedScanPack:
         # dispatch floor at short context (defaults.SCAN_GRID_CAP).
         Am = self.am_grid
         P = P_eff
+        # The dot runs on the stored operands, so its product carries both
+        # quantisation scales; folding them here keeps the kernel arithmetic
+        # unchanged. The certificate's own term is in original units and uses
+        # cc, which is untouched.
+        torch.mul(self.csk_scale_arr, self.qsk_scale, out=self._sc_arr)
+        self._sc_arr.mul_(sc)
         _scan_batched_kernel[
             (min(triton.cdiv(Am, D.SCAN_BUCKET), D.SCAN_GRID_CAP), P)
         ](
@@ -711,7 +731,7 @@ class BatchedScanPack:
             self.hit,
             self.c_counts,
             Am,
-            sc,
+            self._sc_arr,
             H=self.q_heads,
             DD=self.geom.side_dim,
             R=self.v.shape[1],

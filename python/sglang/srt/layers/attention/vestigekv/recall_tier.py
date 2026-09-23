@@ -118,7 +118,7 @@ class RecallTier:
         # power-of-two scale per tier keeps the dequantisation a scalar the
         # kernel folds into the attention scale instead of a per-row load.
         self._csk_fp8 = envs.SGLANG_VESTIGEKV_CSK_FP8.get()
-        self.csk_scale = 1.0
+        self.csk_scale = 2.0**-30 if envs.SGLANG_VESTIGEKV_CSK_FP8.get() else 1.0
         self._side_mat = None  # lazily materialised; see the `side` property
         self._kept_mat = None  # lazily materialised; see `kept_rows`
         self._csk_mat = self._rho_mat = None  # selections over the _all caches
@@ -139,18 +139,36 @@ class RecallTier:
         return torch.float8_e4m3fn if self._csk_fp8 else torch.float16
 
     def _set_csk_scale(self, c: torch.Tensor) -> None:
-        """Fix the tier's sketch scale from its first built chunk.
+        """Widen the tier's sketch scale to cover `c`, requantising what is
+        already stored.
 
-        A power of two so the quantisation is a pure exponent shift and the
-        scale round-trips exactly. It is fixed for the tier's life because
-        extend_closed appends later blocks into the same cache, and a rescale
-        would leave the rows already stored on a different footing.
+        A power of two, so the quantisation is a pure exponent shift. GROW
+        ONLY: a scale fixed from the first chunk is what the r=64 arm died on
+        (2026-09-23) -- extend_closed appends later blocks whose projections
+        exceed the first block's range, and fp8 has no headroom to absorb
+        them. Shrinking is not worth the second pass, and widening already
+        costs one only on the rare close that needs it.
+
+        The failure it replaces is worth naming: torch._assert_async reports
+        at the next stream synchronisation, not at the call that violated it,
+        so the traceback pointed at refresh_membership while the bad
+        quantisation happened in an earlier extend_closed.
         """
         if not self._csk_fp8:
             self.csk_scale = 1.0
             return
-        amax = float(c.abs().amax())
-        self.csk_scale = 2.0 ** math.ceil(math.log2(max(amax, 1e-9) / 448.0))
+        need = max(float(c.abs().amax()), 1e-9) / 448.0
+        if need <= self.csk_scale:
+            return
+        new = 2.0 ** math.ceil(math.log2(need))
+        if self._csk_all is not None and self._csk_all.numel():
+            # rows already stored move to the wider scale; fp8 to fp8 through
+            # fp32, so the only loss is the one the wider step size implies
+            self._csk_all = (
+                (self._csk_all.float() * (self.csk_scale / new))
+                .to(torch.float8_e4m3fn)
+            )
+        self.csk_scale = new
 
     def _q_csk(self, c: torch.Tensor) -> torch.Tensor:
         if not self._csk_fp8:
@@ -519,7 +537,9 @@ class RecallTier:
                 # Scan traffic drops 516 -> 260 B/row: slope ratio 0.475 -> 0.256.
                 # Accumulation everywhere stays fp32/ieee (the tf32 lesson).
                 T = int(row_slots.numel())
-                self._csk_all = torch.empty(T, self.r, device=dev, dtype=self.csk_dtype)
+                # zeros, not empty: a widening rescale multiplies the whole
+                # buffer, and uninitialised fp8 bytes can rescale to inf
+                self._csk_all = torch.zeros(T, self.r, device=dev, dtype=self.csk_dtype)
                 self._rho_all = torch.empty(T, device=dev, dtype=torch.float32)
                 for a0 in range(0, T, D.BUILD_ROW_CHUNK):
                     a1 = min(a0 + D.BUILD_ROW_CHUNK, T)
@@ -529,8 +549,10 @@ class RecallTier:
                     torch._assert_async(
                         (c.abs().amax() < 6e4).to(torch.bool)
                     )  # fp16 range guard: a violation here is a model-scale anomaly
-                    if a0 == 0:
-                        self._set_csk_scale(c)
+                    # every chunk, not just the first: the scale grows to
+                    # cover whatever this one needs and rewrites what is
+                    # already stored, so a later chunk cannot overflow it
+                    self._set_csk_scale(c)
                     self._csk_all[a0:a1] = self._q_csk(c)
                     self._rho_all[a0:a1] = (content - c @ V).norm(dim=-1)
                     del blk, content, c
@@ -909,6 +931,7 @@ class RecallTier:
         # and _pos_all already names every closed row, so carrying a [closed,64]
         # bf16 copy alongside is storing what the pool still holds -- 8 MiB per
         # (layer, request) at 64k, and it grows with the context.
+        self._set_csk_scale(csk)
         self._csk_all = torch.cat([self._csk_all, self._q_csk(csk)])
         self._rho_all = torch.cat([self._rho_all, rho])
         self._pos_all = torch.cat([self._pos_all, new_slots.to(torch.int32)])

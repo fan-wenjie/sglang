@@ -74,5 +74,52 @@ class TestRowMapping(CustomTestCase):
         self.assertEqual(got.shape[0], POOL - 2)
 
 
+class TestSketchScale(CustomTestCase):
+    """The fp8 sketch scale must grow to cover later blocks, not stay put.
+
+    Bug regression: a scale fixed from the first built chunk overflowed when
+    extend_closed appended a block with larger projections, and fp8 has no
+    headroom to absorb it. The served r=64 arm died on the range assert
+    (2026-09-23), and because torch._assert_async reports at the next stream
+    sync the traceback named refresh_membership rather than the quantisation.
+    """
+
+    def _fp8_tier(self):
+        with envs.SGLANG_VESTIGEKV_CSK_FP8.override(True):
+            return RecallTier(r=R)
+
+    def test_the_scale_widens_for_a_larger_later_block(self):
+        t = self._fp8_tier()
+        t._set_csk_scale(torch.full((4, R), 100.0))
+        first = t.csk_scale
+        t._set_csk_scale(torch.full((4, R), 10000.0))
+        self.assertGreater(t.csk_scale, first)
+
+    def test_widening_rescales_what_is_already_stored(self):
+        t = self._fp8_tier()
+        small = torch.full((4, R), 100.0)
+        t._set_csk_scale(small)
+        t._csk_all = t._q_csk(small)
+        before = t._deq_csk(t._csk_all).clone()
+        t._set_csk_scale(torch.full((4, R), 10000.0))
+        after = t._deq_csk(t._csk_all)
+        # the stored rows still mean the same thing, to the wider step size
+        self.assertTrue(torch.allclose(before, after, rtol=0.2))
+        self.assertTrue(bool(torch.isfinite(after).all()))
+
+    def test_a_smaller_block_does_not_shrink_the_scale(self):
+        t = self._fp8_tier()
+        t._set_csk_scale(torch.full((4, R), 10000.0))
+        wide = t.csk_scale
+        t._set_csk_scale(torch.full((4, R), 1.0))
+        self.assertEqual(t.csk_scale, wide)
+
+    def test_fp16_keeps_a_unit_scale(self):
+        with envs.SGLANG_VESTIGEKV_CSK_FP8.override(False):
+            t = RecallTier(r=R)
+        t._set_csk_scale(torch.full((4, R), 10000.0))
+        self.assertEqual(t.csk_scale, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
