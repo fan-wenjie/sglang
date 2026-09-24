@@ -15,6 +15,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+import weakref
+
 import torch
 
 from sglang.srt.configs.hybrid_arch import glm5_next_config, kimi_linear_config
@@ -23,7 +25,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.eviction import (
     blockwise_sigma_from_pool,
-    select_kept,
+    kept_rows,
 )
 from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
@@ -281,6 +283,7 @@ class VestigeKVDSABackend(AttentionBackend):
         self._build_stream = None
         self._qbuf_stack = self._fetch_stack = self._fetch_len_stack = None
         self._eager_steps = 0  # eager decode steps; _stats["steps"] counts replays
+        self._slots_memo = (None, None)  # (weakref to a ForwardBatch, host slots)
         self._fetch_ovf_stack = self._ovf_count_stack = None
         # per-step snapshots of _ovf_count_stack (SGLANG_DEBUG_VESTIGEKV_OVF_TRACE)
         self._ovf_trace_ring, self._ovf_trace_i, self._ovf_trace_flushed = None, 0, 0
@@ -1329,7 +1332,7 @@ class VestigeKVDSABackend(AttentionBackend):
         self._mla_lids.add(lid)
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)
         kbuf = kbuf.reshape(-1, kbuf.shape[-1])
-        slots = forward_batch.req_pool_indices.tolist()
+        slots = self._host_slots(forward_batch)
         lens = (
             forward_batch.seq_lens_cpu.tolist()
             if forward_batch.seq_lens_cpu is not None
@@ -1421,7 +1424,7 @@ class VestigeKVDSABackend(AttentionBackend):
             return
         if w_kc.dtype not in (torch.bfloat16, torch.float16, torch.float32):
             return  # a quantized absorbed weight needs its own dequant path
-        slots = forward_batch.req_pool_indices.tolist()
+        slots = self._host_slots(forward_batch)
         lens = forward_batch.extend_seq_lens_cpu
         prefix = forward_batch.extend_prefix_lens_cpu
         nope = w_kc.shape[1]
@@ -1757,9 +1760,9 @@ class VestigeKVDSABackend(AttentionBackend):
         # a whole-prefix transform here.
         if sigma is None:
             sigma = self._block_sigma(kbuf, row_slots, lid=lid)
-        keep = select_kept(sigma[:closed], rho=self.rho, closed=closed, sinks=D.SINKS)
-        kept_closed = row_slots[:closed][keep.nonzero(as_tuple=True)[0]]
-        return torch.cat([kept_closed, row_slots[closed:]])
+        return kept_rows(
+            sigma[:closed], row_slots, rho=self.rho, closed=closed, sinks=D.SINKS
+        )
 
     # ---- decode: evict (tier-1) + recall (tier-2), both unconditional ----
 
@@ -2337,6 +2340,24 @@ class VestigeKVDSABackend(AttentionBackend):
         self._ovf_count_stack[self._li_map[lid]] += (
             self._fetch_ovf[lid].gather(0, slots).sum(dtype=torch.int32)
         )
+
+    def _host_slots(self, forward_batch):
+        """req_pool_indices on the host, computed once per forward batch.
+
+        The prefill hook runs per MLA layer, and reading this tensor is a D2H
+        copy that waits for everything the chunk has queued: 11 layers over 64
+        chunks of a 32k prompt is 704 drains of the prefill pipeline. Every
+        layer in a forward pass sees the same batch, so one copy serves them
+        all. The weak reference is what makes the memo safe -- an id would be
+        reused by a later batch allocated where a freed one lived, and a strong
+        one would pin that batch's tensors until the next prefill.
+        """
+        ref, slots = self._slots_memo
+        if ref is not None and ref() is forward_batch:
+            return slots
+        slots = forward_batch.req_pool_indices.tolist()
+        self._slots_memo = (weakref.ref(forward_batch), slots)
+        return slots
 
     def _seq_lens_host(self, forward_batch):
         """Host-side seq_lens without a device readback. The scheduler ships
