@@ -570,6 +570,34 @@ class Envs:
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
 
+    # Ablation arm (fbablate-off, fbstream-off): attend the truncated fetch on a
+    # recall overflow instead of the request's full row set, which gives up the
+    # no-under-recall guarantee. Serving has no reason to set it; the arm exists
+    # to measure what the fallback is worth.
+    SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK = EnvBool(False)
+    # Offline-study arm (sidecardump-*): directory for one file per calibrated
+    # index install, holding the exact build inputs and the fitted basis so a
+    # different basis or rank can be refitted without re-running the model.
+    SGLANG_DEBUG_VESTIGEKV_DUMP_DIR = EnvStr(None)
+    # Per-layer VestigeKV counters (VESTIGEKV_STATS): steps, recall overflows, fetch
+    # depth percentiles, fence rate and attended fraction, logged every 200
+    # decode steps. Costs a device readback per window, so it is off by
+    # default and must not be on in a latency measurement.
+    SGLANG_DEBUG_VESTIGEKV_STATS = EnvBool(False)
+
+    # Capture the tier-2 recall scan + CSR pack INSIDE the decode model graph
+    # (via init_forward_metadata_in_graph) instead of replaying a second scan
+    # graph per step: removes the second cudaGraphLaunch's fixed ~0.9 ms
+    # batch-independent cost. The production path; False falls back to the
+    # separately captured scan graph (kill-switch A/B).
+    SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN = EnvBool(True)
+
+    # A/B harness switch: path of a flag file checked at each prefill. Present
+    # -> the FULL arm, where every row is kept and attended, i.e. the dense
+    # control the compressed arm is measured against, in the same process.
+    # Unset (the default) disables arm switching, so nothing is stat()ed.
+    SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG = EnvStr(None)
+
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch

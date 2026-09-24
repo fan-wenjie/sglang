@@ -309,6 +309,37 @@ class ExecKernel(msgspec.Struct):
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
 
+    # -------------------------------------------------------------------------
+    # VestigeKV (--attention-backend vestigekv_mla)
+    # -------------------------------------------------------------------------
+    vestigekv_recall_capacity: A[
+        int,
+        "VestigeKV: rows the tier-2 recall may fetch per layer, request and decode "
+        "step. A fixed buffer width (CUDA graphs bake it), not a per-head cap; a "
+        "step that fires more rows than this overflows. Default 4096 sits above "
+        "the largest fire observed on the reference stack.",
+    ] = 4096
+    vestigekv_activation_min_tokens: A[
+        int,
+        "VestigeKV: requests shorter than this many tokens are served dense "
+        "(nothing closed, archived or recalled). 0 compresses every request from "
+        "its first token.",
+    ] = 0
+    vestigekv_index_rank: A[
+        int,
+        "VestigeKV: rank of the tier-2 recall sketch (rows of the per-layer basis). "
+        "Higher ranks certify more of the latent row and fire fewer rows per scan, at "
+        "2 bytes per rank per archived row per layer of scan traffic and memory.",
+    ] = 64
+    vestigekv_recall_margin: A[
+        float,
+        "VestigeKV: recall margin in scaled-logit units. An archived row is fetched "
+        "when its certified score exceeds the request's best kept-row score minus this "
+        "margin; 0 recalls only rows that could beat the kept max, ln(K) also keeps "
+        "K-way near ties (the softmax weight of a dropped row is bounded by e^-margin "
+        "of the kept max). More rows fetched per step as it grows.",
+    ] = 0.0
+
 
 class ExecMamba(msgspec.Struct):
     """Namespace ``exec.mamba``."""

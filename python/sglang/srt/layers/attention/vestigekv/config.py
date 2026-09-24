@@ -1,0 +1,118 @@
+"""Deployment knobs of the vestigekv_mla backend, resolved once at startup.
+
+The values come from the ``--vestigekv-*`` server flags (exec.kernel
+namespace); this struct is the one object the backend reads them through, so
+the cross-checks between them run in a single place and the effective
+configuration is logged as one line.
+"""
+
+import msgspec
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.vestigekv import defaults as D
+
+RECALL_THRESHOLDS = ("max", "lse")
+
+
+class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
+    # Fixed width of the per-(layer, request, step) recall fetch buffer, in
+    # rows: graph capture bakes it, so it is a capacity, not a per-head cap.
+    recall_capacity: int
+    # A step whose fired recall set exceeds the capacity attends the request's
+    # full row set (dense MLA) instead of a truncated fetch.
+    overflow_fallback: bool
+    # Requests shorter than this are served dense: nothing closed, archived
+    # or recalled.
+    activation_min_tokens: int
+    # Rank of the tier-2 recall sketch.
+    index_rank: int
+    # Recall margin in scaled-logit units: an archived row fires when its
+    # certified score exceeds the kept max minus this. 0 is exact max-recall;
+    # delta bounds the softmax weight of a dropped row at e^-delta of the
+    # kept max (ln K covers K-way near ties, e.g. multi-key needles).
+    recall_margin: float
+    # What the margin is taken from: "max" = the best kept-row score (a dropped
+    # row's weight <= e^-margin of the max row); "lse" = the log-sum-exp of the
+    # kept scores (a dropped row's weight <= e^-margin of the whole kept mass:
+    # self-adapting to how peaked the kept distribution is).
+    recall_threshold: str
+    # Refit a layer's index when its scan overflowed on more than this fraction
+    # of the steps since that layer's last close (0 disables): the fit is
+    # otherwise made once, early, and serves the whole request.
+    rebuild_overflow_fraction: float
+    # Size the decode kernel's KV split count from the attended rows rather than
+    # the request's length (changes the accumulation grouping, not the row set).
+    attended_splits: bool
+    # Extra margin per nat of kept-distribution flatness (0 = threshold unchanged).
+    entropy_margin_gain: float
+    multikey_fence_rows: int
+    min_hard_factor: float
+    cert_gaussian_target: float
+    # Read a lane's rows from the tiers (kept table + fetch buffer, or the page
+    # table when fenced) instead of from a CSR packed for the step.
+
+    @classmethod
+    def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
+        """Build from the ``exec.kernel`` config bag (``get_exec().kernel``)."""
+        cfg = cls(
+            # The four server flags.
+            recall_capacity=kernel.vestigekv_recall_capacity,
+            activation_min_tokens=kernel.vestigekv_activation_min_tokens,
+            index_rank=kernel.vestigekv_index_rank,
+            recall_margin=kernel.vestigekv_recall_margin,
+            # Everything below is a constant, not a flag: each names a research
+            # arm that ships disabled. Exposing one again is a line here.
+            overflow_fallback=not envs.SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK.get(),
+            recall_threshold=D.RECALL_THRESHOLD,
+            rebuild_overflow_fraction=D.REBUILD_OVERFLOW_FRACTION,
+            attended_splits=D.ATTENDED_SPLITS,
+            entropy_margin_gain=D.ENTROPY_MARGIN_GAIN,
+            multikey_fence_rows=D.MULTIKEY_FENCE_ROWS,
+            min_hard_factor=D.MIN_HARD_FACTOR,
+            cert_gaussian_target=D.CERT_GAUSSIAN_TARGET,
+        )
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        if self.entropy_margin_gain < 0:
+            raise ValueError(
+                "--vestigekv-entropy-margin-gain must be >= 0, got "
+                f"{self.entropy_margin_gain}"
+            )
+        if not 0.0 <= self.rebuild_overflow_fraction <= 1.0:
+            raise ValueError(
+                "--vestigekv-rebuild-overflow-fraction must be in [0, 1], got "
+                f"{self.rebuild_overflow_fraction}"
+            )
+        if self.recall_capacity < 1:
+            raise ValueError(
+                f"--vestigekv-recall-capacity must be >= 1, got {self.recall_capacity}"
+            )
+        if self.activation_min_tokens < 0:
+            raise ValueError(
+                "--vestigekv-activation-min-tokens must be >= 0, got "
+                f"{self.activation_min_tokens}"
+            )
+        if self.recall_margin < 0:
+            raise ValueError(
+                f"--vestigekv-recall-margin must be >= 0, got {self.recall_margin}"
+            )
+        if self.recall_threshold not in RECALL_THRESHOLDS:
+            raise ValueError(
+                f"--vestigekv-recall-threshold must be one of {RECALL_THRESHOLDS}, "
+                f"got {self.recall_threshold!r}"
+            )
+        if self.index_rank < 8 or self.index_rank % 8:
+            raise ValueError(
+                f"--vestigekv-index-rank must be a positive multiple of 8, got {self.index_rank}"
+            )
+
+    def describe(self) -> str:
+        return (
+            f"recall_capacity={self.recall_capacity} "
+            f"overflow_fallback={self.overflow_fallback} "
+            f"activation_min_tokens={self.activation_min_tokens} "
+            f"index_rank={self.index_rank} recall_margin={self.recall_margin} "
+            f"recall_threshold={self.recall_threshold}"
+        )

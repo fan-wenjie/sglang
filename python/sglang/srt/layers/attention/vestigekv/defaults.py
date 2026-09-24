@@ -1,0 +1,309 @@
+"""Every tunable constant VestigeKV uses, in one place, with the reason.
+
+A number that only exists at its use site cannot be audited, cannot be diffed
+between two runs, and cannot be found by someone asking "what did this run
+actually do?". Anything here that changes what is compared between two runs
+belongs in a run record, not only in this file.
+
+Deployment knobs (recall capacity, overflow fallback, activation threshold,
+side-pool dtype) are `--vestigekv-*` server flags read through
+`vestigekv.config.VestigeKVConfig`; expert and debug switches are env vars in
+`sglang.srt.environ`. This module holds the values that are NOT knobs -- the
+ones a deployment does not get to vary.
+"""
+
+import contextlib
+import math
+
+import torch
+
+# ---- model geometry (Kimi Linear MLA; the only architecture in scope) ----
+
+KV_LORA_RANK = 512
+"""Content half of an MLA latent row; also the value vector."""
+
+SIDECAR_DIM = 64
+"""Un-roped half of the latent row. Under NoPE this branch is what carries the
+tier-1 anomaly signal and the tier-2 exact summand."""
+
+LATENT_DIM = KV_LORA_RANK + SIDECAR_DIM  # 576
+"""Full latent row width, as stored in the KV pool."""
+
+ATTN_SCALE = 192**-0.5
+"""1/sqrt(qk head dim) = 1/sqrt(128 nope + 64 rope). Applied to every score so
+the tier-2 comparison lives on the same scale as attention's own logits."""
+
+# ---- tier 1: sidecar-residual eviction (frozen at prefill) ----
+
+RHO = 1 / 32
+"""Fraction of the prefix kept by anomaly rank. Sets the compression ratio."""
+
+SINKS = 4
+"""Leading rows kept unconditionally: attention sinks are never anomalous by
+the sigma criterion yet removing them destabilizes the softmax."""
+
+RECENT_WINDOW = 256
+"""Trailing rows kept unconditionally. Decoded tokens join here, which is why
+the archive is fixed at prefill and the tier-2 scan is capturable."""
+
+LOWPASS_KAPPA = 16
+"""rFFT cutoff for the low-pass whose residual defines sigma.
+
+Derivability was measured and rejected (m8, 3 docs x 7 layers, real queries):
+the query-grounded criterion -- attention mass captured by the sigma_kappa
+top-(rho*T) set -- peaks exactly at 16, but the curve is flat to +-0.3% over
+kappa in [4, 64], so data-driven selection has nothing to win; and the one
+cheap query-free proxy (kurtosis of sigma) rises monotonically past 16 and
+would pick 32, disagreeing with the ground truth. A fixed 16 it stays."""
+
+# ---- tier 2: certified recall ----
+
+INDEX_RANK = 64
+"""Sketch rank r. Trades scan bytes (2*r floats per archived row) against how
+often the residual certificate has to inflate a score to stay sound."""
+
+RECALL_TARGET = 0.90
+"""tau: the single quality parameter of the recall tier. Everything below that
+used to be a separate knob is DERIVED from it -- see the functions at the end
+of this file. The total miss budget 1 - tau is split evenly between the two
+stages that can lose a target: the entropy gate (skipping a scan the query
+needed) and the sketch competition (the certified score losing anyway)."""
+
+Z_MAX = 8.0
+"""Safety clamp on the certificate multiplier, and the value the provisional
+(uncalibrated) index serves with. Engineering bound, not a tuning knob: firing
+more than this implies the sketch explains almost nothing of the query, at
+which point more inflation buys noise, not recall."""
+
+GATE_SELF_DISABLE_FRACTION = 0.60
+"""If a fitted gate threshold would leave the gate open on more than this
+fraction of calibration queries it is discarding nothing, so it is disabled
+outright rather than left as a threshold that only looks like a filter.
+A utility constant (scan-cost vs benefit), not a probability."""
+
+N_CAL_START = 8
+"""Decode steps collected before the first calibrated build. The schedule then
+doubles the window until MIN_HARD hard samples exist (or N_CAL_MAX is hit), so
+the effective sample size is set by the conformal requirement below, not by a
+hand-picked count."""
+
+N_CAL_MAX = 64
+"""Upper bound on the adaptive collection window. A prefix whose queries are
+still not producing MIN_HARD hard samples by here is genuinely easy (the kept
+tier dominates); the index then serves with zp clamped to Z_MAX, which errs
+toward over-fetching, never under-recall."""
+
+ENTROPY_EPS = 1e-12
+"""Clamp inside log for the entropy gate."""
+
+BUILD_KEY_CHUNK = 16384
+"""Key-axis chunk for the calibration argmax. Chunked because the full
+[n*H, T] score matrix OOMs at S=512k."""
+
+INDEX_DTYPE = torch.int32
+"""Element type of the VestigeKV-owned row-index tables (kept, fetch) and their
+lengths: pool row ids are far below 2^31 and every VestigeKV kernel widens a
+row id to int64 before multiplying it by a row stride. The packed CSR handed
+to the base backend is NOT this type: the base decode kernel multiplies the
+row id by the row stride in the CSR's own dtype, which overflows int32 once
+the pool exceeds 2^31 / row elements (Kimi Linear: 5.1M rows x 576 = 2.9e9),
+so that buffer keeps the base metadata's kv_indices dtype (int64)."""
+
+# ---- tier-2 scan capture (CUDA graph) ----
+
+# ---- decode-time block closing ----
+
+CLOSE_BLOCK = 4096
+"""Decoded tokens per compression event. Every CLOSE_BLOCK decode steps a
+request's newest block is closed: sigma is computed for its rows, the global
+top-(rho * closed) selection rebalances (matching the reference policy), the
+evicted rows join the tier-2 archive via the live caches, and the recall index
+refreshes by index selection. Without this, rows generated after prefill are
+never evicted (the attended set grows 1:1 with generation) and rows evicted by
+a close would be unrecallable -- both wrong at long generation."""
+
+SCAN_GRID_CAP = 128
+"""Cap on the capacity-baked block grid of the batched scan and compact-write
+kernels. The grid must cover the worst-case archive (max_context rows ->
+cdiv(524288, 1024) = 512 buckets) and its shape is baked into the decode CUDA
+graph, but programs past a pair's a_len exit on one scalar load -- so the
+launch floor scales with the grid, not the archive (measured: 38 us/step of
+pure dispatch at 512 x 7 programs over a 9k archive). A grid-stride loop
+covers the buckets with SCAN_GRID_CAP programs per pair: same worst-case
+coverage, ~8x smaller dispatch floor, and real work (which is bandwidth-bound)
+is unaffected."""
+
+SCAN_CAPTURE_AFTER = 8
+"""Decode steps one scan shape must hold before it is captured, so a short
+generation does not pay for a graph it replays a handful of times."""
+
+# ---- fused scan kernel ----
+
+SCAN_BLOCK_A = 64
+"""Archive rows per Triton block. 128 and 256 measured the same or ran out of
+registers on SM120."""
+
+SCAN_NUM_WARPS = 4
+
+
+def d_block_for_rank(r: int, base: int = 64) -> int:
+    """K-chunk of the content dimension in the kernels that hold a [rank, chunk]
+    slice of the sketch basis on chip. The tiles were tuned at rank 64; a
+    larger rank keeps the on-chip footprint by shrinking the chunk in
+    proportion (never below the 16-wide tensor-core minimum), so rank 64 is
+    untouched and ranks 128/256 fit the shared-memory limit."""
+    return max(16, base * D_BLOCK_RANK_BASE // r)
+
+
+def a_block_for_rank(r: int) -> int:
+    """Rows per program in the operand build, which holds a [rows, rank] fp32
+    sketch tile on chip: 64 rows up to rank 128; rank 256 at 64 rows needs
+    102400 B of shared memory against the 101376 B SM120 limit, so 32."""
+    return 64 if r <= 2 * D_BLOCK_RANK_BASE else 32
+
+
+D_BLOCK_RANK_BASE = INDEX_RANK
+
+
+SCAN_CAPTURE_MAX_FAILS = 3
+"""Consecutive capture refusals before the eager path becomes permanent. One
+refusal can be transient (a busy stream, a momentary OOM) and latching on it
+costs every later step in the process; three in a row is the deployment."""
+
+BUILD_ROW_CHUNK = 16384
+"""Archive rows converted to fp32 at a time when building the index. Bounds the
+build's peak scratch to one chunk instead of a full [T, 576] fp32 copy."""
+
+
+# ---- derivations from RECALL_TARGET (the probability content) ----
+
+
+def gate_alpha(tau: float = RECALL_TARGET) -> float:
+    """Share of the miss budget the entropy gate may spend: (1 - tau) / 2.
+
+    The gate is a binary filter on hard queries; closing on one loses its
+    target outright, so its false-close rate is capped at half the budget."""
+    return (1.0 - tau) / 2.0
+
+
+def scan_target(tau: float = RECALL_TARGET) -> float:
+    """Per-scan recall level once the gate has spent its share.
+
+    Overall recall >= (1 - gate_alpha) * scan_target = tau, so the scan must be
+    calibrated at tau / (1 - gate_alpha)."""
+    return tau / (1.0 - gate_alpha(tau))
+
+
+MIN_HARD_FACTOR = 1.0
+"""Multiple of the conformal EXISTENCE bound required before a tier leaves the
+safety clamp.
+
+The bound below is the fewest samples for which the quantile is definable, not
+the fewest for which it is trustworthy: at tau = 0.90 it is 18, and the
+quantile there is the maximum of 18 draws. Measured at answer steps, the
+clamp loses the top-scoring archived row on 16.0% of records and the fitted
+certificate on 22.85% -- the untrusted clamp is the SAFER of the two on
+multi-key -- and prefill calibration, which removes the clamp period
+altogether, took niah_multikey_3 from 0.900 to 0.320. So leaving the clamp at
+the existence bound is the weakest defensible policy, and this is the knob
+that asks for more evidence. Costs fallback: the clamp over-fetches.
+"""
+
+
+def min_hard(tau: float = RECALL_TARGET) -> int:
+    """Fewest hard samples for which the conformal quantile at scan_target
+    exists: ceil((n+1)*t) <= n requires n >= t / (1 - t), scaled by
+    MIN_HARD_FACTOR when more evidence than existence is wanted."""
+
+    t = scan_target(tau)
+    # 1e-9 guard: for rational tau the ratio is often an exact integer that
+    # floating point lands a hair ABOVE (0.9 -> t = 18/19, t/(1-t) = 18 but
+    # floats give 18.000000000000004), and a raw ceil would then demand one
+    # sample more than the guarantee needs.
+    return math.ceil(MIN_HARD_FACTOR * (t / (1.0 - t)) - 1e-9)
+
+
+def conformal_k(n: int, tau: float = RECALL_TARGET) -> int:
+    """Order-statistic index for the scan-level conformal quantile: with z_(1)
+    <= ... <= z_(n) the required inflations of n exchangeable hard samples,
+    zp = z_(k) at k = ceil((n+1)*scan_target) gives the distribution-free
+    marginal guarantee P(target recovered) >= scan_target."""
+    import math
+
+    return math.ceil((n + 1) * scan_target(tau) - 1e-9)  # same float guard
+
+
+@contextlib.contextmanager
+def ieee_fp32_matmul():
+    """Pin fp32 matmuls to full ieee precision on the certificate path.
+
+    The fire decision compares scores near a conformal threshold; tf32's
+    10-bit mantissa moved 6 of 58900 rows across it in measurement. The
+    scan kernels already force input_precision="ieee"; this guard covers
+    the cuBLAS bmms (qsk projection, qres residual) that would otherwise
+    follow the global --enable-tf32-matmul switch. Wrapping capture/build
+    is enough: kernel selection happens there, replay keeps it.
+    """
+    prev = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(prev)
+
+
+def ieee_fp32(fn):
+    """Decorator form of ieee_fp32_matmul for certificate-path methods."""
+
+    def wrapped(*a, **k):
+        with ieee_fp32_matmul():
+            return fn(*a, **k)
+
+    wrapped.__name__ = fn.__name__
+    wrapped.__doc__ = fn.__doc__
+    return wrapped
+
+
+PAGETABLE_PROBE_EVERY = 512
+"""Decode steps between two samples of the page table's affinity
+(_probe_page_table, stats only). The probe reads req_to_token[slot, :seq],
+which is the one O(context) host-queued op in the instrument, so it is sampled
+rather than run every step; 512 gives ~500 samples over a 256k stream."""
+
+INDEX_STALE_FACTOR = 2.0
+"""Context growth past which a fitted index counts as stale, for the stats
+line's per-state buckets. An index fitted at `built_at` tokens serving a
+request now `seq` tokens long is stale once seq > INDEX_STALE_FACTOR *
+built_at: the archive it was fitted on is less than half of what it now has to
+rank. Reporting only; nothing reads it on the token path."""
+
+
+# Research arms, each disabled at the value below. They were server flags and
+# are constants here: every one defaults to off, so no deployment tunes them,
+# and a CLI surface for an arm nothing ships with is a surface to support.
+# VestigeKVConfig still carries them as fields, so exposing one again is a
+# one-line change in from_kernel_config.
+RECALL_THRESHOLD = "max"
+"""What the recall margin is taken from: the best kept-row score. "lse" takes
+it from the log-sum-exp of the kept scores instead."""
+
+REBUILD_OVERFLOW_FRACTION = 0.0
+"""Refit a layer's index when its scan overflowed on more than this fraction of
+the steps since that layer's last close. 0 disables the trigger: the fit is
+made once, early, and serves the whole request."""
+
+CERT_GAUSSIAN_TARGET = 0.0
+"""Gaussian tail target for the conformal certificate. 0 keeps the empirical
+quantile."""
+
+MULTIKEY_FENCE_ROWS = 0
+"""A lane firing more than this many archived rows attends its full row set.
+0 leaves the buffer overflow as the only fence."""
+
+ENTROPY_MARGIN_GAIN = 0.0
+"""Extra recall margin per nat of kept-distribution flatness. 0 leaves the
+threshold unchanged."""
+
+ATTENDED_SPLITS = False
+"""Size the decode kernel's KV split count from the attended rows rather than
+the request length. Changes the accumulation grouping, not the row set."""
