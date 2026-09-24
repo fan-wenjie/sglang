@@ -745,5 +745,41 @@ class TestPatchNemotronHPattern(unittest.TestCase):
             self.skipTest("NemotronHConfig not available in this transformers version")
 
 
+class TestModelOverrideMovesMirroredFields(unittest.TestCase):
+    """A '{"text_config": {...}}' override must also move the top-level
+    mirror the parser makes of that field: top-level readers
+    (is_deepseek_dsa) see the mirror, and with it left at the checkpoint
+    value a model whose index_topk was nulled still resolved as DSA (page
+    size 64, an index cache) while the model itself ran without one."""
+
+    def test_nested_override_updates_the_mirror(self):
+        from sglang.srt.utils.hf_transformers import config as cfg_mod
+
+        text = PretrainedConfig(index_topk=2048, index_head_dim=128)
+        top = PretrainedConfig(
+            architectures=["ExampleNextForConditionalGeneration"],
+            text_config=text,
+            index_topk=2048,  # the parser's mirror of text_config.index_topk
+            index_head_dim=128,
+            model_type="example_next",
+        )
+        parser = SimpleNamespace(parse=lambda *a, **k: top)
+        with (
+            patch.object(cfg_mod, "check_gguf_file", return_value=False),
+            patch.object(cfg_mod, "resolve_runai_obj_uri", lambda m: m),
+            patch.object(cfg_mod, "is_remote_url", return_value=False),
+            patch.object(cfg_mod, "get_model_config_parser", return_value=parser),
+        ):
+            out = cfg_mod.get_config(
+                "dummy",
+                trust_remote_code=False,
+                model_override_args={"text_config": {"index_topk": None}},
+                model_config_parser="hf",
+            )
+        self.assertIsNone(out.text_config.index_topk)
+        self.assertIsNone(out.index_topk)
+        self.assertEqual(out.index_head_dim, 128)  # untouched fields keep their mirror
+
+
 if __name__ == "__main__":
     unittest.main()

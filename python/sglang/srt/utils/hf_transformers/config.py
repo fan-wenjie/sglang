@@ -321,7 +321,19 @@ def get_config(
         for key, value in model_override_args.items():
             current = getattr(config, key, None)
             if isinstance(value, dict) and isinstance(current, PretrainedConfig):
+                # The parser mirrors sub-config fields the top level lacks
+                # onto the top-level config (the text_config walk above), and
+                # top-level readers (is_deepseek_dsa) see the mirror, not the
+                # sub-config: an overridden field must move its mirror too.
+                mirrored = {
+                    k: getattr(config, k)
+                    for k in value
+                    if hasattr(config, k)
+                    and getattr(config, k) == getattr(current, k, object())
+                }
                 current.update(value)
+                for k in mirrored:
+                    setattr(config, k, value[k])
             else:
                 setattr(config, key, value)
 
