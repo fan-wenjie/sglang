@@ -55,6 +55,40 @@ def select_kept(
     return keep
 
 
+def kept_rows(
+    sigma: torch.Tensor,
+    row_slots: torch.Tensor,
+    rho: float,
+    closed: int,
+    sinks: int = D.SINKS,
+) -> torch.Tensor:
+    """select_kept's row set, with a size the host already knows.
+
+    `row_slots[:closed][select_kept(...).nonzero()]` costs a device sync per
+    call, because nonzero's output shape is data-dependent and the caller then
+    reads it (to size the table write, and the bound the CSR pack is built
+    from). On the prefill path that call runs per MLA layer per chunk -- 704
+    syncs for a 32k prompt at a 512-token chunk, each draining whatever the
+    chunk has queued.
+
+    So the sinks are taken out of the ranking rather than unioned into it:
+    the count becomes exactly `sinks + m + tail`, a host-side expression. The
+    row set is a SUPERSET of select_kept's -- the two differ only when a sink
+    would have won a top-m place, where this keeps the displaced non-sink row
+    as well, at most `sinks` rows more out of ~rho*closed.
+    """
+    m = max(1, round(rho * closed))
+    n_sink = min(sinks, closed)
+    ranked = sigma[:closed].clone()
+    ranked[:n_sink] = float("-inf")  # kept anyway; do not let them win a place
+    m = min(m, closed - n_sink)
+    picked = ranked.topk(m).indices.sort().values if m > 0 else ranked.new_empty(
+        0, dtype=torch.long
+    )
+    pos = torch.cat([torch.arange(n_sink, device=sigma.device), picked])
+    return torch.cat([row_slots[:closed][pos], row_slots[closed:]])
+
+
 def blockwise_sigma_from_pool(
     kbuf: torch.Tensor,
     slots: torch.Tensor,
