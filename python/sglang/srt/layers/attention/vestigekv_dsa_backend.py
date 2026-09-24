@@ -97,6 +97,10 @@ def _refuse_sharded_sequence():
     )
 
 
+def _no_bucket(_name):
+    """The prefill breakdown's off state; see SGLANG_DEBUG_VESTIGEKV_PREFILL_MS."""
+
+
 class VestigeKVDSABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.
 
@@ -284,6 +288,10 @@ class VestigeKVDSABackend(AttentionBackend):
         self._qbuf_stack = self._fetch_stack = self._fetch_len_stack = None
         self._eager_steps = 0  # eager decode steps; _stats["steps"] counts replays
         self._slots_memo = (None, None)  # (weakref to a ForwardBatch, host slots)
+        self._prefill_ms = 0.0  # SGLANG_DEBUG_VESTIGEKV_PREFILL_MS accounting
+        self._prefill_calls = 0
+        self._prefill_buckets, self._prefill_mark = {}, 0.0
+        self._prefill_timing = envs.SGLANG_DEBUG_VESTIGEKV_PREFILL_MS.get()
         self._fetch_ovf_stack = self._ovf_count_stack = None
         # per-step snapshots of _ovf_count_stack (SGLANG_DEBUG_VESTIGEKV_OVF_TRACE)
         self._ovf_trace_ring, self._ovf_trace_i, self._ovf_trace_flushed = None, 0, 0
@@ -1309,6 +1317,18 @@ class VestigeKVDSABackend(AttentionBackend):
         self._build_gpu_state(layer, forward_batch)
 
     def _build_gpu_state(self, layer, forward_batch):
+        if not envs.SGLANG_DEBUG_VESTIGEKV_PREFILL_MS.get():
+            return self._build_gpu_state_inner(layer, forward_batch)
+        import time as _t
+
+        t0 = _t.perf_counter()
+        self._prefill_mark = t0
+        out = self._build_gpu_state_inner(layer, forward_batch)
+        self._prefill_ms += (_t.perf_counter() - t0) * 1e3
+        self._prefill_calls += 1
+        return out
+
+    def _build_gpu_state_inner(self, layer, forward_batch):
         # Prefill-time build (sync here is off the decode critical path): the
         # sidecar-residual kept set for every request in this extend batch.
         # Every request passes through extend before decode, so decode can
@@ -1333,12 +1353,8 @@ class VestigeKVDSABackend(AttentionBackend):
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)
         kbuf = kbuf.reshape(-1, kbuf.shape[-1])
         slots = self._host_slots(forward_batch)
-        lens = (
-            forward_batch.seq_lens_cpu.tolist()
-            if forward_batch.seq_lens_cpu is not None
-            else forward_batch.seq_lens.tolist()
-        )
         prefix_lens = forward_batch.extend_prefix_lens_cpu
+        lens = self._extend_lens_host(forward_batch, prefix_lens)
         if self._mem_dir is not None and lid == min(self._mla_lids):
             self._trace_request_memory(sum(int(p) == 0 for p in prefix_lens))
         for i, (slot, seq_len) in enumerate(zip(slots, lens)):
@@ -1360,12 +1376,16 @@ class VestigeKVDSABackend(AttentionBackend):
                     "sigma": torch.zeros(0, dtype=torch.float32, device=r2t.device),
                 }
                 self._close_state[(slot, lid)] = cl
+            _tm = self._prefill_bucket if self._prefill_timing else _no_bucket
             self._advance_sigma(slot, lid, cl, seq_len, kbuf)
+            _tm("sigma")
             cl["seq"] = seq_len
             kept = self._arm_aware_kept(
                 row_slots, kbuf, seq_len, layer.v_head_dim, lid=lid, sigma=cl["sigma"]
             )
+            _tm("kept")
             n = self._write_kept(lid, slot, kept)
+            _tm("write")
             # Arm decode-time closes: the prefix counts as closed (ranked).
             # Below the activation threshold nothing is closed yet -- the first
             # decode-time close past it ranks the whole prefix in one pass, from
@@ -1403,6 +1423,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 self._fetch_len[lid][slot] = 0
                 self._fetch_ovf[lid][slot] = 0
             self._maybe_prefill_build(slot=slot, lid=lid, seq_len=seq_len, closed=cl["closed"])
+            _tm("book")
             # Deliberately NOT built here: under chunked prefill seq_lens is the
             # running total, not the request length, so "is this the last chunk?"
             # is not decidable from the ForwardBatch (measured: the obvious
@@ -2226,6 +2247,15 @@ class VestigeKVDSABackend(AttentionBackend):
         if envs.SGLANG_DEBUG_VESTIGEKV_TAIL.get():
             self._check_tail_append(forward_batch, reqs)
         self._stage_step(forward_batch, forward_batch.seq_lens.shape[0])
+        if envs.SGLANG_DEBUG_VESTIGEKV_PREFILL_MS.get() and self._prefill_calls:
+            logger.info(
+                "VKPREFILL hook_ms=%.1f calls=%d per_call_us=%.0f buckets=%s",
+                self._prefill_ms, self._prefill_calls,
+                1e3 * self._prefill_ms / self._prefill_calls,
+                {k: round(v, 1) for k, v in sorted(self._prefill_buckets.items())},
+            )
+            self._prefill_ms, self._prefill_calls = 0.0, 0
+            self._prefill_buckets = {}
         if envs.SGLANG_DEBUG_VESTIGEKV_OVF_TRACE.get() is not None:
             self._ovf_trace_step()
         if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
@@ -2340,6 +2370,32 @@ class VestigeKVDSABackend(AttentionBackend):
         self._ovf_count_stack[self._li_map[lid]] += (
             self._fetch_ovf[lid].gather(0, slots).sum(dtype=torch.int32)
         )
+
+    def _prefill_bucket(self, name):
+        """Attribute the prefill hook's host time (SGLANG_DEBUG_VESTIGEKV_PREFILL_MS)."""
+        import time as _t
+
+        now = _t.perf_counter()
+        self._prefill_buckets[name] = self._prefill_buckets.get(name, 0.0) + (
+            now - self._prefill_mark
+        ) * 1e3
+        self._prefill_mark = now
+
+    def _extend_lens_host(self, forward_batch, prefix_lens):
+        """This chunk's per-request seq_lens, without reading the device.
+
+        seq_lens_cpu is the decode path's host mirror; an extend batch does not
+        always carry one, and the fallback -- seq_lens.tolist() -- is a D2H
+        copy in a hook that runs per MLA layer per chunk. The extend batch does
+        carry both halves of the sum on the host already.
+        """
+        cpu = forward_batch.seq_lens_cpu
+        if cpu is not None:
+            return cpu.tolist()
+        ext = forward_batch.extend_seq_lens_cpu
+        if prefix_lens is not None and ext is not None:
+            return [int(p) + int(n) for p, n in zip(prefix_lens, ext)]
+        return forward_batch.seq_lens.tolist()
 
     def _host_slots(self, forward_batch):
         """req_pool_indices on the host, computed once per forward batch.

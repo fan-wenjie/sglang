@@ -618,6 +618,13 @@ class Envs:
     # the per-step overflow pattern across layers can be replayed offline
     # (which layers fence together; what a static per-layer split would buy).
     SGLANG_DEBUG_VESTIGEKV_OVF_TRACE = EnvStr(None)
+    # Host wall time spent inside the prefill hook, summed per layer and per
+    # chunk and logged at the end of each request. The hook runs once per MLA
+    # layer per prefill chunk -- 704 times for a 32k prompt at a 512-token
+    # chunk -- and a chunk-size probe put VestigeKV's prefill tax at +540 ms
+    # there and ~0 at a 2048-token chunk, i.e. per invocation rather than per
+    # token. This says how much of that is the hook's own host time.
+    SGLANG_DEBUG_VESTIGEKV_PREFILL_MS = EnvBool(False)
     # Static per-layer roles: the MLA layer ids that stay pure DSA, as a
     # comma-separated list. Those layers run the indexer and attend its
     # top-k every step (the fence flag is held on); every other layer skips
