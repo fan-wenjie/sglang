@@ -654,6 +654,14 @@ class Envs:
     # not even stable between runs of one config -- {23,39,27,3,19} once,
     # {3,7,11,15} another -- so such a set describes the run it was fitted on.
     SGLANG_VESTIGEKV_DSA_LAYERS = EnvTuple(tuple())
+    # Tier-1 keep rate, overriding defaults.RHO. The coefficient of the only
+    # term that grows with context: the kept set is rho*S rows, scored densely
+    # every step and attended every step. Lowering it cuts both, and raises
+    # the fire rate -- the fire threshold is the best kept row's score, so a
+    # smaller kept set lowers the bar every archived row has to clear.
+    # A study knob: unset means defaults.RHO, and any quoted number must say
+    # which value produced it.
+    SGLANG_VESTIGEKV_RHO = EnvFloat(None)
     # Store the tier-2 sketch as fp8 e4m3 with one power-of-two scale per
     # tier instead of fp16, halving the scan's dominant load. The dot becomes
     # fp8 x fp8 (Triton has no mixed fp8 dot on SM120), so the query is
