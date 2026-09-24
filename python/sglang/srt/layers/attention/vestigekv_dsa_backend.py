@@ -1379,12 +1379,24 @@ class VestigeKVDSABackend(AttentionBackend):
             _tm = self._prefill_bucket if self._prefill_timing else _no_bucket
             self._advance_sigma(slot, lid, cl, seq_len, kbuf)
             _tm("sigma")
+            prev_seq = cl["seq"]
             cl["seq"] = seq_len
-            kept = self._arm_aware_kept(
-                row_slots, kbuf, seq_len, layer.v_head_dim, lid=lid, sigma=cl["sigma"]
-            )
-            _tm("kept")
-            n = self._write_kept(lid, slot, kept)
+            # Between two closes the ranked half of the kept set cannot move:
+            # sigma is append-only and `closed` indexes a prefix of it, so the
+            # same rows win the same top-m. Only the unclosed tail grew, and
+            # appending it is exact -- which turns the ranking, a topk and a
+            # sort over the whole closed prefix, from once per chunk into once
+            # per close (8 times instead of 64 on a 32k prompt).
+            closed_now = self._closed_for(seq_len)
+            if cl.get("kept_n") is not None and cl.get("kept_closed") == closed_now:
+                n = self._append_kept(lid, slot, cl["kept_n"], row_slots[prev_seq:seq_len])
+            else:
+                kept = self._arm_aware_kept(
+                    row_slots, kbuf, seq_len, layer.v_head_dim, lid=lid, sigma=cl["sigma"]
+                )
+                _tm("kept")
+                n = self._write_kept(lid, slot, kept)
+            cl["kept_n"], cl["kept_closed"] = n, closed_now
             _tm("write")
             # Arm decode-time closes: the prefix counts as closed (ranked).
             # Below the activation threshold nothing is closed yet -- the first
@@ -1420,8 +1432,14 @@ class VestigeKVDSABackend(AttentionBackend):
             self._collecting = True
             self._invalidate_scan()
             if lid in self._fetch_len:
-                self._fetch_len[lid][slot] = 0
-                self._fetch_ovf[lid][slot] = 0
+                # fill_ on a one-row slice, not `buf[slot] = 0`: assigning a
+                # python scalar into a device tensor stages an H2D copy that
+                # BLOCKS the host until the stream drains, and this runs per
+                # MLA layer per prefill chunk. Measured against a busy device,
+                # the assignment costs 3.8 ms of host block per call where the
+                # fill costs 0.7 ms.
+                self._fetch_len[lid][slot : slot + 1].fill_(0)
+                self._fetch_ovf[lid][slot : slot + 1].fill_(0)
             self._maybe_prefill_build(slot=slot, lid=lid, seq_len=seq_len, closed=cl["closed"])
             _tm("book")
             # Deliberately NOT built here: under chunked prefill seq_lens is the
@@ -1538,6 +1556,29 @@ class VestigeKVDSABackend(AttentionBackend):
         bound = max(self.config.activation_min_tokens, self._nkm(max_ctx)) + D.CLOSE_BLOCK
         return min(max_ctx, bound)
 
+    def _closed_for(self, seq_len: int) -> int:
+        """Rows of this prefix that tier 1 has ranked; 0 below the threshold,
+        where the request is served dense and nothing is closed."""
+        if seq_len < self.config.activation_min_tokens:
+            return 0
+        return (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
+
+    def _append_kept(self, lid, slot, n_prev: int, rows) -> int:
+        """Extend a kept table by the rows this chunk added to the tail."""
+        buf = self._kept_buf[lid]
+        k = rows.numel()
+        if k == 0:
+            return n_prev
+        n = n_prev + k
+        if n > buf.shape[1]:
+            raise RuntimeError(
+                f"VestigeKV: kept table holds {buf.shape[1]} rows per request, "
+                f"{n} requested (layer {lid}, slot {slot})"
+            )
+        buf[slot, n_prev:n] = rows.to(buf.dtype)
+        self._kept_len[lid][slot : slot + 1].fill_(n)
+        return n
+
     def _write_kept(self, lid, slot, rows) -> int:
         # The one host-side writer of a kept-table row; the in-graph CSR
         # append is the other and is bounded by the close cadence (_kept_cap).
@@ -1551,7 +1592,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 "to serve dense row sets"
             )
         buf[slot, :n] = rows.to(buf.dtype)
-        self._kept_len[lid][slot] = n
+        self._kept_len[lid][slot : slot + 1].fill_(n)
         return n
 
     def _ensure_kept_stacks(self, max_reqs, cap, dev):
