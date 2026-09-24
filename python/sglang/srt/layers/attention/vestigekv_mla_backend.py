@@ -35,6 +35,7 @@ safety width.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import TYPE_CHECKING, Optional
@@ -51,6 +52,7 @@ from sglang.srt.layers.attention.vestigekv.eviction import (
 )
 from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
 from sglang.srt.layers.attention.vestigekv.tier_decode import rows_for_layer
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
@@ -113,11 +115,29 @@ class VestigeKVMLABackend(AttentionBackend):
     _cap_lru_hit = 0
     _scan_cache = None  # OrderedDict[key -> {graph, pack}], LRU cap 2
     _dense_cache = None  # (forward_batch, dense rows) of the eager step's fence
+    _dbg_prev_lanes: list = []  # ROWS check: (slot, seq) per lane of the last decode step
+    _pcal: dict = {}  # (slot, lid) -> {"q": [[H, 576]...], "pos": [...], "built_at": int}
+    _dbg_prev_tail = (
+        None  # TAIL check: (slots, seqs) device tensors of the last decode step
+    )
+    _dbg_tail_bad = None  # TAIL check: per-layer mismatch counters (+ lanes checked)
+    _dbg_tail_steps = 0
+    _mem_dir = None  # SGLANG_DEBUG_VESTIGEKV_MEM_DIR; class default for __new__ fakes
+    _mem_reqs = 0
     _fetch_hist = None
     _stat_acc = None
     _affine_ok = None  # [max_reqs] int32, see _verify_affine
     _affine_capture = False  # the AFFINE constexpr this capture baked
     _idx_state = None  # [3, 2] int64: (scans, overflows) by index state
+    # Class-level so a backend built with __new__ (the unit tests) reads the
+    # arm as off rather than raising on a missing attribute.
+    _omit_blend = False
+    _stepdump = False
+    _rand_fence_p = 0.0
+    _rand_coins = None
+    _stepdump_rows: list = []
+    _logm_stack = _archmu_stack = None
+    _blend_logged = False
     _affine_base = None  # [max_reqs] int64
     _pt_acc = (
         None  # (consecutive pairs, pairs) of the page table; see _probe_page_table
@@ -132,6 +152,7 @@ class VestigeKVMLABackend(AttentionBackend):
         index_rank=64,
         recall_margin=0.0,
         recall_threshold="max",
+        prefill_calibration=False,
         rebuild_overflow_fraction=0.0,
         attended_splits=False,
         entropy_margin_gain=0.0,
@@ -252,12 +273,34 @@ class VestigeKVMLABackend(AttentionBackend):
         )
         # The dedup token for "steps": see _decode_prologue.
         self._last_step_tok = None
+        self._pcal: dict = {}  # prefill calibration queries per (slot, lid)
         # Omitted-mass arm (SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND): per layer,
         # [max_reqs, H] log of the softmax mass the scan skipped and
         # [max_reqs, kv] the archive mean it is carried at.
         # A module-level constant because min_hard() is called from the tier and
         # the offline tools alike; set here, once, from the resolved config.
         D.MIN_HARD_FACTOR = float(self.config.min_hard_factor)
+        self._omit_blend = envs.SGLANG_DEBUG_VESTIGEKV_OMITTED_BLEND.get()
+        # Its OWN directory: sharing SGLANG_DEBUG_VESTIGEKV_DUMP_DIR also turns
+        # on the calibration dump, which wrote 9.9 GB of 72 MB snapshots beside
+        # 1.1 MB of records and took the disk to 92%.
+        self._stepdump = envs.SGLANG_DEBUG_VESTIGEKV_STEPDUMP.get()
+        # Control for the fence: fence a random fraction of lanes at the same
+        # cost, so the gain can be attributed to the SELECTION or to the mere
+        # fact of attending densely more often.
+        self._rand_fence_p = float(
+            envs.SGLANG_DEBUG_VESTIGEKV_RANDOM_FENCE.get() or 0.0
+        )
+        self._rand_coins = None
+        self._stepdump_rows: list = []
+        self._logm: dict = {}
+        self._archmu: dict = {}
+        self._logm_stack = self._archmu_stack = None
+        self._blend_logged = False
+        self._mem_dir = envs.SGLANG_DEBUG_VESTIGEKV_MEM_DIR.get()
+        self._mem_reqs = 0  # requests seen at their first prefill chunk (mem trace)
+        if self._mem_dir is not None:
+            torch.cuda.memory._record_memory_history(max_entries=200000)
         self._fetch_hist = None  # stats only: [W + 1] int64 device histogram
         self._stat_acc = None  # stats only: [fetched, kept, seq] int64 device sums
         self._scan_graph = None
@@ -301,6 +344,8 @@ class VestigeKVMLABackend(AttentionBackend):
     def _decode_prologue(self, forward_batch):
         # Host-side bookkeeping every decode step runs ahead of its recall,
         # however the step is launched.
+        if envs.SGLANG_DEBUG_VESTIGEKV_ROWS.get():
+            self._check_row_invariant(forward_batch)
         reqs, key = self._step_slots(forward_batch)
         # Counted here because this is the one function every decode step runs
         # "however the step is launched": hanging it off the in-graph host step
@@ -331,6 +376,28 @@ class VestigeKVMLABackend(AttentionBackend):
                 self._last_step_tok = tok
                 st["steps"] += 1
                 self._account_step(forward_batch, reqs)
+        if self._rand_fence_p > 0.0 and self._rand_coins is not None:
+            # Refreshed every step outside the graph, into the fixed-address
+            # buffer the captured compaction reads.
+            self._rand_coins.bernoulli_(self._rand_fence_p)
+        if self._stepdump:
+            self._dump_step_attribution(forward_batch, reqs)
+        if self._omit_blend:
+            # Hung off the prologue, not off _recall_step: with the in-graph
+            # scan on (the default) the decode path is
+            # init_forward_metadata_out_graph -> _decode_prologue ->
+            # _ingraph_host_step -> return, and _recall_step is never reached.
+            # This function is the one that provably runs exactly once per
+            # decode step however the step is launched -- calls/step reads 1.00
+            # -- so it is the only safe place to hang per-step work.
+            real = forward_batch.out_cache_loc.shape[0]
+            if real:
+                self._fill_omitted_mass(
+                    forward_batch,
+                    reqs,
+                    real,
+                    forward_batch.req_pool_indices[:real].to(torch.int64),
+                )
         self._maybe_close_blocks(forward_batch, reqs)
         # Collecting a calibration query is five 74 KB clones; it does not
         # need the eager scan path, and tying it to that path cost 16 eager
@@ -674,6 +741,7 @@ class VestigeKVMLABackend(AttentionBackend):
             margin=self.config.recall_margin,
             ent_gain=self.config.entropy_margin_gain,
             fence_rows=self.config.multikey_fence_rows,
+            rand_coins=self._rand_coins,
             thr_lse=self.config.recall_threshold == "lse",
         )
         torch.cuda.synchronize()
@@ -955,6 +1023,62 @@ class VestigeKVMLABackend(AttentionBackend):
                 ),
             )
 
+    def _dump_step_attribution(self, forward_batch, reqs):
+        """One record per (step, layer, lane): where the mass went, against dense.
+
+        The blind spot this exists to close: every offline study in this line
+        runs on CALIBRATED tiers sampled at the eight decode steps right after
+        the build, while 81% of RULER's scans run on a PROVISIONAL tier at
+        ANSWER positions. So "the certificate misses nothing" and "coverage
+        rises with k" describe the 19% of steps RULER barely enters. This
+        records the other 81%, on the steps that actually produce the answer.
+
+        Debug only and far slower than serving: step_attribution computes the
+        dense attention over the whole closed prefix, which is the work the
+        method exists to avoid.
+        """
+        real = forward_batch.out_cache_loc.shape[0]
+        if not real:
+            return
+        seq = self._seq_lens_host(forward_batch)[:real].tolist()
+        step = self._stats.get("steps", 0)
+        for lid in self._local_mla_lids:
+            qb = self._qbuf.get(lid)
+            if qb is None:
+                continue
+            for i in range(real):
+                slot = reqs[i]
+                st = self._recall.get((slot, lid))
+                tier = None if st is None else st["tier"]
+                if tier is None:
+                    continue
+                rec = tier.step_attribution(qb[slot])
+                if not rec:
+                    continue
+                rec.update(
+                    step=step,
+                    lid=lid,
+                    slot=int(slot),
+                    seq=int(seq[i]),
+                    # the state the blind spot is about
+                    provisional=bool(getattr(tier, "need_more_hard", True)),
+                    zp=float(tier.zp),
+                    built_at=int(st.get("built_at", 0)),
+                )
+                self._stepdump_rows.append(rec)
+        if len(self._stepdump_rows) >= 200:
+            self._flush_step_attribution()
+
+    def _flush_step_attribution(self):
+        out_dir = self._stepdump
+        os.makedirs(out_dir, exist_ok=True)
+        tag = os.environ.get("VESTIGEKV_JOB", "step")
+        path = os.path.join(out_dir, f"stepattr_{tag}_tp{self._tp_rank()}.jsonl")
+        with open(path, "a") as f:
+            for r in self._stepdump_rows:
+                f.write(json.dumps(r) + "\n")
+        self._stepdump_rows = []
+
     def _tp_rank(self):
         try:
             from sglang.srt.distributed import get_parallel
@@ -1050,6 +1174,104 @@ class VestigeKVMLABackend(AttentionBackend):
             return 0
         return int(self._ovf_count_stack.sum())
 
+    def _check_packed_rows(self, forward_batch):
+        # SGLANG_DEBUG_VESTIGEKV_ROWS=1: the rows the previous decode step packed
+        # for a lane must all belong to that lane's request (r2t[slot, :seq]);
+        # a foreign row means the CSR, kept table or fetch carried another
+        # request's pool rows. Checked one step late, on lanes whose slot did
+        # not change in between. Syncs; debug only.
+        real = forward_batch.out_cache_loc.shape[0]
+        slots = forward_batch.req_pool_indices[:real].tolist()
+        seqs = forward_batch.seq_lens[:real].tolist()
+        prev = self._dbg_prev_lanes
+        self._dbg_prev_lanes = list(zip(slots, seqs))
+        if not prev or not self._graph_bufs:
+            return
+        r2t = self.req_to_token_pool.req_to_token
+        for i, (slot, seq) in enumerate(zip(slots, seqs)):
+            # same request continuing in this lane: same slot, one token longer
+            # (a warmup/dummy step or a new request in a reused slot is skipped)
+            if i >= len(prev) or prev[i][0] != slot or int(prev[i][1]) + 1 != int(seq):
+                continue
+            valid = r2t[slot, : int(seq)].to(torch.int64)
+            for lid in self._local_mla_lids:
+                bufs = self._graph_bufs.get(lid)
+                if bufs is None:
+                    continue
+                a, b = int(bufs["indptr"][i]), int(bufs["indptr"][i + 1])
+                rows = bufs["indices"][a:b].to(torch.int64)
+                foreign = ~torch.isin(rows, valid)
+                nf = int(foreign.sum())
+                if nf:
+                    raise AssertionError(
+                        f"VESTIGE CHECK: layer {lid} lane {i} slot {slot} seq {seq}: "
+                        f"{nf} of {b - a} packed rows are not this request's "
+                        f"(first: {rows[foreign][:8].tolist()}); kept_len="
+                        f"{int(self._kept_len[lid][slot])} fetch_len="
+                        f"{int(self._fetch_len[lid][slot]) if lid in self._fetch_len else -1} "
+                        f"ovf={int(self._fetch_ovf[lid][slot]) if lid in self._fetch_ovf else -1}"
+                    )
+
+    def _check_row_invariant(self, forward_batch):
+        self._check_packed_rows(forward_batch)
+        # SGLANG_DEBUG_VESTIGEKV_ROWS=1: per-step loud assertion that the attended row
+        # set is the intended one. Catches the silent wrong-row-set class (stale
+        # slot state, never-built tables, chunk-local seq_len) that unit tests
+        # and short-generate smoke tests cannot see. Syncs; debug/CI only.
+        full_arm = self._full_arm()
+        real = forward_batch.out_cache_loc.shape[0]
+        all_slots = forward_batch.req_pool_indices[:real].to(torch.int64)
+        all_seq = forward_batch.seq_lens[:real]
+        for lid in self._local_mla_lids:
+            if lid not in self._kept_len:
+                raise AssertionError(
+                    f"VESTIGE CHECK: layer {lid} kept table never built "
+                    f"(prefill did not reach this backend on this rank)"
+                )
+            # Lanes without compressed state (a warmup batch, a slot never
+            # extended here) are packed dense by design; the invariant is
+            # about the lanes that compress.
+            seen = torch.tensor(
+                [
+                    self._close_state.get((s, lid)) is not None
+                    for s in all_slots.tolist()
+                ],
+                dtype=torch.bool,
+                device=all_slots.device,
+            )
+            if not bool(seen.any()):
+                continue
+            slots, seq = all_slots[seen], all_seq[seen]
+            n = self._kept_len[lid].gather(0, slots)
+            if int((n <= 0).sum()):
+                raise AssertionError(
+                    f"VESTIGE CHECK: layer {lid} kept_len==0 for an active slot "
+                    f"(slot state missing); slots={slots.tolist()}"
+                )
+            if full_arm:
+                # check precedes this step's append: kept_len lags seq_lens by 1
+                bad = (n < seq - 1).sum()
+                if int(bad):
+                    raise AssertionError(
+                        f"VESTIGE CHECK: FULL arm but kept_len < seq_len-1 on "
+                        f"layer {lid}: n={n.tolist()} seq={seq.tolist()}"
+                    )
+            else:
+                # compressed: kept (+ bounded fetch) well below seq past window
+                if lid in self._fetch_len:
+                    n = n + self._fetch_len[lid].gather(0, slots)
+                mask = seq > max(
+                    D.CHECK_MIN_SEQ_BLOCKS * D.CLOSE_BLOCK,
+                    self.config.activation_min_tokens + D.CLOSE_BLOCK,
+                )
+                bad = ((n > (seq * D.CHECK_MAX_KEPT_FRACTION).to(n.dtype)) & mask).sum()
+                if int(bad):
+                    raise AssertionError(
+                        f"VESTIGE CHECK: VESTIGE arm but kept_len ~ seq_len on "
+                        f"layer {lid} (compression not applied): "
+                        f"n={n.tolist()} seq={seq.tolist()}"
+                    )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.base.init_forward_metadata_in_graph(forward_batch)
         if self._ingraph_pack is not None and forward_batch.forward_mode.is_decode():
@@ -1138,6 +1360,8 @@ class VestigeKVMLABackend(AttentionBackend):
             else forward_batch.seq_lens.tolist()
         )
         prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if self._mem_dir is not None and lid == min(self._mla_lids):
+            self._trace_request_memory(sum(int(p) == 0 for p in prefix_lens))
         for i, (slot, seq_len) in enumerate(zip(slots, lens)):
             seq_len = int(seq_len)
             row_slots = r2t[slot, :seq_len]
@@ -1180,13 +1404,17 @@ class VestigeKVMLABackend(AttentionBackend):
             # step bills the SVD to decode (trace: aten::linalg_svd 83 ms inside
             # the decode window). Both were measured and rejected.
             if int(prefix_lens[i]) == 0:
-                # A new request in this slot; later chunks keep the state.
+                # A new request in this slot; later chunks keep the state so a
+                # prefill-time build (and the queries it was fitted on) survive.
                 self._reset_slot_state(slot=slot, lid=lid)
             self._collecting = True
             self._invalidate_scan()
             if lid in self._fetch_len:
                 self._fetch_len[lid][slot] = 0
                 self._fetch_ovf[lid][slot] = 0
+            self._maybe_prefill_build(
+                slot=slot, lid=lid, seq_len=seq_len, closed=closed0
+            )
             # Deliberately NOT built here: under chunked prefill seq_lens is the
             # running total, not the request length, so "is this the last chunk?"
             # is not decidable from the ForwardBatch (measured: the obvious
@@ -1194,6 +1422,71 @@ class VestigeKVMLABackend(AttentionBackend):
             # built once on the first decode step for this slot; that is
             # prefill-phase work by semantics, so serving reports must bill it to
             # TTFT, not to steady-state decode throughput.
+
+    def write_prefill_queries(self, *, layer_id, forward_batch, q, positions, w_kc):
+        """Keep absorbed prompt queries for prefill-time calibration.
+
+        q [tokens, H, nope + rope] with the rope part already rotated; w_kc
+        [H, nope, kv_lora_rank] absorbs the nope part into the latent space
+        (what the decode path hands the backend). One query every
+        D.PREFILL_CAL_STRIDE absolute positions plus each chunk's last one,
+        the newest D.N_CAL_MAX kept per (slot, layer).
+        """
+        if not self.config.prefill_calibration or w_kc is None:
+            return
+        if w_kc.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            return  # a quantized absorbed weight needs its own dequant path
+        slots = forward_batch.req_pool_indices.tolist()
+        lens = forward_batch.extend_seq_lens_cpu
+        prefix = forward_batch.extend_prefix_lens_cpu
+        nope = w_kc.shape[1]
+        start = 0
+        for slot, n, p0 in zip(slots, lens, prefix):
+            n, p0 = int(n), int(p0)
+            key = (slot, layer_id)
+            if p0 == 0 or key not in self._pcal:
+                self._pcal[key] = {"q": [], "pos": [], "built_at": 0}
+            pos = torch.arange(p0, p0 + n)
+            pick = ((pos + 1) % D.PREFILL_CAL_STRIDE == 0).nonzero().flatten().tolist()
+            if not pick or pick[-1] != n - 1:
+                pick.append(n - 1)
+            rows = q[start : start + n][pick]  # [m, H, nope + rope]
+            q_nope = rows[..., :nope].to(w_kc.dtype)
+            absorbed = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
+            qe = torch.cat(
+                [absorbed, rows[..., nope:].to(absorbed.dtype)], dim=-1
+            ).float()
+            pc = self._pcal[key]
+            for j, m in enumerate(pick):
+                pc["q"].append(qe[j].clone())
+                pc["pos"].append(p0 + m)
+            if len(pc["q"]) > D.N_CAL_MAX:
+                pc["q"] = pc["q"][-D.N_CAL_MAX :]
+                pc["pos"] = pc["pos"][-D.N_CAL_MAX :]
+            start += n
+
+    def _calibration_inputs(self, slot, lid, st):
+        # Prefill queries first (older positions), then the decode ones.
+        pc = self._pcal.get((slot, lid), {"q": [], "pos": []})
+        return list(pc["q"]) + list(st["qcal"]), list(pc["pos"]) + list(st["qpos"])
+
+    def _maybe_prefill_build(self, *, slot, lid, seq_len, closed):
+        # Prefill-time calibrated build, paced by the prefix (the last chunk is
+        # not identifiable under chunked prefill); needs an archive to index and
+        # enough absorbed prompt queries. The build runs on the side stream and
+        # installs at the first decode prologue, ahead of the provisional index.
+        if not self.config.prefill_calibration or closed <= 0:
+            return
+        pc = self._pcal.get((slot, lid))
+        st = self._recall.get((slot, lid))
+        if pc is None or st is None or "job" in st or st.get("qcal") is None:
+            return
+        if len(pc["q"]) < D.N_CAL_START or seq_len < max(
+            D.PREFILL_BUILD_MIN, 2 * pc["built_at"]
+        ):
+            return
+        pc["built_at"] = seq_len
+        st["job"] = self._enqueue_build(slot, lid, seq_len, st)
 
     def _reset_slot_state(self, *, slot, lid):
         # The state dict and its in-flight build job reference each other
@@ -1272,6 +1565,29 @@ class VestigeKVMLABackend(AttentionBackend):
                 n, max_reqs, dtype=torch.int32, device=dev
             )
             self._ovf_count_stack = torch.zeros(n, dtype=torch.int32, device=dev)
+            if self._rand_fence_p > 0.0:
+                self._rand_coins = torch.zeros(max_reqs, dtype=torch.int32, device=dev)
+            if self._omit_blend:
+                # Allocated here, with every other fixed-address buffer, because
+                # the blend has to be part of the CAPTURED graph: the router's
+                # python runs once at capture and never again at replay, so a
+                # blend installed later is simply not in the graph. -inf means
+                # "no omitted mass", i.e. sigma = 1, so the captured op is a
+                # no-op until a step writes real values into it.
+                self._logm_stack = torch.full(
+                    (n, max_reqs, self._q_heads),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=dev,
+                )
+                self._archmu_stack = torch.zeros(
+                    n,
+                    max_reqs,
+                    self._q_heads,
+                    D.KV_LORA_RANK,
+                    dtype=torch.float32,
+                    device=dev,
+                )
             # Per pool slot, not per layer: whether this request's page table is
             # one contiguous run, and where it starts. Maintained incrementally
             # (see _verify_affine and the pack's prep kernel) so a fenced lane
@@ -1283,6 +1599,9 @@ class VestigeKVMLABackend(AttentionBackend):
         self._fetch_buf[lid] = self._fetch_stack[li]
         self._fetch_len[lid] = self._fetch_len_stack[li]
         self._fetch_ovf[lid] = self._fetch_ovf_stack[li]
+        if self._omit_blend:
+            self._logm[lid] = self._logm_stack[li]
+            self._archmu[lid] = self._archmu_stack[li]
 
     def _full_arm(self) -> bool:
         # Benchmark-only A/B switch (SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG names a
@@ -1388,6 +1707,12 @@ class VestigeKVMLABackend(AttentionBackend):
                     self._stage_seq[:bs],
                     self._stage_loc[:bs],
                 )
+                if self._omit_blend and lid in self._logm:
+                    self._router.blend[lid] = (
+                        self._logm[lid],
+                        self._archmu[lid],
+                        self._stage_slots[:bs],
+                    )
         else:
             # Eager step: the metadata hook packed this step's CSR into the
             # same buffers the graphs read. Sized for the whole request
@@ -1574,6 +1899,7 @@ class VestigeKVMLABackend(AttentionBackend):
             margin=self.config.recall_margin,
             ent_gain=self.config.entropy_margin_gain,
             fence_rows=self.config.multikey_fence_rows,
+            rand_coins=self._rand_coins,
             thr_lse=self.config.recall_threshold == "lse",
         )
 
@@ -1642,8 +1968,49 @@ class VestigeKVMLABackend(AttentionBackend):
             # one row, which is what the CSR buffers are sized for.
             self._kept_len_stack[:, self._trash_slot] = 0
 
+    def _check_tail_append(self, forward_batch, reqs):
+        # SGLANG_DEBUG_VESTIGEKV_TAIL=1: for every lane continuing its request
+        # (same slot, seq one longer than last step), the row the previous
+        # step appended (kept_buf[slot, kept_len - 1]) must be that request's
+        # previous token row, req_to_token[slot, seq - 2]. Accumulated on the
+        # device; read back and logged every 200 steps so the step timing the
+        # race depends on is preserved.
+        real = forward_batch.out_cache_loc.shape[0]
+        slots = forward_batch.req_pool_indices[:real].to(torch.int64)
+        seqs = forward_batch.seq_lens[:real].to(torch.int64)
+        prev = self._dbg_prev_tail
+        self._dbg_prev_tail = (slots.clone(), seqs.clone())
+        if self._dbg_tail_bad is None:
+            self._dbg_tail_bad = torch.zeros(
+                len(self._local_mla_lids) + 1, dtype=torch.int64, device=slots.device
+            )
+        if prev is None or prev[0].shape[0] != real:
+            return
+        cont = (prev[0] == slots) & (prev[1] + 1 == seqs)
+        r2t = self.req_to_token_pool.req_to_token
+        expect = r2t[slots, (seqs - 2).clamp_min(0)].to(torch.int64)
+        for lid in self._local_mla_lids:
+            if lid not in self._kept_buf:
+                continue
+            n = self._kept_len[lid][slots].to(torch.int64)
+            got = self._kept_buf[lid][slots, (n - 1).clamp_min(0)].to(torch.int64)
+            bad = cont & (n > 0) & (got != expect)
+            self._dbg_tail_bad[self._li_map[lid]] += bad.sum()
+        self._dbg_tail_bad[-1] += cont.sum()
+        self._dbg_tail_steps += 1
+        if self._dbg_tail_steps % 200 == 0:
+            v = self._dbg_tail_bad.tolist()
+            logger.info(
+                "VESTIGEKV_TAIL steps=%d checked=%d bad_per_layer=%s",
+                self._dbg_tail_steps,
+                v[-1],
+                v[:-1],
+            )
+
     def _ingraph_host_step(self, forward_batch, reqs):
         real = forward_batch.out_cache_loc.shape[0]
+        if envs.SGLANG_DEBUG_VESTIGEKV_TAIL.get():
+            self._check_tail_append(forward_batch, reqs)
         self._stage_step(forward_batch, forward_batch.seq_lens.shape[0])
         if self._full_arm():
             if not self._ingraph_full_armed:
@@ -1751,6 +2118,59 @@ class VestigeKVMLABackend(AttentionBackend):
         slots = forward_batch.req_pool_indices[:real].to(torch.int64)
         self._ovf_count_stack[self._li_map[lid]] += (
             self._fetch_ovf[lid].gather(0, slots).sum(dtype=torch.int32)
+        )
+
+    def _fill_omitted_mass(self, forward_batch, reqs, real, slots):
+        """This step's omitted softmax mass and its compensator, per lane.
+
+        A research arm, not the serving path: it materialises the [H, archive]
+        score matrix that query_fixed exists to avoid, once per lane per layer
+        per step. What it buys is the one term every other measurement here
+        conditioned away -- the scan attends ~6% of rows and captures ~57% of
+        the dense softmax mass, so the retained weights are inflated by Z/Zv
+        and the output is a convex combination over the wrong denominator.
+
+        A fenced lane attends its full row set, so it has no omitted mass and
+        is handed -inf; the flag lives on the device, so the choice is a
+        `where`, not a readback. The centroid is per HEAD, not per lane: the
+        weights are the head's own scores, and the arithmetic mean that is not
+        leaves the offline output error at 0.367 against 0.195.
+        """
+        for lid in self._local_mla_lids:
+            if lid in self._qbuf and lid in self._logm:
+                self._fill_one_layer(lid, reqs, real, slots)
+
+    def _fill_one_layer(self, lid, reqs, real, slots):
+        qb = self._qbuf[lid]
+        lm, mu = self._logm[lid], self._archmu[lid]
+        for i in range(real):
+            slot = reqs[i]
+            st = self._recall.get((slot, lid))
+            tier = None if st is None else st["tier"]
+            if tier is None:
+                lm[slot].fill_(float("-inf"))
+                continue
+            lg, ct = tier.omitted_mass_and_mean(qb[slot])
+            lm[slot].copy_(lg)
+            mu[slot].copy_(ct)
+        if not self._blend_logged:
+            self._blend_logged = True
+            logger.info(
+                "VESTIGEKV_BLEND fill: layer %d wrote logM in [%.2f, %.2f] over %d lanes",
+                lid,
+                float(lm.index_select(0, slots).min()),
+                float(lm.index_select(0, slots).max()),
+                real,
+            )
+        fenced = self._fetch_ovf[lid].index_select(0, slots) != 0
+        lm.index_copy_(
+            0,
+            slots,
+            torch.where(
+                fenced[:, None],
+                torch.full_like(lm[:real], float("-inf")),
+                lm.index_select(0, slots),
+            ),
         )
 
     def _seq_lens_host(self, forward_batch):
@@ -1998,8 +2418,8 @@ class VestigeKVMLABackend(AttentionBackend):
             "row_slots": r2t[slot, :seq_len].to(torch.int64).clone(),
             "kept": self._kept_buf[lid][slot, :n_kept].to(torch.int64).clone(),
             "st": st,  # identity token: a re-prefill REPLACES the state dict
-            "qcal": list(st["qcal"]),
-            "qpos": list(st["qpos"]),
+            "qcal": self._calibration_inputs(slot, lid, st)[0],
+            "qpos": self._calibration_inputs(slot, lid, st)[1],
             "operands_from": self._reusable_operands(slot, lid, st, seq_len),
             "ready": torch.cuda.Event(),
             "done": threading.Event(),
@@ -2145,12 +2565,33 @@ class VestigeKVMLABackend(AttentionBackend):
         self._build_jobs = remaining
         return installed
 
+    def _trace_request_memory(self, new_requests):
+        # Allocator bookkeeping only (no device sync): what the caching
+        # allocator holds when a request starts, and a full snapshot every
+        # fifth request so two of them can be diffed by allocation stack.
+        for _ in range(new_requests):
+            self._mem_reqs += 1
+            alloc = torch.cuda.memory_allocated() / 2**30
+            reserved = torch.cuda.memory_reserved() / 2**30
+            logger.info(
+                "VESTIGEKV_MEM req=%d alloc=%.3fGB reserved=%.3fGB",
+                self._mem_reqs,
+                alloc,
+                reserved,
+            )
+            if self._mem_reqs % 5 == 0:
+                os.makedirs(self._mem_dir, exist_ok=True)
+                torch.cuda.memory._dump_snapshot(
+                    os.path.join(
+                        self._mem_dir,
+                        f"mem_tp{get_parallel().tp_rank}_req{self._mem_reqs}.pickle",
+                    )
+                )
+
     def _dump_calibration(self, *, job, slot, lid, stats):
         # One file per install: <dir>/cal_slot<slot>_lid<lid>_seq<seq>.pt with the
         # exact build inputs (rows in pool dtype, queries as collected) plus the
         # fitted basis, so an offline study can refit any basis or rank.
-        from sglang.srt.distributed import get_parallel
-
         out_dir = envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.get()
         os.makedirs(out_dir, exist_ok=True)
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)

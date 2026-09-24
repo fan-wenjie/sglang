@@ -93,6 +93,21 @@ still not producing MIN_HARD hard samples by here is genuinely easy (the kept
 tier dominates); the index then serves with zp clamped to Z_MAX, which errs
 toward over-fetching, never under-recall."""
 
+PREFILL_CAL_STRIDE = 512
+"""Prefill calibration (--enable-vestigekv-prefill-calibration): one absorbed
+query is kept every this many prompt positions, plus each chunk's last
+position; the newest N_CAL_MAX of them calibrate the index before decode."""
+
+PREFILL_BUILD_MIN = 4096
+"""Prefill-time calibrated builds of a request run at prompt lengths 4096,
+8192, 16384, ... (the first closed block, then at every doubling of the prefix
+built last): every prompt with an archive gets a build before its first decode
+step, the last build lies within a factor of two of the prompt's end, and a 1M
+prompt pays eight builds. The last chunk is not identifiable under chunked
+prefill, so builds are paced by the prefix; decode-time closes backfill what
+the last build missed."""
+
+
 ENTROPY_EPS = 1e-12
 """Clamp inside log for the entropy gate."""
 
@@ -164,6 +179,19 @@ def a_block_for_rank(r: int) -> int:
 
 D_BLOCK_RANK_BASE = INDEX_RANK
 
+
+# ---- row invariant (SGLANG_DEBUG_VESTIGEKV_ROWS) ----
+
+CHECK_MIN_SEQ_BLOCKS = 4
+"""The invariant only asserts compression once the sequence is this many
+CLOSE_BLOCKs long. Below that, kept legitimately IS most of the sequence: the
+unclosed tail alone can be CLOSE_BLOCK-1 rows, so at 4 blocks the bound
+rho*seq + CLOSE_BLOCK + SINKS < 0.5*seq holds with margin and asserting
+earlier would fire on correct behavior."""
+
+CHECK_MAX_KEPT_FRACTION = 0.5
+"""Above this share of the sequence the compressed arm is not compressing, which
+is the silent wrong-row-set failure this check exists to catch."""
 
 SCAN_CAPTURE_MAX_FAILS = 3
 """Consecutive capture refusals before the eager path becomes permanent. One
@@ -276,34 +304,3 @@ line's per-state buckets. An index fitted at `built_at` tokens serving a
 request now `seq` tokens long is stale once seq > INDEX_STALE_FACTOR *
 built_at: the archive it was fitted on is less than half of what it now has to
 rank. Reporting only; nothing reads it on the token path."""
-
-
-# Research arms, each disabled at the value below. They were server flags and
-# are constants here: every one defaults to off, so no deployment tunes them,
-# and a CLI surface for an arm nothing ships with is a surface to support.
-# VestigeKVConfig still carries them as fields, so exposing one again is a
-# one-line change in from_kernel_config.
-RECALL_THRESHOLD = "max"
-"""What the recall margin is taken from: the best kept-row score. "lse" takes
-it from the log-sum-exp of the kept scores instead."""
-
-REBUILD_OVERFLOW_FRACTION = 0.0
-"""Refit a layer's index when its scan overflowed on more than this fraction of
-the steps since that layer's last close. 0 disables the trigger: the fit is
-made once, early, and serves the whole request."""
-
-CERT_GAUSSIAN_TARGET = 0.0
-"""Gaussian tail target for the conformal certificate. 0 keeps the empirical
-quantile."""
-
-MULTIKEY_FENCE_ROWS = 0
-"""A lane firing more than this many archived rows attends its full row set.
-0 leaves the buffer overflow as the only fence."""
-
-ENTROPY_MARGIN_GAIN = 0.0
-"""Extra recall margin per nat of kept-distribution flatness. 0 leaves the
-threshold unchanged."""
-
-ATTENDED_SPLITS = False
-"""Size the decode kernel's KV split count from the attended rows rather than
-the request length. Changes the accumulation grouping, not the row set."""

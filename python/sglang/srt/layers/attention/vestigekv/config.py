@@ -9,7 +9,6 @@ configuration is logged as one line.
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.vestigekv import defaults as D
 
 RECALL_THRESHOLDS = ("max", "lse")
 
@@ -36,6 +35,10 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     # kept scores (a dropped row's weight <= e^-margin of the whole kept mass:
     # self-adapting to how peaked the kept distribution is).
     recall_threshold: str
+    # Calibrate the recall index on absorbed prompt queries during prefill
+    # (at PREFILL_BUILD_MIN tokens, then at every doubling) so the first decode
+    # steps are served by a calibrated index instead of the provisional one.
+    prefill_calibration: bool
     # Refit a layer's index when its scan overflowed on more than this fraction
     # of the steps since that layer's last close (0 disables): the fit is
     # otherwise made once, early, and serves the whole request.
@@ -55,21 +58,19 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
     def from_kernel_config(cls, kernel) -> "VestigeKVConfig":
         """Build from the ``exec.kernel`` config bag (``get_exec().kernel``)."""
         cfg = cls(
-            # The four server flags.
             recall_capacity=kernel.vestigekv_recall_capacity,
+            overflow_fallback=not envs.SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK.get(),
             activation_min_tokens=kernel.vestigekv_activation_min_tokens,
             index_rank=kernel.vestigekv_index_rank,
             recall_margin=kernel.vestigekv_recall_margin,
-            # Everything below is a constant, not a flag: each names a research
-            # arm that ships disabled. Exposing one again is a line here.
-            overflow_fallback=not envs.SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK.get(),
-            recall_threshold=D.RECALL_THRESHOLD,
-            rebuild_overflow_fraction=D.REBUILD_OVERFLOW_FRACTION,
-            attended_splits=D.ATTENDED_SPLITS,
-            entropy_margin_gain=D.ENTROPY_MARGIN_GAIN,
-            multikey_fence_rows=D.MULTIKEY_FENCE_ROWS,
-            min_hard_factor=D.MIN_HARD_FACTOR,
-            cert_gaussian_target=D.CERT_GAUSSIAN_TARGET,
+            recall_threshold=kernel.vestigekv_recall_threshold,
+            prefill_calibration=kernel.enable_vestigekv_prefill_calibration,
+            rebuild_overflow_fraction=kernel.vestigekv_rebuild_overflow_fraction,
+            attended_splits=kernel.enable_vestigekv_attended_splits,
+            entropy_margin_gain=kernel.vestigekv_entropy_margin_gain,
+            multikey_fence_rows=kernel.vestigekv_multikey_fence_rows,
+            min_hard_factor=kernel.vestigekv_min_hard_factor,
+            cert_gaussian_target=kernel.vestigekv_cert_gaussian_target,
         )
         cfg.validate()
         return cfg
@@ -114,5 +115,12 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"overflow_fallback={self.overflow_fallback} "
             f"activation_min_tokens={self.activation_min_tokens} "
             f"index_rank={self.index_rank} recall_margin={self.recall_margin} "
-            f"recall_threshold={self.recall_threshold}"
+            f"recall_threshold={self.recall_threshold} "
+            f"prefill_calibration={self.prefill_calibration} "
+            f"rebuild_overflow_fraction={self.rebuild_overflow_fraction} "
+            f"attended_splits={self.attended_splits} "
+            f"entropy_margin_gain={self.entropy_margin_gain} "
+            f"multikey_fence_rows={self.multikey_fence_rows} "
+            f"min_hard_factor={self.min_hard_factor} "
+            f"cert_gaussian_target={self.cert_gaussian_target}"
         )

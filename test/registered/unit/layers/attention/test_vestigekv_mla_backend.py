@@ -2,8 +2,8 @@
 
 Each test pins a black-box behavior that once regressed in the port:
 graph-replay batch padding must not overrun the unpadded out_cache_loc,
-slot reuse must not leak the previous request's kept state, and a block
-closed at decode time must not append a row the capture already holds.
+slot reuse must not leak the previous request's kept state, and the
+SGLANG_DEBUG_VESTIGEKV_ROWS row invariant must both pass and fail correctly.
 """
 
 import unittest
@@ -228,6 +228,253 @@ class TestSlotReuseInvalidation(CustomTestCase):
         self.assertEqual(int(be._fetch_ovf[LID][0]), 0)
 
 
+class TestRowInvariantCheck(CustomTestCase):
+    """SGLANG_DEBUG_VESTIGEKV_ROWS semantics: the check runs before this step's
+    append, so the FULL arm requires kept_len >= seq_len - 1; the VESTIGE arm
+    requires kept_len well below seq_len; a missing table or kept_len == 0
+    always aborts."""
+
+    def _mk(self, kept_lens):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._local_mla_lids = [LID]
+        be._kept_len = {LID: torch.tensor(kept_lens, dtype=torch.int64)}
+        be._fetch_len, be._fetch_ovf = {}, {}
+        be._close_state = {(0, LID): {}, (1, LID): {}}
+        fb = SimpleNamespace(
+            out_cache_loc=torch.tensor([100, 101], dtype=torch.int64),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            # above the assert floor: max(4 * CLOSE_BLOCK, ACTIVATION_MIN_TOKENS
+            # + CLOSE_BLOCK) -- below the activation threshold the VESTIGE arm
+            # deliberately runs dense, so "not compressing" is correct there
+            seq_lens=torch.tensor([40000, 40000], dtype=torch.int64),
+        )
+        return be, fb
+
+    def _run(self, be, fb, full_arm):
+        with patch.object(VestigeKVMLABackend, "_full_arm", return_value=full_arm):
+            be._check_row_invariant(fb)
+
+    def test_vestige_arm_compressed_passes(self):
+        be, fb = self._mk([5000, 5000])  # rho*closed + tail(<=4096) + sinks
+        self._run(be, fb, full_arm=False)
+
+    def test_vestige_arm_uncompressed_raises(self):
+        be, fb = self._mk([39000, 39000])  # kept ~= seq: not compressing
+        with self.assertRaisesRegex(AssertionError, "compression not applied"):
+            self._run(be, fb, full_arm=False)
+
+    def test_full_arm_pending_append_passes(self):
+        be, fb = self._mk([39999, 39999])
+        self._run(be, fb, full_arm=True)
+
+    def test_full_arm_short_raises(self):
+        be, fb = self._mk([5000, 5000])
+        with self.assertRaisesRegex(AssertionError, "FULL arm"):
+            self._run(be, fb, full_arm=True)
+
+    def test_missing_table_raises(self):
+        be, fb = self._mk([19000, 19000])
+        be._kept_len = {}
+        with self.assertRaisesRegex(AssertionError, "never built"):
+            self._run(be, fb, full_arm=False)
+
+    def test_lane_without_state_is_outside_the_invariant(self):
+        # the warmup's dummy batch has no compressed state for its slots and
+        # packs dense; the check must not read that as a missing table
+        be, fb = self._mk([0, 0])
+        be._close_state = {}
+        with patch.object(VestigeKVMLABackend, "_full_arm", return_value=False):
+            be._check_row_invariant(fb)  # must not raise
+
+
+class TestPrefillCalibration(CustomTestCase):
+    """--enable-vestigekv-prefill-calibration: absorbed prompt queries are
+    collected at a stride during extend, a paced side-stream build is enqueued
+    from them, and a build that finished during prefill installs before the
+    first decode step could build the provisional index."""
+
+    def _backend(self, enabled=True):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.config = msgspec.structs.replace(
+            FLAG_DEFAULT_CONFIG, prefill_calibration=enabled
+        )
+        be._pcal = {}
+        be._recall = {}
+        return be
+
+    def _fb(self, slots, lens, prefix):
+        return SimpleNamespace(
+            req_pool_indices=torch.tensor(slots),
+            extend_seq_lens_cpu=list(lens),
+            extend_prefix_lens_cpu=list(prefix),
+            positions=torch.cat([torch.arange(p, p + n) for p, n in zip(prefix, lens)]),
+        )
+
+    def test_queries_are_absorbed_at_the_stride_and_at_each_chunk_end(self):
+        torch.manual_seed(0)
+        H, nope, rope, kv = 2, 8, 4, 16
+        w_kc = torch.randn(H, nope, kv)
+        be = self._backend()
+        n = 3 * D.PREFILL_CAL_STRIDE + 7  # three stride hits plus the chunk's last row
+        q = torch.randn(n, H, nope + rope)
+        be.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([5], [n], [0]),
+            q=q,
+            positions=None,
+            w_kc=w_kc,
+        )
+        pc = be._pcal[(5, LID)]
+        want_pos = [
+            D.PREFILL_CAL_STRIDE - 1,
+            2 * D.PREFILL_CAL_STRIDE - 1,
+            3 * D.PREFILL_CAL_STRIDE - 1,
+            n - 1,
+        ]
+        self.assertEqual(pc["pos"], want_pos)
+        for qe, pos in zip(pc["q"], want_pos):
+            ref = torch.cat(
+                [torch.einsum("hd,hdk->hk", q[pos, :, :nope], w_kc), q[pos, :, nope:]],
+                -1,
+            )
+            self.assertTrue(torch.allclose(qe, ref, atol=1e-5))
+        # second chunk continues the same request; a new request (prefix 0) starts over
+        be.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([5], [10], [n]),
+            q=torch.randn(10, H, nope + rope),
+            positions=None,
+            w_kc=w_kc,
+        )
+        self.assertEqual(be._pcal[(5, LID)]["pos"][-1], n + 9)
+        self.assertEqual(len(be._pcal[(5, LID)]["q"]), 5)
+        be.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([5], [10], [0]),
+            q=torch.randn(10, H, nope + rope),
+            positions=None,
+            w_kc=w_kc,
+        )
+        self.assertEqual(be._pcal[(5, LID)]["pos"], [9])
+
+    def test_collection_keeps_the_newest_queries_and_is_off_by_default(self):
+        H, nope, rope, kv = 1, 4, 2, 8
+        w_kc = torch.randn(H, nope, kv)
+        be = self._backend()
+        n = (D.N_CAL_MAX + 5) * D.PREFILL_CAL_STRIDE
+        be.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([0], [n], [0]),
+            q=torch.randn(n, H, nope + rope),
+            positions=None,
+            w_kc=w_kc,
+        )
+        self.assertEqual(len(be._pcal[(0, LID)]["q"]), D.N_CAL_MAX)
+        self.assertEqual(be._pcal[(0, LID)]["pos"][-1], n - 1)
+        off = self._backend(enabled=False)
+        off.write_prefill_queries(
+            layer_id=LID,
+            forward_batch=self._fb([0], [n], [0]),
+            q=torch.randn(n, H, nope + rope),
+            positions=None,
+            w_kc=w_kc,
+        )
+        self.assertEqual(off._pcal, {})
+
+    def test_prefill_build_is_paced_and_needs_an_archive(self):
+        be = self._backend()
+        st = {
+            "tier": None,
+            "built_at": 0,
+            "qcal": [],
+            "qpos": [],
+            "target": D.N_CAL_START,
+        }
+        be._recall[(0, LID)] = st
+        be._pcal[(0, LID)] = {
+            "q": [torch.zeros(1, 1)] * D.N_CAL_START,
+            "pos": list(range(D.N_CAL_START)),
+            "built_at": 0,
+        }
+        calls = []
+        with patch.object(
+            VestigeKVMLABackend,
+            "_enqueue_build",
+            lambda _s, slot, lid, seq_len, st: calls.append(seq_len) or {"done": None},
+        ):
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN, closed=0
+            )  # no archive
+            self.assertEqual(calls, [])
+            # Regression: builds were paced every 16k prompt tokens, so 4k-16k
+            # prompts (RULER's short cells) started decode on the provisional
+            # index; the first closed block must already get a build.
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK
+            )
+            self.assertEqual(calls, [D.PREFILL_BUILD_MIN])
+            self.assertIn("job", st)
+            st.pop("job")
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=D.PREFILL_BUILD_MIN + 100, closed=D.CLOSE_BLOCK
+            )
+            self.assertEqual(calls, [D.PREFILL_BUILD_MIN])  # next build at the doubling
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=2 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK
+            )
+            self.assertEqual(calls, [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN])
+            st.pop("job")
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=3 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK
+            )
+            self.assertEqual(
+                calls, [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN]
+            )  # 12k < 2 x 8k
+            be._maybe_prefill_build(
+                slot=0, lid=LID, seq_len=4 * D.PREFILL_BUILD_MIN, closed=D.CLOSE_BLOCK
+            )
+            self.assertEqual(
+                calls,
+                [D.PREFILL_BUILD_MIN, 2 * D.PREFILL_BUILD_MIN, 4 * D.PREFILL_BUILD_MIN],
+            )
+        # the build's inputs put the prompt queries before the decode ones
+        st["qcal"], st["qpos"] = [torch.ones(1, 1)], [99]
+        q, pos = be._calibration_inputs(0, LID, st)
+        self.assertEqual(pos, list(range(D.N_CAL_START)) + [99])
+        self.assertEqual(len(q), D.N_CAL_START + 1)
+
+
+class TestPackedCsrDtype(CustomTestCase):
+    def test_csr_keeps_the_base_index_dtype(self):
+        # The base decode kernel multiplies row id by row stride in the CSR's
+        # dtype; an int32 CSR overflowed on a 5.1M-row pool (Kimi Linear) and
+        # served garbage rows. VestigeKV's own tables stay int32.
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.base = SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                kv_indptr=torch.zeros(5, dtype=torch.int32),
+                kv_indices=torch.zeros(8, dtype=torch.int64),
+            ),
+            max_context_len=64,
+        )
+        be.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros(3, 64, dtype=torch.int32)
+        )
+        be.token_to_kv_pool = SimpleNamespace(size=5_095_798)
+        be._local_mla_lids = [LID]
+        be._li_map = {LID: 0}
+        be._kept_buf, be._kept_len, be._qbuf = {}, {}, {}
+        be._fetch_buf, be._fetch_len, be._fetch_ovf, be._graph_bufs = {}, {}, {}, {}
+        be._q_heads, be._q_dim, be._fetch_w = 2, 576, 16
+        be._qbuf_stack = be._fetch_stack = be._fetch_len_stack = None
+        be._fetch_ovf_stack = be._ovf_count_stack = None
+        be._trash_slot = 3
+        be._ensure_graph_bufs()
+        self.assertEqual(be._graph_bufs[LID]["indices"].dtype, torch.int64)
+        self.assertEqual(be._kept_buf[LID].dtype, D.INDEX_DTYPE)
+        self.assertEqual(be._fetch_buf[LID].dtype, D.INDEX_DTYPE)
+
+
 class TestOverflowRearm(CustomTestCase):
     """A calibrated index is fitted once and then serves the whole request, so a
     fit made at short context over-fires at long context and every overflowing
@@ -322,6 +569,24 @@ class TestConfig(CustomTestCase):
             VestigeKVConfig.from_kernel_config(ExecKernel()), FLAG_DEFAULT_CONFIG
         )
 
+    def test_overflow_fallback_is_on_unless_the_debug_key_is_set(self):
+        """The fallback has no deployment off-switch.
+
+        It was a ServerArgs flag and is now a debug key, so a config built
+        from the kernel bag alone must have it ON; only the ablation key
+        turns it off. A regression here would put the trade back on a
+        deployment config surface, where there is no trade to take.
+        """
+        from sglang.srt.arg_groups.fields.exec_ import ExecKernel
+        from sglang.srt.environ import envs
+
+        self.assertTrue(
+            VestigeKVConfig.from_kernel_config(ExecKernel()).overflow_fallback
+        )
+        with envs.SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK.override(True):
+            cfg = VestigeKVConfig.from_kernel_config(ExecKernel())
+        self.assertFalse(cfg.overflow_fallback)
+
     def test_out_of_range_values_are_refused(self):
         base = FLAG_DEFAULT_CONFIG
         for bad in (
@@ -398,8 +663,264 @@ class TestOverflowFence(CustomTestCase):
         )
 
 
+class TestStatsTelemetry(CustomTestCase):
+    """VESTIGEKV_STATS reports the fetched-row distribution and the fallback rate
+    from a device histogram; the percentile is the nearest-rank one over bin
+    counts, and one scan of an overflowed lane lands in the capacity bin."""
+
+    def test_hist_percentiles_are_nearest_rank(self):
+        from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
+
+        # values: 1 x3, 3 x2, 4 x5 (total 10) -> ranks 5, 9, 10
+        self.assertEqual(hist_percentiles([0, 3, 0, 2, 5], (0.5, 0.9, 0.99)), [3, 4, 4])
+        self.assertEqual(hist_percentiles([], (0.5,)), [0])
+        self.assertEqual(hist_percentiles([7], (0.5, 1.0)), [0, 0])
+
+    def test_account_step_bins_last_steps_fetch_counts(self):
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._fetch_w = 8
+        be._mla_lids = {LID}
+        be._qbuf = {LID: None}
+        be._fetch_len = {LID: torch.tensor([3, 8, 0, 5], dtype=torch.int32)}
+        be._kept_len = {LID: torch.tensor([10, 20, 30, 40], dtype=torch.int32)}
+        be._stats = dict.fromkeys(("steps", "scan_calls", "fetched", "kept", "seq"), 0)
+        be._stats["steps"] = 1  # off the dump cadence
+        be._fetch_hist = None
+        fb = SimpleNamespace(
+            out_cache_loc=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([100, 200], dtype=torch.int64),
+        )
+        be._stat_acc = None
+        be._fetch_ovf = {}
+        be._idx_state = None
+        be._account_step(fb, fb.req_pool_indices.tolist())
+        self.assertEqual(be._fetch_hist.tolist(), [0, 0, 0, 0, 0, 1, 0, 0, 1])
+        self.assertEqual(be._stats["scan_calls"], 2)
+        # the sums stay on the device until the dump reads them back
+        self.assertEqual(be._stat_acc.tolist(), [13, 60, 300])
+        self.assertEqual(be._stats["fetched"], 0)
+
+    def test_a_step_is_counted_once_however_many_times_the_prologue_runs(self):
+        """The prologue is entered more than once per decode step.
+
+        init_forward_metadata reaches it through _eager_decode_step and the
+        graph runner's load_batch reaches it again through
+        init_forward_metadata_out_graph. Counting on entry multiplied steps and
+        scan_calls by that multiplicity and DIVIDED the reported fallback rate
+        by it -- RULER 64k read 0.118 against the once-per-step 0.360, and the
+        two were compared as if they measured the same thing. So: repeated
+        entries at one step count once, the next step counts again, and
+        prologue_calls keeps the raw entry count so the multiplicity stays
+        visible instead of being inferred from a ratio.
+        """
+        from sglang.srt.environ import envs
+
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._stats = dict.fromkeys(
+            (
+                "steps",
+                "scan_calls",
+                "fetched",
+                "kept",
+                "seq",
+                "replays",
+                "prologue_calls",
+            ),
+            0,
+        )
+        be._last_step_tok = None
+        be._collecting = False
+        seen = []
+        be._step_slots = lambda fb: ([1], "k")
+        be._account_step = lambda fb, reqs: seen.append(int(fb.seq_lens_cpu.sum()))
+        be._maybe_close_blocks = lambda fb, reqs: None
+
+        def fb_at(total):
+            return SimpleNamespace(
+                out_cache_loc=torch.zeros(1, dtype=torch.int64),
+                req_pool_indices=torch.tensor([1], dtype=torch.int64),
+                seq_lens=torch.tensor([total], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([total], dtype=torch.int64),
+            )
+
+        with envs.SGLANG_DEBUG_VESTIGEKV_STATS.override(True):
+            for _ in range(3):  # one step, entered three times
+                be._decode_prologue(fb_at(100))
+            be._decode_prologue(fb_at(101))  # the next step
+            be._decode_prologue(fb_at(101))
+
+        self.assertEqual(be._stats["steps"], 2)
+        self.assertEqual(be._stats["prologue_calls"], 5)
+        self.assertEqual(seen, [100, 101])  # accounting ran once per step
+
+    def test_the_prologue_is_where_per_step_work_must_hang(self):
+        """Per-step work hung off _recall_step never runs in the default config.
+
+        With the in-graph scan on (the default) the decode path is
+        init_forward_metadata_out_graph -> _decode_prologue ->
+        _ingraph_host_step -> return, so _recall_step is not reached at all.
+        The omitted-mass arm hung its fill there and shipped THREE runs whose
+        blend was a silent no-op. _decode_prologue is the one function that
+        runs exactly once per decode step however the step is launched, and
+        this pins that anything per-step goes through it.
+        """
+        from sglang.srt.environ import envs
+
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._stats = dict.fromkeys(
+            (
+                "steps",
+                "scan_calls",
+                "fetched",
+                "kept",
+                "seq",
+                "replays",
+                "prologue_calls",
+            ),
+            0,
+        )
+        be._last_step_tok = None
+        be._collecting = False
+        be._omit_blend = True
+        called = []
+        be._step_slots = lambda fb: ([1], "k")
+        be._account_step = lambda fb, reqs: None
+        be._maybe_close_blocks = lambda fb, reqs: None
+        be._fill_omitted_mass = lambda fb, reqs, real, slots: called.append(real)
+        fb = SimpleNamespace(
+            out_cache_loc=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([100, 100], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([100, 100], dtype=torch.int64),
+        )
+        with envs.SGLANG_DEBUG_VESTIGEKV_STATS.override(False):
+            be._decode_prologue(fb)
+        self.assertEqual(called, [2])  # the arm's per-step work actually ran
+
+    def test_the_step_attribution_dump_runs_off_the_prologue_too(self):
+        """The attribution dump exists to record the PROVISIONAL regime.
+
+        It must therefore run on the path the in-graph scan actually takes,
+        which is the prologue; hung off _recall_step it would record nothing,
+        exactly as the omitted-mass fill did for three runs.
+        """
+        from sglang.srt.environ import envs
+
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._stats = dict.fromkeys(
+            (
+                "steps",
+                "scan_calls",
+                "fetched",
+                "kept",
+                "seq",
+                "replays",
+                "prologue_calls",
+            ),
+            0,
+        )
+        be._last_step_tok = None
+        be._collecting = False
+        be._omit_blend = False
+        be._stepdump = True
+        seen = []
+        be._step_slots = lambda fb: ([1], "k")
+        be._account_step = lambda fb, reqs: None
+        be._maybe_close_blocks = lambda fb, reqs: None
+        be._dump_step_attribution = lambda fb, reqs: seen.append(reqs)
+        fb = SimpleNamespace(
+            out_cache_loc=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([100, 100], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([100, 100], dtype=torch.int64),
+        )
+        with envs.SGLANG_DEBUG_VESTIGEKV_STATS.override(False):
+            be._decode_prologue(fb)
+        self.assertEqual(seen, [[1]])
+
+    def test_index_state_buckets_by_the_index_that_served_the_scan(self):
+        """A scan is attributed to the state of the index that served it.
+
+        Three lanes, one in each state: a tier still calibrating (z at Z_MAX),
+        one fitted and not outgrown, and one fitted at 50 tokens now serving
+        200 -- past INDEX_STALE_FACTOR. Each contributes its own scan, its
+        fired-row count and its overflow flag to its own row, so a run can say
+        which state the misses are under rather than only how many there were.
+        """
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be._mla_lids = {LID}
+        be._qbuf = {LID: None}
+        be._fetch_len = {LID: torch.tensor([3, 8, 0, 5], dtype=torch.int32)}
+        be._fetch_ovf = {LID: torch.tensor([0, 1, 0, 0], dtype=torch.int32)}
+        be._idx_state = None
+        be._recall = {
+            (1, LID): {"tier": SimpleNamespace(need_more_hard=True), "built_at": 0},
+            (2, LID): {"tier": SimpleNamespace(need_more_hard=False), "built_at": 50},
+            (3, LID): {"tier": SimpleNamespace(need_more_hard=False), "built_at": 50},
+        }
+        fb = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 2, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([100, 60, 200], dtype=torch.int64),
+        )
+        reqs = fb.req_pool_indices.tolist()
+        slots = fb.req_pool_indices.to(torch.int64)
+        be._account_index_state(fb, reqs, slots, 3)
+        # rows: provisional, fresh, stale; columns: scans, fired rows, overflows
+        self.assertEqual(be._idx_state.tolist(), [[1, 8, 1], [1, 0, 0], [1, 5, 0]])
+        # an unbuilt tier is provisional, not a crash: the second pass adds
+        # that lane's own scan to the bucket alongside the still-calibrating one
+        be._recall[(2, LID)]["tier"] = None
+        be._account_index_state(fb, reqs, slots, 3)
+        self.assertEqual(be._idx_state.tolist(), [[3, 16, 2], [1, 0, 0], [2, 10, 0]])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCapabilityDelegation(CustomTestCase):
+    """Capability flags are class attributes, so a wrapper that only forwards
+    methods silently inherits AttentionBackend's defaults instead of the
+    wrapped backend's values -- which changes the runtime's fast paths.
+    Missing needs_cpu_seq_lens alone cost 137 -> 51 tok/s (per-step host sync
+    of seq_lens) with no functional symptom."""
+
+    def test_capability_flags_are_delegated(self):
+        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
+        flags = [
+            name
+            for name, val in vars(AttentionBackend).items()
+            if not name.startswith("_")
+            and not callable(val)
+            and not isinstance(val, (property, classmethod, staticmethod))
+        ]
+        self.assertIn("needs_cpu_seq_lens", flags)
+        sentinel = {f: object() for f in flags}
+        extra = {
+            "token_to_kv_pool": SimpleNamespace(full_attention_layer_id_mapping=[LID]),
+            "req_to_token_pool": None,
+            "kv_index_translator": None,
+        }
+        base = SimpleNamespace(**{**extra, **sentinel})
+        be = VestigeKVMLABackend.__new__(VestigeKVMLABackend)
+        be.base = base
+        # replay only the delegation block of __init__
+        for f in (
+            "needs_cpu_seq_lens",
+            "extend_dummy_seqs_capped_by_req_pool",
+            "supports_ragged_verify_graph",
+            "supports_full_cuda_graph_chunked_prefix",
+            "use_captured_forward_metadata_for_breakable_cuda_graph",
+            "prefill_attention_backend_str",
+            "decode_attention_backend_str",
+        ):
+            setattr(be, f, getattr(base, f))
+        # a runtime-queried flag must never resolve to the class default
+        for f in ("needs_cpu_seq_lens", "supports_ragged_verify_graph"):
+            self.assertIs(getattr(be, f), sentinel[f])
+            self.assertIsNot(getattr(be, f), getattr(AttentionBackend, f))
 
 
 def _mk_scan_backend(archs, built=True):
@@ -674,6 +1195,76 @@ class TestStaticPackMatchesReference(CustomTestCase):
         self._run_once(2, 2, [5, 9], [16, 16], 64, 16, random.Random(2))
 
 
+class _CountingSlots:
+    """req_pool_indices stand-in that records every .tolist() readback."""
+
+    def __init__(self, values):
+        self.values, self.reads = list(values), 0
+
+    def tolist(self):
+        self.reads += 1
+        return list(self.values)
+
+
+def _slots_fb(slots, graph_bs, real_bs):
+    return SimpleNamespace(
+        req_pool_indices=_CountingSlots(slots),
+        seq_lens=torch.zeros(graph_bs, dtype=torch.int64),
+        out_cache_loc=torch.zeros(real_bs, dtype=torch.int64),
+    )
+
+
+class TestStepSlotCache(CustomTestCase):
+    """The per-step slot list is cached to keep a D2H readback off the decode
+    path. It must refresh on exactly the two events that can change it: a batch
+    that shrank (a shape) and a prefill (which also rebuilds a tier).
+    """
+
+    def test_repeated_steps_read_the_device_once(self):
+        be = _mk_scan_backend({(0, 3): 100, (0, 7): 200})
+        fb = _slots_fb([0], 1, 1)
+        for _ in range(10):
+            reqs, _ = be._step_slots(fb)
+            self.assertEqual(reqs, [0])
+        self.assertEqual(fb.req_pool_indices.reads, 1)
+
+    def test_a_shrinking_batch_refreshes(self):
+        be = _mk_scan_backend({(0, 3): 100, (0, 7): 200, (1, 3): 100, (1, 7): 200})
+        wide = _slots_fb([0, 1], 2, 2)
+        be._step_slots(wide)
+        narrow = _slots_fb([0], 2, 1)  # one request finished
+        reqs, _ = be._step_slots(narrow)
+        self.assertEqual(reqs, [0])
+        self.assertEqual(narrow.req_pool_indices.reads, 1)
+
+    def test_prefill_refreshes(self):
+        be = _mk_scan_backend({(0, 3): 100, (0, 7): 200})
+        fb = _slots_fb([0], 1, 1)
+        be._step_slots(fb)
+        be._invalidate_scan()  # what every prefill calls
+        be._step_slots(fb)
+        self.assertEqual(fb.req_pool_indices.reads, 2)
+
+    def test_key_is_cached_with_the_slots(self):
+        be = _mk_scan_backend({(0, 3): 100, (0, 7): 200})
+        fb = _slots_fb([0], 1, 1)
+        _, first = be._step_slots(fb)
+        self.assertIsNotNone(first)
+        _, again = be._step_slots(fb)
+        self.assertIs(first, again)
+
+    def test_an_unbuilt_tier_caches_no_key_and_recovers(self):
+        be = _mk_scan_backend({(0, 3): 100}, built=False)
+        fb = _slots_fb([0], 1, 1)
+        self.assertIsNone(be._step_slots(fb)[1])
+        # the build that follows calls _invalidate_scan, so the next step must
+        # recompute rather than serve the cached None forever
+        be._recall[(0, 3)] = {"tier": SimpleNamespace(arch=torch.zeros(100))}
+        be._recall[(0, 7)] = {"tier": SimpleNamespace(arch=torch.zeros(200))}
+        be._invalidate_scan()
+        self.assertIsNotNone(be._step_slots(fb)[1])
+
+
 class TestTierTwoIsNeverOff(CustomTestCase):
     """Tier 2 has no off state, and the calibrated build is ASYNC: the
     provisional index (built synchronously on the first decode step) serves
@@ -831,6 +1422,55 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         self.assertEqual(called, [])
         self.assertGreater(be._pack_epoch, epoch0)
 
+    def test_install_writes_the_calibration_snapshot_when_dump_dir_is_set(self):
+        # SGLANG_DEBUG_VESTIGEKV_DUMP_DIR contract: the installed build's exact
+        # inputs land in one file, rows gathered in the row_slots order, so the
+        # offline certificate study in the experiment repository can refit them.
+        import os
+        import tempfile
+
+        from sglang.srt.environ import envs
+
+        be = self._backend()
+        kbuf = torch.randn(300, 576)
+        be.token_to_kv_pool = SimpleNamespace(get_key_buffer=lambda lid: kbuf)
+        be.index_rank = 64
+        st = be._recall[(0, LID)]
+        row_slots = torch.tensor([5, 9, 2, 100, 7], dtype=torch.int32)
+        job = {
+            "slot": 0,
+            "lid": LID,
+            "st": st,
+            "seq_len": 5,
+            "qcal": [torch.randn(2, 576) for _ in range(3)],
+            "qpos": [2, 3, 4],
+            "row_slots": row_slots,
+            "kept": torch.tensor([9, 100], dtype=torch.int32),
+            "done": SimpleNamespace(is_set=lambda: True),
+            "tier": SimpleNamespace(V=torch.eye(64, 512), scale=0.125),
+            "stats": {"need_more_hard": False, "n_hard": 99},
+            "error": None,
+        }
+        be._build_jobs = [job]
+        with (
+            tempfile.TemporaryDirectory() as d,
+            envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.override(d),
+            patch(
+                f"{VestigeKVMLABackend.__module__}.get_parallel",
+                lambda: SimpleNamespace(tp_rank=0),
+            ),
+        ):
+            self.assertTrue(be._install_finished_builds())
+            (name,) = os.listdir(d)
+            snap = torch.load(os.path.join(d, name))
+        self.assertEqual(name, f"cal_tp0_slot0_lid{LID}_seq5.pt")
+        self.assertTrue(torch.equal(snap["rows"], kbuf[row_slots.long()]))
+        self.assertEqual(snap["qcal"].shape, (3, 2, 576))
+        self.assertEqual(snap["qpos"].tolist(), [2, 3, 4])
+        self.assertEqual(snap["kept"].tolist(), [9, 100])
+        self.assertEqual(snap["index_rank"], 64)
+        self.assertEqual(snap["geom"]["kv_lora_rank"], 512)
+
     def test_replaced_slot_state_and_its_job_are_freed_without_the_cyclic_gc(self):
         # A request that ends before its calibrated build installs must not
         # leave its state dict and job (which reference each other) to the
@@ -865,6 +1505,33 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         finally:
             gc.enable()
         self.assertEqual(be._build_jobs, [])
+
+    def test_memory_trace_snapshots_every_fifth_request(self):
+        # SGLANG_DEBUG_VESTIGEKV_MEM_DIR contract: one VESTIGEKV_MEM line per request
+        # and a snapshot file at requests 5, 10, ...; a dump on every request
+        # would be 100+ MB each and a dump on none leaves nothing to diff.
+        import os
+        import tempfile
+
+        dumped = []
+        be = self._backend()
+        with (
+            tempfile.TemporaryDirectory() as d,
+            patch.object(torch.cuda, "memory_allocated", lambda: 0),
+            patch.object(torch.cuda, "memory_reserved", lambda: 0),
+            patch.object(
+                torch.cuda.memory, "_dump_snapshot", lambda p: dumped.append(p)
+            ),
+            patch(
+                f"{VestigeKVMLABackend.__module__}.get_parallel",
+                lambda: SimpleNamespace(tp_rank=0),
+            ),
+        ):
+            be._mem_dir = d
+            be._trace_request_memory(3)
+            be._trace_request_memory(4)
+            self.assertEqual(be._mem_reqs, 7)
+            self.assertEqual(dumped, [os.path.join(d, "mem_tp0_req5.pickle")])
 
     def test_reachable_hard_rate_jumps_the_window_predictively(self):
         # window 8, n_hard=6 -> needed = ceil(18*8/6)=24 -> next pow2 = 32,
@@ -999,6 +1666,87 @@ class TestTierTwoIsNeverOff(CustomTestCase):
         qcal = be._recall[(0, LID)]["qcal"]
         self.assertEqual(float(qcal[0][0, 0]), 1.0)
         self.assertEqual(float(qcal[1][0, 0]), 2.0)
+
+
+class TestDerivedCalibrationConstants(CustomTestCase):
+    """The recall tier has ONE quality parameter, tau. These pin the algebra
+    that derives everything else, so a future edit cannot silently decouple
+    them."""
+
+    def test_miss_budget_splits_evenly(self):
+        self.assertAlmostEqual(D.gate_alpha(0.9), 0.05)
+        self.assertAlmostEqual((1 - D.gate_alpha(0.9)) * D.scan_target(0.9), 0.9)
+
+    def test_min_hard_is_the_smallest_n_where_the_quantile_exists(self):
+        for tau in (0.8, 0.9, 0.95):
+            n = D.min_hard(tau)
+            self.assertLessEqual(D.conformal_k(n, tau), n)
+            if n > 1:
+                self.assertGreater(D.conformal_k(n - 1, tau), n - 1)
+
+    def test_conformal_k_is_within_bounds(self):
+        for n in (18, 50, 512):
+            k = D.conformal_k(n)
+            self.assertGreaterEqual(k, 1)
+            self.assertLessEqual(k, n)
+
+
+class TestCollectionRunsOnBothPaths(CustomTestCase):
+    """Collection used to live on the eager scan path, so capture had to be
+    blocked until calibration finished or the provisional index would never be
+    replaced -- 16 eager steps per request at 11.3 ms each against 1.5 ms for a
+    replayed step. Collection is now a few small clones done before the paths
+    diverge, so capture is free to proceed; these pin that it still happens.
+    """
+
+    def test_capture_is_not_blocked_by_pending_calibration(self):
+        be = _mk_scan_backend({(0, 3): 100, (0, 7): 200})
+        for lid in (3, 7):
+            be._recall[(0, lid)]["qcal"] = [object()]
+        self.assertIsNotNone(be._scan_key(_scan_fb(1), [0]))
+
+    def test_collection_happens_before_the_paths_diverge(self):
+        # the shared prologue collects; every path (replay, stats, in-graph,
+        # eager) runs it before its recall
+        import inspect
+
+        prologue = inspect.getsource(VestigeKVMLABackend._decode_prologue)
+        self.assertIn("_collect_calibration", prologue)
+        src = inspect.getsource(VestigeKVMLABackend.init_forward_metadata_out_graph)
+        collect = src.index("_decode_prologue(")
+        replay = src.index("_replay_scan")
+        stats = src.index("_step_with_stats")
+        self.assertLess(collect, replay, "collection must precede the replay")
+        self.assertLess(collect, stats, "collection must precede the stats path")
+        eager = inspect.getsource(VestigeKVMLABackend._eager_decode_step)
+        self.assertLess(
+            eager.index("_decode_prologue("),
+            eager.index("_recall_step("),
+            "collection must precede the eager recall",
+        )
+
+
+class TestStatsPathMatchesProduction(CustomTestCase):
+    """An instrument that takes a different branch than production measures
+    something production does not run. Twice now this backend has had that
+    defect: first pricing the eager scan on steps that replayed a graph, then
+    packing the CSR a second time on steps whose graph had already packed it
+    (which also double-appended to kept_len). Pin the shape by reading the
+    source, since the failure is structural, not numeric.
+    """
+
+    def test_stats_path_delegates_the_branch_choice(self):
+        import inspect
+
+        src = inspect.getsource(VestigeKVMLABackend._step_with_stats)
+        self.assertIn("self._replay_scan(", src)
+        self.assertIn("if not replayed:", src)
+        # the eager-only work must sit under a `not replayed` guard, never at
+        # the top level of the step
+        for call in ("_recall_step(", "_refresh_graph_bufs("):
+            idx = src.index(call)
+            guard = src.rindex("if not replayed:", 0, idx)
+            self.assertGreater(guard, src.index("replayed = "), f"{call} not guarded")
 
 
 class TestCaptureDoesNotDuplicateKeptRows(CustomTestCase):
@@ -1282,6 +2030,29 @@ class TestEmptyKeptRows(CustomTestCase):
         out_ovf = torch.zeros(1, dtype=torch.int32, device="cuda")
         t.query_fixed(qe, out, out_len, out_ovf, 0)  # must not raise
         self.assertGreaterEqual(int(out_len[0]), 0)
+
+
+class TestEpochFastPathLocals(CustomTestCase):
+    """The epoch fast path must not reference slow-path locals.
+
+    Regression: `real` was defined only inside the epoch-mismatch branch but
+    used by the stage copies after it; the first steady-state fast-path step
+    raised UnboundLocalError and killed the scheduler (unit tests had only
+    exercised the slow path).
+    """
+
+    def test_fast_path_body_defines_real_before_branch(self):
+        import inspect
+
+        from sglang.srt.layers.attention.vestigekv_mla_backend import (
+            VestigeKVMLABackend,
+        )
+
+        src = inspect.getsource(VestigeKVMLABackend._replay_scan)
+        # `real = ...` must appear before the epoch branch in the same block
+        i_real = src.index("real = forward_batch.out_cache_loc.shape[0]")
+        i_branch = src.index("_pack_epoch != self._pack_epoch_synced")
+        self.assertLess(i_real, i_branch)
 
 
 class TestNoPEPreconditionGuard(CustomTestCase):

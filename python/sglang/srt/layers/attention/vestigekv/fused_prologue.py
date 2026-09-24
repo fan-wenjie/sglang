@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
 logger = logging.getLogger(__name__)
@@ -414,6 +415,13 @@ def _pool_read_mode(device):
     global _POOL_MODE, _TMA_ALLOCATOR_SET
     if _POOL_MODE is not None:
         return _POOL_MODE
+    forced = envs.SGLANG_VESTIGEKV_POOL_READ.get()
+    if forced in (1, 2):
+        if forced == 2:
+            _set_tma_allocator(device)
+        _POOL_MODE = forced
+        logger.info("vestigekv: kept-row read pinned to mode %d", forced)
+        return _POOL_MODE
     _POOL_MODE = 1
     if hasattr(tl, "make_tensor_descriptor"):
         _set_tma_allocator(device)
@@ -619,8 +627,10 @@ def _compact_write_kernel(
     Am,
     W,
     FENCE,
+    rand_fence_ptr,  # [NSLOT] int32 per-step coin, or 0 when the control is off
     NSLOT,
     BLOCK_A: tl.constexpr,
+    SPREAD: tl.constexpr,
 ):
     p = tl.program_id(1)
     pid = tl.program_id(0)
@@ -632,14 +642,27 @@ def _compact_write_kernel(
         # fetch_len is consumed every step, even by an empty pair, so its
         # write cannot ride on bucket 0 existing in the (capped) grid.
         t = tl.load(total_ptr + p)
-        tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
+        if SPREAD:
+            # An overflowing pair keeps W rows SPREAD over the archive instead
+            # of its first W. Same count, different positions: the falsifiable
+            # half of "multi-key fails because the keys are spread through the
+            # document and a positional prefix cuts the later ones".
+            st_ = tl.maximum((t + W - 1) // W, 1)
+            tl.store(out_len_ptr + li * NSLOT + slot, (t + st_ - 1) // st_)
+        else:
+            tl.store(out_len_ptr + li * NSLOT + slot, tl.minimum(t, W))
         # The flag and the buffer cap are separate thresholds. FENCE is the
         # buffer cap by default; a multi-key fence lowers it so a lane that
         # fires more than a handful of archived rows -- the cheap signal that
         # this step needs SEVERAL of them, measured monotonic in the number of
         # rows that beat max1 -- attends its full row set instead of ranking.
         # Raising the flag early is safe: a fenced lane never reads the buffer.
-        fenced = t > FENCE
+        # The random control ORs in a coin the host refreshes each step, so a
+        # lane can be fenced without regard to how many rows it fired. Same
+        # cost, different selection: if the accuracy gain survives, the count
+        # was never a detector.
+        coin = tl.load(rand_fence_ptr + slot) != 0
+        fenced = (t > FENCE) or coin
         tl.store(out_ovf_ptr + li * NSLOT + slot, fenced.to(tl.int32))
         if fenced:
             tl.atomic_add(ovf_count_ptr + li, 1)
@@ -655,8 +678,27 @@ def _compact_write_kernel(
         base = tl.load(offsets_ptr + p * nb + b)
         pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
         arch = tl.load(arch_ptr + abase + offs, mask=m, other=0)
-        ok = h & (pos < W)
-        tl.store(out_ptr + li * NSLOT * W + slot * W + pos, arch, mask=ok)
+        if SPREAD:
+            t_all = tl.load(total_ptr + p)
+            st2 = tl.maximum((t_all + W - 1) // W, 1)
+            dst = pos // st2
+            ok = h & (pos % st2 == 0) & (dst < W)
+            tl.store(out_ptr + li * NSLOT * W + slot * W + dst, arch, mask=ok)
+        else:
+            ok = h & (pos < W)
+            tl.store(out_ptr + li * NSLOT * W + slot * W + pos, arch, mask=ok)
+
+
+_ZERO_COINS: dict = {}
+
+
+def _zero_coins(like):
+    key = (like.device, int(like.shape[-1]))
+    z = _ZERO_COINS.get(key)
+    if z is None:
+        z = torch.zeros(like.shape[-1], dtype=torch.int32, device=like.device)
+        _ZERO_COINS[key] = z
+    return z
 
 
 def compact_fired(
@@ -674,6 +716,7 @@ def compact_fired(
     am_grid,
     p_live=None,
     fence_rows=0,
+    rand_fence=None,
 ):
     """Deterministic fired-row compaction. scratch: (counts, offsets, total)
     int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W]; fetch_len/fetch_ovf
@@ -684,6 +727,9 @@ def compact_fired(
     bounds the sum). Rows are addressed as a_off[p] + i, masked by a_len[p].
     A pair firing more than W rows keeps the first W in position order,
     raises its fetch_ovf flag and counts once in ovf_count[li].
+    SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE keeps them spread over the archive
+    instead, at the same count: an experiment on whether the positional prefix
+    is what costs the multi-key tasks when the fallback is off.
     """
     Am = am_grid
     P = p_live if p_live is not None else a_len.shape[0]
@@ -719,6 +765,10 @@ def compact_fired(
         # attends its full row set. 0 keeps the historical behaviour, where the
         # only fence is the buffer overflowing.
         min(W, fence_rows) if fence_rows > 0 else W,
+        # A real zero buffer when the control is off: passing any live tensor
+        # here would fence every lane whose entry happens to be non-zero.
+        rand_fence if rand_fence is not None else _zero_coins(fetch_len),
         fetch_buf.shape[1],
         BLOCK_A=BLOCK_A,
+        SPREAD=envs.SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE.get(),
     )

@@ -136,13 +136,22 @@ def run_eval(args):
     output_throughput = num_output_tokens / latency
 
     # Print results
+    # The count, not only the rate: at n=1209 a rate printed to three places
+    # cannot be inverted -- 1107 and 1108 both read as 0.916 -- so a table that
+    # wants "how many questions" cannot get there from the log.
+    print(
+        f"Correct: {int(np.sum(np.array(preds) == np.array(labels)))} / {len(labels)}"
+    )
     print(f"Accuracy: {acc:.3f}")
     print(f"Invalid: {invalid:.3f}")
     print(f"Latency: {latency:.3f} s")
     print(f"Output throughput: {output_throughput:.3f} token/s")
 
     # Dump results
-    dump_state_text("tmp_output_gsm8k.txt", states)
+    # One fixed name in the working directory: every run overwrites the last,
+    # so the per-question states of an arm are gone the moment its partner
+    # runs. Keyed by the questions it answered instead.
+    dump_state_text(f"tmp_output_gsm8k_{len(labels)}_{acc:.4f}.txt", states)
 
     return {
         "accuracy": acc,
