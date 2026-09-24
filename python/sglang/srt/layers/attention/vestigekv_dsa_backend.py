@@ -196,7 +196,22 @@ class VestigeKVDSABackend(AttentionBackend):
             "decode_attention_backend_str",
         ):
             setattr(self, _flag, getattr(base, _flag))
-        self.rho = rho
+        _rho = envs.SGLANG_VESTIGEKV_RHO.get()
+        self.rho = float(_rho) if _rho else rho
+        if _rho:
+            # Only downward. The kept table and the scan arena are sized from
+            # defaults.RHO (_nkm), not from this value, so a smaller rho leaves
+            # them oversized and safe while a larger one would undersize them --
+            # and the first symptom would be _write_kept raising mid-request,
+            # after a capacity check that reads like a defect rather than a
+            # misconfiguration.
+            if self.rho > rho:
+                raise ValueError(
+                    f"SGLANG_VESTIGEKV_RHO={self.rho:g} exceeds the compiled-in "
+                    f"{rho:g}; the kept table and scan arena are sized from the "
+                    "latter. Raise defaults.RHO instead."
+                )
+            logger.info("VestigeKV: rho overridden to %.6g (default %.6g)", self.rho, rho)
         self.index_rank = index_rank
         # Route the base's stage-1 decode at the tiers instead of a packed CSR.
         # `decode_attention_fwd` is an instance attribute of the base, so the
