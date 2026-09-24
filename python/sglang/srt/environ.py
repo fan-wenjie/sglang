@@ -643,6 +643,15 @@ class Envs:
     # The set is a process constant so that the decision is a Python branch
     # at capture time and costs nothing at replay; per-step per-layer
     # dispatch measured +0.68 ms/step, more than the whole DSA chain.
+    #
+    # ONLY TWO VALUES ARE REPORTABLE, and both are uniform across layers:
+    # unset (every layer VestigeKV, a fenced lane attends DSA's top-2048) and
+    # "none" (every layer VestigeKV, a fenced lane attends its page table).
+    # A NAMED SET IS A RESEARCH PROBE, NOT A CONFIGURATION TO PUBLISH: the set
+    # is fitted to measured per-layer fence rates, so quoting its total reads
+    # as picking the cheapest mechanism per layer and summing. The rates are
+    # not even stable between runs of one config -- {23,39,27,3,19} once,
+    # {3,7,11,15} another -- so such a set describes the run it was fitted on.
     SGLANG_VESTIGEKV_DSA_LAYERS = EnvTuple(tuple())
     # Store the tier-2 sketch as fp8 e4m3 with one power-of-two scale per
     # tier instead of fp16, halving the scan's dominant load. The dot becomes
