@@ -663,6 +663,12 @@ class Envs:
     # nothing in serving (the provisional basis is sound, only looser) but it
     # makes a run irreproducible, which a quality number cannot afford.
     SGLANG_DEBUG_VESTIGEKV_SYNC_BUILD = EnvBool(False)
+    # Ablation: the dtype of the calibration's exact-score labels. "" keeps the
+    # fp32 GEMM over an upcast copy of the bf16 pool; "bf16" multiplies the
+    # pool as stored; "fp16" converts it, which is lossless for a bf16 value
+    # and rounds only the query. The label picks which row the conformal fit
+    # calls the truth, so this is measured, not adopted.
+    SGLANG_DEBUG_VESTIGEKV_CAL_DTYPE = EnvStr("")
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register

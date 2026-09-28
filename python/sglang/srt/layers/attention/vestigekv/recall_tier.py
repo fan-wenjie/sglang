@@ -54,6 +54,29 @@ def _log_zp(method, target, zp, n, zmax, rate=float('nan')):
         )
 
 
+
+def _cal_dtype():
+    """Storage dtype for the calibration's exact-score labels, or None for fp32.
+
+    The pool is bf16, so fp32 here buys nothing on the archive operand and
+    costs an upcast copy of every chunk; measured at [2048,576]x[576,16384],
+    909.6 us fp32 against 237.3 bf16 and 256.2 fp16. What separates the two low
+    forms is the QUERY: a bf16 value is exactly representable in fp16, so
+    converting the pool loses nothing and only fp16 keeps the query's mantissa
+    near fp32's -- 1 label changes against fp32, where bf16 changes 28 of 2048.
+    """
+    name = envs.SGLANG_DEBUG_VESTIGEKV_CAL_DTYPE.get()
+    if not name:
+        return None
+    try:
+        return {"bf16": torch.bfloat16, "fp16": torch.float16}[name]
+    except KeyError:
+        raise SystemExit(
+            f"ABORT: SGLANG_DEBUG_VESTIGEKV_CAL_DTYPE={name!r} is not one of "
+            "'', 'bf16', 'fp16'; a typo here would silently keep fp32 and the "
+            "ablation would report the baseline twice")
+
+
 class RecallTier:
     def __init__(
         self,
@@ -139,6 +162,15 @@ class RecallTier:
     @rho.setter
     def rho(self, v):
         self._rho_mat = v
+
+    def _operand_builder(self):
+        """The kernel that fills the closed-prefix caches. branch_tier swaps it
+        for one with no basis, which is half the content traffic and no dot."""
+        from sglang.srt.layers.attention.vestigekv.operand_fused import (
+            build_operands_fused,
+        )
+
+        return build_operands_fused
 
     def drop_operands(self):
         """Release the materialised archive selections; the properties
@@ -332,17 +364,13 @@ class RecallTier:
             # attempt set _pos_all eagerly while side/csk stayed lazy, and the
             # close path -- which reads _pos_all.shape[0] as its backfill
             # watermark -- then indexed a cache that did not cover it.
-            from sglang.srt.layers.attention.vestigekv.operand_fused import (
-                build_operands_fused,
-            )
-
             if kbuf.is_cuda and kbuf.dtype == torch.bfloat16:
                 # Fused single-kernel operand build: gather + project +
                 # residual + casts (operand_fused.py). Same fp32-ieee
                 # arithmetic; ~1 ulp reduction-order difference vs cuBLAS,
                 # gated by fire-set stability + retrieval. Per row, so the
                 # values on the archived subset do not depend on the row set.
-                self._csk_all, self._rho_all, _side = build_operands_fused(
+                self._csk_all, self._rho_all, _side = self._operand_builder()(
                     kbuf, row_slots, V
                 )
                 del _side
@@ -420,6 +448,12 @@ class RecallTier:
         abest_val = torch.full((nq,), torch.finfo(torch.float32).min, device=dev)
         atgt = torch.zeros(nq, dtype=torch.long, device=dev)
         KB = D.BUILD_KEY_CHUNK
+        cal_dt = _cal_dtype()
+        q_cal_lo = None if cal_dt is None else qe.to(cal_dt)
+        if cal_dt is torch.float16:
+            # fp16 tops out at 65504 and the pool is bf16, whose range is
+            # fp32's; the same guard csk carries, for the same reason.
+            torch._assert_async((qe.abs().amax() < 6e4).to(torch.bool))
         if diag:
             # Debug telemetry: how many ARCHIVED rows each calibration query
             # truly prefers to its best kept row (the recall need), against
@@ -437,9 +471,16 @@ class RecallTier:
             # In place throughout: `* sc_` and `masked_fill` each copied the
             # whole [n*H, KB] block, 67 MB per chunk that the allocator then had
             # to find under a serving mem-fraction.
-            cblk = kbuf[row_slots[k0:k1]].float()
-            blk = qe @ cblk.T
-            del cblk
+            if cal_dt is None:
+                cblk = kbuf[row_slots[k0:k1]].float()
+                blk = qe @ cblk.T
+                del cblk
+            else:
+                kblk = kbuf[row_slots[k0:k1]]
+                if kblk.dtype != cal_dt:
+                    kblk = kblk.to(cal_dt)
+                blk = (q_cal_lo @ kblk.T).float()
+                del kblk
             blk.mul_(sc_)
             colk = torch.arange(k0, k1, device=dev)[None, :]
             blk.masked_fill_(colk > qpos_r[:, None], torch.finfo(torch.float32).min)
