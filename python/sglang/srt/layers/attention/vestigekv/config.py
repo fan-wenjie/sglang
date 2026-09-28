@@ -108,6 +108,19 @@ class VestigeKVConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError(
                 f"--vestigekv-index-rank must be a positive multiple of 8, got {self.index_rank}"
             )
+        # The scan kernel reshapes by the rank, and Triton requires a power of
+        # two there. A multiple of 8 is not enough: 192 passes the check above,
+        # starts a server, and dies inside the scheduler on a Triton
+        # CompilationError ("Shape element 1 must be a power of 2") that names
+        # neither the flag nor the value. Refuse it here, where the message can.
+        if self.index_rank & (self.index_rank - 1):
+            raise ValueError(
+                f"--vestigekv-index-rank must be a power of two (the scan "
+                f"kernel reshapes by it and Triton requires one), got "
+                f"{self.index_rank}; nearest valid are "
+                f"{1 << (self.index_rank.bit_length() - 1)} and "
+                f"{1 << self.index_rank.bit_length()}"
+            )
 
     def describe(self) -> str:
         return (
