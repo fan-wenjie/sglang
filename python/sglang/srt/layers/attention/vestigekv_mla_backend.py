@@ -167,7 +167,7 @@ class VestigeKVMLABackend(AttentionBackend):
         model_runner: ModelRunner,
         *,
         config: VestigeKVConfig,
-        rho: float = D.RHO,
+        rho: float = D.RHO,   # SGLANG_DEBUG_VESTIGEKV_RHO overrides below
     ):
         self.base = base
         self.config = config
@@ -188,7 +188,8 @@ class VestigeKVMLABackend(AttentionBackend):
             "decode_attention_backend_str",
         ):
             setattr(self, _flag, getattr(base, _flag))
-        self.rho = rho
+        _rho_ov = envs.SGLANG_DEBUG_VESTIGEKV_RHO.get()
+        self.rho = _rho_ov if _rho_ov else rho
         self.index_rank = index_rank
         # Route the base's stage-1 decode at the tiers instead of a packed CSR.
         # `decode_attention_fwd` is an instance attribute of the base, so the
@@ -1826,7 +1827,9 @@ class VestigeKVMLABackend(AttentionBackend):
         max_ctx = self.base.max_context_len
         # Kept rows are bounded by tier-1's keep rate plus the un-closed tail
         # (blocks close every CLOSE_BLOCK); the slack absorbs close latency.
-        nkm = int(D.RHO * max_ctx) + 3 * D.CLOSE_BLOCK
+        # self.rho, not D.RHO: the ablation override raises the keep rate, and
+        # a table sized for the default would overflow the moment it does.
+        nkm = int(self.rho * max_ctx) + 3 * D.CLOSE_BLOCK
         # Archive rows are the tokens tier-1 did NOT keep, so per layer their
         # sum over the running batch is bounded by the KV pool itself, not by
         # max_bs x max_context -- a batch cannot hold more tokens than the pool
