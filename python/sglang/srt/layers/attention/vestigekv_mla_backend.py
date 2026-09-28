@@ -2461,6 +2461,16 @@ class VestigeKVMLABackend(AttentionBackend):
     def _build_worker_loop(self):
         from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
 
+        tier_cls = RecallTier
+        if envs.SGLANG_DEBUG_VESTIGEKV_BRANCH_ONLY.get():
+            # Branch-only recall's basis is zero, so it is built as zero
+            # rather than fitted and then overwritten (branch_tier.py).
+            from sglang.srt.layers.attention.vestigekv.branch_tier import (
+                BranchRecallTier,
+            )
+
+            tier_cls = BranchRecallTier
+
         while True:
             job = self._build_queue.get()
             try:
@@ -2473,7 +2483,7 @@ class VestigeKVMLABackend(AttentionBackend):
                     q_pos = torch.tensor(
                         job["qpos"], device=kbuf.device, dtype=torch.long
                     )
-                    tier = RecallTier(
+                    tier = tier_cls(
                         r=self.index_rank,
                         margin=self.config.recall_margin,
                         ent_gain=self.config.entropy_margin_gain,
@@ -2695,6 +2705,16 @@ class VestigeKVMLABackend(AttentionBackend):
         a sync costs nothing. See _collect_calibration for what `proxy` means."""
         from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
 
+        tier_cls = RecallTier
+        if envs.SGLANG_DEBUG_VESTIGEKV_BRANCH_ONLY.get():
+            # Branch-only recall's basis is zero, so it is built as zero
+            # rather than fitted and then overwritten (branch_tier.py).
+            from sglang.srt.layers.attention.vestigekv.branch_tier import (
+                BranchRecallTier,
+            )
+
+            tier_cls = BranchRecallTier
+
         kbuf = self.token_to_kv_pool.get_key_buffer(lid)
         kbuf = kbuf.reshape(-1, kbuf.shape[-1])
         r2t = self.req_to_token_pool.req_to_token
@@ -2716,7 +2736,7 @@ class VestigeKVMLABackend(AttentionBackend):
         else:
             q_cal = torch.stack(st["qcal"]).float()  # [n_cal, H, 576]
             q_pos = torch.tensor(st["qpos"], device=row_slots.device, dtype=torch.long)
-        tier = RecallTier(
+        tier = tier_cls(
             r=self.index_rank,
             margin=self.config.recall_margin,
             ent_gain=self.config.entropy_margin_gain,
