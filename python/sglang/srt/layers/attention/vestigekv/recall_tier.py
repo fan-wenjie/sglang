@@ -592,7 +592,7 @@ class RecallTier:
             return 0.0
         return self.ent_gain * (torch.logsumexp(skept, -1) - skept.max(-1).values)
 
-    def _adaptive_margin(self, qe, qsk, qres, max1, sc_):
+    def _adaptive_margin(self, qe, qsk, qres, max1, sc_, lse_kept=None):
         """gamma = max(0, lse_arch - max1 + ln(1/eps)), per head.
 
         The margin the leakage lemma actually asks for. It compares the mass
@@ -667,7 +667,15 @@ class RecallTier:
             # where that either shows up on real traffic or does not.
             cut = (max1 - self.margin)[:, None] - g[:, None]
             left = torch.where(s_keep <= cut, s_keep, s_keep.new_full((), -1e30))
-            leak = torch.exp(torch.logsumexp(left, -1) - max1)
+            # Normalise by the INCLUDED set's log-sum-exp, not by max1. The
+            # online-softmax merge identity says the output is
+            #   sigma(L_F - L_E) o_F + sigma(L_E - L_F) o_E,
+            # so the weight the omitted rows actually carry in the answer is
+            # sigma(L_E - L_F). max1 is a single row and overstates that
+            # weight whenever the kept set is diffuse, which is most steps.
+            ref = max1 if lse_kept is None else lse_kept
+            lse_excl = torch.logsumexp(left, -1)
+            leak = torch.sigmoid(lse_excl - ref)
             self._leak_hist = getattr(self, "_leak_hist", [])
             self._leak_hist.append(float(leak.median()))
             if len(self._leak_hist) % 256 == 0:
@@ -778,6 +786,7 @@ class RecallTier:
             max1 = qe.new_full((H,), float("-inf"))
             gate = qe.new_ones(H, dtype=torch.bool)
             emarg = 0.0
+            skept = None      # no kept scores exist on this branch
         else:
             skept = (qe.to(torch.bfloat16) @ self.kept_rows.T).float() * sc_
             max1 = self._thr_base(skept, skept.max(-1).values)
@@ -804,7 +813,9 @@ class RecallTier:
         # +inf makes it lose every comparison and the kernel needs no second
         # predicate. Scores stay in registers -- see scan_kernel for why
         # that, not arithmetic, is what the scan costs.
-        amarg = self._adaptive_margin(qe, qsk, qres, max1, sc_)
+        amarg = self._adaptive_margin(
+            qe, qsk, qres, max1, sc_,
+            lse_kept=None if skept is None else torch.logsumexp(skept, -1))
         max1g = torch.where(gate, max1 - self.margin - emarg - amarg, self._inf)
         hit = (
             vestige_scan(
