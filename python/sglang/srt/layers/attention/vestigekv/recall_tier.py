@@ -31,7 +31,7 @@ from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
 _ZP_SEEN = [0]
 
 
-def _log_zp(method, target, zp, n, zmax):
+def _log_zp(method, target, zp, n, zmax, rate=float('nan')):
     """One reading per process of what the certificate actually fitted.
 
     Three arms shipped this month as silent no-ops, and an arm that changes
@@ -42,12 +42,14 @@ def _log_zp(method, target, zp, n, zmax):
     _ZP_SEEN[0] += 1
     if _ZP_SEEN[0] % 200 == 1:
         logging.getLogger(__name__).info(
-            "VKZP fit=%s target=%.4f zp=%.4f n_cal=%d sample_max=%.4f (build %d)",
+            "VKZP fit=%s target=%.4f zp=%.4f n_cal=%d sample_max=%.4f "
+            "hard_rate=%.3f (build %d)",
             method,
             target,
             zp,
             n,
             zmax,
+            rate,
             _ZP_SEEN[0],
         )
 
@@ -95,6 +97,8 @@ class RecallTier:
         self.kept_slots = None  # pool row ids tier-1 keeps
         self._kbuf = None  # the layer's pool buffer, to re-read from
         self.version = 0  # bumped on in-place membership refresh (pack sync key)
+        self.hard_rate = float("nan")   # set at each calibrated build
+        self.archive_bound = False      # regime detector's verdict
         self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
         # fixed-address staging for the fused scan (capturable)
         self._qside_t = self._qsk_t = self._hit_buf = self._inf = None
@@ -483,12 +487,31 @@ class RecallTier:
         # _arch_idx is the archive's positions in it, ascending.
         has_arch = abest_val > torch.finfo(torch.float32).min
         n_cal_q = int(has_arch.sum())
+        # Regime detection, from evidence the calibration already gathered.
+        # `hard` marks calibration queries whose best row is ARCHIVED. A needle
+        # decode wants the kept tier most steps; a request reading a long
+        # answer out of context wants the archive nearly every step, and its
+        # answer is a conjunction over hundreds of them, which no per-step
+        # recall target reaches while staying sparse. Detect it here, where the
+        # rate is already computed, and let the request keep the clamp.
+        self.hard_rate = n_hard / max(int(hard.numel()), 1)
+        _rr = envs.SGLANG_DEBUG_VESTIGEKV_REGIME_RATE.get()
+        self.archive_bound = bool(_rr) and self.hard_rate >= _rr
         self.need_more_hard = n_cal_q < D.min_hard(self.recall_target)
         if self.need_more_hard:
             # Not enough evidence for the guarantee yet: serve with the safety
             # clamp (over-fetches, never under-recalls) and tell the caller to
             # keep collecting.
             self.zp = D.Z_MAX
+        elif self.archive_bound:
+            # Escalate for THIS request: the fitted quantile is sound per step
+            # and irrelevant to a conjunction this long, so the clamp stays.
+            self.zp = D.Z_MAX
+            logger.info(
+                "VKREGIME archive-bound: hard_rate=%.3f >= %.3f, keeping the "
+                "Z_MAX clamp (n_hard=%d/%d, n_cal_q=%d)",
+                self.hard_rate, _rr, n_hard, int(hard.numel()), n_cal_q,
+            )
         else:
             qh = qe[has_arch]
             qskh = qh[:, : D.KV_LORA_RANK] @ V.T
@@ -544,7 +567,8 @@ class RecallTier:
                 )
                 self.zp = min(float(mu + q * sd), D.Z_MAX)
                 _log_zp(
-                    "gauss", self.gauss_target, self.zp, n_cal_q, float(z_req.max())
+                    "gauss", self.gauss_target, self.zp, n_cal_q,
+                    float(z_req.max()), self.hard_rate,
                 )
             else:
                 k = D.conformal_k(n_cal_q, self.recall_target)
@@ -555,6 +579,7 @@ class RecallTier:
                     self.zp,
                     n_cal_q,
                     float(z_req.max()),
+                    self.hard_rate,
                 )
         zp = self.zp
         # Per-row projection caches over ALL closed rows (kept and archived

@@ -637,6 +637,16 @@ class Envs:
     # If that is right, keeping MORE makes a verbatim copy worse, not better.
     # 0 leaves the default.
     SGLANG_DEBUG_VESTIGEKV_RHO = EnvFloat(0.0)
+
+    # Regime detector. A request whose recent decode steps mostly wanted an
+    # ARCHIVED row is reading its answer out of the archive rather than looking
+    # one fact up, and a per-step recall target cannot underwrite that: at the
+    # measured 0.93 a 600-step copy survives with probability 6e-20. Such a
+    # request keeps the Z_MAX clamp instead of installing the fitted quantile,
+    # for itself alone. The value is the fraction of calibration queries whose
+    # best row is archived, above which the request is treated as
+    # archive-dependent; 0 disables the detector.
+    SGLANG_DEBUG_VESTIGEKV_REGIME_RATE = EnvFloat(0.0)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
