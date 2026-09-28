@@ -658,6 +658,11 @@ class Envs:
     # bandwidth it would save: the all-zero sketch is still stored and still
     # scanned, so the scan reads the same bytes it does today.
     SGLANG_DEBUG_VESTIGEKV_BRANCH_ONLY = EnvBool(False)
+    # Measurement only: block on the calibrated tier build instead of adopting
+    # it on whichever step the worker happens to finish before. The race costs
+    # nothing in serving (the provisional basis is sound, only looser) but it
+    # makes a run irreproducible, which a quality number cannot afford.
+    SGLANG_DEBUG_VESTIGEKV_SYNC_BUILD = EnvBool(False)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
