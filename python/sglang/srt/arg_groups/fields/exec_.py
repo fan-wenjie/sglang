@@ -321,7 +321,12 @@ class ExecKernel(msgspec.Struct):
         int,
         "VestigeKV: rank of the tier-2 recall sketch (rows of the per-layer basis). "
         "Higher ranks certify more of the latent row and fire fewer rows per scan, at "
-        "2 bytes per rank per archived row per layer of scan traffic and memory.",
+        "2 bytes per rank per archived row per layer of scan traffic and memory. "
+        "Must be a power of two (the scan kernel reshapes by it). Bounded from "
+        "BELOW as well: at rank 8 the kernel asks for 229392 B of shared memory "
+        "against a 101376 B limit on this hardware and dies during graph "
+        "capture, so a small rank is not automatically a cheap one. 32 is the "
+        "smallest rank observed to serve here.",
     ] = 64
     vestigekv_recall_margin: A[
         float,
