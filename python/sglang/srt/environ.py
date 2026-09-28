@@ -613,6 +613,21 @@ class Envs:
     # a kept neighbour -- it opens to ln(1/epsilon) on its own. 0 disables.
     # Epsilon is the recall target's complement, not a new knob.
     SGLANG_DEBUG_VESTIGEKV_ADAPTIVE_MARGIN = EnvFloat(0.0)
+
+    # Which adaptive rule the margin above uses.
+    #   bound  -- provable: 0 when the whole archive holds under eps of the
+    #             kept maximum's weight, else ln(n_arch/eps).
+    #   smooth -- lse_arch - max1 + ln(1/eps). NOT provable: against rows
+    #             clustered just under the cut it solves to half the needed
+    #             exponent. Kept because whether that configuration occurs in
+    #             real traffic is an empirical question, and the leakage
+    #             telemetry below answers it rather than the algebra.
+    SGLANG_DEBUG_VESTIGEKV_ADAPTIVE_MODE = EnvStr("bound")
+
+    # Log the mass actually left outside the admitted set, per scan, as a
+    # fraction of the kept maximum's weight. The number the bound is about,
+    # measured instead of bounded.
+    SGLANG_DEBUG_VESTIGEKV_LEAKAGE = EnvBool(False)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register

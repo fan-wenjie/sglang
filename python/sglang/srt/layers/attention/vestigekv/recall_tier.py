@@ -634,7 +634,10 @@ class RecallTier:
         s_arch = idxs + self.zp * cert
         lse = torch.logsumexp(s_arch, dim=-1)
         n_arch = s_arch.shape[-1]
-        del idxs, cert, s_arch
+        s_keep = s_arch if envs.SGLANG_DEBUG_VESTIGEKV_LEAKAGE.get() else None
+        del idxs, cert
+        if s_keep is None:
+            del s_arch
         # Two branches, because only two are provable. The excluded rows all
         # sit below max1 - gamma, so their mass is at most
         # n_arch * exp(max1 - gamma); holding that under eps * exp(max1) needs
@@ -650,11 +653,34 @@ class RecallTier:
         # at n_arch = 16k. That clustering is not a corner case here: it is
         # what a verbatim copy looks like, which is the regime the margin was
         # being derived for.
-        return torch.where(
-            lse - max1 <= math.log(eps),
-            torch.zeros_like(lse),
-            torch.full_like(lse, math.log(n_arch / eps)),
-        )
+        if envs.SGLANG_DEBUG_VESTIGEKV_ADAPTIVE_MODE.get() == "smooth":
+            g = (lse - max1 + math.log(1.0 / eps)).clamp_min(0.0)
+        else:
+            g = torch.where(
+                lse - max1 <= math.log(eps),
+                torch.zeros_like(lse),
+                torch.full_like(lse, math.log(n_arch / eps)),
+            )
+        if envs.SGLANG_DEBUG_VESTIGEKV_LEAKAGE.get():
+            # What the rule actually leaves outside, relative to exp(max1):
+            # the algebra says the smooth rule can exceed eps here, and this is
+            # where that either shows up on real traffic or does not.
+            cut = (max1 - self.margin)[:, None] - g[:, None]
+            left = torch.where(s_keep <= cut, s_keep, s_keep.new_full((), -1e30))
+            leak = torch.exp(torch.logsumexp(left, -1) - max1)
+            self._leak_hist = getattr(self, "_leak_hist", [])
+            self._leak_hist.append(float(leak.median()))
+            if len(self._leak_hist) % 256 == 0:
+                import statistics as _st
+                logger.info(
+                    "VKLEAK mode=%s eps=%.3f scans=%d leak_median=%.4g leak_p90=%.4g "
+                    "gamma_median=%.2f",
+                    envs.SGLANG_DEBUG_VESTIGEKV_ADAPTIVE_MODE.get(), eps,
+                    len(self._leak_hist), _st.median(self._leak_hist),
+                    sorted(self._leak_hist)[int(0.9 * len(self._leak_hist))],
+                    float(g.median()),
+                )
+        return g
 
     def _thr_base(self, skept, max1):
         # The score the margin is taken from: the best kept row, or the kept
