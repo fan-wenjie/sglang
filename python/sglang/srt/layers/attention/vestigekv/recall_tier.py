@@ -23,6 +23,7 @@ import logging
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
@@ -463,6 +464,8 @@ class RecallTier:
         )
         if float((ent > thr_g).float().mean()) > D.GATE_SELF_DISABLE_FRACTION:
             thr_g = float("-inf")
+        if envs.SGLANG_DEBUG_VESTIGEKV_NO_GATE.get():
+            thr_g = float("-inf")     # ablation: gate never closes
         self.thr_g = thr_g
 
         # zp in closed form. Requirement per calibration query q: the certified
