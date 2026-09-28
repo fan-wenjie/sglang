@@ -586,6 +586,14 @@ class Envs:
     # Ablation only: attends the truncated fetch on a recall overflow instead
     # of the request's full row set, which gives up no-under-recall.
     SGLANG_DEBUG_VESTIGEKV_NO_OVERFLOW_FALLBACK = EnvBool(False)
+
+    # Hold the entropy gate open: never skip a scan's fetch because the kept
+    # tier's attention was peaked. The threshold is fitted on the first 8-64
+    # decode steps, so a request whose later steps live in a different regime
+    # -- verbatim copying, where attention is peaked BECAUSE the answer is
+    # being read out of context -- is gated on a distribution it never saw.
+    # Ablation only: measures what the gate costs on such a request.
+    SGLANG_DEBUG_VESTIGEKV_NO_GATE = EnvBool(False)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
