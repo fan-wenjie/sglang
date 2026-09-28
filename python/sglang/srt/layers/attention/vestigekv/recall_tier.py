@@ -633,8 +633,28 @@ class RecallTier:
         ) ** 0.5
         s_arch = idxs + self.zp * cert
         lse = torch.logsumexp(s_arch, dim=-1)
+        n_arch = s_arch.shape[-1]
         del idxs, cert, s_arch
-        return (lse - max1 + math.log(1.0 / eps)).clamp_min(0.0)
+        # Two branches, because only two are provable. The excluded rows all
+        # sit below max1 - gamma, so their mass is at most
+        # n_arch * exp(max1 - gamma); holding that under eps * exp(max1) needs
+        # gamma >= ln(n_arch / eps). The log-sum-exp buys exactly one thing:
+        # when the WHOLE archive holds less than eps of the kept maximum's
+        # weight, excluding all of it is already within budget and gamma is 0.
+        #
+        # A smooth interpolation between the two -- gamma = lse - max1 +
+        # ln(1/eps) -- was written here first and is WRONG. Its fixed point
+        # against an archive whose rows cluster just under the cut is
+        # gamma = ln(n_arch/eps)/2, half of what the bound needs, and the
+        # excluded mass then exceeds eps by more than two orders of magnitude
+        # at n_arch = 16k. That clustering is not a corner case here: it is
+        # what a verbatim copy looks like, which is the regime the margin was
+        # being derived for.
+        return torch.where(
+            lse - max1 <= math.log(eps),
+            torch.zeros_like(lse),
+            torch.full_like(lse, math.log(n_arch / eps)),
+        )
 
     def _thr_base(self, skept, max1):
         # The score the margin is taken from: the best kept row, or the kept
