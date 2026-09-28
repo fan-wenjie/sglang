@@ -594,6 +594,15 @@ class Envs:
     # being read out of context -- is gated on a distribution it never saw.
     # Ablation only: measures what the gate costs on such a request.
     SGLANG_DEBUG_VESTIGEKV_NO_GATE = EnvBool(False)
+
+    # Admit the k archive-order successors of every row that fires. Recall is
+    # stale by one step by construction -- step t scans the query step t-1
+    # recorded -- which costs nothing when the target is static, as a needle
+    # is, and is systematically wrong when the target ADVANCES, as it does
+    # during a verbatim copy: the set is chosen by a query pointing at row p
+    # while the step needs row p+1. 0 disables; the archive is in position
+    # order, so a successor is the nearest archived position after a hit.
+    SGLANG_DEBUG_VESTIGEKV_SUCCESSOR = EnvInt(0)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register

@@ -730,6 +730,14 @@ class RecallTier:
             )
             != 0
         )
+        k_succ = envs.SGLANG_DEBUG_VESTIGEKV_SUCCESSOR.get()
+        if k_succ:
+            # Ablation: dilate the fire mask forward along the archive so a
+            # stale query that points at row p also admits p+1..p+k.
+            dil = hit.clone()
+            for _j in range(1, int(k_succ) + 1):
+                dil[_j:] |= hit[:-_j]
+            hit = dil
         W = out.shape[1]
         total = hit.sum()  # [] int64 on device
         n = total.clamp(max=W)
