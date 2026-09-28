@@ -592,6 +592,50 @@ class RecallTier:
             return 0.0
         return self.ent_gain * (torch.logsumexp(skept, -1) - skept.max(-1).values)
 
+    def _adaptive_margin(self, qe, qsk, qres, max1, sc_):
+        """gamma = max(0, lse_arch - max1 + ln(1/eps)), per head.
+
+        The margin the leakage lemma actually asks for. It compares the mass
+        the ARCHIVE holds against the kept maximum rather than how flat the
+        KEPT set is, which is what the entropy margin measures and why that one
+        vanishes exactly where it is needed: during a verbatim copy the kept
+        distribution is peaked, because a kept row from the passage being
+        copied is a near-duplicate of the row the next step wants, so
+        lse(kept) - max(kept) is ~0 while the archive is full of near-ties.
+
+        ABLATION ONLY as written: it materialises the certified scores of every
+        archived row in fp32 to take their log-sum-exp, which is the work the
+        scan kernel exists to avoid. It answers whether the RULE is right; if
+        it is, the reduction belongs in the kernel, which already visits every
+        one of these scores and discards them.
+        """
+        eps = envs.SGLANG_DEBUG_VESTIGEKV_ADAPTIVE_MARGIN.get()
+        if not eps:
+            return 0.0
+        import math
+
+        idxs = (qsk.half().float() @ self.csk.float().T) * sc_
+        if D.SIDECAR_DIM:
+            # The branch term is half the certified score; without it the
+            # log-sum-exp below is of a different quantity than the scan
+            # thresholds on, and the margin would be derived from a score the
+            # kernel never computes.
+            idxs = (
+                idxs
+                + (
+                    qe[:, D.KV_LORA_RANK :].to(torch.bfloat16).float()
+                    @ self.side.float().T
+                )
+                * sc_
+            )
+        cert = (qres[:, None] * self.rho[None, :]) * sc_ / (
+            D.KV_LORA_RANK - self.r
+        ) ** 0.5
+        s_arch = idxs + self.zp * cert
+        lse = torch.logsumexp(s_arch, dim=-1)
+        del idxs, cert, s_arch
+        return (lse - max1 + math.log(1.0 / eps)).clamp_min(0.0)
+
     def _thr_base(self, skept, max1):
         # The score the margin is taken from: the best kept row, or the kept
         # set's log-sum-exp (>= max1; equal when one row holds the mass).
@@ -714,7 +758,8 @@ class RecallTier:
         # +inf makes it lose every comparison and the kernel needs no second
         # predicate. Scores stay in registers -- see scan_kernel for why
         # that, not arithmetic, is what the scan costs.
-        max1g = torch.where(gate, max1 - self.margin - emarg, self._inf)
+        amarg = self._adaptive_margin(qe, qsk, qres, max1, sc_)
+        max1g = torch.where(gate, max1 - self.margin - emarg - amarg, self._inf)
         hit = (
             vestige_scan(
                 self._qside_t,

@@ -603,6 +603,16 @@ class Envs:
     # while the step needs row p+1. 0 disables; the archive is in position
     # order, so a successor is the nearest archived position after a hit.
     SGLANG_DEBUG_VESTIGEKV_SUCCESSOR = EnvInt(0)
+
+    # Adaptive recall margin, epsilon in nats-of-mass terms. The bounded-leakage
+    # lemma wants the excluded softmax mass under epsilon; the margin that
+    # guarantees it is gamma = max(0, lse_arch - max1 + ln(1/epsilon)), which
+    # needs no tuning: when the archive carries no mass against the kept
+    # maximum it is 0 and costs nothing, and when the archive carries
+    # comparable mass -- a verbatim copy, where the next row is a near-tie with
+    # a kept neighbour -- it opens to ln(1/epsilon) on its own. 0 disables.
+    # Epsilon is the recall target's complement, not a new knob.
+    SGLANG_DEBUG_VESTIGEKV_ADAPTIVE_MARGIN = EnvFloat(0.0)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
