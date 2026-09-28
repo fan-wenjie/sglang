@@ -628,6 +628,15 @@ class Envs:
     # fraction of the kept maximum's weight. The number the bound is about,
     # measured instead of bounded.
     SGLANG_DEBUG_VESTIGEKV_LEAKAGE = EnvBool(False)
+
+    # Override the tier-1 keep ratio (default 1/32). Ablation for a
+    # counter-intuitive prediction: the admission bar is the best KEPT row's
+    # score, and tier 1 is required to spread along the sequence, so it leaves
+    # rows inside every passage -- each of which is a near-duplicate of the
+    # rows the recall tier must fetch next and raises the bar against them.
+    # If that is right, keeping MORE makes a verbatim copy worse, not better.
+    # 0 leaves the default.
+    SGLANG_DEBUG_VESTIGEKV_RHO = EnvFloat(0.0)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
