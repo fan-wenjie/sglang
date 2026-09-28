@@ -647,6 +647,17 @@ class Envs:
     # best row is archived, above which the request is treated as
     # archive-dependent; 0 disables the detector.
     SGLANG_DEBUG_VESTIGEKV_REGIME_RATE = EnvFloat(0.0)
+
+    # Recall on the 64-dim branch alone. Implemented by zeroing the sketch
+    # basis, which makes every downstream quantity take its branch-only form
+    # without touching the kernel: qsk becomes 0 so the index score is the
+    # branch term, qres becomes ||q_c|| and rho becomes ||c_u||, so the
+    # certificate becomes the Cauchy-Schwarz bound on the whole content block
+    # (its 1/sqrt(d_c - r) factor is absorbed by the conformal fit of z).
+    # This measures the QUALITY of branch-only recall. It does not measure the
+    # bandwidth it would save: the all-zero sketch is still stored and still
+    # scanned, so the scan reads the same bytes it does today.
+    SGLANG_DEBUG_VESTIGEKV_BRANCH_ONLY = EnvBool(False)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
