@@ -593,21 +593,26 @@ class RecallTier:
         return self.ent_gain * (torch.logsumexp(skept, -1) - skept.max(-1).values)
 
     def _adaptive_margin(self, qe, qsk, qres, max1, sc_, lse_kept=None):
-        """gamma = max(0, lse_arch - max1 + ln(1/eps)), per head.
+        """gamma from the archive's own mass, per head. NOT ON THE SERVED PATH.
 
-        The margin the leakage lemma actually asks for. It compares the mass
-        the ARCHIVE holds against the kept maximum rather than how flat the
-        KEPT set is, which is what the entropy margin measures and why that one
-        vanishes exactly where it is needed: during a verbatim copy the kept
-        distribution is peaked, because a kept row from the passage being
-        copied is a near-duplicate of the row the next step wants, so
-        lse(kept) - max(kept) is ~0 while the archive is full of near-ties.
+        This runs inside query_fixed, the per-(layer, slot) form. Decode does
+        not use it: batched_step's fused prologue computes skept, the softmax,
+        the entropy, the gate, qsk, qres and max1g in one kernel, and max1g is
+        the threshold. Setting the env flag therefore changed nothing, and the
+        leakage telemetry below never logged a line -- which is how this was
+        found, after the two adaptive runs came back at 0.343 and 0.390 where
+        an equivalent fixed margin reads 0.865.
 
-        ABLATION ONLY as written: it materialises the certified scores of every
-        archived row in fp32 to take their log-sum-exp, which is the work the
-        scan kernel exists to avoid. It answers whether the RULE is right; if
-        it is, the reduction belongs in the kernel, which already visits every
-        one of these scores and discards them.
+        The architecture is the finding, not the bug. max1g is computed BEFORE
+        the archive is scanned, so a threshold cannot depend on the archive's
+        score distribution without a second pass over it, and the scan is the
+        cost. That is why the entropy margin keys on the KEPT distribution:
+        at prologue time it is the only distribution that exists.
+
+        What fits: have the scan accumulate lse over the certified scores it
+        already visits and discards -- one register reduction, no extra
+        traffic -- and let the NEXT step's prologue use it. Recall is stale by
+        one step by construction, so this adds no staleness that is not there.
         """
         eps = envs.SGLANG_DEBUG_VESTIGEKV_ADAPTIVE_MARGIN.get()
         if not eps:
