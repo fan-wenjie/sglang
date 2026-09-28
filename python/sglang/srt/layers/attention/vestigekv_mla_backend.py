@@ -1821,6 +1821,23 @@ class VestigeKVMLABackend(AttentionBackend):
     def _build_ingraph_pack(self):
         from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
 
+        pack_cls = BatchedScanPack
+        if envs.SGLANG_DEBUG_VESTIGEKV_BRANCH_ONLY.get():
+            # Branch-only recall has no sketch, so the scan that skips reading
+            # one is a fork in its own module: same fire set, half the traffic.
+            from sglang.srt.layers.attention.vestigekv.branch_scan import (
+                BranchScanPack,
+                BRANCH_BLOCK_A,
+                BRANCH_NUM_WARPS,
+            )
+
+            pack_cls = BranchScanPack
+            # Say so in the log: the previous branch-only kernel was wired to a
+            # path decode never calls, and nothing reported that it had not run.
+            logger.info(
+                "VestigeKV branch-only: in-graph scan is %s (block=%d warps=%d)",
+                pack_cls.__name__, BRANCH_BLOCK_A, BRANCH_NUM_WARPS,
+            )
         dev = self._qbuf_stack.device
         maxbs = max(self._graph_max_bs, 1)
         self._ensure_stage(maxbs, dev)
@@ -1872,7 +1889,7 @@ class VestigeKVMLABackend(AttentionBackend):
                 [str(k.dtype) for k in kbufs],
                 row_elems,
             )
-        self._ingraph_pack = BatchedScanPack.at_capacity(
+        self._ingraph_pack = pack_cls.at_capacity(
             n_lids * maxbs,
             max(1, min(nkm, max_ctx)),
             max_ctx,
