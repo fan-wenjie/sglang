@@ -2511,8 +2511,15 @@ class VestigeKVMLABackend(AttentionBackend):
             return False
         installed = False
         remaining = []
+        sync = envs.SGLANG_DEBUG_VESTIGEKV_SYNC_BUILD.get()
         for job in self._build_jobs:
-            if not job["done"].is_set():
+            if sync:
+                # Which step first sees the calibrated basis is otherwise a
+                # race with the worker thread, so two identical runs diverge
+                # from the step where they disagree. Waiting pins adoption to
+                # the first step after submission, which is deterministic.
+                job["done"].wait()
+            elif not job["done"].is_set():
                 remaining.append(job)
                 continue
             slot, lid = job["slot"], job["lid"]
