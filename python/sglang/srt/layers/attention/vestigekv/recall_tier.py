@@ -270,6 +270,8 @@ class RecallTier:
             # the certificate fired the whole archive (fallback 0.6-0.8).
             evals, evecs = torch.linalg.eigh(qcal_c.T @ qcal_c)
             V = evecs[:, -self.r :].T.flip(0)  # descending singular value order
+        if envs.SGLANG_DEBUG_VESTIGEKV_BRANCH_ONLY.get():
+            V = torch.zeros_like(V)   # branch-only recall; see the env doc
         self.V = V
         # Chunked, and the pool rows are never materialized in fp32 as a whole.
         # The unchunked form allocated the full [T, 576] fp32 copy plus TWO
@@ -303,6 +305,10 @@ class RecallTier:
                 "operand reuse from a tier holding a different prefix row-set"
             )
             self.V = V = operands_from.V
+            if envs.SGLANG_DEBUG_VESTIGEKV_BRANCH_ONLY.get():
+                # the inherited basis needs the same treatment, or a request
+                # that reuses one silently keeps the sketch term
+                self.V = V = torch.zeros_like(V)
             # Adopt the closed-prefix CACHES, not the archive selections over
             # them: the selections are properties now, and a tier that owns
             # only a selection cannot re-derive one after a drop or a
