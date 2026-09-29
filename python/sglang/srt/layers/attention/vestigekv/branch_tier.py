@@ -38,6 +38,26 @@ class BranchRecallTier(RecallTier):
 
         return build_operands_branch
 
+    def extend_closed(self, new_rows: torch.Tensor, new_slots: torch.Tensor) -> None:
+        """Append a closed block, with no projection and no sketch to store.
+
+        The base form computes csk = C V^T and rho = ||C - csk V||, then
+        concatenates the sketch onto a cache that grows with the context. With
+        a zero basis both products are zero and rho is ||C||, so this keeps the
+        norm, drops both matmuls, and re-expands the one zero row rather than
+        concatenating 128 bytes per closed row onto a table nothing reads.
+        """
+        dev = new_rows.device
+        if self._rho_all is None:
+            self._pos_all = torch.zeros(0, dtype=torch.int64, device=dev)
+            self._rho_all = torch.zeros(0, device=dev)
+        content = new_rows[:, : D.KV_LORA_RANK].float()
+        self._rho_all = torch.cat([self._rho_all, content.norm(dim=-1)])
+        self._pos_all = torch.cat([self._pos_all, new_slots])
+        self._csk_all = torch.zeros(
+            1, self.r, device=dev, dtype=torch.float16
+        ).expand(self._pos_all.numel(), self.r)
+
     def build(
         self,
         kbuf: torch.Tensor,
