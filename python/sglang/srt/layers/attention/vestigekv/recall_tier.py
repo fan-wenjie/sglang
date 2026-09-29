@@ -998,7 +998,31 @@ class RecallTier:
         rank = (cert_sc > cert_sc.gather(1, a_top1[:, None])).sum(1)
         marg = cert_sc.gather(1, a_top1[:, None]).squeeze(1) - max1
         sel = arch_is_top & (~fired.gather(0, a_top1.clamp_max(fired.numel() - 1)))
+        # Leakage, both the observable and the truth, so the probe can ask
+        # whether one tracks the other. The scan can know only the first: the
+        # certified scores of the rows it did NOT fire, against the kept
+        # log-sum-exp. By the online-softmax merge identity the weight those
+        # rows carry in the answer is sigma(L_excluded - L_included), which is
+        # why neither is normalised by max1 -- a single row overstates that
+        # weight whenever the kept set is diffuse, which is most steps.
+        cert_all = idxs + self.zp * cert
+        neg = torch.finfo(torch.float32).min
+        lse_kept_h = torch.logsumexp(skept, -1)
+        out_cert = torch.where(fired[None, :], torch.full_like(cert_all, neg), cert_all)
+        leak_cert = torch.sigmoid(torch.logsumexp(out_cert, -1) - lse_kept_h)
+        # and what was actually left out, by the exact scores
+        out_true = torch.where(fired[None, :], torch.full_like(strue, neg), strue)
+        in_true = torch.cat(
+            [skept, torch.where(fired[None, :], strue, torch.full_like(strue, neg))], -1
+        )
+        leak_true = torch.sigmoid(
+            torch.logsumexp(out_true, -1) - torch.logsumexp(in_true, -1)
+        )
         return {
+            "leak_cert_p50": float(leak_cert.median()),
+            "leak_cert_max": float(leak_cert.max()),
+            "leak_true_p50": float(leak_true.median()),
+            "leak_true_max": float(leak_true.max()),
             "top1_rank_p50": float(rank[sel].median()) if bool(sel.any()) else -1.0,
             "top1_margin_p50": float(marg[sel].median()) if bool(sel.any()) else 0.0,
             "qperp_rel": float((qres / qe[:, :kv].norm(dim=-1)).median()),
