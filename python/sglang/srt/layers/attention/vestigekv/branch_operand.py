@@ -19,10 +19,13 @@ second loop keeps its content read and loses its dot. The content is then read
 ONCE instead of twice, no tensor-core work remains, and the [R, KV] basis is
 never touched: 2048 -> 1024 bytes per row of content traffic.
 
-csk is still returned, as zeros, because the tier's caches and the eager
-query_fixed path index it by shape. It is allocated rather than written, so
-the kernel stores rho and side only, and the fp16 range guard has nothing to
-check (zero is in range) and is dropped with it.
+csk is still RETURNED as a [A, r] tensor of zeros, because three readers index
+it by shape (the tier's csk property, refresh_membership's tgt_csk, and
+extend_closed's cat). It is returned as a broadcast VIEW of one zero row, so
+those readers see the shape they require and the storage is r*2 bytes instead
+of A*r*2 -- 128 bytes against 16 MiB per layer at 131072 closed rows. A zero
+matrix only has to be stored once. The kernel therefore writes rho and side
+only, and the fp16 range guard has nothing left to check.
 
 A fork rather than a constexpr arm in the original, for the reason
 .claude/rules/disassemble-check-for-spills.md gives: an arm that exists to
@@ -81,7 +84,10 @@ def build_operands_branch(kbuf: torch.Tensor, arch_slots: torch.Tensor, V: torch
     A = arch_slots.numel()
     dev = kbuf.device
     r = V.shape[0]
-    csk = torch.zeros(A, r, dtype=torch.float16, device=dev)
+    # One zero row, viewed as [A, r]: see the module docstring. Nothing on
+    # this path writes into it, so a non-contiguous view is safe; build()
+    # assigns whole tensors and extend_closed re-expands.
+    csk = torch.zeros(1, r, dtype=torch.float16, device=dev).expand(A, r)
     rho = torch.empty(A, dtype=torch.float32, device=dev)
     side = torch.empty(A, D.SIDECAR_DIM, dtype=torch.bfloat16, device=dev)
     if A == 0:
