@@ -372,3 +372,98 @@ class TestBothControllersAnswerOneEntryPoint(unittest.TestCase):
         for gone in ("self._width.set_base(", "self._width.apply_(",
                      "self._width.set_calibration("):
             self.assertNotIn(gone, src, f"pack still calls {gone} directly")
+
+
+class TestGeometryWidthController(unittest.TestCase):
+    """Width from the query's own geometry, before the scan.
+
+    The properties that make it preferable to the other two are the ones pinned
+    here: it does not move when the width moves (no feedback), a layer with no
+    history serves WIDE rather than narrow (evidence is earned, not assumed),
+    and the threshold tracks each layer's own tail rather than an absolute level
+    -- the per-layer offset spans 0.339 to 0.698, so an absolute threshold is
+    exactly what gets it wrong.
+    """
+
+    def _ctl(self, P=3, H=4, level=0.7, memory=64):
+        from sglang.srt.layers.attention.vestigekv.width_control import (
+            GeometryWidthController,
+        )
+        return GeometryWidthController(P, H, torch.device("cpu"), level=level,
+                                       gain_hi=1.0, gain_lo=0.5, memory=memory)
+
+    def _step(self, c, rel, P=3, H=4, base=0.5):
+        cc = torch.zeros(P)
+        qn = torch.ones(P, H)
+        qres = torch.tensor(rel, dtype=torch.float32).view(P, 1).expand(P, H).contiguous()
+        c.write_cc(qres=qres, qc_norm=qn, cc_base=torch.full((P,), base),
+                   cc_out=cc)
+        return cc
+
+    def test_a_cold_layer_serves_wide(self):
+        """Threshold starts at 0, so everything is above it. Width is given up
+        only once there is evidence about the layer's tail."""
+        c = self._ctl()
+        cc = self._step(c, [0.1, 0.5, 0.9])
+        self.assertEqual([round(v, 4) for v in cc.tolist()], [0.5, 0.5, 0.5])
+
+    def test_the_widen_rate_converges_to_one_minus_level(self):
+        """The operational property, and the one to assert: at level 0.7 the
+        controller should widen about 30% of steps. Asserting on thr itself is
+        the wrong target -- Robbins-Monro oscillates around its fixed point with
+        amplitude set by the step size, so a single final reading of thr is a
+        draw from that oscillation, not the estimate."""
+        import random
+        c = self._ctl(P=1, H=2, level=0.7, memory=512)
+        rng = random.Random(0)
+        wide = 0
+        N = 8000
+        for i in range(N):
+            cc = self._step(c, [rng.random()], P=1, H=2, base=1.0)
+            if i >= N // 2:                      # discard the burn-in
+                wide += 1 if cc[0].item() > 0.75 else 0
+        rate = wide / (N - N // 2)
+        self.assertAlmostEqual(rate, 0.30, delta=0.04,
+                               msg=f"widen rate {rate:.3f}, thr={c.thr[0]:.4f}")
+
+    def test_each_layer_tracks_its_own_offset(self):
+        """Two layers with different scales must reach different thresholds --
+        the whole reason a shared absolute level fails."""
+        import random
+        c = self._ctl(P=2, H=2, level=0.7, memory=64)
+        rng = random.Random(1)
+        for _ in range(6000):
+            self._step(c, [0.2 * rng.random(), 0.5 + 0.5 * rng.random()],
+                       P=2, H=2)
+        self.assertLess(c.thr[0].item(), 0.25, f"lo layer thr={c.thr[0].item():.3f}")
+        self.assertGreater(c.thr[1].item(), 0.7, f"hi layer thr={c.thr[1].item():.3f}")
+
+    def test_width_does_not_feed_back_into_the_signal(self):
+        """cc_base changing must not move the threshold: the signal is the
+        query's geometry, not the fire set's response to the width."""
+        c = self._ctl(P=1, H=2)
+        for _ in range(200):
+            self._step(c, [0.4], P=1, H=2, base=0.5)
+        t_small = c.thr[0].item()
+        c2 = self._ctl(P=1, H=2)
+        for _ in range(200):
+            self._step(c2, [0.4], P=1, H=2, base=50.0)
+        self.assertAlmostEqual(t_small, c2.thr[0].item(), places=6)
+
+    def test_allocates_nothing_after_construction(self):
+        c = self._ctl()
+        names = ["thr", "rel", "seen", "_x", "_w", "_b", "_hb"]
+        before = {n: getattr(c, n).data_ptr() for n in names}
+        for k in range(10):
+            self._step(c, [0.1 * k, 0.5, 0.9])
+        for n in names:
+            self.assertEqual(before[n], getattr(c, n).data_ptr(), f"{n} realloc")
+
+    def test_reset_clears_the_threshold(self):
+        c = self._ctl()
+        for _ in range(100):
+            self._step(c, [0.9, 0.9, 0.9])
+        self.assertGreater(c.thr.max().item(), 0.0)
+        c.reset(torch.tensor([1]))
+        self.assertEqual(c.thr[1].item(), 0.0)
+        self.assertGreater(c.thr[0].item(), 0.0)
