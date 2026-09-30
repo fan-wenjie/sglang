@@ -517,6 +517,24 @@ class RecallTier:
             thr_g = float("-inf")
         if envs.SGLANG_DEBUG_VESTIGEKV_NO_GATE.get():
             thr_g = float("-inf")     # ablation: gate never closes
+        _skip = envs.SGLANG_DEBUG_VESTIGEKV_SKIP_TIER2_HARD.get()
+        if _skip >= 0.0 and self.hard_rate <= _skip:
+            # The archive holds the winner on none of the calibration queries,
+            # so the recall guarantee this tier's width pays for is vacuous
+            # here. +inf closes the gate, which the scan already reads as "no
+            # row can fire"; an empty kept set still forces it open, so a
+            # request with nothing in tier 1 is not stranded.
+            #
+            # The risk is the one that killed hard_rate as a detector:
+            # calibration queries are the prompt's last few and answer steps
+            # are not them -- 0.1% against 22.85% miss. This is an ablation,
+            # not a default, for exactly that reason.
+            thr_g = float("inf")
+            logger.info(
+                "VKSKIP tier2 off: hard_rate=%.4f <= %.4f (arch=%d, kept=%d)",
+                self.hard_rate, _skip, int(arch_idx.numel()),
+                int(keep.sum()),
+            )
         self.thr_g = thr_g
 
         # zp in closed form. Requirement per calibration query q: the certified
