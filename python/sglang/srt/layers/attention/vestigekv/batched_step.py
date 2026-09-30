@@ -29,6 +29,19 @@ from sglang.srt.layers.attention.vestigekv.fused_prologue import (
     fused_prologue_split,
 )
 
+def _margin_delta() -> float:
+    """Extra margin for heads above their layer's qperp_rel quantile.
+
+    Read through a helper because this module imports `envs` locally rather
+    than at module scope; a bare `envs.` in __init__ is a NameError that only
+    fires when a pack is built, which is what test_vestigekv_module_globals
+    exists to catch and did.
+    """
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_MARGIN_DELTA.get()
+
+
 def _geometry_width_cls():
     from sglang.srt.layers.attention.vestigekv.width_control import (
         GeometryWidthController,
@@ -67,15 +80,13 @@ def _make_width_controller(P: int, dev, H: int = 32):
             GeometryWidthController,
         )
 
-        lo = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_LO.get()
-        hi = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_HI.get()
+        dm = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_MARGIN_DELTA.get()
         logging.getLogger(__name__).info(
-            "VKWIDTH geometry: qperp_rel level=%.3f hi=%.3f lo=%.3f over %d "
-            "slots%s", lvl, hi, lo, P,
-            " (both gains 1.0, exact no-op)" if hi == 1.0 and lo == 1.0 else "",
+            "VKWIDTH geometry: qperp_rel level=%.3f margin_delta=%.3f over %d "
+            "slots%s", lvl, dm, P,
+            " (delta 0, exact no-op)" if dm == 0.0 else "",
         )
-        return GeometryWidthController(P, H, dev, level=lvl, gain_hi=hi,
-                                       gain_lo=lo)
+        return GeometryWidthController(P, H, dev, level=lvl)
 
     delta = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_DELTA.get()
     if delta > 0.0:
@@ -341,10 +352,17 @@ class BatchedScanPack:
         # arm is on -- 64 floats a slot is small but not free.
         # Geometry arm: the prologue's qperp_rel and an untouched copy of the
         # build's width, since cc itself is overwritten every step.
-        self._qrel = self._cc_base = None
+        # Geometry arm: the prologue emits qperp_rel and reads back the
+        # per-slot threshold it should compare against. cc is untouched -- the
+        # actuator is the margin, applied per head inside that same kernel.
+        self._margin_delta = _margin_delta()
+        self._qrel = self._relthr = None
         if isinstance(self._width, _geometry_width_cls()):
             self._qrel = torch.zeros(P, q_heads, device=dev)
-            self._cc_base = torch.zeros(P, device=dev)
+            # Starts at 0, so every head is above it and the FIRST steps run at
+            # the wide margin: width is given up only once the layer's tail is
+            # known.
+            self._relthr = torch.zeros(P, device=dev)
         self._z_host = self._ncal_host = self._fac_host = self._fac = None
         if isinstance(self._width, _derived_width_cls()):
             self._z_host = torch.zeros(P, D.N_CAL_MAX)
@@ -518,10 +536,17 @@ class BatchedScanPack:
         # arm is on -- 64 floats a slot is small but not free.
         # Geometry arm: the prologue's qperp_rel and an untouched copy of the
         # build's width, since cc itself is overwritten every step.
-        self._qrel = self._cc_base = None
+        # Geometry arm: the prologue emits qperp_rel and reads back the
+        # per-slot threshold it should compare against. cc is untouched -- the
+        # actuator is the margin, applied per head inside that same kernel.
+        self._margin_delta = _margin_delta()
+        self._qrel = self._relthr = None
         if isinstance(self._width, _geometry_width_cls()):
             self._qrel = torch.zeros(P, q_heads, device=dev)
-            self._cc_base = torch.zeros(P, device=dev)
+            # Starts at 0, so every head is above it and the FIRST steps run at
+            # the wide margin: width is given up only once the layer's tail is
+            # known.
+            self._relthr = torch.zeros(P, device=dev)
         self._z_host = self._ncal_host = self._fac_host = self._fac = None
         if isinstance(self._width, _derived_width_cls()):
             self._z_host = torch.zeros(P, D.N_CAL_MAX)
@@ -709,20 +734,19 @@ class BatchedScanPack:
         # Stale slots keep the value they were last given: the loop writes only
         # live ones and a_len masks the kernel off their tails, so _cc_host
         # persists across calls and is copied whole.
-        if self._width is None:
-            self.cc.copy_(self._cc_host, non_blocking=True)
-        else:
+        # Always publish the build's width first. A controller that wants to
+        # change it overwrites below; one that acts on the MARGIN instead
+        # (geometry) leaves it, and must still find cc populated -- leaving it
+        # zero kills the certificate term outright, which is what
+        # test_geometry_arm_neutral_matches_no_arm caught.
+        self.cc.copy_(self._cc_host, non_blocking=True)
+        if self._width is not None:
             # One call, whichever controller is installed: it takes what it
             # needs by keyword and ignores the rest. c_total holds the PREVIOUS
             # step's fired counts because update() runs before the scan, and
             # that staleness is the design -- the label is autocorrelated across
             # adjacent steps in a layer (phi +0.46 served, +0.56 branch), so
             # acting one step late costs 0.039 of AUC.
-            if self._cc_base is not None:
-                # Geometry arm sets cc after the prologue, so keep the build's
-                # width where the scaling can read it; cc is overwritten there.
-                self._cc_base.copy_(self._cc_host, non_blocking=True)
-                self.cc.copy_(self._cc_host, non_blocking=True)
             self._width.write_cc(
                 fired=self._fired_prev(), cc_host=self._cc_host,
                 a_len=self.a_len, z=self._z_host, n_cal=self._ncal_host,
@@ -804,12 +828,15 @@ class BatchedScanPack:
             mode=self.pool_mode,
             a_len=self.a_len,
             qrel=self._qrel,
+            relthr=self._relthr,
+            margin_hi=self.margin + self._margin_delta,
         )
-        if self._width is not None and self._qrel is not None:
-            # Between the prologue and the scan: this step's own geometry, so
-            # the decision has no staleness at all.
-            self._width.after_prologue(qrel=self._qrel, cc_base=self._cc_base,
-                                       cc_out=self.cc)
+        if self._qrel is not None:
+            # The prologue already applied the margin per head this step; this
+            # only advances the threshold it will compare against next step.
+            # A slow-moving quantile does not care about one step of lag.
+            self._width.after_prologue(qrel=self._qrel,
+                                       relthr_out=self._relthr)
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
         # Grid covers the LARGEST per-pair archive, not the arena: programs
         # past a pair's a_len do no work, so a grid sized for the arena would

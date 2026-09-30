@@ -512,11 +512,8 @@ class GeometryWidthController(_WidthController):
     """
 
     def __init__(self, P: int, H: int, device, level: float = 0.70,
-                 gain_hi: float = 1.0, gain_lo: float = 0.5,
                  memory: int = 256):
         self.level = float(level)
-        self.gain_hi = float(gain_hi)
-        self.gain_lo = float(gain_lo)
         self.eta = 1.0 / float(memory)
         self.thr = torch.zeros(P, device=device)
         self.rel = torch.zeros(P, device=device)
@@ -539,34 +536,30 @@ class GeometryWidthController(_WidthController):
             self.seen.index_fill_(0, lanes, 0.0)
 
     @torch.inference_mode()
-    def after_prologue(self, *, qrel, cc_base, cc_out, **_ignored):
-        """Set this step's width from this step's query geometry, in place.
+    def after_prologue(self, *, qrel, relthr_out, **_ignored):
+        """Advance this layer's qperp_rel threshold, in place, from this step.
 
-        qrel [P, H] is qperp_rel, emitted by the fused prologue that has just
-        run (WRITE_REL); cc_base [P] is the width the build fitted. Nothing here
-        reads a device value back to the host and nothing allocates.
+        It no longer writes cc. Scaling cc moves only the certificate term, and
+        on the served arm firing is not certificate-driven -- Spearman between
+        qperp_rel and the fire fraction is -0.292 on the layer carrying 82% of
+        the fetch. The actuator is the MARGIN, and the prologue applies it per
+        head in the same kernel that computes qperp_rel, so all this has to do
+        is keep the threshold that kernel compares against.
+
+        qrel [P, H] is what the prologue just emitted. The threshold is per
+        slot, so the heads are reduced by median -- the aggregation the offline
+        separation was measured at.
         """
-        # One number per slot: the median over heads, matching how the
-        # separation above was measured. A max would track the worst head and
-        # is a different quantity that has not been scored.
         self._hb.copy_(qrel)
         self.rel.copy_(self._hb.median(dim=1).values)
 
-        # Widen where this step sits in the layer's own upper tail. Until a
-        # layer has been seen at all its threshold is 0, so everything is above
-        # it and the layer serves WIDE -- width is given up only once there is
-        # evidence about what that layer's tail looks like.
+        # Robbins-Monro step toward the level-quantile. Elementwise, hence
+        # capturable; a ring buffer's write index moves every step and would be
+        # baked in at capture. eta is the reciprocal of the memory length.
         torch.gt(self.rel, self.thr, out=self._b)
         self._w.copy_(self._b)
-
-        # gain = lo + (hi - lo) * wide
-        self._x.copy_(self._w)
-        self._x.mul_(self.gain_hi - self.gain_lo)
-        self._x.add_(self.gain_lo)
-        torch.mul(cc_base, self._x, out=cc_out)
-
-        # Robbins-Monro step toward the level-quantile.
         self._w.sub_(1.0 - self.level)
         self._w.mul_(self.eta)
         self.thr.add_(self._w)
         self.seen.add_(1.0)
+        relthr_out.copy_(self.thr)
