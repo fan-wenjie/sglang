@@ -127,3 +127,47 @@ class TestCertWidthController(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestArmedControllerIsBitIdenticalWhenNeutral(unittest.TestCase):
+    """The armed-but-neutral seam must reproduce the unarmed cc exactly.
+
+    An end-to-end score cannot establish this: four identical served-arm MRCR
+    runs span 0.414-0.436, so a real regression and a no-op are
+    indistinguishable there. The tensor comparison is decisive and costs no GPU
+    hours, which is the right order to do these in -- this test was written
+    after a validation run came back at 0.229 with no way to tell whether the
+    seam or the workload had moved it.
+    """
+
+    def test_neutral_gains_reproduce_the_base_exactly(self):
+        P = 7  # one slot per MLA layer, which is what the server reports
+        torch.manual_seed(0)
+        base = torch.rand(P).double().float()
+        c = CertWidthController(P, torch.device("cpu"), tau=0.5,
+                                gain_hi=1.0, gain_lo=1.0, warmup=4)
+        c.set_base(base)
+        cc = torch.zeros(P)
+        for step in range(40):
+            fired = torch.randint(0, 101, (P,), dtype=torch.int32)
+            c.apply_(fired, torch.full((P,), 100.0), cc)
+            self.assertTrue(
+                torch.equal(cc, base),
+                f"step {step}: cc drifted from base by "
+                f"{(cc - base).abs().max().item():.3e}",
+            )
+
+    def test_gain_multiplies_base_exactly_once_latched(self):
+        """And when it IS armed, cc is base * gain to the bit -- no accumulated
+        drift from the running mean's in-place arithmetic."""
+        P = 7
+        base = torch.full((P,), 0.3)
+        c = CertWidthController(P, torch.device("cpu"), tau=0.5,
+                                gain_hi=2.0, gain_lo=0.5, warmup=2)
+        c.set_base(base)
+        cc = torch.zeros(P)
+        for _ in range(10):
+            c.apply_(torch.tensor([100, 100, 100, 0, 0, 0, 0], dtype=torch.int32),
+                     torch.full((P,), 100.0), cc)
+        self.assertTrue(torch.equal(cc, base * c.gain), (cc, base * c.gain))
+        self.assertEqual(c.gain.tolist(), [2.0] * 3 + [0.5] * 4)
