@@ -392,12 +392,13 @@ class TestGeometryWidthController(unittest.TestCase):
         return GeometryWidthController(P, H, torch.device("cpu"), level=level,
                                        gain_hi=1.0, gain_lo=0.5, memory=memory)
 
+    def _rel(self, vals, P, H):
+        return torch.tensor(vals, dtype=torch.float32).view(P, 1).expand(P, H).contiguous()
+
     def _step(self, c, rel, P=3, H=4, base=0.5):
         cc = torch.zeros(P)
-        qn = torch.ones(P, H)
-        qres = torch.tensor(rel, dtype=torch.float32).view(P, 1).expand(P, H).contiguous()
-        c.write_cc(qres=qres, qc_norm=qn, cc_base=torch.full((P,), base),
-                   cc_out=cc)
+        c.after_prologue(qrel=self._rel(rel, P, H),
+                         cc_base=torch.full((P,), base), cc_out=cc)
         return cc
 
     def test_a_cold_layer_serves_wide(self):

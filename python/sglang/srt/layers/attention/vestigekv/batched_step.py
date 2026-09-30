@@ -29,6 +29,14 @@ from sglang.srt.layers.attention.vestigekv.fused_prologue import (
     fused_prologue_split,
 )
 
+def _geometry_width_cls():
+    from sglang.srt.layers.attention.vestigekv.width_control import (
+        GeometryWidthController,
+    )
+
+    return GeometryWidthController
+
+
 def _derived_width_cls():
     from sglang.srt.layers.attention.vestigekv.width_control import (
         DerivedWidthController,
@@ -37,7 +45,7 @@ def _derived_width_cls():
     return DerivedWidthController
 
 
-def _make_width_controller(P: int, dev):
+def _make_width_controller(P: int, dev, H: int = 32):
     """Arm dynamic certificate width only when both knobs are set.
 
     Off by default and an exact no-op when GAIN is 0, so the arm can be enabled
@@ -52,6 +60,22 @@ def _make_width_controller(P: int, dev):
         CertWidthController,
         DerivedWidthController,
     )
+
+    lvl = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_QLEVEL.get()
+    if lvl > 0.0:
+        from sglang.srt.layers.attention.vestigekv.width_control import (
+            GeometryWidthController,
+        )
+
+        lo = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_LO.get()
+        hi = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_HI.get()
+        logging.getLogger(__name__).info(
+            "VKWIDTH geometry: qperp_rel level=%.3f hi=%.3f lo=%.3f over %d "
+            "slots%s", lvl, hi, lo, P,
+            " (both gains 1.0, exact no-op)" if hi == 1.0 and lo == 1.0 else "",
+        )
+        return GeometryWidthController(P, H, dev, level=lvl, gain_hi=hi,
+                                       gain_lo=lo)
 
     delta = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_DELTA.get()
     if delta > 0.0:
@@ -311,10 +335,16 @@ class BatchedScanPack:
         # source would make that copy synchronous -- which is the stall this
         # replaces, not a new one. 4 bytes per slot.
         self._cc_host = torch.zeros(P).pin_memory() if dev != 'cpu' else torch.zeros(P)
-        self._width = _make_width_controller(P, dev)
+        self._width = _make_width_controller(P, dev, H=q_heads)
         # Derived-width staging: the sorted conformal sample per slot, its
         # true size, and scale/sqrt(kv_lora - r). Only allocated when that
         # arm is on -- 64 floats a slot is small but not free.
+        # Geometry arm: the prologue's qperp_rel and an untouched copy of the
+        # build's width, since cc itself is overwritten every step.
+        self._qrel = self._cc_base = None
+        if isinstance(self._width, _geometry_width_cls()):
+            self._qrel = torch.zeros(P, q_heads, device=dev)
+            self._cc_base = torch.zeros(P, device=dev)
         self._z_host = self._ncal_host = self._fac_host = self._fac = None
         if isinstance(self._width, _derived_width_cls()):
             self._z_host = torch.zeros(P, D.N_CAL_MAX)
@@ -482,10 +512,16 @@ class BatchedScanPack:
         # source would make that copy synchronous -- which is the stall this
         # replaces, not a new one. 4 bytes per slot.
         self._cc_host = torch.zeros(P).pin_memory() if dev != 'cpu' else torch.zeros(P)
-        self._width = _make_width_controller(P, dev)
+        self._width = _make_width_controller(P, dev, H=q_heads)
         # Derived-width staging: the sorted conformal sample per slot, its
         # true size, and scale/sqrt(kv_lora - r). Only allocated when that
         # arm is on -- 64 floats a slot is small but not free.
+        # Geometry arm: the prologue's qperp_rel and an untouched copy of the
+        # build's width, since cc itself is overwritten every step.
+        self._qrel = self._cc_base = None
+        if isinstance(self._width, _geometry_width_cls()):
+            self._qrel = torch.zeros(P, q_heads, device=dev)
+            self._cc_base = torch.zeros(P, device=dev)
         self._z_host = self._ncal_host = self._fac_host = self._fac = None
         if isinstance(self._width, _derived_width_cls()):
             self._z_host = torch.zeros(P, D.N_CAL_MAX)
@@ -682,6 +718,11 @@ class BatchedScanPack:
             # that staleness is the design -- the label is autocorrelated across
             # adjacent steps in a layer (phi +0.46 served, +0.56 branch), so
             # acting one step late costs 0.039 of AUC.
+            if self._cc_base is not None:
+                # Geometry arm sets cc after the prologue, so keep the build's
+                # width where the scaling can read it; cc is overwritten there.
+                self._cc_base.copy_(self._cc_host, non_blocking=True)
+                self.cc.copy_(self._cc_host, non_blocking=True)
             self._width.write_cc(
                 fired=self._fired_prev(), cc_host=self._cc_host,
                 a_len=self.a_len, z=self._z_host, n_cal=self._ncal_host,
@@ -762,7 +803,13 @@ class BatchedScanPack:
             pool_rows=self._pool_rows,
             mode=self.pool_mode,
             a_len=self.a_len,
+            qrel=self._qrel,
         )
+        if self._width is not None and self._qrel is not None:
+            # Between the prologue and the scan: this step's own geometry, so
+            # the decision has no staleness at all.
+            self._width.after_prologue(qrel=self._qrel, cc_base=self._cc_base,
+                                       cc_out=self.cc)
         qside_t, qsk_t, qres, max1g = self.qside_t, self.qsk_t, self.qres, self.max1g
         # Grid covers the LARGEST per-pair archive, not the arena: programs
         # past a pair's a_len do no work, so a grid sized for the arena would
