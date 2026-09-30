@@ -128,6 +128,10 @@ class RecallTier:
         self._kbuf = None  # the layer's pool buffer, to re-read from
         self.version = 0  # bumped on in-place membership refresh (pack sync key)
         self.hard_rate = float("nan")   # set at each calibrated build
+        # Sorted conformal sample and its size, kept so the width can be
+        # re-derived at a new target (width_control.DerivedWidthController).
+        self.z_sorted = None
+        self.n_cal = 0
         self.archive_bound = False      # regime detector's verdict
         self._scatter_buf = None  # reused static-shape scatter target (query_fixed)
         # fixed-address staging for the fused scan (capturable)
@@ -649,6 +653,26 @@ class RecallTier:
             else:
                 k = D.conformal_k(n_cal_q, self.recall_target)
                 self.zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
+                # Keep the whole SORTED sample, not just the quantile picked
+                # here. Re-reading the order statistic at a different target is
+                # the only way to move the width and stay ON the conformal
+                # guarantee -- scaling cc instead moves it off. 64 floats per
+                # (layer, lane); padded to N_CAL_MAX with the sample maximum,
+                # so an index past n_cal reads the max, which is exactly what
+                # "this sample cannot certify that target" should serve.
+                zs = torch.sort(z_req).values
+                self.n_cal = int(zs.numel())
+                # A fixed-size grid of the EMPIRICAL QUANTILE FUNCTION, not the
+                # raw sample: n_cal is the number of calibration queries whose
+                # best row is archived and routinely runs past N_CAL_MAX, so a
+                # raw-sample buffer would have to be sized for the worst case.
+                # The grid decouples the buffer from n. n itself is still what
+                # limits which targets are REACHABLE (nothing past
+                # n/(n+1)), so it is kept separately.
+                lv = torch.linspace(0.0, 1.0, D.N_CAL_MAX, device=zs.device)
+                gi = (lv * (self.n_cal - 1)).round().long().clamp_(
+                    0, self.n_cal - 1)
+                self.z_sorted = zs.index_select(0, gi).float()
                 _log_zp(
                     "conformal",
                     self.recall_target,

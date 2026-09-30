@@ -29,6 +29,14 @@ from sglang.srt.layers.attention.vestigekv.fused_prologue import (
     fused_prologue_split,
 )
 
+def _derived_width_cls():
+    from sglang.srt.layers.attention.vestigekv.width_control import (
+        DerivedWidthController,
+    )
+
+    return DerivedWidthController
+
+
 def _make_width_controller(P: int, dev):
     """Arm dynamic certificate width only when both knobs are set.
 
@@ -38,14 +46,24 @@ def _make_width_controller(P: int, dev):
     """
     from sglang.srt.environ import envs
 
+    import logging
+
+    from sglang.srt.layers.attention.vestigekv.width_control import (
+        CertWidthController,
+        DerivedWidthController,
+    )
+
+    delta = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_DELTA.get()
+    if delta > 0.0:
+        logging.getLogger(__name__).info(
+            "VKWIDTH derived: delta=%.4g over %d slots (no other constant)",
+            delta, P,
+        )
+        return DerivedWidthController(P, D.N_CAL_MAX, dev, delta=delta)
+
     tau = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_TAU.get()
     if tau < 0.0:
         return None
-    from sglang.srt.layers.attention.vestigekv.width_control import (
-        CertWidthController,
-    )
-
-    import logging
 
     hi = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_HI.get()
     lo = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_LO.get()
@@ -294,6 +312,15 @@ class BatchedScanPack:
         # replaces, not a new one. 4 bytes per slot.
         self._cc_host = torch.zeros(P).pin_memory() if dev != 'cpu' else torch.zeros(P)
         self._width = _make_width_controller(P, dev)
+        # Derived-width staging: the sorted conformal sample per slot, its
+        # true size, and scale/sqrt(kv_lora - r). Only allocated when that
+        # arm is on -- 64 floats a slot is small but not free.
+        self._z_host = self._ncal_host = self._fac_host = self._fac = None
+        if isinstance(self._width, _derived_width_cls()):
+            self._z_host = torch.zeros(P, D.N_CAL_MAX)
+            self._ncal_host = torch.zeros(P)
+            self._fac_host = torch.zeros(P)
+            self._fac = torch.zeros(P, device=dev)
         self._nk_col = torch.arange(NKm, device=dev)
         self.nk_mask = torch.zeros(P, 1, NKm, dtype=torch.bool, device=dev)
         self.scale = tiers[0].scale
@@ -456,6 +483,15 @@ class BatchedScanPack:
         # replaces, not a new one. 4 bytes per slot.
         self._cc_host = torch.zeros(P).pin_memory() if dev != 'cpu' else torch.zeros(P)
         self._width = _make_width_controller(P, dev)
+        # Derived-width staging: the sorted conformal sample per slot, its
+        # true size, and scale/sqrt(kv_lora - r). Only allocated when that
+        # arm is on -- 64 floats a slot is small but not free.
+        self._z_host = self._ncal_host = self._fac_host = self._fac = None
+        if isinstance(self._width, _derived_width_cls()):
+            self._z_host = torch.zeros(P, D.N_CAL_MAX)
+            self._ncal_host = torch.zeros(P)
+            self._fac_host = torch.zeros(P)
+            self._fac = torch.zeros(P, device=dev)
         self._nk_col = torch.arange(NKm, device=dev)
         # all pairs empty -> every kept column masked True from step one
         self.nk_mask = torch.ones(P, 1, NKm, dtype=torch.bool, device=dev)
@@ -623,6 +659,17 @@ class BatchedScanPack:
             # stalls the host -- once per lane per LAYER per step, since
             # update() refreshes the captured graph rather than recapturing.
             self._cc_host[i] = t.zp * t.scale / (D.KV_LORA_RANK - t.r) ** 0.5
+            if self._z_host is not None:
+                self._fac_host[i] = t.scale / (D.KV_LORA_RANK - t.r) ** 0.5
+                if t.z_sorted is None:
+                    # Provisional or parametric build: no order statistic to
+                    # re-read, so every index resolves to the width this
+                    # build chose and the derived arm serves it unchanged.
+                    self._z_host[i].fill_(t.zp)
+                    self._ncal_host[i] = 1.0
+                else:
+                    self._z_host[i].copy_(t.z_sorted, non_blocking=False)
+                    self._ncal_host[i] = float(t.n_cal)
         # Stale slots keep the value they were last given: the loop writes only
         # live ones and a_len masks the kernel off their tails, so _cc_host
         # persists across calls and is copied whole.

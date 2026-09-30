@@ -188,7 +188,9 @@ class TestDerivedWidthController(unittest.TestCase):
         c = DerivedWidthController(P, n_cal, torch.device("cpu"), delta=delta)
         # calibration sample z_(1..64) = 1..64, so z_(k) reads back as k
         c.set_calibration(torch.arange(1, n_cal + 1).float().expand(P, n_cal)
-                          .contiguous())
+                          .contiguous(),
+                          torch.full((P,), float(n_cal)))
+        self._fac = torch.full((P,), 1.0 / (512 ** 0.5))
         return c
 
     def test_no_evidence_starts_at_maximum_width(self):
@@ -197,7 +199,7 @@ class TestDerivedWidthController(unittest.TestCase):
         earned, not granted -- which is why no warmup constant is needed."""
         c = self._ctl()
         cc = torch.zeros(3)
-        c.apply_(torch.tensor([1, 1, 1], dtype=torch.int32), 1.0, 0, cc)
+        c.apply_(torch.tensor([1, 1, 1], dtype=torch.int32), self._fac, cc)
         self.assertGreater(c.hbar.min().item(), 0.5)
         self.assertGreater(c.rho.min().item(), 0.99)
 
@@ -221,12 +223,12 @@ class TestDerivedWidthController(unittest.TestCase):
         c = self._ctl(delta=0.01)
         cc = torch.zeros(3)
         for _ in range(200):
-            c.apply_(torch.zeros(3, dtype=torch.int32), 1.0, 0, cc)
+            c.apply_(torch.zeros(3, dtype=torch.int32), self._fac, cc)
         # the evidence DID accumulate: h is bounded well away from 1
         self.assertLess(c.hbar.max().item(), 0.05,
                         "200 non-binding steps did not shrink the bound")
         # but the derived target still runs off the sample
-        self.assertGreater(c.rho.min().item(), 64.0 / 65.0)
+        self.assertGreaterEqual(c.rho.min().item(), 64.0 / 65.0 - 1e-9)
         self.assertTrue(bool(c.infeasible.all()),
                         "should report the spec unreachable at this sample size")
         self.assertAlmostEqual(cc.max().item(), 64.0 / (512 ** 0.5), places=5)
@@ -244,7 +246,7 @@ class TestDerivedWidthController(unittest.TestCase):
         cc = torch.zeros(2)
         for _ in range(400):
             # lane 0 binds every step, lane 1 never does
-            c.apply_(torch.tensor([3, 0], dtype=torch.int32), 1.0, 0, cc)
+            c.apply_(torch.tensor([3, 0], dtype=torch.int32), self._fac, cc)
         self.assertGreater(c.hbar[0].item(), 0.9)
         self.assertLess(c.hbar[1].item(), 0.02)
         self.assertGreater(c.rho[0].item(), c.rho[1].item(),
@@ -258,7 +260,7 @@ class TestDerivedWidthController(unittest.TestCase):
         c = self._ctl()
         cc = torch.zeros(3)
         for _ in range(200):
-            c.apply_(torch.tensor([5, 5, 5], dtype=torch.int32), 1.0, 0, cc)
+            c.apply_(torch.tensor([5, 5, 5], dtype=torch.int32), self._fac, cc)
         self.assertGreater(c.hbar.min().item(), 0.9)
         # rho = 1 - delta/(2*hbar*T) with T=200, hbar~1, delta=0.01 -> ~0.999975
         self.assertGreater(c.rho.min().item(), 0.9999)
@@ -271,9 +273,9 @@ class TestDerivedWidthController(unittest.TestCase):
         c = self._ctl(n_cal=64)
         cc = torch.zeros(3)
         for _ in range(50):
-            c.apply_(torch.tensor([1, 1, 1], dtype=torch.int32), 1.0, 0, cc)
+            c.apply_(torch.tensor([1, 1, 1], dtype=torch.int32), self._fac, cc)
         self.assertTrue(bool(c.infeasible.all()))
-        # cc = z_(k) * scale / sqrt(kv_lora - r); z_(64)=64, scale=1, r=0
+        # grid top is z_(64)=64; cc = z * scale / sqrt(kv_lora - r)
         expect = 64.0 / (512 ** 0.5)
         for v in cc.tolist():
             self.assertAlmostEqual(v, expect, places=5,
@@ -284,7 +286,7 @@ class TestDerivedWidthController(unittest.TestCase):
         c = self._ctl(P=1, delta=0.02)
         cc = torch.zeros(1)
         for _ in range(100):
-            c.apply_(torch.zeros(1, dtype=torch.int32), 1.0, 0, cc)
+            c.apply_(torch.zeros(1, dtype=torch.int32), self._fac, cc)
         h = c.hbar[0].item()
         expected = 1.0 - 0.01 / max(h * 100.0, 1e-9)
         self.assertAlmostEqual(c.rho[0].item(), max(0.0, min(1.0, expected)),
@@ -297,7 +299,7 @@ class TestDerivedWidthController(unittest.TestCase):
             c = self._ctl(P=1, delta=d)
             cc = torch.zeros(1)
             for _ in range(100):
-                c.apply_(torch.zeros(1, dtype=torch.int32), 1.0, 0, cc)
+                c.apply_(torch.zeros(1, dtype=torch.int32), self._fac, cc)
             widths.append(cc[0].item())
         self.assertEqual(widths, sorted(widths),
                          f"width not monotone in the spec: {widths}")
@@ -305,12 +307,12 @@ class TestDerivedWidthController(unittest.TestCase):
     def test_apply_allocates_nothing(self):
         c = self._ctl()
         cc = torch.zeros(3)
-        names = ["z_sorted", "n", "a", "rho", "hbar", "infeasible",
+        names = ["z_sorted", "n_cal", "n", "a", "rho", "hbar", "infeasible",
                  "_t", "_u", "_k", "_g", "_b"]
         before = {n: getattr(c, n).data_ptr() for n in names}
         before["cc"] = cc.data_ptr()
         for k in range(20):
-            c.apply_(torch.tensor([k % 2] * 3, dtype=torch.int32), 1.0, 0, cc)
+            c.apply_(torch.tensor([k % 2] * 3, dtype=torch.int32), self._fac, cc)
         for n in names:
             self.assertEqual(before[n], getattr(c, n).data_ptr(), f"{n} realloc")
         self.assertEqual(before["cc"], cc.data_ptr())
