@@ -140,6 +140,20 @@ class CertWidthController:
             self.seen.index_fill_(0, lanes, 0.0)
             self.latched.index_fill_(0, lanes, False)
 
+    def write_cc(self, *, fired, cc_host, a_len, cc_out, **_ignored):
+        """Single entry point the pack calls on whichever controller it holds.
+
+        The pack used to branch on which controller was installed and pick the
+        matching call; one of those branches went missing in an edit and the
+        arm died at serve time with an AttributeError, after the unit tests --
+        which exercise the controllers directly -- all passed. One name that
+        every controller answers to removes the branch and the bug class with
+        it. Extra keywords are accepted and ignored so the pack can pass
+        everything either controller might want without knowing which it has.
+        """
+        self.set_base(cc_host)
+        self.apply_(fired, a_len, cc_out)
+
     @torch.inference_mode()
     def apply_(self, fired: torch.Tensor, a_len: torch.Tensor,
                cc_out: torch.Tensor) -> None:
@@ -314,6 +328,12 @@ class DerivedWidthController:
             self.a.index_fill_(0, lanes, 0.0)
             self.hbar.index_fill_(0, lanes, 1.0)
             self.infeasible.index_fill_(0, lanes, False)
+
+    def write_cc(self, *, fired, z, n_cal, fac_host, fac, cc_out, **_ignored):
+        """See CertWidthController.write_cc: one name, no dispatch in the pack."""
+        fac.copy_(fac_host, non_blocking=True)
+        self.set_calibration(z, n_cal)
+        self.apply_(fired, fac, cc_out)
 
     @torch.inference_mode()
     def apply_(self, fired: torch.Tensor, cc_factor: torch.Tensor,

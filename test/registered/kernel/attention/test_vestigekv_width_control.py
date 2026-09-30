@@ -316,3 +316,59 @@ class TestDerivedWidthController(unittest.TestCase):
         for n in names:
             self.assertEqual(before[n], getattr(c, n).data_ptr(), f"{n} realloc")
         self.assertEqual(before["cc"], cc.data_ptr())
+
+
+class TestBothControllersAnswerOneEntryPoint(unittest.TestCase):
+    """The pack calls write_cc and nothing else.
+
+    It used to branch on which controller was installed; an edit dropped one
+    branch and the derived arm died at serve time with an AttributeError, after
+    every unit test passed -- because the unit tests drive the controllers
+    directly and never exercised the pack's dispatch. This pins the property
+    that made the branch unnecessary.
+    """
+
+    def _kwargs(self, P, cc_out):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        return dict(
+            fired=torch.zeros(P, dtype=torch.int32),
+            cc_host=torch.full((P,), 0.5),
+            a_len=torch.full((P,), 100.0),
+            z=torch.arange(1, D.N_CAL_MAX + 1).float().expand(
+                P, D.N_CAL_MAX).contiguous(),
+            n_cal=torch.full((P,), float(D.N_CAL_MAX)),
+            fac_host=torch.full((P,), 1.0 / (512 ** 0.5)),
+            fac=torch.zeros(P),
+            cc_out=cc_out,
+        )
+
+    def test_every_controller_accepts_the_same_call(self):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.width_control import (
+            CertWidthController,
+            DerivedWidthController,
+        )
+        P = 3
+        made = [
+            CertWidthController(P, torch.device("cpu"), tau=0.5, warmup=2),
+            DerivedWidthController(P, D.N_CAL_MAX, torch.device("cpu"),
+                                   delta=0.05),
+        ]
+        for c in made:
+            cc = torch.zeros(P)
+            kw = self._kwargs(P, cc)
+            for _ in range(4):
+                c.write_cc(**kw)
+            self.assertTrue(torch.isfinite(cc).all(),
+                            f"{type(c).__name__} wrote non-finite cc: {cc}")
+
+    def test_the_pack_calls_write_cc_and_no_variant_of_it(self):
+        """A second entry point is how the dispatch crept back in last time."""
+        import pathlib
+        src = pathlib.Path(
+            "python/sglang/srt/layers/attention/vestigekv/batched_step.py"
+        ).read_text()
+        self.assertIn("self._width.write_cc(", src)
+        for gone in ("self._width.set_base(", "self._width.apply_(",
+                     "self._width.set_calibration("):
+            self.assertNotIn(gone, src, f"pack still calls {gone} directly")

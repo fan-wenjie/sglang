@@ -676,12 +676,17 @@ class BatchedScanPack:
         if self._width is None:
             self.cc.copy_(self._cc_host, non_blocking=True)
         else:
-            # c_total holds the PREVIOUS step's fired counts, because update()
-            # runs before the scan. The staleness is the design: the label is
-            # autocorrelated across adjacent steps in a layer (phi +0.46 served,
-            # +0.56 branch) and acting one step late costs 0.039 of AUC.
-            self._width.set_base(self._cc_host)
-            self._width.apply_(self._fired_prev(), self.a_len, self.cc)
+            # One call, whichever controller is installed: it takes what it
+            # needs by keyword and ignores the rest. c_total holds the PREVIOUS
+            # step's fired counts because update() runs before the scan, and
+            # that staleness is the design -- the label is autocorrelated across
+            # adjacent steps in a layer (phi +0.46 served, +0.56 branch), so
+            # acting one step late costs 0.039 of AUC.
+            self._width.write_cc(
+                fired=self._fired_prev(), cc_host=self._cc_host,
+                a_len=self.a_len, z=self._z_host, n_cal=self._ncal_host,
+                fac_host=self._fac_host, fac=self._fac, cc_out=self.cc,
+            )
         if self.csk is None:
             # Hold the caches alive: cbase is a raw address, and a tier going
             # out of scope would free the memory the graph still points at.
