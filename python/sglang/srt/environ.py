@@ -669,6 +669,13 @@ class Envs:
     # and rounds only the query. The label picks which row the conformal fit
     # calls the truth, so this is measured, not adopted.
     SGLANG_DEBUG_VESTIGEKV_CAL_DTYPE = EnvStr("")
+    # Ablation, and the only knob here that may be NEGATIVE: an additive shift
+    # on the scan threshold. Positive widens admission as --vestigekv-recall-
+    # margin does; negative RAISES the threshold above max1, which drops rows
+    # the certificate says might win -- it buys a lower fallback rate with
+    # recall below the fitted target. The CLI flag stays non-negative because
+    # its guard catches typos; this is deliberate and says so.
+    SGLANG_DEBUG_VESTIGEKV_MARGIN_DELTA = EnvFloat(0.0)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register

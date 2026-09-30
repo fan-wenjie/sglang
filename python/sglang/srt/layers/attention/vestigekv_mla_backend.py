@@ -285,6 +285,20 @@ class VestigeKVMLABackend(AttentionBackend):
         # Its OWN directory: sharing SGLANG_DEBUG_VESTIGEKV_DUMP_DIR also turns
         # on the calibration dump, which wrote 9.9 GB of 72 MB snapshots beside
         # 1.1 MB of records and took the disk to 92%.
+        # Resolved once: config is frozen for this object's life, and the
+        # delta may be negative where recall_margin may not.
+        self._margin_eff = float(
+            self.config.recall_margin
+            + envs.SGLANG_DEBUG_VESTIGEKV_MARGIN_DELTA.get()
+        )
+        if self._margin_eff != self.config.recall_margin:
+            logger.info(
+                "VestigeKV margin %.4f = recall_margin %.4f + delta %.4f%s",
+                self._margin_eff, self.config.recall_margin,
+                envs.SGLANG_DEBUG_VESTIGEKV_MARGIN_DELTA.get(),
+                "  (NEGATIVE: recall below the fitted target)"
+                if self._margin_eff < self.config.recall_margin else "",
+            )
         self._stepdump = envs.SGLANG_DEBUG_VESTIGEKV_STEPDUMP.get()
         # Control for the fence: fence a random fraction of lanes at the same
         # cost, so the gain can be attributed to the SELECTION or to the mere
@@ -739,7 +753,7 @@ class VestigeKVMLABackend(AttentionBackend):
             self._fetch_ovf_stack,
             self._ovf_count_stack,
             self._q_heads,
-            margin=self.config.recall_margin,
+            margin=self._margin_eff,
             ent_gain=self.config.entropy_margin_gain,
             fence_rows=self.config.multikey_fence_rows,
             rand_coins=self._rand_coins,
@@ -1916,7 +1930,7 @@ class VestigeKVMLABackend(AttentionBackend):
             # numbers. Unlike the pool, that cache is reallocated at every
             # block close, which update() handles by refreshing the address.
             csk_from_tier=True,
-            margin=self.config.recall_margin,
+            margin=self._margin_eff,
             ent_gain=self.config.entropy_margin_gain,
             fence_rows=self.config.multikey_fence_rows,
             rand_coins=self._rand_coins,
@@ -2485,7 +2499,7 @@ class VestigeKVMLABackend(AttentionBackend):
                     )
                     tier = tier_cls(
                         r=self.index_rank,
-                        margin=self.config.recall_margin,
+                        margin=self._margin_eff,
                         ent_gain=self.config.entropy_margin_gain,
                         fence_rows=self.config.multikey_fence_rows,
                         threshold=self.config.recall_threshold,
@@ -2738,7 +2752,7 @@ class VestigeKVMLABackend(AttentionBackend):
             q_pos = torch.tensor(st["qpos"], device=row_slots.device, dtype=torch.long)
         tier = tier_cls(
             r=self.index_rank,
-            margin=self.config.recall_margin,
+            margin=self._margin_eff,
             ent_gain=self.config.entropy_margin_gain,
             fence_rows=self.config.multikey_fence_rows,
             threshold=self.config.recall_threshold,
