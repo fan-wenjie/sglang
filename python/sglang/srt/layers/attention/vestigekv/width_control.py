@@ -79,6 +79,8 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.layers.attention.vestigekv import defaults as D
+
 
 class CertWidthController:
     """One-way width escalation per pack slot, driven on device.
@@ -198,3 +200,197 @@ def needs_mass_accumulator() -> str:
     ones whose feature never fires).
     """
     return "scan must store sum(exp(b_u - max1)) over non-fired rows"
+
+
+class DerivedWidthController:
+    r"""Per-layer certificate width with NO tuned constant but the spec itself.
+
+    CertWidthController above works, but it buys adaptivity with four new
+    constants -- tau, gain_hi, gain_lo, warmup -- which is a bad trade: a method
+    that needs four numbers chosen by hand is not obviously better than one
+    number chosen by hand. This class removes all four by deriving the width
+    instead of scaling it.
+
+    The chain is short because the pieces already exist.
+
+    1. zp is ALREADY a pure function of one target. build() computes
+       zp = z_(k) with k = ceil((n_cal+1) * rho), the conformal order statistic
+       of the calibration sample. Nothing is tuned there; rho is the whole
+       input. So the right thing to adapt is rho, not a multiplier on cc -- a
+       gain on cc moves the width off the order statistic and forfeits the
+       distribution-free guarantee that made it meaningful.
+
+    2. rho follows from the conjunction, not from taste. An answer is a
+       conjunction over the steps that read the archive, and the paper's own
+       arithmetic is that a 0.929 per-step recall is 6.4e-20 over 600 steps. So
+       fix a SPEC: the whole generation should fail with probability at most
+       delta. Only the steps where the archive holds the winner can fail; if
+       that happens at rate h, there are about h*T of them, and a union bound
+       gives
+
+           h * T * (1 - rho)  <=  delta      =>      rho >= 1 - delta/(h*T)
+
+       which is the per-layer target. A layer whose archive never binds has
+       h -> 0 and no constraint, so it narrows. A layer that binds every step
+       gets rho = 1 - delta/T and stays wide. Continuous in h, so the tau
+       THRESHOLD disappears, and gain_hi/gain_lo disappear with it because the
+       width is now read off the order statistic rather than scaled.
+
+    3. h is measured, and measured in the safe direction. A row fires exactly
+       when its certified bound beats the threshold, so "at least one row
+       fired" is implied by "an archived row truly beat the kept max" at the
+       certificate's own confidence. Counting steps with |F| > 0 therefore
+       OVER-estimates h, which over-tightens rho, which widens. Wrong in the
+       direction that costs work rather than answers.
+
+    4. warmup disappears because the estimate carries its own uncertainty. Take
+       the Wilson upper bound on h rather than the sample rate: with no
+       evidence it is 1, so the layer starts at maximum width and NARROWS as it
+       earns the right to. There is no window to choose and no moment at which
+       a decision is taken -- the width simply tracks the evidence.
+
+    What remains is delta, and delta is a specification rather than a knob: it
+    is the answer-level failure rate the deployment will accept. Z_MAX stops
+    being a constant to pick as well, and becomes a diagnostic: if the required
+    k exceeds n_cal, the calibration sample CANNOT certify the spec for that
+    layer, and the honest response is to serve the sample maximum and say so,
+    not to silently clamp.
+
+    Not removed, and worth naming: T. Here it is the number of decode steps
+    taken so far, so the bound covers the prefix generated so far and tightens
+    as the answer lengthens. Using a planned max_new_tokens instead would make
+    it a fixed budget spent up front. That is a modelling choice, not a tuned
+    value, but it is a choice.
+    """
+
+    def __init__(self, P: int, n_cal: int, device, delta: float = 0.01):
+        # The only number, and it is the spec: acceptable probability that the
+        # generated answer is wrong BECAUSE a needed archived row was missed.
+        # Split once, half to the certificate's per-step miss and half to the
+        # uncertainty in h, so a single delta covers both.
+        self.delta = float(delta)
+        self.n_cal = int(n_cal)
+        # z for the Wilson bound at 1 - delta/2, computed once on the host.
+        self.zc = _normal_quantile(1.0 - 0.5 * self.delta)
+        self.z_sorted = torch.zeros(P, n_cal, device=device)
+        self.n = torch.zeros(P, device=device)      # steps observed
+        self.a = torch.zeros(P, device=device)      # steps with |F| > 0
+        self.rho = torch.zeros(P, device=device)    # derived target, for logs
+        self.hbar = torch.ones(P, device=device)    # Wilson upper bound on h
+        self.infeasible = torch.zeros(P, device=device, dtype=torch.bool)
+        self._t = torch.zeros(P, device=device)
+        self._u = torch.zeros(P, device=device)
+        self._k = torch.zeros(P, 1, device=device, dtype=torch.int64)
+        self._g = torch.zeros(P, 1, device=device)
+        self._b = torch.zeros(P, device=device, dtype=torch.bool)
+
+    def set_calibration(self, z_sorted: torch.Tensor) -> None:
+        """Adopt the build's SORTED calibration sample, [P, n_cal].
+
+        Kept because the order statistic has to be re-read at a new target, and
+        re-deriving it needs the sample, not just the one quantile build chose.
+        64 floats per slot.
+        """
+        self.z_sorted.copy_(z_sorted, non_blocking=True)
+
+    def reset(self, lanes: torch.Tensor | None = None) -> None:
+        if lanes is None:
+            self.n.zero_()
+            self.a.zero_()
+            self.hbar.fill_(1.0)
+            self.infeasible.fill_(False)
+        else:
+            self.n.index_fill_(0, lanes, 0.0)
+            self.a.index_fill_(0, lanes, 0.0)
+            self.hbar.index_fill_(0, lanes, 1.0)
+            self.infeasible.index_fill_(0, lanes, False)
+
+    @torch.inference_mode()
+    def apply_(self, fired: torch.Tensor, scale: float, r: int,
+               cc_out: torch.Tensor) -> None:
+        """Width for the next step, derived. In place; allocates nothing."""
+        # a += [ |F| > 0 ]; n += 1
+        torch.gt(fired, 0, out=self._b)
+        self._t.copy_(self._b)
+        self.a.add_(self._t)
+        self.n.add_(1.0)
+
+        # Wilson upper bound on h at 1 - delta/2. n = 0 leaves hbar at 1.
+        z2 = self.zc * self.zc
+        self._t.copy_(self.a)                      # a
+        self._u.copy_(self.n)
+        self._u.sub_(self.a)                       # n - a
+        self._t.mul_(self._u)
+        self._t.div_(self.n.clamp_min(1.0))        # a(n-a)/n
+        self._t.add_(0.25 * z2)
+        self._t.sqrt_()
+        self._t.mul_(self.zc)
+        self._t.add_(self.a)
+        self._t.add_(0.5 * z2)
+        self._u.copy_(self.n)
+        self._u.add_(z2)
+        self._t.div_(self._u)
+        self._t.clamp_(0.0, 1.0)
+        # keep hbar = 1 until a step has been seen
+        torch.gt(self.n, 0.0, out=self._b)
+        self._u.copy_(self._b)
+        self._t.mul_(self._u)
+        self._u.mul_(-1.0)
+        self._u.add_(1.0)
+        self._t.add_(self._u)
+        self.hbar.copy_(self._t)
+
+        # rho = 1 - delta / (2 * hbar * T), T = steps so far
+        self._t.copy_(self.hbar)
+        self._t.mul_(self.n)
+        self._t.clamp_min_(1e-9)
+        self._u.fill_(0.5 * self.delta)
+        self._u.div_(self._t)
+        self._u.mul_(-1.0)
+        self._u.add_(1.0)
+        self._u.clamp_(0.0, 1.0)
+        self.rho.copy_(self._u)
+
+        # k = ceil((n_cal + 1) * rho); infeasible when it runs off the sample
+        self._u.mul_(self.n_cal + 1)
+        self._u.ceil_()
+        torch.gt(self._u, float(self.n_cal), out=self.infeasible)
+        self._u.clamp_(1.0, float(self.n_cal))
+        self._k.copy_(self._u.unsqueeze(1).to(torch.int64))
+        self._k.sub_(1)
+
+        # zp = z_(k); cc = zp * scale / sqrt(kv_lora - r)
+        torch.gather(self.z_sorted, 1, self._k, out=self._g)
+        cc_out.copy_(self._g.squeeze(1))
+        cc_out.mul_(scale / (D.KV_LORA_RANK - r) ** 0.5)
+
+
+def _normal_quantile(p: float) -> float:
+    """Inverse standard normal, Acklam's rational approximation.
+
+    Inlined rather than pulled from scipy: this runs once per process on a
+    scalar, and the engine does not depend on scipy.
+    """
+    import math
+
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    pl, ph = 0.02425, 1 - 0.02425
+    if p < pl:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p > ph:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = p - 0.5
+    rr = q * q
+    return (((((a[0]*rr+a[1])*rr+a[2])*rr+a[3])*rr+a[4])*rr+a[5])*q / \
+           (((((b[0]*rr+b[1])*rr+b[2])*rr+b[3])*rr+b[4])*rr+1)

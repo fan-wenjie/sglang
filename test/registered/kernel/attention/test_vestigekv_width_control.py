@@ -171,3 +171,146 @@ class TestArmedControllerIsBitIdenticalWhenNeutral(unittest.TestCase):
                      torch.full((P,), 100.0), cc)
         self.assertTrue(torch.equal(cc, base * c.gain), (cc, base * c.gain))
         self.assertEqual(c.gain.tolist(), [2.0] * 3 + [0.5] * 4)
+
+
+class TestDerivedWidthController(unittest.TestCase):
+    """Width with no tuned constant but the spec.
+
+    The claim being pinned is that rho is DERIVED -- from delta, the measured
+    binding rate h, and the conjunction length -- so these check the arithmetic
+    against hand-computed values rather than just checking it moves.
+    """
+
+    def _ctl(self, P=3, n_cal=64, delta=0.01):
+        from sglang.srt.layers.attention.vestigekv.width_control import (
+            DerivedWidthController,
+        )
+        c = DerivedWidthController(P, n_cal, torch.device("cpu"), delta=delta)
+        # calibration sample z_(1..64) = 1..64, so z_(k) reads back as k
+        c.set_calibration(torch.arange(1, n_cal + 1).float().expand(P, n_cal)
+                          .contiguous())
+        return c
+
+    def test_no_evidence_starts_at_maximum_width(self):
+        """With nothing observed the Wilson bound is ~1, so the layer assumes
+        the archive binds every step and serves the widest certificate. Width is
+        earned, not granted -- which is why no warmup constant is needed."""
+        c = self._ctl()
+        cc = torch.zeros(3)
+        c.apply_(torch.tensor([1, 1, 1], dtype=torch.int32), 1.0, 0, cc)
+        self.assertGreater(c.hbar.min().item(), 0.5)
+        self.assertGreater(c.rho.min().item(), 0.99)
+
+    def test_the_64_sample_cannot_express_an_answer_level_target(self):
+        """Deriving rho from a spec exposes a hard limit of the calibration.
+
+        A conformal order statistic over n_cal samples can only express targets
+        up to n_cal/(n_cal+1) = 64/65 = 0.9846. But an ANSWER-level spec over a
+        few hundred steps needs per-step recall far tighter than that: 200 steps
+        at h=0.03 is about 6 binding steps, and delta=0.01 over them is
+        rho = 1 - 0.005/6.4 = 0.99922, which needs k = 65 on a 64-sample.
+
+        So the target is not reachable and the layer correctly reports
+        infeasible and serves the sample maximum. This is the quantitative form
+        of the per-step-versus-conjunction problem: 0.93 per step is 6e-20 over
+        600, and a 64-sample quantile tops out three orders of magnitude short of
+        what the conjunction demands. Going further needs the PARAMETRIC fit,
+        which is the one thing an order statistic cannot do -- it cannot exceed
+        its own sample maximum.
+        """
+        c = self._ctl(delta=0.01)
+        cc = torch.zeros(3)
+        for _ in range(200):
+            c.apply_(torch.zeros(3, dtype=torch.int32), 1.0, 0, cc)
+        # the evidence DID accumulate: h is bounded well away from 1
+        self.assertLess(c.hbar.max().item(), 0.05,
+                        "200 non-binding steps did not shrink the bound")
+        # but the derived target still runs off the sample
+        self.assertGreater(c.rho.min().item(), 64.0 / 65.0)
+        self.assertTrue(bool(c.infeasible.all()),
+                        "should report the spec unreachable at this sample size")
+        self.assertAlmostEqual(cc.max().item(), 64.0 / (512 ** 0.5), places=5)
+
+    def test_the_saving_is_across_layers_at_equal_T_not_over_time(self):
+        """A never-binding layer gets a looser target than an always-binding one.
+
+        Not a narrowing over TIME: rho = 1 - delta/(2*hbar*T) and hbar*T is the
+        expected number of binding steps, which only grows as the answer
+        lengthens -- correctly, because the conjunction it has to survive is
+        getting longer. What the derivation buys is the gap BETWEEN layers at
+        the same T, and that gap is the whole saving.
+        """
+        c = self._ctl(P=2, delta=0.5)
+        cc = torch.zeros(2)
+        for _ in range(400):
+            # lane 0 binds every step, lane 1 never does
+            c.apply_(torch.tensor([3, 0], dtype=torch.int32), 1.0, 0, cc)
+        self.assertGreater(c.hbar[0].item(), 0.9)
+        self.assertLess(c.hbar[1].item(), 0.02)
+        self.assertGreater(c.rho[0].item(), c.rho[1].item(),
+                           "binding layer should demand the tighter target")
+        self.assertGreater(cc[0].item(), cc[1].item(),
+                           "binding layer should serve the wider certificate")
+        self.assertTrue(bool(c.infeasible[0]), "always-binding must be infeasible")
+        self.assertFalse(bool(c.infeasible[1]), "never-binding should be reachable")
+
+    def test_a_layer_that_always_fires_stays_wide(self):
+        c = self._ctl()
+        cc = torch.zeros(3)
+        for _ in range(200):
+            c.apply_(torch.tensor([5, 5, 5], dtype=torch.int32), 1.0, 0, cc)
+        self.assertGreater(c.hbar.min().item(), 0.9)
+        # rho = 1 - delta/(2*hbar*T) with T=200, hbar~1, delta=0.01 -> ~0.999975
+        self.assertGreater(c.rho.min().item(), 0.9999)
+        self.assertTrue(bool(c.infeasible.all()),
+                        "k should run off a 64-sample at rho > 1 - 1/65")
+
+    def test_infeasible_is_flagged_not_silently_clamped(self):
+        """When the sample cannot certify the spec the layer says so and serves
+        the sample maximum. That replaces Z_MAX-as-a-constant with a diagnostic."""
+        c = self._ctl(n_cal=64)
+        cc = torch.zeros(3)
+        for _ in range(50):
+            c.apply_(torch.tensor([1, 1, 1], dtype=torch.int32), 1.0, 0, cc)
+        self.assertTrue(bool(c.infeasible.all()))
+        # cc = z_(k) * scale / sqrt(kv_lora - r); z_(64)=64, scale=1, r=0
+        expect = 64.0 / (512 ** 0.5)
+        for v in cc.tolist():
+            self.assertAlmostEqual(v, expect, places=5,
+                                   msg="not serving the sample max")
+
+    def test_rho_matches_the_union_bound_by_hand(self):
+        """rho = 1 - delta/(2*hbar*T), checked against a hand computation."""
+        c = self._ctl(P=1, delta=0.02)
+        cc = torch.zeros(1)
+        for _ in range(100):
+            c.apply_(torch.zeros(1, dtype=torch.int32), 1.0, 0, cc)
+        h = c.hbar[0].item()
+        expected = 1.0 - 0.01 / max(h * 100.0, 1e-9)
+        self.assertAlmostEqual(c.rho[0].item(), max(0.0, min(1.0, expected)),
+                               places=6)
+
+    def test_delta_is_the_only_knob_that_moves_width(self):
+        """Tightening the spec must widen the certificate, monotonically."""
+        widths = []
+        for d in (0.2, 0.05, 0.01):
+            c = self._ctl(P=1, delta=d)
+            cc = torch.zeros(1)
+            for _ in range(100):
+                c.apply_(torch.zeros(1, dtype=torch.int32), 1.0, 0, cc)
+            widths.append(cc[0].item())
+        self.assertEqual(widths, sorted(widths),
+                         f"width not monotone in the spec: {widths}")
+
+    def test_apply_allocates_nothing(self):
+        c = self._ctl()
+        cc = torch.zeros(3)
+        names = ["z_sorted", "n", "a", "rho", "hbar", "infeasible",
+                 "_t", "_u", "_k", "_g", "_b"]
+        before = {n: getattr(c, n).data_ptr() for n in names}
+        before["cc"] = cc.data_ptr()
+        for k in range(20):
+            c.apply_(torch.tensor([k % 2] * 3, dtype=torch.int32), 1.0, 0, cc)
+        for n in names:
+            self.assertEqual(before[n], getattr(c, n).data_ptr(), f"{n} realloc")
+        self.assertEqual(before["cc"], cc.data_ptr())
