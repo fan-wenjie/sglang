@@ -709,6 +709,14 @@ class Envs:
     # n_cal/(n_cal+1) = 64/65, and the arm reports `infeasible` rather than
     # pretending otherwise.
     SGLANG_DEBUG_VESTIGEKV_WIDTH_DELTA = EnvFloat(-1.0)
+    # Geometry arm, and the one the measurements favour: threshold qperp_rel =
+    # ||q_res||/||q_c|| at each layer's OWN running quantile at this level, and
+    # scale cc by GAIN_HI above it and GAIN_LO below. Against the right label
+    # (the top-1 row actually lost) it separates at AUC 0.82-0.92 per layer, and
+    # at level 0.70 catches 91.5% of losses while widening 21.5% of steps. -1
+    # off; both gains 1.0 is an exact no-op. Per layer is essential -- pooled it
+    # reads 0.740 because the quantity's per-layer offset spans 0.339 to 0.698.
+    SGLANG_DEBUG_VESTIGEKV_WIDTH_QLEVEL = EnvFloat(-1.0)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register

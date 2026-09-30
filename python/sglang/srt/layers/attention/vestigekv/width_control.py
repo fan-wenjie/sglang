@@ -82,7 +82,26 @@ import torch
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
 
-class CertWidthController:
+class _WidthController:
+    """Two hooks, both no-ops by default, so the pack never dispatches.
+
+    A controller acts at one of two moments and they are not interchangeable:
+    `write_cc` runs in update(), before the prologue, where only the previous
+    step's outcome is known; `after_prologue` runs between the prologue and the
+    scan, where this step's query geometry is available. Defaulting both to
+    no-ops lets the pack call both unconditionally -- the alternative is an
+    if-chain on the controller type, which is exactly what silently lost a
+    branch once already.
+    """
+
+    def write_cc(self, **_kw):
+        return
+
+    def after_prologue(self, **_kw):
+        return
+
+
+class CertWidthController(_WidthController):
     """One-way width escalation per pack slot, driven on device.
 
     Owns `base` (the width the build fitted) and `gain` (>= 1, monotone within
@@ -216,7 +235,7 @@ def needs_mass_accumulator() -> str:
     return "scan must store sum(exp(b_u - max1)) over non-fired rows"
 
 
-class DerivedWidthController:
+class DerivedWidthController(_WidthController):
     r"""Per-layer certificate width with NO tuned constant but the spec itself.
 
     CertWidthController above works, but it buys adaptivity with four new
@@ -443,7 +462,7 @@ def _normal_quantile(p: float) -> float:
            (((((b[0]*rr+b[1])*rr+b[2])*rr+b[3])*rr+b[4])*rr+1)
 
 
-class GeometryWidthController:
+class GeometryWidthController(_WidthController):
     r"""Width from the query's own geometry, decided before the scan.
 
     Scored against the right label -- the top-1 row actually LOST, not the
@@ -520,19 +539,17 @@ class GeometryWidthController:
             self.seen.index_fill_(0, lanes, 0.0)
 
     @torch.inference_mode()
-    def write_cc(self, *, qres, qc_norm, cc_base, cc_out, **_ignored):
+    def after_prologue(self, *, qrel, cc_base, cc_out, **_ignored):
         """Set this step's width from this step's query geometry, in place.
 
-        qres [P, H] and qc_norm [P, H] come from the prologue, which has already
-        run; cc_base [P] is the width the build fitted. Nothing here reads a
-        device value back to the host and nothing allocates.
+        qrel [P, H] is qperp_rel, emitted by the fused prologue that has just
+        run (WRITE_REL); cc_base [P] is the width the build fitted. Nothing here
+        reads a device value back to the host and nothing allocates.
         """
         # One number per slot: the median over heads, matching how the
         # separation above was measured. A max would track the worst head and
         # is a different quantity that has not been scored.
-        self._hb.copy_(qc_norm)
-        self._hb.clamp_min_(1e-9)
-        torch.div(qres, self._hb, out=self._hb)
+        self._hb.copy_(qrel)
         self.rel.copy_(self._hb.median(dim=1).values)
 
         # Widen where this step sits in the layer's own upper tail. Until a

@@ -308,6 +308,7 @@ def _prologue_merge_kernel(
     qside_t_ptr,
     qsk_t_ptr,
     qres_ptr,
+    qrel_ptr,  # [P, H] fp32 out, WRITE_REL only: ||q_res|| / ||q_c||
     NSPLIT: tl.constexpr,
     H: tl.constexpr,
     R: tl.constexpr,
@@ -315,6 +316,7 @@ def _prologue_merge_kernel(
     DD: tl.constexpr,
     BLOCK_D: tl.constexpr,
     THR_LSE: tl.constexpr = False,  # margin from the kept log-sum-exp, not the max
+    WRITE_REL: tl.constexpr = False,  # also emit qperp_rel; see width_control
 ):
     p = tl.program_id(0)
     if tl.load(a_len_ptr + p) == 0:
@@ -334,10 +336,16 @@ def _prologue_merge_kernel(
         vc = tl.load(v_ptr + p * R * KV + r[:, None] * KV + d[None, :])
         qsk += tl.dot(qc, tl.trans(vc), input_precision="ieee")
         qnorm2 += tl.sum(qc * qc, 1)
-    tl.store(
-        qres_ptr + p * H + h,
-        tl.sqrt(tl.maximum(qnorm2 - tl.sum(qsk * qsk, 1), 0.0)),
-    )
+    qres_v = tl.sqrt(tl.maximum(qnorm2 - tl.sum(qsk * qsk, 1), 0.0))
+    tl.store(qres_ptr + p * H + h, qres_v)
+    if WRITE_REL:
+        # qperp_rel = ||q_res|| / ||q_c||, the per-layer width signal. Both
+        # norms are already in registers here, so storing the RATIO rather than
+        # qnorm keeps the addition to one rsqrt and one store, and leaves the
+        # consumer no division to do. Gated as a constexpr so the default build
+        # specialises without it.
+        tl.store(qrel_ptr + p * H + h,
+                 qres_v * tl.rsqrt(tl.maximum(qnorm2, 1e-18)))
     dd = tl.arange(0, DD)
     qside = tl.load(qb + h[:, None] * 576 + (KV + dd)[None, :]).to(tl.float32)
     tl.store(
@@ -490,6 +498,7 @@ def fused_prologue_split(
     nkm=None,
     row=None,
     pool_rows=None,
+    qrel=None,  # [P, H] fp32; when given the kernel also emits qperp_rel
     mode=None,
     margin=0.0,
     ent_gain=0.0,
@@ -575,6 +584,7 @@ def fused_prologue_split(
         qside_t,
         qsk_t,
         qres,
+        qrel if qrel is not None else qres,
         NSPLIT=_NSPLIT,
         H=H,
         R=R,
@@ -582,6 +592,7 @@ def fused_prologue_split(
         DD=D.SIDECAR_DIM,
         BLOCK_D=D.d_block_for_rank(R),
         THR_LSE=bool(thr_lse),
+        WRITE_REL=qrel is not None,
         num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
