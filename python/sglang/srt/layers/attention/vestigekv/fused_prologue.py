@@ -309,6 +309,8 @@ def _prologue_merge_kernel(
     qsk_t_ptr,
     qres_ptr,
     qrel_ptr,  # [P, H] fp32 out, WRITE_REL only: ||q_res|| / ||q_c||
+    relthr_ptr,  # [P] fp32, MARGIN_SEL only: this slot's qperp_rel threshold
+    margin_hi,  # margin used where qperp_rel is above that threshold
     NSPLIT: tl.constexpr,
     H: tl.constexpr,
     R: tl.constexpr,
@@ -317,6 +319,7 @@ def _prologue_merge_kernel(
     BLOCK_D: tl.constexpr,
     THR_LSE: tl.constexpr = False,  # margin from the kept log-sum-exp, not the max
     WRITE_REL: tl.constexpr = False,  # also emit qperp_rel; see width_control
+    MARGIN_SEL: tl.constexpr = False,  # pick margin per head from qperp_rel
 ):
     p = tl.program_id(0)
     if tl.load(a_len_ptr + p) == 0:
@@ -338,6 +341,21 @@ def _prologue_merge_kernel(
         qnorm2 += tl.sum(qc * qc, 1)
     qres_v = tl.sqrt(tl.maximum(qnorm2 - tl.sum(qsk * qsk, 1), 0.0))
     tl.store(qres_ptr + p * H + h, qres_v)
+    # Per-head admission width from this step's own geometry. It sits here, not
+    # in the caller, because qperp_rel is computed at line above and the margin
+    # is consumed ~40 lines below IN THE SAME KERNEL -- deciding outside would
+    # make it stale by a step for no reason. The slow-moving THRESHOLD is still
+    # maintained on the host across steps, where staleness costs nothing.
+    # Direction: thr = max1 - margin, so a LARGER margin admits more, and a high
+    # qperp_rel (the top-1 row is at risk) is what should admit more.
+    m_sel = margin
+    if MARGIN_SEL:
+        m_sel = tl.where(
+            qres_v * tl.rsqrt(tl.maximum(qnorm2, 1e-18))
+            > tl.load(relthr_ptr + p),
+            margin_hi,
+            margin,
+        )
     if WRITE_REL:
         # qperp_rel = ||q_res|| / ||q_c||, the per-layer width signal. Both
         # norms are already in registers here, so storing the RATIO rather than
@@ -382,7 +400,7 @@ def _prologue_merge_kernel(
         max1g_ptr + p * H + h,
         tl.where(
             gate,
-            max1 - margin - ent_gain * tl.where(nonempty, lse - gm, 0.0),
+            max1 - m_sel - ent_gain * tl.where(nonempty, lse - gm, 0.0),
             float("inf"),
         ),
     )
@@ -499,6 +517,8 @@ def fused_prologue_split(
     row=None,
     pool_rows=None,
     qrel=None,  # [P, H] fp32; when given the kernel also emits qperp_rel
+    relthr=None,  # [P] fp32; when given, margin is picked per head from qperp_rel
+    margin_hi=None,  # the wider margin, used above relthr
     mode=None,
     margin=0.0,
     ent_gain=0.0,
@@ -585,6 +605,8 @@ def fused_prologue_split(
         qsk_t,
         qres,
         qrel if qrel is not None else qres,
+        relthr if relthr is not None else nk_len,
+        float(margin_hi if margin_hi is not None else margin),
         NSPLIT=_NSPLIT,
         H=H,
         R=R,
@@ -593,6 +615,7 @@ def fused_prologue_split(
         BLOCK_D=D.d_block_for_rank(R),
         THR_LSE=bool(thr_lse),
         WRITE_REL=qrel is not None,
+        MARGIN_SEL=relthr is not None,
         num_warps=4,
     )
     return max1g, qside_t, qsk_t, qres
