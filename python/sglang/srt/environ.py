@@ -676,6 +676,12 @@ class Envs:
     # recall below the fitted target. The CLI flag stays non-negative because
     # its guard catches typos; this is deliberate and says so.
     SGLANG_DEBUG_VESTIGEKV_MARGIN_DELTA = EnvFloat(0.0)
+    # Skip tier 2 entirely for a (layer, request) whose calibration says the
+    # archive never holds the winner: hard_rate <= this closes the gate, which
+    # the kernel already expresses as max1g = +inf, so no row can fire and
+    # nothing is fetched. -1 is off; 0.0 means "only when hard_rate is exactly
+    # zero", which is a state that occurs (natural streaming reads 0.000).
+    SGLANG_DEBUG_VESTIGEKV_SKIP_TIER2_HARD = EnvFloat(-1.0)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
