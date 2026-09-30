@@ -116,3 +116,82 @@ class TestPrologueSplit(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestPerHeadMarginSelector(CustomTestCase):
+    """margin chosen per head from this step's own qperp_rel.
+
+    It lives in the kernel because qperp_rel is computed there and the margin is
+    consumed there; deciding outside would make it stale by a step for nothing.
+    And it is the MARGIN rather than cc because on the served arm firing is not
+    certificate-driven -- Spearman between qperp_rel and the fire fraction is
+    -0.292 on the layer carrying 82% of the fetch, so scaling cc cannot move
+    admission while the margin shifts the threshold directly.
+    """
+
+    def _run_sel(self, relthr, margin, margin_hi, P=4):
+        from sglang.srt.layers.attention.vestigekv import fused_prologue as FP
+
+        qbuf, li, slot, kr, v, nk, thr, al = _case(P=P)
+        dev = "cuda"
+        out = (torch.zeros(P, H, device=dev),
+               torch.zeros(P, DD, H, device=dev, dtype=torch.bfloat16),
+               torch.zeros(P, R, H, device=dev, dtype=torch.float16),
+               torch.zeros(P, H, device=dev))
+        qrel = torch.zeros(P, H, device=dev)
+        parts = tuple(torch.zeros(P, FP._NSPLIT, H, device=dev) for _ in range(3))
+        FP.fused_prologue_split(
+            qbuf, li, slot, kr, v, nk, thr, 1.0 / (192 ** 0.5),
+            out=out, partials=parts, a_len=al, qrel=qrel,
+            relthr=relthr, margin=margin, margin_hi=margin_hi,
+        )
+        torch.cuda.synchronize()
+        return out[0], qrel
+
+    def test_threshold_at_zero_selects_the_wide_margin_everywhere(self):
+        """qperp_rel >= 0 always, so thr=0 must give margin_hi for every head;
+        compare against a plain run at that same margin."""
+        P = 4
+        lo = self._run_sel(torch.zeros(P, device="cuda"), 0.0, 3.0)[0]
+        ref = self._run_sel(None, 3.0, None)[0]
+        torch.testing.assert_close(lo, ref, rtol=1e-5, atol=1e-5)
+
+    def test_threshold_above_one_selects_the_narrow_margin_everywhere(self):
+        P = 4
+        hi = self._run_sel(torch.full((P,), 2.0, device="cuda"), 0.0, 3.0)[0]
+        ref = self._run_sel(None, 0.0, None)[0]
+        torch.testing.assert_close(hi, ref, rtol=1e-5, atol=1e-5)
+
+    def test_the_split_is_per_head_and_follows_qperp_rel(self):
+        """With the threshold at each slot's own median, about half the heads
+        should take the wide margin -- and exactly the ones above it."""
+        P = 4
+        _, qrel = self._run_sel(torch.zeros(P, device="cuda"), 0.0, 3.0)
+        med = qrel.median(dim=1).values
+        wide, _ = self._run_sel(med, 0.0, 3.0)
+        narrow, _ = self._run_sel(torch.full((P,), 9.0, device="cuda"), 0.0, 3.0)
+        allwide, _ = self._run_sel(torch.zeros(P, device="cuda"), 0.0, 3.0)
+        took_wide = (wide - narrow).abs() > 1e-6
+        self.assertTrue(bool((took_wide == (qrel > med[:, None])).all()),
+                        "per-head selection did not follow qperp_rel")
+        frac = took_wide.float().mean().item()
+        self.assertGreater(frac, 0.3, f"only {frac:.2f} of heads took the wide margin")
+        self.assertLess(frac, 0.7, f"{frac:.2f} of heads took the wide margin")
+        self.assertFalse(bool(torch.equal(allwide, narrow)), "margin had no effect")
+
+    def test_the_selector_does_not_spill(self):
+        from sglang.srt.layers.attention.vestigekv import fused_prologue as FP
+
+        def compiled():
+            return list(FP._prologue_merge_kernel.device_caches[
+                torch.cuda.current_device()][0].values())
+
+        self._run_sel(None, 0.0, None)
+        base = compiled()[-1]
+        self._run_sel(torch.zeros(4, device="cuda"), 0.0, 3.0)
+        sel = [k for k in compiled() if k is not base][-1]
+        self.assertEqual(sel.n_spills, 0, f"selector spills {sel.n_spills} B")
+        self.assertLessEqual(sel.n_regs, base.n_regs + 6,
+                             f"selector costs {sel.n_regs - base.n_regs} regs "
+                             f"({base.n_regs} -> {sel.n_regs})")
