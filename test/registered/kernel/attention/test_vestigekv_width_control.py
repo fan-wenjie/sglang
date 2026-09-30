@@ -347,18 +347,22 @@ class TestBothControllersAnswerOneEntryPoint(unittest.TestCase):
         from sglang.srt.layers.attention.vestigekv.width_control import (
             CertWidthController,
             DerivedWidthController,
+            GeometryWidthController,
         )
         P = 3
         made = [
             CertWidthController(P, torch.device("cpu"), tau=0.5, warmup=2),
             DerivedWidthController(P, D.N_CAL_MAX, torch.device("cpu"),
                                    delta=0.05),
+            GeometryWidthController(P, 4, torch.device("cpu"), level=0.7),
         ]
         for c in made:
             cc = torch.zeros(P)
             kw = self._kwargs(P, cc)
             for _ in range(4):
                 c.write_cc(**kw)
+                c.after_prologue(qrel=torch.zeros(P, 4),
+                                 relthr_out=torch.zeros(P), **kw)
             self.assertTrue(torch.isfinite(cc).all(),
                             f"{type(c).__name__} wrote non-finite cc: {cc}")
 
@@ -375,14 +379,17 @@ class TestBothControllersAnswerOneEntryPoint(unittest.TestCase):
 
 
 class TestGeometryWidthController(unittest.TestCase):
-    """Width from the query's own geometry, before the scan.
+    """The threshold the kernel compares qperp_rel against, per layer.
 
-    The properties that make it preferable to the other two are the ones pinned
-    here: it does not move when the width moves (no feedback), a layer with no
-    history serves WIDE rather than narrow (evidence is earned, not assumed),
-    and the threshold tracks each layer's own tail rather than an absolute level
-    -- the per-layer offset spans 0.339 to 0.698, so an absolute threshold is
-    exactly what gets it wrong.
+    The controller no longer writes cc -- scaling cc moves only the certificate
+    term, and on the served arm firing is not certificate-driven. The actuator
+    is the margin, applied per head inside the prologue that computes
+    qperp_rel, so all this does is keep that comparison threshold current.
+
+    Pinned here: a cold layer runs WIDE (threshold 0, every head above it), the
+    threshold converges to the layer's own quantile, each layer tracks its own
+    offset (0.339 to 0.698 across the seven, so a shared absolute level is
+    exactly what fails), and nothing allocates after construction.
     """
 
     def _ctl(self, P=3, H=4, level=0.7, memory=64):
@@ -390,66 +397,48 @@ class TestGeometryWidthController(unittest.TestCase):
             GeometryWidthController,
         )
         return GeometryWidthController(P, H, torch.device("cpu"), level=level,
-                                       gain_hi=1.0, gain_lo=0.5, memory=memory)
+                                       memory=memory)
 
-    def _rel(self, vals, P, H):
-        return torch.tensor(vals, dtype=torch.float32).view(P, 1).expand(P, H).contiguous()
+    def _step(self, c, rel, P=3, H=4):
+        out = torch.zeros(P)
+        qrel = torch.tensor(rel, dtype=torch.float32).view(P, 1).expand(P, H)
+        c.after_prologue(qrel=qrel.contiguous(), relthr_out=out)
+        return out
 
-    def _step(self, c, rel, P=3, H=4, base=0.5):
-        cc = torch.zeros(P)
-        c.after_prologue(qrel=self._rel(rel, P, H),
-                         cc_base=torch.full((P,), base), cc_out=cc)
-        return cc
-
-    def test_a_cold_layer_serves_wide(self):
-        """Threshold starts at 0, so everything is above it. Width is given up
-        only once there is evidence about the layer's tail."""
+    def test_a_cold_layer_starts_at_zero_so_every_head_runs_wide(self):
         c = self._ctl()
-        cc = self._step(c, [0.1, 0.5, 0.9])
-        self.assertEqual([round(v, 4) for v in cc.tolist()], [0.5, 0.5, 0.5])
+        self.assertEqual(c.thr.tolist(), [0.0] * 3)
+        out = self._step(c, [0.1, 0.5, 0.9])
+        self.assertTrue(bool((out >= 0).all()), out)
 
-    def test_the_widen_rate_converges_to_one_minus_level(self):
-        """The operational property, and the one to assert: at level 0.7 the
-        controller should widen about 30% of steps. Asserting on thr itself is
-        the wrong target -- Robbins-Monro oscillates around its fixed point with
-        amplitude set by the step size, so a single final reading of thr is a
-        draw from that oscillation, not the estimate."""
+    def test_the_exceedance_rate_converges_to_one_minus_level(self):
+        """The operational property. Asserting on thr itself is the wrong
+        target: Robbins-Monro oscillates around its fixed point with amplitude
+        set by the step size, so one final reading is a draw from that
+        oscillation rather than the estimate."""
         import random
         c = self._ctl(P=1, H=2, level=0.7, memory=512)
         rng = random.Random(0)
-        wide = 0
+        above = 0
         N = 8000
         for i in range(N):
-            cc = self._step(c, [rng.random()], P=1, H=2, base=1.0)
-            if i >= N // 2:                      # discard the burn-in
-                wide += 1 if cc[0].item() > 0.75 else 0
-        rate = wide / (N - N // 2)
+            v = rng.random()
+            t = self._step(c, [v], P=1, H=2)
+            if i >= N // 2 and v > t[0].item():
+                above += 1
+        rate = above / (N - N // 2)
         self.assertAlmostEqual(rate, 0.30, delta=0.04,
-                               msg=f"widen rate {rate:.3f}, thr={c.thr[0]:.4f}")
+                               msg=f"exceedance {rate:.3f}, thr={c.thr[0]:.4f}")
 
     def test_each_layer_tracks_its_own_offset(self):
-        """Two layers with different scales must reach different thresholds --
-        the whole reason a shared absolute level fails."""
         import random
         c = self._ctl(P=2, H=2, level=0.7, memory=64)
         rng = random.Random(1)
         for _ in range(6000):
             self._step(c, [0.2 * rng.random(), 0.5 + 0.5 * rng.random()],
                        P=2, H=2)
-        self.assertLess(c.thr[0].item(), 0.25, f"lo layer thr={c.thr[0].item():.3f}")
-        self.assertGreater(c.thr[1].item(), 0.7, f"hi layer thr={c.thr[1].item():.3f}")
-
-    def test_width_does_not_feed_back_into_the_signal(self):
-        """cc_base changing must not move the threshold: the signal is the
-        query's geometry, not the fire set's response to the width."""
-        c = self._ctl(P=1, H=2)
-        for _ in range(200):
-            self._step(c, [0.4], P=1, H=2, base=0.5)
-        t_small = c.thr[0].item()
-        c2 = self._ctl(P=1, H=2)
-        for _ in range(200):
-            self._step(c2, [0.4], P=1, H=2, base=50.0)
-        self.assertAlmostEqual(t_small, c2.thr[0].item(), places=6)
+        self.assertLess(c.thr[0].item(), 0.25, f"lo thr={c.thr[0].item():.3f}")
+        self.assertGreater(c.thr[1].item(), 0.7, f"hi thr={c.thr[1].item():.3f}")
 
     def test_allocates_nothing_after_construction(self):
         c = self._ctl()
@@ -468,3 +457,65 @@ class TestGeometryWidthController(unittest.TestCase):
         c.reset(torch.tensor([1]))
         self.assertEqual(c.thr[1].item(), 0.0)
         self.assertGreater(c.thr[0].item(), 0.0)
+
+
+class TestBothControllersAnswerOneEntryPoint(unittest.TestCase):
+    """The pack calls write_cc and nothing else.
+
+    It used to branch on which controller was installed; an edit dropped one
+    branch and the derived arm died at serve time with an AttributeError, after
+    every unit test passed -- because the unit tests drive the controllers
+    directly and never exercised the pack's dispatch. This pins the property
+    that made the branch unnecessary.
+    """
+
+    def _kwargs(self, P, cc_out):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        return dict(
+            fired=torch.zeros(P, dtype=torch.int32),
+            cc_host=torch.full((P,), 0.5),
+            a_len=torch.full((P,), 100.0),
+            z=torch.arange(1, D.N_CAL_MAX + 1).float().expand(
+                P, D.N_CAL_MAX).contiguous(),
+            n_cal=torch.full((P,), float(D.N_CAL_MAX)),
+            fac_host=torch.full((P,), 1.0 / (512 ** 0.5)),
+            fac=torch.zeros(P),
+            cc_out=cc_out,
+        )
+
+    def test_every_controller_accepts_the_same_call(self):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.width_control import (
+            CertWidthController,
+            DerivedWidthController,
+            GeometryWidthController,
+        )
+        P = 3
+        made = [
+            CertWidthController(P, torch.device("cpu"), tau=0.5, warmup=2),
+            DerivedWidthController(P, D.N_CAL_MAX, torch.device("cpu"),
+                                   delta=0.05),
+            GeometryWidthController(P, 4, torch.device("cpu"), level=0.7),
+        ]
+        for c in made:
+            cc = torch.zeros(P)
+            kw = self._kwargs(P, cc)
+            for _ in range(4):
+                c.write_cc(**kw)
+                c.after_prologue(qrel=torch.zeros(P, 4),
+                                 relthr_out=torch.zeros(P), **kw)
+            self.assertTrue(torch.isfinite(cc).all(),
+                            f"{type(c).__name__} wrote non-finite cc: {cc}")
+
+    def test_the_pack_calls_write_cc_and_no_variant_of_it(self):
+        """A second entry point is how the dispatch crept back in last time."""
+        import pathlib
+        src = pathlib.Path(
+            "python/sglang/srt/layers/attention/vestigekv/batched_step.py"
+        ).read_text()
+        self.assertIn("self._width.write_cc(", src)
+        for gone in ("self._width.set_base(", "self._width.apply_(",
+                     "self._width.set_calibration("):
+            self.assertNotIn(gone, src, f"pack still calls {gone} directly")
+
+

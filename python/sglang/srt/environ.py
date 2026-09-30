@@ -717,6 +717,14 @@ class Envs:
     # off; both gains 1.0 is an exact no-op. Per layer is essential -- pooled it
     # reads 0.740 because the quantity's per-layer offset spans 0.339 to 0.698.
     SGLANG_DEBUG_VESTIGEKV_WIDTH_QLEVEL = EnvFloat(-1.0)
+    # How much EXTRA margin a head gets when its qperp_rel is above its layer's
+    # running QLEVEL quantile. thr = max1 - margin, so a larger margin admits
+    # more, and a high qperp_rel (the top-1 row is at risk) is what should admit
+    # more. 0.0 is an exact no-op, so QLEVEL can be armed without moving a
+    # served number. This is the MARGIN and not cc on purpose: cc scales only
+    # the certificate term, and on the served arm firing is not
+    # certificate-driven (Spearman -0.292 on the layer carrying 82% of fetch).
+    SGLANG_DEBUG_VESTIGEKV_WIDTH_MARGIN_DELTA = EnvFloat(0.0)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
