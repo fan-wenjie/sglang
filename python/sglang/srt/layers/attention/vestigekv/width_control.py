@@ -441,3 +441,115 @@ def _normal_quantile(p: float) -> float:
     rr = q * q
     return (((((a[0]*rr+a[1])*rr+a[2])*rr+a[3])*rr+a[4])*rr+a[5])*q / \
            (((((b[0]*rr+b[1])*rr+b[2])*rr+b[3])*rr+b[4])*rr+1)
+
+
+class GeometryWidthController:
+    r"""Width from the query's own geometry, decided before the scan.
+
+    Scored against the right label -- the top-1 row actually LOST, not the
+    proxy "an archived row beat the kept maximum" -- qperp_rel = ||q_res|| /
+    ||q_c|| separates per layer at AUC 0.823 / 0.866 / 0.871 / 0.860 / 0.922 on
+    the five sig-cont layers that ever lose a top-1. At each layer's own p70
+    quantile it catches 91.5% of losses while widening 21.5% of steps; p60
+    catches 100% at 28.6%.
+
+    PER LAYER is not decoration. Pooled, the same quantity reads only 0.740,
+    because it carries a strong per-layer offset -- median 0.339 to 0.698 across
+    the seven layers -- and pooling mixes baselines that are not comparable.
+    That is Simpson's paradox, and it is the shape that hid this signal until
+    the layers were separated.
+
+    Three properties decide it against the alternatives here.
+
+      No feedback. It is a property of the QUERY, not of the fire set, so it
+      does not move when the width moves. The fire fraction rises when width
+      rises (a loop on it diverges); the certified omitted mass falls (a loop is
+      safe but needs an accumulator the scan does not store).
+
+      No staleness. The fused prologue computes ||q_res|| before the scan, so
+      the decision uses this step's own geometry. Every other candidate was
+      stale by a step or by a layer.
+
+      Free. fused_prologue line 69 is qres2 = qnorm2 - sum(qsk*qsk): both norms
+      are already in registers there. Until that store is added -- a decode-path
+      Triton change, so it needs a disassembly pass first -- ||q_c|| is recovered
+      with one small reduction over the query buffer.
+
+    It is dead on synthetic retrieval (sig-mrcr AUC 0.514, 0.384-0.582 per
+    layer), which is precisely where cross-layer prediction works (phi +0.41,
+    previous layer's signal at AUC 0.78). Neither covers both regimes; together
+    they do.
+
+    The threshold is each layer's own running quantile, so no absolute level is
+    ever chosen -- the quantity's per-layer offset is exactly what a fixed
+    threshold would get wrong. It is tracked by the Robbins-Monro update
+
+        thr <- thr + eta * (1[x > thr] - (1 - level))
+
+    whose fixed point is the level-quantile, because it is elementwise and
+    therefore capturable: a ring buffer's write index changes every step and
+    would be baked in at capture. eta is the reciprocal of the memory length,
+    not a free parameter -- it says how many steps the estimate averages over.
+    """
+
+    def __init__(self, P: int, H: int, device, level: float = 0.70,
+                 gain_hi: float = 1.0, gain_lo: float = 0.5,
+                 memory: int = 256):
+        self.level = float(level)
+        self.gain_hi = float(gain_hi)
+        self.gain_lo = float(gain_lo)
+        self.eta = 1.0 / float(memory)
+        self.thr = torch.zeros(P, device=device)
+        self.rel = torch.zeros(P, device=device)
+        self.seen = torch.zeros(P, device=device)
+        self._x = torch.zeros(P, device=device)
+        self._w = torch.zeros(P, device=device)
+        self._b = torch.zeros(P, device=device, dtype=torch.bool)
+        # Per-head scratch, allocated here and not on first use: a lazy
+        # allocation lands inside graph capture, which is the bug this class's
+        # two predecessors each had a version of.
+        self._hb = torch.zeros(P, H, device=device)
+
+    def reset(self, lanes: torch.Tensor | None = None) -> None:
+        """A new occupant of a slot inherits no threshold."""
+        if lanes is None:
+            self.thr.zero_()
+            self.seen.zero_()
+        else:
+            self.thr.index_fill_(0, lanes, 0.0)
+            self.seen.index_fill_(0, lanes, 0.0)
+
+    @torch.inference_mode()
+    def write_cc(self, *, qres, qc_norm, cc_base, cc_out, **_ignored):
+        """Set this step's width from this step's query geometry, in place.
+
+        qres [P, H] and qc_norm [P, H] come from the prologue, which has already
+        run; cc_base [P] is the width the build fitted. Nothing here reads a
+        device value back to the host and nothing allocates.
+        """
+        # One number per slot: the median over heads, matching how the
+        # separation above was measured. A max would track the worst head and
+        # is a different quantity that has not been scored.
+        self._hb.copy_(qc_norm)
+        self._hb.clamp_min_(1e-9)
+        torch.div(qres, self._hb, out=self._hb)
+        self.rel.copy_(self._hb.median(dim=1).values)
+
+        # Widen where this step sits in the layer's own upper tail. Until a
+        # layer has been seen at all its threshold is 0, so everything is above
+        # it and the layer serves WIDE -- width is given up only once there is
+        # evidence about what that layer's tail looks like.
+        torch.gt(self.rel, self.thr, out=self._b)
+        self._w.copy_(self._b)
+
+        # gain = lo + (hi - lo) * wide
+        self._x.copy_(self._w)
+        self._x.mul_(self.gain_hi - self.gain_lo)
+        self._x.add_(self.gain_lo)
+        torch.mul(cc_base, self._x, out=cc_out)
+
+        # Robbins-Monro step toward the level-quantile.
+        self._w.sub_(1.0 - self.level)
+        self._w.mul_(self.eta)
+        self.thr.add_(self._w)
+        self.seen.add_(1.0)
