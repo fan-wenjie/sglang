@@ -23,10 +23,40 @@ import triton.language as tl
 from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 from sglang.srt.layers.attention.vestigekv.fused_prologue import (
+
     _NSPLIT,
     compact_fired,
     fused_prologue_split,
 )
+
+def _make_width_controller(P: int, dev):
+    """Arm dynamic certificate width only when both knobs are set.
+
+    Off by default and an exact no-op when GAIN is 0, so the arm can be enabled
+    in a run without moving a served number -- which is how the ablation stays
+    interpretable.
+    """
+    from sglang.srt.environ import envs
+
+    tau = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_TAU.get()
+    if tau < 0.0:
+        return None
+    from sglang.srt.layers.attention.vestigekv.width_control import (
+        CertWidthController,
+    )
+
+    import logging
+
+    hi = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_HI.get()
+    lo = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_LO.get()
+    warm = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_WARMUP.get()
+    logging.getLogger(__name__).info(
+        "VKWIDTH armed: tau=%.3f hi=%.3f lo=%.3f warmup=%d over %d slots%s",
+        tau, hi, lo, warm, P,
+        " (both gains 1.0, exact no-op)" if hi == 1.0 and lo == 1.0 else "",
+    )
+    return CertWidthController(P, dev, tau=tau, gain_hi=hi, gain_lo=lo,
+                               warmup=warm)
 
 
 @triton.jit
@@ -258,6 +288,12 @@ class BatchedScanPack:
         self.nk_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.thr = torch.zeros(P, 1, device=dev)
         self.cc = torch.zeros(P, device=dev)
+        # Pinned: update() enqueues this copy on the main stream before the
+        # replay that reads it (it is not inside capture), and a pageable
+        # source would make that copy synchronous -- which is the stall this
+        # replaces, not a new one. 4 bytes per slot.
+        self._cc_host = torch.zeros(P).pin_memory() if dev != 'cpu' else torch.zeros(P)
+        self._width = _make_width_controller(P, dev)
         self._nk_col = torch.arange(NKm, device=dev)
         self.nk_mask = torch.zeros(P, 1, NKm, dtype=torch.bool, device=dev)
         self.scale = tiers[0].scale
@@ -414,6 +450,12 @@ class BatchedScanPack:
         self.nk_len = torch.zeros(P, dtype=torch.int64, device=dev)
         self.thr = torch.zeros(P, 1, device=dev)
         self.cc = torch.zeros(P, device=dev)
+        # Pinned: update() enqueues this copy on the main stream before the
+        # replay that reads it (it is not inside capture), and a pageable
+        # source would make that copy synchronous -- which is the stall this
+        # replaces, not a new one. 4 bytes per slot.
+        self._cc_host = torch.zeros(P).pin_memory() if dev != 'cpu' else torch.zeros(P)
+        self._width = _make_width_controller(P, dev)
         self._nk_col = torch.arange(NKm, device=dev)
         # all pairs empty -> every kept column masked True from step one
         self.nk_mask = torch.ones(P, 1, NKm, dtype=torch.bool, device=dev)
@@ -460,6 +502,16 @@ class BatchedScanPack:
             and sum(t.arch.shape[0] for t in tiers) <= self.arena
             and all(t.r == self.rank for t in tiers)
         )
+
+    def _fired_prev(self) -> torch.Tensor:
+        """Last step's fired-row count per slot, [P] and on device.
+
+        The scan stores it per (slot, block) in c_total's companion c_counts;
+        c_total is the compaction's per-slot total, which is the same number and
+        already reduced. Kept as a method so the reduction, if one is ever
+        needed, has one home rather than being inlined at the call site.
+        """
+        return self.c_total if self.c_total.dim() == 1 else self.c_total.sum(-1)
 
     def update(self, pairs, tiers):
         """Point the pack at a new set of tiers IN PLACE.
@@ -566,7 +618,23 @@ class BatchedScanPack:
             self.nk_len[i] = nk
             self.thr[i, 0] = t.thr_g
             self.thr_flat[i] = t.thr_g
-            self.cc[i] = t.zp * t.scale / (D.KV_LORA_RANK - t.r) ** 0.5
+            # Host-side, then one H2D copy below. `self.cc[i] = <float>` is a
+            # scalar store into a CUDA tensor, which stages its own copy and
+            # stalls the host -- once per lane per LAYER per step, since
+            # update() refreshes the captured graph rather than recapturing.
+            self._cc_host[i] = t.zp * t.scale / (D.KV_LORA_RANK - t.r) ** 0.5
+        # Stale slots keep the value they were last given: the loop writes only
+        # live ones and a_len masks the kernel off their tails, so _cc_host
+        # persists across calls and is copied whole.
+        if self._width is None:
+            self.cc.copy_(self._cc_host, non_blocking=True)
+        else:
+            # c_total holds the PREVIOUS step's fired counts, because update()
+            # runs before the scan. The staleness is the design: the label is
+            # autocorrelated across adjacent steps in a layer (phi +0.46 served,
+            # +0.56 branch) and acting one step late costs 0.039 of AUC.
+            self._width.set_base(self._cc_host)
+            self._width.apply_(self._fired_prev(), self.a_len, self.cc)
         if self.csk is None:
             # Hold the caches alive: cbase is a raw address, and a tier going
             # out of scope would free the memory the graph still points at.
