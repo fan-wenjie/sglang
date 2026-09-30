@@ -697,6 +697,18 @@ class Envs:
     SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_HI = EnvFloat(1.0)
     SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_LO = EnvFloat(1.0)
     SGLANG_DEBUG_VESTIGEKV_WIDTH_WARMUP = EnvInt(16)
+    # Derived width: set this INSTEAD of the tau/gain knobs above and the
+    # width stops being scaled and starts being solved for. delta is the
+    # answer-level failure rate the deployment accepts; rho = 1 - delta/(h*T)
+    # by a union bound over the steps where the archive holds the winner, and
+    # zp is re-read off that slot's own conformal order statistic at the
+    # resulting target. -1 is off. It is a specification, not a tuning knob,
+    # and it is the only number the arm takes -- tau, both gains and warmup all
+    # fall out of the derivation. Note the sample caps what is reachable: an
+    # order statistic over n_cal points cannot express a target past
+    # n_cal/(n_cal+1) = 64/65, and the arm reports `infeasible` rather than
+    # pretending otherwise.
+    SGLANG_DEBUG_VESTIGEKV_WIDTH_DELTA = EnvFloat(-1.0)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register

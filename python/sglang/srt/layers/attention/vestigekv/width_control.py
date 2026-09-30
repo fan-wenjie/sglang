@@ -263,16 +263,21 @@ class DerivedWidthController:
     value, but it is a choice.
     """
 
-    def __init__(self, P: int, n_cal: int, device, delta: float = 0.01):
+    def __init__(self, P: int, n_cal_max: int, device, delta: float = 0.01):
         # The only number, and it is the spec: acceptable probability that the
         # generated answer is wrong BECAUSE a needed archived row was missed.
         # Split once, half to the certificate's per-step miss and half to the
         # uncertainty in h, so a single delta covers both.
         self.delta = float(delta)
-        self.n_cal = int(n_cal)
+        self.n_grid = int(n_cal_max)
         # z for the Wilson bound at 1 - delta/2, computed once on the host.
         self.zc = _normal_quantile(1.0 - 0.5 * self.delta)
-        self.z_sorted = torch.zeros(P, n_cal, device=device)
+        self.z_sorted = torch.zeros(P, n_cal_max, device=device)  # quantile grid
+        # Per slot: a build can stop short of N_CAL_MAX (the window doubles
+        # until MIN_HARD hard samples exist), so the reachable target
+        # n_cal/(n_cal+1) differs per layer and k must be formed against each
+        # slot's own sample size.
+        self.n_cal = torch.zeros(P, device=device)
         self.n = torch.zeros(P, device=device)      # steps observed
         self.a = torch.zeros(P, device=device)      # steps with |F| > 0
         self.rho = torch.zeros(P, device=device)    # derived target, for logs
@@ -284,14 +289,19 @@ class DerivedWidthController:
         self._g = torch.zeros(P, 1, device=device)
         self._b = torch.zeros(P, device=device, dtype=torch.bool)
 
-    def set_calibration(self, z_sorted: torch.Tensor) -> None:
-        """Adopt the build's SORTED calibration sample, [P, n_cal].
+    def set_calibration(self, z_sorted: torch.Tensor,
+                        n_cal: torch.Tensor) -> None:
+        """Adopt the build's SORTED calibration samples, [P, N_CAL_MAX], and
+        each slot's true sample size.
 
         Kept because the order statistic has to be re-read at a new target, and
         re-deriving it needs the sample, not just the one quantile build chose.
-        64 floats per slot.
+        Rows are padded with their own sample maximum, so an index past n_cal
+        reads the max -- which is what "this sample cannot certify that target"
+        should serve.
         """
         self.z_sorted.copy_(z_sorted, non_blocking=True)
+        self.n_cal.copy_(n_cal, non_blocking=True)
 
     def reset(self, lanes: torch.Tensor | None = None) -> None:
         if lanes is None:
@@ -306,9 +316,14 @@ class DerivedWidthController:
             self.infeasible.index_fill_(0, lanes, False)
 
     @torch.inference_mode()
-    def apply_(self, fired: torch.Tensor, scale: float, r: int,
+    def apply_(self, fired: torch.Tensor, cc_factor: torch.Tensor,
                cc_out: torch.Tensor) -> None:
-        """Width for the next step, derived. In place; allocates nothing."""
+        """Width for the next step, derived. In place; allocates nothing.
+
+        cc_factor [P] is scale / sqrt(kv_lora - r) per slot, which the caller
+        already knows per tier; keeping it per slot rather than scalar means a
+        pack holding tiers of different rank still gets each one's own factor.
+        """
         # a += [ |F| > 0 ]; n += 1
         torch.gt(fired, 0, out=self._b)
         self._t.copy_(self._b)
@@ -351,18 +366,30 @@ class DerivedWidthController:
         self._u.clamp_(0.0, 1.0)
         self.rho.copy_(self._u)
 
-        # k = ceil((n_cal + 1) * rho); infeasible when it runs off the sample
-        self._u.mul_(self.n_cal + 1)
+        # Conformal rank for this target, k = ceil((n+1) * rho), then the grid
+        # is addressed by the LEVEL k/n rather than by rho directly. Going
+        # through k matters at the endpoint: rho = n/(n+1) is the tightest
+        # reachable target and must land on the sample maximum, which indexing
+        # by rho misses by one grid point.
+        self._t.copy_(self.n_cal)
+        self._t.add_(1.0)
+        self._u.mul_(self._t)
         self._u.ceil_()
-        torch.gt(self._u, float(self.n_cal), out=self.infeasible)
-        self._u.clamp_(1.0, float(self.n_cal))
+        # A sample of n points cannot certify past k = n; flag, do not pretend.
+        torch.gt(self._u, self.n_cal, out=self.infeasible)
+        self._t.copy_(self.n_cal)
+        self._t.clamp_min_(1.0)
+        torch.minimum(self._u, self._t, out=self._u)
+        self._u.div_(self._t)                   # level = k/n in (0, 1]
+        self._u.mul_(self.n_grid - 1)
+        self._u.round_()
+        self._u.clamp_(0.0, float(self.n_grid - 1))
         self._k.copy_(self._u.unsqueeze(1).to(torch.int64))
-        self._k.sub_(1)
 
         # zp = z_(k); cc = zp * scale / sqrt(kv_lora - r)
         torch.gather(self.z_sorted, 1, self._k, out=self._g)
         cc_out.copy_(self._g.squeeze(1))
-        cc_out.mul_(scale / (D.KV_LORA_RANK - r) ** 0.5)
+        cc_out.mul_(cc_factor)
 
 
 def _normal_quantile(p: float) -> float:
