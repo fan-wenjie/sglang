@@ -517,24 +517,6 @@ class RecallTier:
             thr_g = float("-inf")
         if envs.SGLANG_DEBUG_VESTIGEKV_NO_GATE.get():
             thr_g = float("-inf")     # ablation: gate never closes
-        _skip = envs.SGLANG_DEBUG_VESTIGEKV_SKIP_TIER2_HARD.get()
-        if _skip >= 0.0 and self.hard_rate <= _skip:
-            # The archive holds the winner on none of the calibration queries,
-            # so the recall guarantee this tier's width pays for is vacuous
-            # here. +inf closes the gate, which the scan already reads as "no
-            # row can fire"; an empty kept set still forces it open, so a
-            # request with nothing in tier 1 is not stranded.
-            #
-            # The risk is the one that killed hard_rate as a detector:
-            # calibration queries are the prompt's last few and answer steps
-            # are not them -- 0.1% against 22.85% miss. This is an ablation,
-            # not a default, for exactly that reason.
-            thr_g = float("inf")
-            logger.info(
-                "VKSKIP tier2 off: hard_rate=%.4f <= %.4f (arch=%d, kept=%d)",
-                self.hard_rate, _skip, int(arch_idx.numel()),
-                int(keep.sum()),
-            )
         self.thr_g = thr_g
 
         # zp in closed form. Requirement per calibration query q: the certified
@@ -562,6 +544,28 @@ class RecallTier:
         self.hard_rate = n_hard / max(int(hard.numel()), 1)
         _rr = envs.SGLANG_DEBUG_VESTIGEKV_REGIME_RATE.get()
         self.archive_bound = bool(_rr) and self.hard_rate >= _rr
+        _skip = envs.SGLANG_DEBUG_VESTIGEKV_SKIP_TIER2_HARD.get()
+        if _skip >= 0.0 and self.hard_rate <= _skip:
+            # Vacuous guarantee: the archive holds the winner on none of the
+            # calibration queries, so the width this tier's gate pays for buys
+            # nothing. +inf is what the scan already reads as "no row can
+            # fire"; an empty kept set still forces the gate open, so a
+            # request with nothing in tier 1 is not stranded.
+            #
+            # This sits AFTER hard_rate is assigned, which is the whole point:
+            # the first version read it four statements too early, got the
+            # float("nan") from __init__, and never fired -- nan <= 0.0 is
+            # False. Three ablation jobs came back as clean baselines and only
+            # the silence of the log line below said so.
+            #
+            # The standing risk is the one that retired hard_rate as a
+            # detector: calibration queries are the prompt's last few, answer
+            # steps are not them, 0.1% against 22.85% miss.
+            self.thr_g = float("inf")
+            logger.info(
+                "VKSKIP tier2 off: hard_rate=%.4f <= %.4f (arch=%d)",
+                self.hard_rate, _skip, int(arch_idx.numel()),
+            )
         self.need_more_hard = n_cal_q < D.min_hard(self.recall_target)
         if self.need_more_hard:
             # Not enough evidence for the guarantee yet: serve with the safety
@@ -1052,6 +1056,17 @@ class RecallTier:
             "n_fired": int(fired.sum()),
             "n_kept": int(self.kept_slots.shape[0]),
             "n_arch": int(rows.numel()),
+            # The calibration's own regime reading, carried per step so it can
+            # be crossed against n_beat_max1 PER LAYER. Constant across a
+            # request's steps for a given layer, which is the point: the
+            # question is whether the build's hard_rate predicts what the
+            # answer steps of that same layer actually need. Two skip-tier2
+            # ablations came back vacuous for want of this one number --
+            # _log_zp throttles at every 200th build, so its hard_rate reading
+            # is one sample per rank, never the distribution a threshold has to
+            # be chosen against.
+            "hard_rate": float(self.hard_rate),
+            "archive_bound": bool(self.archive_bound),
         }
 
     @torch.inference_mode()
