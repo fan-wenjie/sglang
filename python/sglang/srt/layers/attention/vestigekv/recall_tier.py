@@ -28,6 +28,13 @@ from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.srt.layers.attention.vestigekv.defaults import ieee_fp32
 from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
 
+# Every logging call in this module ran as a NameError until now, and the build
+# worker catches Exception and keeps the provisional index -- so the three
+# branches that log (the tier-2 skip, the archive-bound regime, and the rank
+# report) each turned into "calibration silently did not happen" instead of
+# into a message. Two ablation rounds came back as clean baselines that way.
+logger = logging.getLogger(__name__)
+
 _ZP_SEEN = [0]
 
 

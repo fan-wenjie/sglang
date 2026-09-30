@@ -2520,7 +2520,18 @@ class VestigeKVMLABackend(AttentionBackend):
                     stats["reused"] = job["operands_from"] is not None
                 job["tier"], job["stats"] = tier, stats
             except Exception as e:  # provisional keeps serving; never crash
+                # Keep the traceback, not just str(e). Three unrelated build
+                # bugs hid behind this one handler -- an undefined `logger`, an
+                # empty-tensor quantile, and a None operand -- because the
+                # install side logged only the message, and a message like
+                # "'NoneType' object has no attribute 'float'" names none of
+                # the eleven .float() calls it could have come from. Diagnosing
+                # one of them cost more than every traceback this will ever
+                # print.
+                import traceback
+
                 job["error"] = e
+                job["traceback"] = traceback.format_exc()
             job["done"].set()
 
     def _install_finished_builds(self):
@@ -2562,8 +2573,9 @@ class VestigeKVMLABackend(AttentionBackend):
                 logging.getLogger(__name__).warning(
                     "VestigeKV: async calibrated build failed (%s); the "
                     "provisional index keeps serving (over-fetches, never "
-                    "under-recalls)",
+                    "under-recalls)\n%s",
                     job["error"],
+                    job.get("traceback", "<no traceback recorded>"),
                 )
                 st["qcal"] = st["qpos"] = None
                 continue
