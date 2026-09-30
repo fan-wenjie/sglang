@@ -682,6 +682,21 @@ class Envs:
     # nothing is fetched. -1 is off; 0.0 means "only when hard_rate is exactly
     # zero", which is a state that occurs (natural streaming reads 0.000).
     SGLANG_DEBUG_VESTIGEKV_SKIP_TIER2_HARD = EnvFloat(-1.0)
+    # Per-request static per-layer certificate width, decided from the fire
+    # fraction |F|/|A| measured over the first WARMUP decode steps -- AUC 0.952
+    # on the branch arm and 0.856 on the served one against the step dump's own
+    # label. TAU is the fraction that counts as "this layer needs the archive"
+    # (-1 off); the measured medians are 1.0000 when it was needed and 0.0000
+    # when not, so 0.5 is not tuned against the data that chose it. GAIN_HI and
+    # GAIN_LO are multiplicative on cc, hence on zp; both 1.0 is an exact no-op.
+    # It LATCHES rather than looping: the fire fraction rises when width rises
+    # and falls when it falls, so a per-step loop diverges in either direction.
+    # Observing at the build's width and deciding once removes the feedback path
+    # entirely. See vestigekv/width_control.py.
+    SGLANG_DEBUG_VESTIGEKV_WIDTH_TAU = EnvFloat(-1.0)
+    SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_HI = EnvFloat(1.0)
+    SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_LO = EnvFloat(1.0)
+    SGLANG_DEBUG_VESTIGEKV_WIDTH_WARMUP = EnvInt(16)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
