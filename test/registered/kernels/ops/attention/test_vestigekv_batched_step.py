@@ -853,3 +853,71 @@ class TestRecallOverflowFlag(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestNeutralWidthArmIsInert(CustomTestCase):
+    """Arming a width controller with neutral gains must not change cc.
+
+    Two different controllers, each armed with gains that make them exact
+    no-ops, both moved MRCR from the 0.245-0.256 baseline band to 0.229 -- the
+    same value from different code. A 24-sample score cannot tell a real
+    regression from the run-to-run floor, so the question is settled here, on
+    the tensor the scan actually reads.
+    """
+
+    def _cc_after_update(self, env):
+        import importlib
+        import os
+
+        from sglang.srt.layers.attention.vestigekv import batched_step as BS
+
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update({k: v for k, v in env.items()})
+        try:
+            importlib.reload(BS)
+            torch.manual_seed(3)
+            L, max_reqs, W = 2, 6, 64
+            pairs = [(0, 1), (1, 4)]
+            base = {
+                p: _mk_tier(800, 12000, seed=7 + p[1], zp=1.0,
+                            thr_g=-float("inf"))
+                for p in pairs
+            }
+            qbuf = torch.randn(L, max_reqs, H, 576, device="cuda")
+            fetch = torch.zeros(L, max_reqs, W, dtype=torch.int64, device="cuda")
+            flen = torch.zeros(L, max_reqs, dtype=torch.int64, device="cuda")
+            pack = BS.BatchedScanPack(
+                pairs, [base[p] for p in pairs], qbuf, fetch, flen,
+                _ovf(flen), _cnt(flen), H, margin=0.0,
+            )
+            torch.cuda.synchronize()
+            return pack.cc.clone(), type(pack._width).__name__
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            importlib.reload(BS)
+
+    def test_cert_arm_neutral_matches_no_arm(self):
+        off, n_off = self._cc_after_update({})
+        on, n_on = self._cc_after_update({
+            "SGLANG_DEBUG_VESTIGEKV_WIDTH_TAU": "0.5",
+            "SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_HI": "1.0",
+            "SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_LO": "1.0",
+        })
+        self.assertEqual(n_off, "NoneType")
+        self.assertEqual(n_on, "CertWidthController")
+        torch.testing.assert_close(on, off, rtol=0, atol=0)
+
+    def test_geometry_arm_neutral_matches_no_arm(self):
+        off, _ = self._cc_after_update({})
+        on, n_on = self._cc_after_update({
+            "SGLANG_DEBUG_VESTIGEKV_WIDTH_QLEVEL": "0.7",
+            "SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_HI": "1.0",
+            "SGLANG_DEBUG_VESTIGEKV_WIDTH_GAIN_LO": "1.0",
+        })
+        self.assertEqual(n_on, "GeometryWidthController")
+        torch.testing.assert_close(on, off, rtol=0, atol=0)
