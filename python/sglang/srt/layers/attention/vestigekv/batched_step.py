@@ -56,6 +56,7 @@ def _rank_hit() -> bool:
 
 
 _RANK_LOGGED = [False]
+_RANK_SEEN = [0]
 
 
 def _margin_delta() -> float:
@@ -858,6 +859,28 @@ class BatchedScanPack:
             # that staleness is the design -- the label is autocorrelated across
             # adjacent steps in a layer (phi +0.46 served, +0.56 branch), so
             # acting one step late costs 0.039 of AUC.
+            if self._rank_cut is not None:
+                # Read the PREVIOUS step's cutoff here, not in run(): run() is
+                # replayed from a captured graph and "no host code runs here at
+                # replay time" (vestigekv_mla_backend._ingraph_device_step), so
+                # a log line inside it fires once at capture and never again.
+                # update() refreshes tensor contents to revalidate the graph, so
+                # it does run per step. One reading per 200 steps, because the
+                # .tolist() is a device-to-host sync.
+                _RANK_SEEN[0] += 1
+                if _RANK_SEEN[0] % 200 == 1:
+                    import logging
+
+                    _c = self._rank_cut.tolist()
+                    _nb = D.RANK_NBIN
+                    logging.getLogger(__name__).info(
+                        "VKCUT cutoff=%s idle(=1)=%d/%d clamped(=%d)=%d/%d "
+                        "span=%s (step %d)",
+                        _c, sum(1 for x in _c if x <= 1), len(_c), _nb,
+                        sum(1 for x in _c if x >= _nb), len(_c),
+                        [round(x, 4) for x in self._span.tolist()],
+                        _RANK_SEEN[0],
+                    )
             self._width.write_cc(
                 fired=self._fired_prev(), cc_host=self._cc_host,
                 a_len=self.a_len, z=self._z_host, n_cal=self._ncal_host,
@@ -1004,7 +1027,12 @@ class BatchedScanPack:
             # placement does not need to be exact -- a same-step range would
             # need a second pass over the archive to find -- but it does need to
             # be the right order of magnitude, which 1.0 was not.
-            self._span.copy_(self._spanmax.clamp_min(1e-6))
+            # In place: clamp_min() ALLOCATES, and run() is replayed from a
+            # captured graph on the in-graph path, where an allocation is the
+            # bug two of today's tests exist to catch. Same reason the width
+            # controllers route every op through a preallocated buffer.
+            self._span.copy_(self._spanmax)
+            self._span.clamp_min_(1e-6)
             self._spanmax.zero_()
         if self._rank_cut is not None:
             # Between the scan and the compaction: the ranks are written and the
