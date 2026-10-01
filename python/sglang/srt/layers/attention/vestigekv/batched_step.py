@@ -29,6 +29,13 @@ from sglang.srt.layers.attention.vestigekv.fused_prologue import (
     fused_prologue_split,
 )
 
+def _rank_hit() -> bool:
+    """Whether the scan's hit byte carries a bin rank instead of a flag."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_DEBUG_VESTIGEKV_RANK_HIT.get())
+
+
 def _margin_delta() -> float:
     """Extra margin for heads above their layer's qperp_rel quantile.
 
@@ -150,7 +157,8 @@ def _scan_batched_kernel(
     a_len_ptr,  # [P] int64: real archive rows of this pair
     a_off_ptr,  # [P] int64 arena offset per pair
     cc_ptr,  # [P] fp32: zp * sc / sqrt(kv_lora - R)
-    hit_ptr,  # [P, Amax] int8 out (0/1 fired flag)
+    hit_ptr,  # [P, Amax] int8 out: 0/1 fired flag, or a 1..NBIN rank
+    span_ptr,  # [P] fp32, RANK_HIT only: the excess range the bins cover
     counts_ptr,  # [P, NB] int32 fused compact-count out (NB = ceil(Amax/1024))
     Amax,
     sc,
@@ -165,6 +173,8 @@ def _scan_batched_kernel(
     POOL_ROWS: tl.constexpr,  # pool row count, for the TMA descriptor
     BLOCK_A: tl.constexpr,
     MULTI: tl.constexpr,
+    RANK_HIT: tl.constexpr = False,  # hit carries a 1..NBIN rank, not a flag
+    NBIN: tl.constexpr = 32,  # 32 costs 0.5-0.7 points against an exact top-W
 ):
     p = tl.program_id(1)
     al = tl.load(a_len_ptr + p)
@@ -277,7 +287,24 @@ def _scan_batched_kernel(
             acc = tl.dot(s, qs).to(tl.float32) + tl.dot(c, qk).to(tl.float32)
             score = acc * sc + cc * rh[:, None] * qr[None, :]
             fired = tl.max((score > m1[None, :]).to(tl.int32), 1)
-            tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
+            if RANK_HIT:
+                # hit carries a BIN INDEX, not a flag: 0 unfired, 1..NBIN by how
+                # far the best head's certified score clears the threshold. The
+                # byte is the same byte -- hit_ptr is already int8 and 32 bins
+                # fit -- so ranking the truncation costs no memory and no extra
+                # pass over the archive. The compaction then selects hit >= a
+                # per-lane cutoff instead of hit != 0, and at cutoff 1 the two
+                # are identical by construction, which is what makes this
+                # provable as a no-op before any cutoff is computed.
+                exc = tl.max(score - m1[None, :], 1)
+                sp = tl.load(span_ptr + p)
+                b_i = tl.minimum(
+                    (exc / tl.maximum(sp, 1e-9) * NBIN).to(tl.int32), NBIN - 1
+                )
+                rank = tl.where(fired > 0, b_i + 1, 0)
+                tl.store(hit_ptr + abase + offs, rank.to(tl.int8), mask=m)
+            else:
+                tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
             cnt += tl.sum(tl.where(m, fired, 0), 0)
         # Fused compact count: the bucket index is the store slot (pre-zeroing
         # by the prefix kernel covers buckets no program ran).
@@ -402,6 +429,11 @@ class BatchedScanPack:
         # torch.empty garbage would read as fired rows of ARCH padding.
         # int8: a 0/1 fired flag; the compaction reads it as a predicate.
         self.hit = torch.zeros(arena, dtype=torch.int8, device=dev)
+        # RANK_HIT only: the excess range the bins cover, per pair. Taken from
+        # the PREVIOUS step -- bin placement does not need to be exact, and a
+        # same-step range would need a second pass over the archive to find.
+        self._span = torch.ones(P, device=dev)
+        self._rank_hit = _rank_hit()
         # fixed-address fused-prologue outputs (graph reads/writes in place)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
@@ -584,6 +616,11 @@ class BatchedScanPack:
         self.slot = torch.full((P,), pad_slot, dtype=torch.int64, device=dev)
         # int8: a 0/1 fired flag; the compaction reads it as a predicate.
         self.hit = torch.zeros(arena, dtype=torch.int8, device=dev)
+        # RANK_HIT only: the excess range the bins cover, per pair. Taken from
+        # the PREVIOUS step -- bin placement does not need to be exact, and a
+        # same-step range would need a second pass over the archive to find.
+        self._span = torch.ones(P, device=dev)
+        self._rank_hit = _rank_hit()
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
         self.qside_t = torch.zeros(
@@ -889,6 +926,7 @@ class BatchedScanPack:
             self.a_off,
             self.cc,
             self.hit,
+            self._span,
             self.c_counts,
             Am,
             sc,
@@ -904,6 +942,7 @@ class BatchedScanPack:
             BLOCK_A=D.SCAN_BLOCK_A,
             MULTI=16,  # 16 x BLOCK_A(64) = one 1024-row compact bucket
             num_warps=D.SCAN_NUM_WARPS,
+            RANK_HIT=self._rank_hit,
         )
         # Deterministic two-phase Triton compaction: the torch chain's int64
         # cumsum alone cost 157 us/step at 128k (nsys, 1.5x the scan kernel).
