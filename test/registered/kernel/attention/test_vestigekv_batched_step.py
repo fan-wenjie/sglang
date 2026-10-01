@@ -921,3 +921,78 @@ class TestNeutralWidthArmIsInert(CustomTestCase):
         })
         self.assertEqual(n_on, "GeometryWidthController")
         torch.testing.assert_close(on, off, rtol=0, atol=0)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestRankHitIsInertAtCutoffOne(CustomTestCase):
+    """The scan's hit byte can carry a 1..NBIN bin rank instead of a 0/1 flag.
+
+    The point is the truncation: when a lane fires more rows than the buffer
+    holds, compact_fired keeps "the first W in position order", and position has
+    nothing to do with whether a row beats the kept maximum. Measured offline on
+    the r=0 dumps, at the production W=4096 the positional prefix retains 61.9%
+    of the rows that truly beat max1 against 99.1% for bound order -- same W,
+    same traffic.
+
+    This pins the foundation of that change rather than the change itself: a
+    rank of 0 still means unfired and `hit >= 1` is exactly `hit != 0`, so until
+    a cutoff above 1 is computed the arm must be invisible. A regression here
+    would be invisible in a score, which is why it is asserted on the fetched
+    rows.
+    """
+
+    def _run(self, rank_hit):
+        import importlib
+        import os
+
+        from sglang.srt.layers.attention.vestigekv import batched_step as BS
+
+        prev = os.environ.get("SGLANG_DEBUG_VESTIGEKV_RANK_HIT")
+        os.environ["SGLANG_DEBUG_VESTIGEKV_RANK_HIT"] = "1" if rank_hit else "0"
+        try:
+            importlib.reload(BS)
+            torch.manual_seed(3)
+            L, max_reqs, W = 2, 6, 64
+            pairs = [(0, 1), (1, 4)]
+            base = {p: _mk_tier(800, 12000, seed=7 + p[1], zp=1.0,
+                                thr_g=-float("inf")) for p in pairs}
+            qbuf = torch.randn(L, max_reqs, H, 576, device="cuda")
+            fetch = torch.zeros(L, max_reqs, W, dtype=torch.int64, device="cuda")
+            flen = torch.zeros(L, max_reqs, dtype=torch.int64, device="cuda")
+            pack = BS.BatchedScanPack(pairs, [base[p] for p in pairs], qbuf,
+                                      fetch, flen, _ovf(flen), _cnt(flen), H,
+                                      margin=0.0)
+            pack.run()
+            torch.cuda.synchronize()
+            # Grab the compiled kernel HERE: the reload below installs a fresh
+            # JITFunction whose cache is empty, so reading it afterwards finds
+            # nothing. That cost one confusing IndexError.
+            cache = BS._scan_batched_kernel.device_caches[
+                torch.cuda.current_device()][0]
+            return flen.clone(), fetch.clone(), pack, list(cache.values())[-1]
+        finally:
+            if prev is None:
+                os.environ.pop("SGLANG_DEBUG_VESTIGEKV_RANK_HIT", None)
+            else:
+                os.environ["SGLANG_DEBUG_VESTIGEKV_RANK_HIT"] = prev
+            importlib.reload(BS)
+
+    def test_the_fetched_set_is_bit_identical(self):
+        lo, fo, po, _ = self._run(False)
+        ln, fn, pn, _ = self._run(True)
+        self.assertFalse(po._rank_hit)
+        self.assertTrue(pn._rank_hit)
+        torch.testing.assert_close(ln, lo, rtol=0, atol=0)
+        torch.testing.assert_close(fn, fo, rtol=0, atol=0)
+
+    def test_the_rank_variant_does_not_spill(self):
+        """A spilling build slows every step, including the ones that never
+        truncate -- which here is most of them."""
+        _, _, _, off = self._run(False)
+        _, _, _, on = self._run(True)
+        self.assertEqual(on.n_spills, 0, f"rank variant spills {on.n_spills} B")
+        self.assertLessEqual(
+            on.n_regs, off.n_regs + 4,
+            f"rank variant costs {on.n_regs - off.n_regs} registers "
+            f"({off.n_regs} -> {on.n_regs}); score and m1 were already live",
+        )

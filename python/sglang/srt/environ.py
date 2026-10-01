@@ -734,6 +734,15 @@ class Envs:
     # qperp_rel is a ratio in [0, 1], so a per-slot threshold of -1 or +2 forces
     # either branch -- so it adds no kernel variant and no registers.
     SGLANG_DEBUG_VESTIGEKV_MARGIN_LAYERS = EnvTuple(())
+    # Carry a 1..32 bin RANK in the scan's hit byte instead of a 0/1 flag, so
+    # the compaction can keep the W rows with the strongest certified bound
+    # instead of the first W in archive position order. Measured offline on the
+    # r=0 dumps: at the production W=4096 the positional prefix retains 61.9% of
+    # the rows that truly beat max1 and bound order retains 99.1%, same W and
+    # same traffic. It is the same byte (hit is already int8), so this costs no
+    # memory and no extra pass. Adds no tuned width: the cutoff follows from
+    # bringing the count under the capacity already configured.
+    SGLANG_DEBUG_VESTIGEKV_RANK_HIT = EnvBool(False)
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
