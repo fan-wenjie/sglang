@@ -647,6 +647,7 @@ def _compact_scan_kernel(counts_ptr, offsets_ptr, total_ptr, NB, NB2: tl.constex
 @triton.jit
 def _compact_write_kernel(
     hit_ptr,
+    cutoff_ptr,  # [P] int32, HAS_CUT only: per-lane rank cutoff
     offsets_ptr,
     arch_ptr,
     out_ptr,
@@ -665,6 +666,7 @@ def _compact_write_kernel(
     NSLOT,
     BLOCK_A: tl.constexpr,
     SPREAD: tl.constexpr,
+    HAS_CUT: tl.constexpr = False,  # select hit >= cutoff, not hit != 0
 ):
     p = tl.program_id(1)
     pid = tl.program_id(0)
@@ -708,7 +710,11 @@ def _compact_write_kernel(
         b = pid + i * G
         offs = b * BLOCK_A + tl.arange(0, BLOCK_A)
         m = (offs < Am) & (offs < alen)
-        h = tl.load(hit_ptr + abase + offs, mask=m, other=0) != 0
+        hv = tl.load(hit_ptr + abase + offs, mask=m, other=0).to(tl.int32)
+        # hit carries a rank when RANK_HIT is on, and CUT is 1 otherwise, so
+        # `>= CUT` degenerates to the old `!= 0` exactly.
+        cut = tl.load(cutoff_ptr + p) if HAS_CUT else 1
+        h = hv >= cut
         base = tl.load(offsets_ptr + p * nb + b)
         pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
         arch = tl.load(arch_ptr + abase + offs, mask=m, other=0)
@@ -735,6 +741,99 @@ def _zero_coins(like):
     return z
 
 
+@triton.jit
+def _rank_hist_kernel(
+    hit_ptr,  # [arena] int8: 0 unfired, else a 1..NBIN rank
+    a_len_ptr,
+    a_off_ptr,
+    hist_ptr,  # [P, NB, NBIN] int32 out
+    Amax,
+    NBIN: tl.constexpr,
+    BLOCK_A: tl.constexpr,
+):
+    """Histogram the ranks the scan already wrote.
+
+    Deliberately NOT inside the scan: NBIN bin counters are NBIN live values on
+    the hottest kernel in the system, and a spilling build slows every step
+    including the ones whose feature never fires -- which here is most of them.
+    `hit` is already materialised at one byte per row, so this pass costs about
+    0.7% of the scan's 137 B/row and leaves the scan's register count untouched
+    (measured: 86 -> 86 for the rank store itself).
+    """
+    p = tl.program_id(1)
+    b = tl.program_id(0)
+    al = tl.load(a_len_ptr + p)
+    nb = (Amax + BLOCK_A - 1) // BLOCK_A
+    if b * BLOCK_A >= al:
+        return
+    abase = tl.load(a_off_ptr + p)
+    offs = b * BLOCK_A + tl.arange(0, BLOCK_A)
+    m = offs < al
+    h = tl.load(hit_ptr + abase + offs, mask=m, other=0).to(tl.int32)
+    # One (p, b) per program, so each writes its own row: no atomics.
+    for k in range(1, NBIN + 1):
+        c = tl.sum(tl.where(m & (h == k), 1, 0), 0)
+        tl.store(hist_ptr + (p * nb + b) * NBIN + (k - 1), c)
+
+
+@triton.jit
+def _rank_cutoff_kernel(
+    hist_ptr,
+    counts_ptr,  # [P, NB] int32 out: rows at or above the cutoff, per bucket
+    cutoff_ptr,  # [P] int32 out
+    nb,
+    W,
+    NBIN: tl.constexpr,
+):
+    """The cutoff is not a tuned width: it is the answer to what fits in W.
+
+    Cumulates from the strongest bin down and stops at the lowest bin whose
+    running total still fits the capacity already configured, then rewrites the
+    per-bucket counts so the existing prefix and scatter consume them unchanged.
+    """
+    p = tl.program_id(0)
+    cut = NBIN + 1
+    run = 0
+    for k in range(NBIN, 0, -1):
+        tot = 0
+        for b in range(nb):
+            tot += tl.load(hist_ptr + (p * nb + b) * NBIN + (k - 1))
+        nxt = run + tot
+        cut = tl.where((nxt <= W) & (cut == k + 1), k, cut)
+        run = tl.where(cut == k, nxt, run)
+    # If even the single strongest bin exceeds W, no cutoff fits and cut would
+    # stay NBIN+1, which matches nothing and fetches NOTHING. Clamp to NBIN:
+    # take the top bin and let the positional prefix decide within it, which
+    # cannot be worse than today's prefix over the whole archive.
+    cut = tl.minimum(tl.maximum(cut, 1), NBIN)
+    tl.store(cutoff_ptr + p, cut.to(tl.int32))
+    for b in range(nb):
+        acc = 0
+        for k in range(1, NBIN + 1):
+            v = tl.load(hist_ptr + (p * nb + b) * NBIN + (k - 1))
+            acc += tl.where(k >= cut, v, 0)
+        tl.store(counts_ptr + p * nb + b, acc.to(tl.int32))
+
+
+def rank_cutoff(hit, a_len, a_off, am_grid, W, hist, cutoff, counts,
+                nbin=None, p_live=None):
+    """Per-lane rank cutoff, and the per-bucket counts it implies.
+
+    Runs between the scan and compact_fired: the scan has written the ranks and
+    compact_fired has not yet taken the prefix, so rewriting `counts` here is
+    all it takes for the existing compaction to honour the cutoff.
+    """
+    nbin = D.RANK_NBIN if nbin is None else nbin
+    P = a_len.shape[0] if p_live is None else p_live
+    BLOCK_A = 1024
+    nb = triton.cdiv(am_grid, BLOCK_A)
+    hist.zero_()
+    _rank_hist_kernel[(nb, P)](hit, a_len, a_off, hist, am_grid,
+                               NBIN=nbin, BLOCK_A=BLOCK_A)
+    _rank_cutoff_kernel[(P,)](hist, counts, cutoff, nb, int(W), NBIN=nbin)
+    return cutoff
+
+
 def compact_fired(
     hit,
     arch,
@@ -751,6 +850,7 @@ def compact_fired(
     p_live=None,
     fence_rows=0,
     rand_fence=None,
+    cutoff=None,  # [P] int32; when given, select hit >= cutoff[p] not hit != 0
 ):
     """Deterministic fired-row compaction. scratch: (counts, offsets, total)
     int32 [P, NB] x2 + [P]; fetch_buf [n_li, n_slot, W]; fetch_len/fetch_ovf
@@ -782,6 +882,7 @@ def compact_fired(
     # exited, but the dispatch floor alone was ~12 us at short context.
     _compact_write_kernel[(min(NB, D.SCAN_GRID_CAP), P)](
         hit,
+        cutoff if cutoff is not None else a_len,
         offsets,
         arch,
         fetch_buf,
@@ -805,4 +906,5 @@ def compact_fired(
         fetch_buf.shape[1],
         BLOCK_A=BLOCK_A,
         SPREAD=envs.SGLANG_DEBUG_VESTIGEKV_SPREAD_TRUNCATE.get(),
+        HAS_CUT=cutoff is not None,
     )

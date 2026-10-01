@@ -128,6 +128,13 @@ so that buffer keeps the base metadata's kv_indices dtype (int64)."""
 
 # ---- decode-time block closing ----
 
+RANK_NBIN = 32
+"""Bins the scan's hit byte carries when RANK_HIT is on, so the compaction can
+keep the rows with the strongest certified bound instead of the first W in
+archive position order. Measured offline on the r=0 dumps: 32 bins costs 0.5-0.7
+points of recall against an exact top-W, 8 costs 3.8-5.9, and 64 buys back
+0.0-0.2. It fits the int8 hit byte, which is what makes the ranking free."""
+
 CLOSE_BLOCK = 4096
 """Decoded tokens per compression event. Every CLOSE_BLOCK decode steps a
 request's newest block is closed: sigma is computed for its rows, the global
