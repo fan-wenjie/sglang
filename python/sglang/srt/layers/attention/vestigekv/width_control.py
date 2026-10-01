@@ -563,3 +563,60 @@ class GeometryWidthController(_WidthController):
         self.thr.add_(self._w)
         self.seen.add_(1.0)
         relthr_out.copy_(self.thr)
+
+
+class LayerMarginController(_WidthController):
+    r"""A different margin on named layers, with no kernel change at all.
+
+    The fetch is not spread across layers, it is concentrated: on the served
+    arm, layer 26 alone carries 81.8% of every fetched row on natural decode and
+    65.9% on MRCR, and it is the heaviest layer on three of the four step dumps.
+    It fires on 96% of steps while losing the top-1 row on 0.84% of them
+    (3.70% on MRCR). So one layer does most of the work for a failure rate under
+    one percent, and width control anywhere else can only reach the other 18%.
+
+    This is a PER-LAYER allocation, which is a different hypothesis from the
+    per-head selection that lost to a tuned scalar at matched work. There,
+    giving 30% of heads extra margin and the rest none was worse than giving
+    everyone a little: the starved heads cost more than the favoured ones
+    gained. Across layers the asymmetry is far larger -- 82% against 18% rather
+    than 30% against 70% -- so it is worth asking separately rather than
+    assuming the earlier verdict carries.
+
+    It needs no new kernel path. The prologue already selects
+    `margin_hi` where `qperp_rel > relthr[p]` and `margin` otherwise, and
+    qperp_rel is a norm ratio in [0, 1]; so relthr = -1 forces margin_hi on a
+    slot and relthr = +2 forces margin. Setting it from the slot's layer id
+    turns the per-head selector into a per-layer switch, through a path that is
+    already disassembled (REG 96, SPILLS 0) and tested.
+
+    Direction: thr = max1 - margin, so margin_hi BELOW margin (a negative
+    WIDTH_MARGIN_DELTA) narrows the named layers. That is the intended use --
+    narrow the one layer that is over-fetching -- and the opposite sign widens
+    them instead, which is also expressible and also worth a point on the curve.
+    """
+
+    def __init__(self, P: int, layers: tuple[int, ...], device):
+        # The named layers take margin_hi; everything else takes margin. Stored
+        # as a set because the pack's layer ids are not contiguous (the MLA
+        # layers are 3, 7, 11, 15, 19, 23, 26 on this model).
+        self.layers = frozenset(int(x) for x in layers)
+        self.sel = torch.full((P,), 2.0, device=device)
+        self._li_seen: tuple[int, ...] | None = None
+
+    def write_cc(self, *, li, relthr, **_ignored):
+        """Point each slot at the branch its layer should take.
+
+        `li` [P] is the pack's layer index per slot. It only changes when the
+        pack is re-pointed at new tiers, so the recompute is skipped when it has
+        not moved -- a device-to-host read per step would stall the step this is
+        meant to make cheaper.
+        """
+        if relthr is None:
+            return
+        key = tuple(int(x) for x in li.tolist())
+        if key != self._li_seen:
+            self._li_seen = key
+            for i, lid in enumerate(key):
+                self.sel[i] = -1.0 if lid in self.layers else 2.0
+        relthr.copy_(self.sel, non_blocking=True)

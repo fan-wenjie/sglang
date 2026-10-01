@@ -42,6 +42,14 @@ def _margin_delta() -> float:
     return envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_MARGIN_DELTA.get()
 
 
+def _layer_margin_cls():
+    from sglang.srt.layers.attention.vestigekv.width_control import (
+        LayerMarginController,
+    )
+
+    return LayerMarginController
+
+
 def _geometry_width_cls():
     from sglang.srt.layers.attention.vestigekv.width_control import (
         GeometryWidthController,
@@ -73,6 +81,20 @@ def _make_width_controller(P: int, dev, H: int = 32):
         CertWidthController,
         DerivedWidthController,
     )
+
+    ml = envs.SGLANG_DEBUG_VESTIGEKV_MARGIN_LAYERS.get()
+    if ml:
+        from sglang.srt.layers.attention.vestigekv.width_control import (
+            LayerMarginController,
+        )
+
+        dm = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_MARGIN_DELTA.get()
+        logging.getLogger(__name__).info(
+            "VKWIDTH per-layer: layers=%s margin_delta=%+.3f over %d slots%s",
+            ",".join(str(x) for x in ml), dm, P,
+            " (delta 0, exact no-op)" if dm == 0.0 else "",
+        )
+        return LayerMarginController(P, tuple(int(x) for x in ml), dev)
 
     lvl = envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_QLEVEL.get()
     if lvl > 0.0:
@@ -357,7 +379,7 @@ class BatchedScanPack:
         # actuator is the margin, applied per head inside that same kernel.
         self._margin_delta = _margin_delta()
         self._qrel = self._relthr = None
-        if isinstance(self._width, _geometry_width_cls()):
+        if isinstance(self._width, (_geometry_width_cls(), _layer_margin_cls())):
             self._qrel = torch.zeros(P, q_heads, device=dev)
             # Starts at 0, so every head is above it and the FIRST steps run at
             # the wide margin: width is given up only once the layer's tail is
@@ -541,7 +563,7 @@ class BatchedScanPack:
         # actuator is the margin, applied per head inside that same kernel.
         self._margin_delta = _margin_delta()
         self._qrel = self._relthr = None
-        if isinstance(self._width, _geometry_width_cls()):
+        if isinstance(self._width, (_geometry_width_cls(), _layer_margin_cls())):
             self._qrel = torch.zeros(P, q_heads, device=dev)
             # Starts at 0, so every head is above it and the FIRST steps run at
             # the wide margin: width is given up only once the layer's tail is
@@ -751,6 +773,7 @@ class BatchedScanPack:
                 fired=self._fired_prev(), cc_host=self._cc_host,
                 a_len=self.a_len, z=self._z_host, n_cal=self._ncal_host,
                 fac_host=self._fac_host, fac=self._fac, cc_out=self.cc,
+                li=self.li, relthr=self._relthr,
             )
         if self.csk is None:
             # Hold the caches alive: cbase is a raw address, and a tier going

@@ -725,6 +725,15 @@ class Envs:
     # the certificate term, and on the served arm firing is not
     # certificate-driven (Spearman -0.292 on the layer carrying 82% of fetch).
     SGLANG_DEBUG_VESTIGEKV_WIDTH_MARGIN_DELTA = EnvFloat(0.0)
+    # Layers that take the margin_hi branch instead of the base margin, as a
+    # comma-separated list of layer ids (empty = off). With a NEGATIVE
+    # WIDTH_MARGIN_DELTA this narrows exactly the named layers, which is the
+    # point: on the served arm layer 26 alone carries 81.8% of every fetched row
+    # on natural decode and 65.9% on MRCR, while losing the top-1 row on 0.84%
+    # and 3.70% of its own steps. Reuses the per-head selector's kernel path --
+    # qperp_rel is a ratio in [0, 1], so a per-slot threshold of -1 or +2 forces
+    # either branch -- so it adds no kernel variant and no registers.
+    SGLANG_DEBUG_VESTIGEKV_MARGIN_LAYERS = EnvTuple(())
     # Timing probe, never a serving mode: compiles the CSR gather's fenced
     # branch as a no-op while every other part of the fence stays armed, so the
     # cost of the branch merely EXISTING (it is sized into the kernel's register
