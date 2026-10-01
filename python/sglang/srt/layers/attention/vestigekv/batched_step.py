@@ -876,6 +876,16 @@ class BatchedScanPack:
                     _RANK_SEEN[0],
                 )
         if self._width is not None:
+            # The layer vector is taken from `pairs` on the HOST, not from
+            # self.li: that tensor is copied further down this function, so it
+            # still holds the PREVIOUS step's layers here -- the zero vector on
+            # the first update, which latched a selection computed from layer 0's
+            # membership alone across every slot. It self-corrected on the second
+            # update, so a served run was mis-selected for one step, but a pack
+            # run() without a following update() stayed wrong. Reading the host
+            # list also drops a per-step device-to-host sync that the controller
+            # was explicitly written to avoid.
+            li_host = [p[0] for p in pairs] + [0] * (self.li.shape[0] - len(pairs))
             # One call, whichever controller is installed: it takes what it
             # needs by keyword and ignores the rest. c_total holds the PREVIOUS
             # step's fired counts because update() runs before the scan, and
@@ -886,7 +896,7 @@ class BatchedScanPack:
                 fired=self._fired_prev(), cc_host=self._cc_host,
                 a_len=self.a_len, z=self._z_host, n_cal=self._ncal_host,
                 fac_host=self._fac_host, fac=self._fac, cc_out=self.cc,
-                li=self.li, relthr=self._relthr,
+                li=li_host, relthr=self._relthr,
             )
         if self.csk is None:
             # Hold the caches alive: cbase is a raw address, and a tier going

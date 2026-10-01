@@ -11,6 +11,7 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1016,3 +1017,61 @@ class TestRankHitIsInertAtCutoffOne(CustomTestCase):
             f"rank variant costs {on.n_regs - off.n_regs} registers "
             f"({off.n_regs} -> {on.n_regs}); score and m1 were already live",
         )
+
+
+class TestLayerMarginSelectsPerSlot(CustomTestCase):
+    """The per-layer arm must select PER SLOT, and on THIS step's layers.
+
+    Four runs of the arm came back null (sl2-slack/-b, sl2-tight/-b at
+    131k-262k, all inside their control band). That reading is only safe if
+    the selection was actually per-slot, and it was not: write_cc ran before
+    update() copied self.li, so the key was the previous step's layer vector --
+    the zero vector on the first update -- and every slot took layer 0's
+    membership. It self-corrected on the second update, which is why a served
+    run was wrong for one step only; a pack run() without a following update()
+    stayed wrong for its whole life.
+    """
+
+    def _sel_for(self, layers, pairs):
+        from sglang.srt.layers.attention.vestigekv import batched_step as BS
+        with envs.SGLANG_DEBUG_VESTIGEKV_MARGIN_LAYERS.override(layers), \
+             envs.SGLANG_DEBUG_VESTIGEKV_WIDTH_MARGIN_DELTA.override(-1.0):
+            torch.manual_seed(11)
+            tiers = {p: _mk_tier(200, 1500, seed=5 + p[0], zp=2.0,
+                                 thr_g=-float("inf")) for p in pairs}
+            n = len(pairs)
+            qbuf = torch.randn(n, 1, H, 576, device="cuda")
+            fetch = torch.zeros(n, 1, 4096, dtype=torch.int64, device="cuda")
+            flen = torch.zeros(n, 1, dtype=torch.int64, device="cuda")
+            pk = BS.BatchedScanPack(pairs, [tiers[p] for p in pairs], qbuf,
+                                    fetch, flen, _ovf(flen), _cnt(flen), H,
+                                    margin=0.0)
+            return pk, [round(x, 1) for x in pk._width.sel.tolist()]
+
+    def test_selection_is_per_slot_right_after_construction(self):
+        pairs = [(0, 0), (1, 0), (2, 0), (3, 0)]
+        _, sel = self._sel_for("0,1", pairs)
+        # -1 forces margin_hi, +2 forces margin (qperp_rel is a ratio <= 1)
+        self.assertEqual(sel, [-1.0, -1.0, 2.0, 2.0],
+                         "slots 2,3 are not in {0,1} and must keep `margin`; "
+                         "a uniform vector means the stale-li latch is back")
+
+    def test_a_disjoint_set_selects_the_complement(self):
+        pairs = [(0, 0), (1, 0), (2, 0), (3, 0)]
+        _, sel = self._sel_for("2,3", pairs)
+        self.assertEqual(sel, [2.0, 2.0, -1.0, -1.0])
+
+    def test_margin_layers_are_pack_indices_not_model_layer_ids(self):
+        """A model layer id above n_mla selects nothing -- pin it, don't fix it.
+
+        MARGIN_LAYERS is matched against the pack index the backend fills from
+        _li_map ({3:0, 7:1, 11:2, 15:3, 19:4, 23:5, 26:6} on this model). Four
+        queued arms were silently inert because they named model layer ids.
+        """
+        pairs = [(0, 0), (1, 0), (2, 0), (3, 0)]
+        _, sel = self._sel_for("11,15,19", pairs)
+        self.assertEqual(sel, [2.0, 2.0, 2.0, 2.0],
+                         "11,15,19 are not valid pack indices here, so the arm "
+                         "must be an exact no-op -- if this starts failing, the "
+                         "env now takes model layer ids and the four sl2-* runs "
+                         "need re-reading")
