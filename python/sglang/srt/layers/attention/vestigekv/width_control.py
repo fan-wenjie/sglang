@@ -607,14 +607,21 @@ class LayerMarginController(_WidthController):
     def write_cc(self, *, li, relthr, **_ignored):
         """Point each slot at the branch its layer should take.
 
-        `li` [P] is the pack's layer index per slot. It only changes when the
-        pack is re-pointed at new tiers, so the recompute is skipped when it has
-        not moved -- a device-to-host read per step would stall the step this is
-        meant to make cheaper.
+        `li` is a host sequence of this step's pack layer indices, one per
+        slot. The recompute is skipped when it has not moved, and the caller
+        passes a plain list so no device-to-host read happens at all.
+
+        These are PACK indices (0..n_mla-1), not model layer ids: the backend
+        fills them from `_li_map`, which on this model is
+        {3:0, 7:1, 11:2, 15:3, 19:4, 23:5, 26:6}. SGLANG_DEBUG_VESTIGEKV_MARGIN_LAYERS
+        is matched against these, so naming a model layer id above n_mla selects
+        nothing and the arm is an exact no-op.
         """
         if relthr is None:
             return
-        key = tuple(int(x) for x in li.tolist())
+        # `li` arrives as a host list of this step's layer indices (see the
+        # caller): no .tolist(), so no device sync, and no staleness.
+        key = tuple(int(x) for x in li)
         if key != self._li_seen:
             self._li_seen = key
             for i, lid in enumerate(key):
