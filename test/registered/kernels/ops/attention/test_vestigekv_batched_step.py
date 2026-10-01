@@ -941,7 +941,7 @@ class TestRankHitIsInertAtCutoffOne(CustomTestCase):
     rows.
     """
 
-    def _run(self, rank_hit):
+    def _run(self, rank_hit, steps=1):
         import importlib
         import os
 
@@ -962,8 +962,9 @@ class TestRankHitIsInertAtCutoffOne(CustomTestCase):
             pack = BS.BatchedScanPack(pairs, [base[p] for p in pairs], qbuf,
                                       fetch, flen, _ovf(flen), _cnt(flen), H,
                                       margin=0.0)
-            pack.run()
-            torch.cuda.synchronize()
+            for _ in range(steps):
+                pack.run()
+                torch.cuda.synchronize()
             # Grab the compiled kernel HERE: the reload below installs a fresh
             # JITFunction whose cache is empty, so reading it afterwards finds
             # nothing. That cost one confusing IndexError.
@@ -984,6 +985,25 @@ class TestRankHitIsInertAtCutoffOne(CustomTestCase):
         self.assertTrue(pn._rank_hit)
         torch.testing.assert_close(ln, lo, rtol=0, atol=0)
         torch.testing.assert_close(fn, fo, rtol=0, atol=0)
+
+    def test_the_arm_actually_truncates_after_a_second_step(self):
+        """The arm must CHANGE the fetched set once the span is real.
+
+        Two bugs hid behind single-step tests. The span was never updated from
+        the scan, so every fired row saturated into the top bin and the cutoff
+        clamped to NBIN -- inert, and indistinguishable from a correct no-op.
+        And the span is stale-by-one by design, so one step can never exercise
+        it however correct the code is. Hence: run twice, then assert the
+        fetched set moved and the cutoff is a real interior value.
+        """
+        _, f0, _, _ = self._run(False, steps=2)
+        _, f1, p1, _ = self._run(True, steps=2)
+        cut = p1._rank_cut.tolist()
+        self.assertTrue(all(1 < c < 32 for c in cut),
+                        f"cutoff not interior: {cut} -- 1 means nothing to "
+                        f"truncate, 32 means the degenerate clamp")
+        self.assertFalse(torch.equal(f0, f1),
+                         "fetched set unchanged; the arm did nothing")
 
     def test_the_rank_variant_does_not_spill(self):
         """A spilling build slows every step, including the ones that never
