@@ -30,10 +30,31 @@ from sglang.srt.layers.attention.vestigekv.fused_prologue import (
 )
 
 def _rank_hit() -> bool:
-    """Whether the scan's hit byte carries a bin rank instead of a flag."""
+    """Whether the scan's hit byte carries a bin rank instead of a flag.
+
+    Logged on the way out. An arm that is correctly INERT and an arm that never
+    armed produce identical numbers by construction, so without a line in the
+    server log the validation run proves nothing -- which is exactly what
+    happened to rkin-*: the env reached the runner and nothing recorded whether
+    the pack read it. A geometry arm degraded to a silent no-op the same way
+    earlier and was only caught because an unrelated log line happened to carry
+    a zero.
+    """
+    import logging
+
     from sglang.srt.environ import envs
 
-    return bool(envs.SGLANG_DEBUG_VESTIGEKV_RANK_HIT.get())
+    on = bool(envs.SGLANG_DEBUG_VESTIGEKV_RANK_HIT.get())
+    if on and not _RANK_LOGGED[0]:
+        _RANK_LOGGED[0] = True
+        logging.getLogger(__name__).info(
+            "VKRANK hit carries a %d-bin rank; cutoff not yet computed, so "
+            "hit >= 1 is still exactly hit != 0", D.RANK_NBIN,
+        )
+    return on
+
+
+_RANK_LOGGED = [False]
 
 
 def _margin_delta() -> float:
@@ -174,7 +195,7 @@ def _scan_batched_kernel(
     BLOCK_A: tl.constexpr,
     MULTI: tl.constexpr,
     RANK_HIT: tl.constexpr = False,  # hit carries a 1..NBIN rank, not a flag
-    NBIN: tl.constexpr = 32,  # 32 costs 0.5-0.7 points against an exact top-W
+    NBIN: tl.constexpr = 32,  # see D.RANK_NBIN; 32 costs 0.5-0.7 points
 ):
     p = tl.program_id(1)
     al = tl.load(a_len_ptr + p)

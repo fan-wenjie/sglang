@@ -195,3 +195,114 @@ class TestPerHeadMarginSelector(CustomTestCase):
         self.assertLessEqual(sel.n_regs, base.n_regs + 6,
                              f"selector costs {sel.n_regs - base.n_regs} regs "
                              f"({base.n_regs} -> {sel.n_regs})")
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestRankCutoff(CustomTestCase):
+    """Bound-ordered truncation: the cutoff is what fits W, not a tuned width.
+
+    When a lane fires more rows than the buffer holds, compact_fired keeps "the
+    first W in position order", and archive position has nothing to do with
+    whether a row beats the kept maximum. Measured offline on the r=0 dumps with
+    the denominator fixed across W, the positional prefix retains 61.9% of the
+    rows that truly beat max1 at the production W=4096 and bound order retains
+    99.1%; at W=256 it is 24.9% against 81.6%.
+    """
+
+    def _hist_case(self, lens, ranks, W, nbin=None):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.fused_prologue import (
+            rank_cutoff,
+        )
+        nbin = D.RANK_NBIN if nbin is None else nbin
+        dev = "cuda"
+        P = len(lens)
+        Am = max(lens)
+        a_len = torch.tensor(lens, dtype=torch.int64, device=dev)
+        a_off = torch.tensor([i * Am for i in range(P)], dtype=torch.int64,
+                             device=dev)
+        hit = torch.zeros(P * Am, dtype=torch.int8, device=dev)
+        for i, (n, r) in enumerate(zip(lens, ranks)):
+            hit[i * Am: i * Am + n] = r[:n].to(torch.int8).to(dev)
+        nb = (Am + 1023) // 1024
+        hist = torch.zeros(P, nb, nbin, dtype=torch.int32, device=dev)
+        cutoff = torch.zeros(P, dtype=torch.int32, device=dev)
+        counts = torch.zeros(P, nb, dtype=torch.int32, device=dev)
+        rank_cutoff(hit, a_len, a_off, Am, W, hist, cutoff, counts, nbin=nbin)
+        return hit, a_len, a_off, Am, cutoff, counts, nbin
+
+    def test_the_cutoff_is_the_lowest_bin_that_fits(self):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        torch.manual_seed(0)
+        n = 4096
+        r = (torch.rand(n) ** 3 * D.RANK_NBIN).to(torch.int32) + 1
+        r[torch.rand(n) < 0.3] = 0
+        W = 256
+        hit, a_len, a_off, Am, cut, counts, nbin = self._hist_case([n], [r], W)
+        k = int(cut[0])
+        h = hit[:n].int()
+        self.assertLessEqual(int((h >= k).sum()), W, "cutoff does not fit W")
+        if k > 1:
+            self.assertGreater(int((h >= k - 1).sum()), W,
+                               "one bin lower would also fit; cutoff too high")
+        self.assertEqual(int(counts[0].sum()), int((h >= k).sum()),
+                         "per-bucket counts disagree with the cutoff")
+
+    def test_a_lane_that_does_not_overflow_gets_cutoff_one(self):
+        """The arm must be invisible where there is nothing to truncate, which
+        is most steps: the branch arm's median fire is 12 rows."""
+        r = torch.full((17,), 7, dtype=torch.int32)
+        _, _, _, _, cut, counts, _ = self._hist_case([17], [r], 256)
+        self.assertEqual(int(cut[0]), 1)
+        self.assertEqual(int(counts[0].sum()), 17)
+
+    def test_no_cutoff_fits_falls_back_to_the_top_bin_not_to_nothing(self):
+        """If the strongest bin alone exceeds W, cut would run off the end and
+        match nothing. Clamping to NBIN keeps the top bin and lets the
+        positional prefix decide within it -- never worse than today."""
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        n = 4096
+        r = torch.full((n,), D.RANK_NBIN, dtype=torch.int32)
+        _, _, _, _, cut, counts, _ = self._hist_case([n], [r], 256)
+        self.assertEqual(int(cut[0]), D.RANK_NBIN)
+        self.assertEqual(int(counts[0].sum()), n, "fetched nothing")
+
+    def test_cutoff_one_reproduces_the_unranked_compaction_exactly(self):
+        """Second no-op proof, at the compaction rather than the scan: a cutoff
+        of 1 selects hit >= 1, which is exactly hit != 0."""
+        from sglang.srt.layers.attention.vestigekv.fused_prologue import (
+            compact_fired,
+        )
+        dev = "cuda"
+        torch.manual_seed(2)
+        P, Am, W, L, NSLOT = 2, 2048, 64, 1, 4
+        a_len = torch.tensor([Am, Am // 2], dtype=torch.int64, device=dev)
+        a_off = torch.tensor([0, Am], dtype=torch.int64, device=dev)
+        hit = (torch.rand(P * Am, device=dev) < 0.02).to(torch.int8)
+        arch = torch.arange(P * Am, dtype=torch.int64, device=dev)
+        li = torch.zeros(P, dtype=torch.int64, device=dev)
+        slot = torch.arange(P, dtype=torch.int64, device=dev)
+        nb = (Am + 1023) // 1024
+        def run(cut):
+            buf = torch.zeros(L, NSLOT, W, dtype=torch.int64, device=dev)
+            ln = torch.zeros(L, NSLOT, dtype=torch.int64, device=dev)
+            ovf = torch.zeros(L, NSLOT, dtype=torch.int32, device=dev)
+            oc = torch.zeros(L, dtype=torch.int32, device=dev)
+            scratch = (torch.zeros(P, nb, dtype=torch.int32, device=dev),
+                       torch.zeros(P, nb, dtype=torch.int32, device=dev),
+                       torch.zeros(P, dtype=torch.int32, device=dev))
+            # per-lane bucket counts; lanes have different a_len, so each is
+            # padded into its own row rather than stacked
+            for p in range(P):
+                hp = hit[int(a_off[p]):int(a_off[p]) + int(a_len[p])].int()
+                for bi in range(nb):
+                    seg = hp[bi * 1024:(bi + 1) * 1024]
+                    scratch[0][p, bi] = int(seg.sum()) if seg.numel() else 0
+            compact_fired(hit, arch, a_len, a_off, li, slot, buf, ln, ovf, oc,
+                          scratch, Am, cutoff=cut)
+            torch.cuda.synchronize()
+            return ln.clone(), buf.clone()
+        l0, b0 = run(None)
+        l1, b1 = run(torch.ones(P, dtype=torch.int32, device=dev))
+        torch.testing.assert_close(l1, l0, rtol=0, atol=0)
+        torch.testing.assert_close(b1, b0, rtol=0, atol=0)
