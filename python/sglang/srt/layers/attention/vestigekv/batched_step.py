@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.vestigekv.fused_prologue import (
 
     _NSPLIT,
     compact_fired,
+    rank_cutoff,
     fused_prologue_split,
 )
 
@@ -180,6 +181,7 @@ def _scan_batched_kernel(
     cc_ptr,  # [P] fp32: zp * sc / sqrt(kv_lora - R)
     hit_ptr,  # [P, Amax] int8 out: 0/1 fired flag, or a 1..NBIN rank
     span_ptr,  # [P] fp32, RANK_HIT only: the excess range the bins cover
+    spanmax_ptr,  # [P] fp32 out, RANK_HIT only: largest excess seen this step
     counts_ptr,  # [P, NB] int32 fused compact-count out (NB = ceil(Amax/1024))
     Amax,
     sc,
@@ -324,6 +326,15 @@ def _scan_batched_kernel(
                 )
                 rank = tl.where(fired > 0, b_i + 1, 0)
                 tl.store(hit_ptr + abase + offs, rank.to(tl.int8), mask=m)
+                # Record the largest excess seen, so the NEXT step's bins span
+                # the range that actually occurs. Without this the span stays at
+                # its initial value, every fired row saturates into the top bin,
+                # and the cutoff clamps to NBIN -- the arm goes inert and looks
+                # exactly like a correct no-op. One atomic per program.
+                tl.atomic_max(
+                    spanmax_ptr + p,
+                    tl.max(tl.where(m & (fired > 0), exc, 0.0), 0),
+                )
             else:
                 tl.store(hit_ptr + abase + offs, fired.to(tl.int8), mask=m)
             cnt += tl.sum(tl.where(m, fired, 0), 0)
@@ -454,7 +465,17 @@ class BatchedScanPack:
         # the PREVIOUS step -- bin placement does not need to be exact, and a
         # same-step range would need a second pass over the archive to find.
         self._span = torch.ones(P, device=dev)
+        self._spanmax = torch.zeros(P, device=dev)
         self._rank_hit = _rank_hit()
+        # Bound-ordered truncation. hist is [P, NB, NBIN] int32 and cutoff [P]
+        # int32; both are tiny (a 16k archive is 16 buckets, so 7*16*32*4 = 14
+        # kB) and only allocated when the arm is on.
+        self._rank_hist = self._rank_cut = None
+        if self._rank_hit:
+            _nb = (Am + 1023) // 1024
+            self._rank_hist = torch.zeros(P, _nb, D.RANK_NBIN,
+                                          dtype=torch.int32, device=dev)
+            self._rank_cut = torch.zeros(P, dtype=torch.int32, device=dev)
         # fixed-address fused-prologue outputs (graph reads/writes in place)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
@@ -641,7 +662,17 @@ class BatchedScanPack:
         # the PREVIOUS step -- bin placement does not need to be exact, and a
         # same-step range would need a second pass over the archive to find.
         self._span = torch.ones(P, device=dev)
+        self._spanmax = torch.zeros(P, device=dev)
         self._rank_hit = _rank_hit()
+        # Bound-ordered truncation. hist is [P, NB, NBIN] int32 and cutoff [P]
+        # int32; both are tiny (a 16k archive is 16 buckets, so 7*16*32*4 = 14
+        # kB) and only allocated when the arm is on.
+        self._rank_hist = self._rank_cut = None
+        if self._rank_hit:
+            _nb = (Am + 1023) // 1024
+            self._rank_hist = torch.zeros(P, _nb, D.RANK_NBIN,
+                                          dtype=torch.int32, device=dev)
+            self._rank_cut = torch.zeros(P, dtype=torch.int32, device=dev)
         H = q_heads
         self.max1g = torch.zeros(P, H, device=dev)
         self.qside_t = torch.zeros(
@@ -948,6 +979,7 @@ class BatchedScanPack:
             self.cc,
             self.hit,
             self._span,
+            self._spanmax,
             self.c_counts,
             Am,
             sc,
@@ -967,6 +999,24 @@ class BatchedScanPack:
         )
         # Deterministic two-phase Triton compaction: the torch chain's int64
         # cumsum alone cost 157 us/step at 128k (nsys, 1.5x the scan kernel).
+        if self._rank_hit:
+            # Adopt this step's observed range for the NEXT step's bins. Bin
+            # placement does not need to be exact -- a same-step range would
+            # need a second pass over the archive to find -- but it does need to
+            # be the right order of magnitude, which 1.0 was not.
+            self._span.copy_(self._spanmax.clamp_min(1e-6))
+            self._spanmax.zero_()
+        if self._rank_cut is not None:
+            # Between the scan and the compaction: the ranks are written and the
+            # prefix has not been taken, so rewriting counts here is all it
+            # takes for the existing compaction to honour the cutoff. The
+            # effective threshold this step becomes whatever fits the capacity
+            # already configured -- adaptive, with no tuned width.
+            rank_cutoff(
+                self.hit, self.a_len, self.a_off, Am, self.fetch_buf.shape[-1],
+                self._rank_hist, self._rank_cut, self.c_counts,
+                p_live=P_eff,
+            )
         compact_fired(
             self.hit,
             self.arch,
@@ -981,5 +1031,6 @@ class BatchedScanPack:
             (self.c_counts, self.c_offsets, self.c_total),
             self.am_grid,
             fence_rows=self.fence_rows,
+            cutoff=self._rank_cut,
             rand_fence=self.rand_coins,
         )
