@@ -49,8 +49,9 @@ def _rank_hit() -> bool:
     if on and not _RANK_LOGGED[0]:
         _RANK_LOGGED[0] = True
         logging.getLogger(__name__).info(
-            "VKRANK hit carries a %d-bin rank; cutoff not yet computed, so "
-            "hit >= 1 is still exactly hit != 0", D.RANK_NBIN,
+            "VKRANK hit carries a %d-bin rank; the scatter admits hit >= cutoff, "
+            "and cutoff=1 is exactly hit != 0 (see VKCUT for the live value)",
+            D.RANK_NBIN,
         )
     return on
 
@@ -852,6 +853,28 @@ class BatchedScanPack:
         # zero kills the certificate term outright, which is what
         # test_geometry_arm_neutral_matches_no_arm caught.
         self.cc.copy_(self._cc_host, non_blocking=True)
+        if self._rank_cut is not None:
+            # Read the PREVIOUS step's cutoff here, not in run(): run() is
+            # replayed from a captured graph and "no host code runs here at
+            # replay time" (vestigekv_mla_backend._ingraph_device_step), so
+            # a log line inside it fires once at capture and never again.
+            # update() refreshes tensor contents to revalidate the graph, so
+            # it does run per step. One reading per 200 steps, because the
+            # .tolist() is a device-to-host sync.
+            _RANK_SEEN[0] += 1
+            if _RANK_SEEN[0] % 200 == 1:
+                import logging
+
+                _c = self._rank_cut.tolist()
+                _nb = D.RANK_NBIN
+                logging.getLogger(__name__).info(
+                    "VKCUT cutoff=%s idle(=1)=%d/%d clamped(=%d)=%d/%d "
+                    "span=%s (step %d)",
+                    _c, sum(1 for x in _c if x <= 1), len(_c), _nb,
+                    sum(1 for x in _c if x >= _nb), len(_c),
+                    [round(x, 4) for x in self._span.tolist()],
+                    _RANK_SEEN[0],
+                )
         if self._width is not None:
             # One call, whichever controller is installed: it takes what it
             # needs by keyword and ignores the rest. c_total holds the PREVIOUS
@@ -859,28 +882,6 @@ class BatchedScanPack:
             # that staleness is the design -- the label is autocorrelated across
             # adjacent steps in a layer (phi +0.46 served, +0.56 branch), so
             # acting one step late costs 0.039 of AUC.
-            if self._rank_cut is not None:
-                # Read the PREVIOUS step's cutoff here, not in run(): run() is
-                # replayed from a captured graph and "no host code runs here at
-                # replay time" (vestigekv_mla_backend._ingraph_device_step), so
-                # a log line inside it fires once at capture and never again.
-                # update() refreshes tensor contents to revalidate the graph, so
-                # it does run per step. One reading per 200 steps, because the
-                # .tolist() is a device-to-host sync.
-                _RANK_SEEN[0] += 1
-                if _RANK_SEEN[0] % 200 == 1:
-                    import logging
-
-                    _c = self._rank_cut.tolist()
-                    _nb = D.RANK_NBIN
-                    logging.getLogger(__name__).info(
-                        "VKCUT cutoff=%s idle(=1)=%d/%d clamped(=%d)=%d/%d "
-                        "span=%s (step %d)",
-                        _c, sum(1 for x in _c if x <= 1), len(_c), _nb,
-                        sum(1 for x in _c if x >= _nb), len(_c),
-                        [round(x, 4) for x in self._span.tolist()],
-                        _RANK_SEEN[0],
-                    )
             self._width.write_cc(
                 fired=self._fired_prev(), cc_host=self._cc_host,
                 a_len=self.a_len, z=self._z_host, n_cal=self._ncal_host,
