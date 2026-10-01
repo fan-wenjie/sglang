@@ -519,3 +519,61 @@ class TestBothControllersAnswerOneEntryPoint(unittest.TestCase):
             self.assertNotIn(gone, src, f"pack still calls {gone} directly")
 
 
+
+
+class TestLayerMarginController(unittest.TestCase):
+    """A different margin on named layers, through the per-head selector's path.
+
+    qperp_rel is a norm ratio in [0, 1], so a per-slot threshold of -1 forces
+    the margin_hi branch and +2 forces the base margin. That turns the per-head
+    selector into a per-layer switch with no new kernel variant -- which is the
+    whole reason to express it this way, so pinning the two sentinel values is
+    pinning the mechanism.
+    """
+
+    def _ctl(self, layers=(26,), P=4):
+        from sglang.srt.layers.attention.vestigekv.width_control import (
+            LayerMarginController,
+        )
+        return LayerMarginController(P, layers, torch.device("cpu"))
+
+    def test_named_layers_take_the_hi_branch_and_others_the_base(self):
+        c = self._ctl(layers=(26, 3))
+        relthr = torch.zeros(4)
+        c.write_cc(li=torch.tensor([3, 7, 26, 15]), relthr=relthr)
+        # -1 forces margin_hi (qperp_rel >= 0 always exceeds it); +2 forces base
+        self.assertEqual(relthr.tolist(), [-1.0, 2.0, -1.0, 2.0])
+
+    def test_the_sentinels_bracket_the_signal_range(self):
+        """If qperp_rel could reach these values the switch would leak."""
+        c = self._ctl()
+        relthr = torch.zeros(4)
+        c.write_cc(li=torch.tensor([26, 26, 26, 26]), relthr=relthr)
+        self.assertTrue(bool((relthr < 0.0).all()), relthr)
+        c.write_cc(li=torch.tensor([3, 3, 3, 3]), relthr=relthr)
+        self.assertTrue(bool((relthr > 1.0).all()),
+                        f"base-branch sentinel {relthr} is inside [0,1]")
+
+    def test_it_recomputes_only_when_the_layer_map_moves(self):
+        """li only changes when the pack is re-pointed; a device read per step
+        would stall the step this is meant to make cheaper."""
+        c = self._ctl()
+        relthr = torch.zeros(4)
+        li = torch.tensor([3, 7, 26, 15])
+        c.write_cc(li=li, relthr=relthr)
+        first = c._li_seen
+        c.write_cc(li=li, relthr=relthr)
+        self.assertIs(first, c._li_seen, "recomputed on an unchanged map")
+        c.write_cc(li=torch.tensor([26, 7, 3, 15]), relthr=relthr)
+        self.assertIsNot(first, c._li_seen, "did not notice the map moving")
+        self.assertEqual(relthr.tolist(), [-1.0, 2.0, 2.0, 2.0])
+
+    def test_no_relthr_buffer_is_a_no_op_not_a_crash(self):
+        c = self._ctl()
+        c.write_cc(li=torch.tensor([26, 3, 7, 15]), relthr=None)
+
+    def test_an_empty_layer_list_touches_nothing(self):
+        c = self._ctl(layers=())
+        relthr = torch.zeros(4)
+        c.write_cc(li=torch.tensor([3, 7, 26, 15]), relthr=relthr)
+        self.assertEqual(relthr.tolist(), [2.0] * 4)
