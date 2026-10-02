@@ -299,6 +299,19 @@ class VestigeKVMLABackend(AttentionBackend):
                 "  (NEGATIVE: recall below the fitted target)"
                 if self._margin_eff < self.config.recall_margin else "",
             )
+        # Resolved once: config is frozen for this object's life. zp, the gate
+        # alpha, the hard-sample minimum and the conformal order statistic all
+        # derive from it, so a per-call read would let them disagree.
+        self._recall_target_eff = float(
+            envs.SGLANG_DEBUG_VESTIGEKV_RECALL_TARGET.get() or D.RECALL_TARGET
+        )
+        if self._recall_target_eff != D.RECALL_TARGET:
+            logger.info(
+                "VestigeKV recall_target %.4f (default %.4f); conformal k = "
+                "ceil((n_cal+1)*target), which at n_cal=128 is %d of 128",
+                self._recall_target_eff, D.RECALL_TARGET,
+                D.conformal_k(128, self._recall_target_eff),
+            )
         self._stepdump = envs.SGLANG_DEBUG_VESTIGEKV_STEPDUMP.get()
         # Control for the fence: fence a random fraction of lanes at the same
         # cost, so the gain can be attributed to the SELECTION or to the mere
@@ -2504,6 +2517,7 @@ class VestigeKVMLABackend(AttentionBackend):
                         fence_rows=self.config.multikey_fence_rows,
                         threshold=self.config.recall_threshold,
                         gauss_target=self.config.cert_gaussian_target,
+                        recall_target=self._recall_target_eff,
                     )
                     stats = tier.build(
                         kbuf,
@@ -2769,6 +2783,7 @@ class VestigeKVMLABackend(AttentionBackend):
             fence_rows=self.config.multikey_fence_rows,
             threshold=self.config.recall_threshold,
             gauss_target=self.config.cert_gaussian_target,
+            recall_target=self._recall_target_eff,
         )
         stats = tier.build(
             kbuf,

@@ -677,6 +677,9 @@ class Envs:
     # recall below the fitted target. The CLI flag stays non-negative because
     # its guard catches typos; this is deliberate and says so.
     SGLANG_DEBUG_VESTIGEKV_MARGIN_DELTA = EnvFloat(0.0)
+    # 0.0 means defaults.RECALL_TARGET; a target of zero is meaningless so
+    # the sentinel cannot collide with a real value.
+    SGLANG_DEBUG_VESTIGEKV_RECALL_TARGET = EnvFloat(0.0)
     # Skip tier 2 entirely for a (layer, request) whose calibration says the
     # archive never holds the winner: hard_rate <= this closes the gate, which
     # the kernel already expresses as max1g = +inf, so no row can fire and
