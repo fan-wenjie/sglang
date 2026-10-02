@@ -36,10 +36,16 @@ from sglang.srt.layers.attention.vestigekv.scan_kernel import vestige_scan
 logger = logging.getLogger(__name__)
 
 _ZP_SEEN = [0]
+# Every build's outcome, not the 1-in-200 the line below prints. The throttle
+# exists because a build runs per request per layer, but it turns a minority
+# outcome into a coin flip: at 262k four logged fits read two clipped and two
+# certified, which says nothing about the rate. Counting is free; printing is
+# what is expensive.
+_ZP_STATE = {}
 
 
 def _log_zp(method, target, zp, n, zmax, rate=float('nan'),
-            k=None, zp_raw=None):
+            k=None, zp_raw=None, forced=None):
     """One reading per process of what the certificate actually fitted.
 
     Three arms shipped this month as silent no-ops, and an arm that changes
@@ -51,25 +57,35 @@ def _log_zp(method, target, zp, n, zmax, rate=float('nan'),
     # made a tau sweep from 0.90 to 0.98 unreadable until the sorted sample was
     # dug out of the dumps by hand. width_control.py already prescribes the
     # answer: serve the sample maximum and SAY SO rather than clamp silently.
-    if zp_raw is not None and zp_raw > D.Z_MAX + 1e-9:
+    if forced is not None:
+        # A caller that never reached the fit: zp is Z_MAX because the evidence
+        # or the regime said so, not because a quantile exceeded it. Without
+        # this these two routes were indistinguishable from a real clip in the
+        # log, and need_more_hard emitted nothing at all.
+        state = forced
+    elif zp_raw is not None and zp_raw > D.Z_MAX + 1e-9:
         state = "ZMAX_CLIPPED"      # the target asked for more than Z_MAX allows
     elif k is not None and k >= n:
         state = "SAMPLE_MAX"        # the sample cannot certify the target
     else:
         state = "certified"
+    _ZP_STATE[state] = _ZP_STATE.get(state, 0) + 1
     _ZP_SEEN[0] += 1
     if _ZP_SEEN[0] % 200 == 1:
         logging.getLogger(__name__).info(
-            "VKZP fit=%s target=%.4f zp=%.4f n_cal=%d sample_max=%.4f "
-            "hard_rate=%.3f k=%s state=%s (build %d)",
+            "VKZP fit=%s target=%.4f zp=%.4f zp_raw=%s n_cal=%d "
+            "sample_max=%.4f hard_rate=%.3f k=%s state=%s tally=%s "
+            "(build %d)",
             method,
             target,
             zp,
+            "-" if zp_raw is None else "%.4f" % zp_raw,
             n,
             zmax,
             rate,
             k if k is not None else "-",
             state,
+            ",".join("%s=%d" % kv for kv in sorted(_ZP_STATE.items())),
             _ZP_SEEN[0],
         )
 
@@ -596,10 +612,20 @@ class RecallTier:
             # clamp (over-fetches, never under-recalls) and tell the caller to
             # keep collecting.
             self.zp = D.Z_MAX
+            _log_zp(
+                "clamp", self.recall_target, self.zp, n_cal_q,
+                float("nan"), self.hard_rate,
+                forced="NEED_MORE_HARD",
+            )
         elif self.archive_bound:
             # Escalate for THIS request: the fitted quantile is sound per step
             # and irrelevant to a conjunction this long, so the clamp stays.
             self.zp = D.Z_MAX
+            _log_zp(
+                "clamp", self.recall_target, self.zp, n_cal_q,
+                float("nan"), self.hard_rate,
+                forced="ARCHIVE_BOUND",
+            )
             logger.info(
                 "VKREGIME archive-bound: hard_rate=%.3f >= %.3f, keeping the "
                 "Z_MAX clamp (n_hard=%d/%d, n_cal_q=%d)",

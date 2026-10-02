@@ -436,3 +436,76 @@ class TestGaussianCertificate(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestZpStateIsDistinguishable(CustomTestCase):
+    """The VKZP line must separate the four routes to zp == Z_MAX.
+
+    Three of them produce the identical zp, and for a while two produced no
+    line at all: `need_more_hard` returned before the fit and logged nothing,
+    `archive_bound` logged only VKREGIME. A reader then could not tell a
+    certificate that asked for more than Z_MAX allows from one that never had
+    the evidence to ask -- and at 262k both were live. These pin the state, the
+    clip magnitude, and the whole-run tally that makes a minority outcome
+    readable through the 1-in-200 throttle.
+    """
+
+    def setUp(self):
+        from sglang.srt.layers.attention.vestigekv import recall_tier as rt
+
+        self._rt = rt
+        self._seen, self._state = rt._ZP_SEEN[0], dict(rt._ZP_STATE)
+        rt._ZP_SEEN[0] = 0
+        rt._ZP_STATE.clear()
+
+    def tearDown(self):
+        self._rt._ZP_SEEN[0] = self._seen
+        self._rt._ZP_STATE.clear()
+        self._rt._ZP_STATE.update(self._state)
+
+    def _one(self, **kw):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+
+        self._rt._ZP_SEEN[0] = 0
+        with self.assertLogs(self._rt.__name__, level="INFO") as cm:
+            self._rt._log_zp(
+                kw.pop("method", "conformal"), 0.90, kw.pop("zp", 4.0),
+                kw.pop("n", 128), kw.pop("zmax", 5.0), 0.3, **kw
+            )
+        self.assertEqual(len(cm.output), 1)
+        return cm.output[0]
+
+    def test_a_real_clip_is_not_a_missing_sample(self):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+
+        clipped = self._one(zp=D.Z_MAX, k=123, zp_raw=D.Z_MAX + 8.1)
+        self.assertIn("state=ZMAX_CLIPPED", clipped)
+        # The magnitude the clamp discarded has to be readable: zp alone is
+        # Z_MAX for every one of these routes.
+        self.assertIn("zp_raw=16.1000", clipped)
+
+        self.assertIn("state=SAMPLE_MAX", self._one(k=128, n=128, zp_raw=1.0))
+        self.assertIn("state=certified", self._one(k=123, zp_raw=1.0))
+
+    def test_the_two_fitless_routes_announce_themselves(self):
+        for forced in ("NEED_MORE_HARD", "ARCHIVE_BOUND"):
+            line = self._one(method="clamp", zp=8.0, forced=forced)
+            self.assertIn("state=%s" % forced, line)
+            # No quantile was computed, so there is no raw value to print.
+            self.assertIn("zp_raw=-", line)
+
+    def test_the_tally_counts_every_build_not_every_logged_one(self):
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+
+        # 250 builds past the first: only two lines print, but the tally must
+        # carry all of them, which is the whole point of counting separately.
+        self._rt._ZP_SEEN[0] = 0
+        self._rt._ZP_STATE.clear()
+        for i in range(250):
+            self._rt._log_zp(
+                "conformal", 0.90, 4.0, 128, 5.0, 0.3,
+                k=123, zp_raw=(D.Z_MAX + 1.0 if i % 5 == 0 else 1.0),
+            )
+        self.assertEqual(self._rt._ZP_STATE["ZMAX_CLIPPED"], 50)
+        self.assertEqual(self._rt._ZP_STATE["certified"], 200)
+        self.assertEqual(sum(self._rt._ZP_STATE.values()), 250)
