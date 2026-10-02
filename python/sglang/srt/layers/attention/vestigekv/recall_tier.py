@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 _ZP_SEEN = [0]
 
 
-def _log_zp(method, target, zp, n, zmax, rate=float('nan')):
+def _log_zp(method, target, zp, n, zmax, rate=float('nan'),
+            k=None, zp_raw=None):
     """One reading per process of what the certificate actually fitted.
 
     Three arms shipped this month as silent no-ops, and an arm that changes
@@ -46,17 +47,29 @@ def _log_zp(method, target, zp, n, zmax, rate=float('nan')):
     one number that says which fit ran and what it produced, and the sample
     maximum beside it is the ceiling the order statistic cannot pass.
     """
+    # Three outcomes used to print the same zp whenever the clamp bound, which
+    # made a tau sweep from 0.90 to 0.98 unreadable until the sorted sample was
+    # dug out of the dumps by hand. width_control.py already prescribes the
+    # answer: serve the sample maximum and SAY SO rather than clamp silently.
+    if zp_raw is not None and zp_raw > D.Z_MAX + 1e-9:
+        state = "ZMAX_CLIPPED"      # the target asked for more than Z_MAX allows
+    elif k is not None and k >= n:
+        state = "SAMPLE_MAX"        # the sample cannot certify the target
+    else:
+        state = "certified"
     _ZP_SEEN[0] += 1
     if _ZP_SEEN[0] % 200 == 1:
         logging.getLogger(__name__).info(
             "VKZP fit=%s target=%.4f zp=%.4f n_cal=%d sample_max=%.4f "
-            "hard_rate=%.3f (build %d)",
+            "hard_rate=%.3f k=%s state=%s (build %d)",
             method,
             target,
             zp,
             n,
             zmax,
             rate,
+            k if k is not None else "-",
+            state,
             _ZP_SEEN[0],
         )
 
@@ -645,14 +658,16 @@ class RecallTier:
                         self.gauss_target, device=z_req.device, dtype=z_req.dtype
                     )
                 )
-                self.zp = min(float(mu + q * sd), D.Z_MAX)
+                zp_raw = float(mu + q * sd)
+                self.zp = min(zp_raw, D.Z_MAX)
                 _log_zp(
                     "gauss", self.gauss_target, self.zp, n_cal_q,
-                    float(z_req.max()), self.hard_rate,
+                    float(z_req.max()), self.hard_rate, zp_raw=zp_raw,
                 )
             else:
                 k = D.conformal_k(n_cal_q, self.recall_target)
-                self.zp = min(float(z_req.kthvalue(k).values), D.Z_MAX)
+                zp_raw = float(z_req.kthvalue(k).values)
+                self.zp = min(zp_raw, D.Z_MAX)
                 # Keep the whole SORTED sample, not just the quantile picked
                 # here. Re-reading the order statistic at a different target is
                 # the only way to move the width and stay ON the conformal
@@ -680,6 +695,8 @@ class RecallTier:
                     n_cal_q,
                     float(z_req.max()),
                     self.hard_rate,
+                    k=k,
+                    zp_raw=zp_raw,
                 )
         zp = self.zp
         # Per-row projection caches over ALL closed rows (kept and archived
