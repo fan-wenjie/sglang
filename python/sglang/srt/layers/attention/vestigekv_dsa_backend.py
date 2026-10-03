@@ -1513,9 +1513,20 @@ class VestigeKVDSABackend(AttentionBackend):
             start += n
 
     def _calibration_inputs(self, slot, lid, st):
-        # Prefill queries first (older positions), then the decode ones.
+        """(latent queries, positions, indexer queries) in one order.
+
+        Prefill queries first (older positions), then the decode ones. The
+        indexer-query list is padded with None over the prefill part, which
+        collects no indexer query -- the three lists have to stay index-aligned
+        or an offline reader pairs a latent query with another step's indexer
+        query and cannot tell.
+        """
         pc = self._pcal.get((slot, lid), {"q": [], "pos": []})
-        return list(pc["q"]) + list(st["qcal"]), list(pc["pos"]) + list(st["qpos"])
+        qcal = list(pc["q"]) + list(st["qcal"])
+        qpos = list(pc["pos"]) + list(st["qpos"])
+        qidx = [None] * len(pc["q"]) + list(st.get("qidx") or [])
+        qidx += [None] * (len(qcal) - len(qidx))
+        return qcal, qpos, qidx
 
     def _maybe_prefill_build(self, *, slot, lid, seq_len, closed):
         # Prefill-time calibrated build, paced by the prefix (the last chunk is
@@ -1550,6 +1561,7 @@ class VestigeKVDSABackend(AttentionBackend):
             "built_at": 0,
             "qcal": [],
             "qpos": [],
+            "qidx": [],
             "target": D.N_CAL_START,
         }
 
@@ -1725,16 +1737,34 @@ class VestigeKVDSABackend(AttentionBackend):
                 f"({forward_batch.positions.shape[0]}) disagree; hidden states "
                 "must be one row per token of the batch"
             )
+        # Stash, do not consume: the selector and the calibration dump both want
+        # the indexer query, and these are the only places it exists without
+        # rebuilding wq_b. One entry per layer, overwritten each step and never
+        # grown -- the ring this family replaced cost a write per token per
+        # layer per step and that lesson stands.
+        #
+        # req_pool_indices rides along because the query is indexed by BATCH
+        # ROW and every consumer here knows a pool SLOT. Without it a caller
+        # silently reads another request's query whenever bs > 1.
         if query is not None:
-            # Stash, do not consume: the selector and the calibration dump both
-            # want the indexer query, and this is the only place it exists
-            # without rebuilding wq_b. One tensor per layer, overwritten each
-            # step, never grown -- the ring this replaced cost a write per
-            # token per layer per step and that lesson stands.
-            self._index_q[layer_id] = (
-                query.detach(),
-                None if head_weights is None else head_weights.detach(),
-            )
+            self._index_q[layer_id] = {
+                "q": query.detach(),
+                "w": None if head_weights is None else head_weights.detach(),
+                "slots": forward_batch.req_pool_indices.detach().clone(),
+                "lazy": None,
+            }
+        elif indexer is not None and q_lora is not None:
+            # Lean step: the scoring GEMMs did not run, so there is no query.
+            # Keep what builds one and defer the projection to whoever asks --
+            # the calibration collector asks on a handful of steps, not every
+            # step, and a stale query from an earlier step would be worse than
+            # none (it would look like this step's and rank differently).
+            self._index_q[layer_id] = {
+                "q": None,
+                "w": None,
+                "slots": forward_batch.req_pool_indices.detach().clone(),
+                "lazy": (indexer, q_lora.detach()),
+            }
         if not self._salience_seen:
             self._salience_seen = True
             logger.info(
@@ -1834,24 +1864,34 @@ class VestigeKVDSABackend(AttentionBackend):
             "row_bytes": int(self._index_head_dim + 4),
             "pool_page_size": int(getattr(self.token_to_kv_pool, "page_size", -1)),
             "buf_shape": tuple(buf.shape),
-            # The indexer query and head gate for this layer's latest scoring
-            # step, stashed by write_salience. Without them a dump cannot
-            # evaluate a selector that scores pooled index keys at all -- the
-            # score would be identically zero, which is how an offline study
-            # reports "no difference" for a reason that has nothing to do with
-            # the method.
-            "index_q": (
-                None
-                if lid not in self._index_q
-                else self._index_q[lid][0].float().cpu()
-            ),
-            "index_head_w": (
-                None
-                if lid not in self._index_q or self._index_q[lid][1] is None
-                else self._index_q[lid][1].float().cpu()
-            ),
             "slots_min_max": (int(rows.min()), int(rows.max())),
         }
+
+    def _indexer_query_for(self, lid: int, slot: int):
+        """This step's indexer query for `slot`, [n_heads, dim] fp32, or None.
+
+        Resolves the lean step's deferred projection. Returns None rather than
+        a stale query: a query from an earlier step would rank differently and
+        nothing downstream could tell.
+        """
+        rec = self._index_q.get(lid)
+        if rec is None:
+            return None
+        q = rec["q"]
+        if q is None:
+            if rec["lazy"] is None:
+                return None
+            from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+                indexer_query,
+            )
+
+            indexer, q_lora = rec["lazy"]
+            q = indexer_query(indexer, q_lora)
+            rec["q"] = q.detach()
+        row = (rec["slots"] == int(slot)).nonzero().flatten()
+        if row.numel() == 0:
+            return None
+        return q[int(row[0])].float()
 
     def _page_table_row(self, slot: int) -> torch.Tensor:
         """One request's page table, indexed in TOKEN pages.
@@ -2761,6 +2801,13 @@ class VestigeKVDSABackend(AttentionBackend):
                     continue
                 st["qcal"].append(self._qbuf[lid][slot].clone())
                 st["qpos"].append(prefix_len)
+                # The indexer query for THIS step, beside the latent one. Two
+                # selectors can only be compared against one oracle if all
+                # three come from the same step; a query stashed per layer and
+                # read later belongs to whatever step ran last.
+                st.setdefault("qidx", []).append(
+                    self._indexer_query_for(lid, slot)
+                )
                 if st["tier"] is None:
                     # The provisional build stays SYNCHRONOUS: it is ~0.7 ms
                     # (sketch basis cached) and tier 2 must serve from the
@@ -2822,6 +2869,7 @@ class VestigeKVDSABackend(AttentionBackend):
 
         r2t = self.req_to_token_pool.req_to_token
         n_kept = int(self._kept_len[lid][slot])
+        _cal_in = self._calibration_inputs(slot, lid, st)
         job = {
             "slot": slot,
             "lid": lid,
@@ -2829,8 +2877,9 @@ class VestigeKVDSABackend(AttentionBackend):
             "row_slots": r2t[slot, :seq_len].to(torch.int64).clone(),
             "kept": self._kept_buf[lid][slot, :n_kept].to(torch.int64).clone(),
             "st": st,  # identity token: a re-prefill REPLACES the state dict
-            "qcal": self._calibration_inputs(slot, lid, st)[0],
-            "qpos": self._calibration_inputs(slot, lid, st)[1],
+            "qcal": _cal_in[0],
+            "qpos": _cal_in[1],
+            "qidx": _cal_in[2],
             "operands_from": self._reusable_operands(slot, lid, st, seq_len),
             "ready": torch.cuda.Event(),
             "done": threading.Event(),
@@ -2928,7 +2977,7 @@ class VestigeKVDSABackend(AttentionBackend):
                     job["error"],
                     exc_info=job["error"],
                 )
-                st["qcal"] = st["qpos"] = None
+                st["qcal"] = st["qpos"] = st["qidx"] = None
                 continue
             stats = job["stats"]
             if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
@@ -2974,7 +3023,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 # that did not record it would let a later rebuild at a
                 # different prefix adopt a cache that does not cover it.
                 st["operands_seq_len"] = job["seq_len"]
-                st["qcal"] = st["qpos"] = None
+                st["qcal"] = st["qpos"] = st["qidx"] = None
                 installed = True
         self._build_jobs = remaining
         return installed
@@ -3017,6 +3066,16 @@ class VestigeKVDSABackend(AttentionBackend):
                 "kept": job["kept"].cpu(),
                 "qcal": torch.stack(job["qcal"]).cpu(),
                 "qpos": torch.tensor(job["qpos"], dtype=torch.long),
+                # One indexer query per CALIBRATION QUERY, same step, same
+                # order as qcal. Not a per-layer latest stash: that belongs to
+                # whatever step ran last, and scoring one selector against
+                # another step's oracle is a comparison that cannot fail
+                # visibly. None entries are steps where no query resolved and
+                # must be skipped by the reader, not filled in.
+                "qidx": [
+                    None if t is None else t.float().cpu()
+                    for t in (job.get("qidx") or [])
+                ],
                 "V": tier.V.cpu(),
                 "scale": tier.scale,
                 "index_rank": self.index_rank,
