@@ -1746,7 +1746,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 rows,
                 index_head_dim=self._index_head_dim,
                 quant_block_size=self._index_quant_block,
-                page_size=self.token_to_kv_pool.page_size,
+                slots_per_page=self.token_to_kv_pool.slots_per_page,
             )
         self._spectrum.observe(side, D.CLOSE_BLOCK, lid=lid)
 
@@ -1769,7 +1769,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 rows,
                 index_head_dim=self._index_head_dim,
                 quant_block_size=self._index_quant_block,
-                page_size=self.token_to_kv_pool.page_size,
+                slots_per_page=self.token_to_kv_pool.slots_per_page,
             ).cpu(),
             "row_bytes": int(self._index_head_dim + 4),
             "pool_page_size": int(getattr(self.token_to_kv_pool, "page_size", -1)),
@@ -1792,7 +1792,7 @@ class VestigeKVDSABackend(AttentionBackend):
             slots=slots,
             index_head_dim=self._index_head_dim,
             quant_block_size=self._index_quant_block,
-            page_size=self.token_to_kv_pool.page_size,
+            slots_per_page=self.token_to_kv_pool.slots_per_page,
             block=D.CLOSE_BLOCK,
         )
 

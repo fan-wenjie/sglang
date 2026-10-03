@@ -32,7 +32,7 @@ from sglang.srt.layers.attention.vestigekv import defaults as D
 
 
 def index_page_views(buf: torch.Tensor, *, index_head_dim: int,
-                     quant_block_size: int, page_size: int):
+                     quant_block_size: int, slots_per_page: int):
     """((num_pages, page_size, dim) fp8, (num_pages, page_size) fp32) over `buf`.
 
     Three dimensions, not two: the key block's rows are contiguous within a
@@ -48,17 +48,21 @@ def index_page_views(buf: torch.Tensor, *, index_head_dim: int,
         f"sigma takes one scale per row; this geometry has {scale_elems} "
         f"(index_head_dim {index_head_dim}, quant_block_size {quant_block_size})"
     )
-    k_bytes = page_size * index_head_dim
-    want = k_bytes + page_size * scale_elems * 4
+    # slots_per_page, not the pool's page_size: the write kernel takes them as
+    # separate constexprs (PAGE_SIZE and SLOTS_PER_PAGE) and computes the scale
+    # block's offset as slots_per_page * index_head_dim. They are equal in this
+    # config and need not stay so.
+    k_bytes = slots_per_page * index_head_dim
+    want = k_bytes + slots_per_page * scale_elems * 4
     assert buf.shape[1] == want, (
-        f"index-k page is {buf.shape[1]} bytes, expected {want} for page_size "
-        f"{page_size} and index_head_dim {index_head_dim}"
+        f"index-k page is {buf.shape[1]} bytes, expected {want} for "
+        f"slots_per_page {slots_per_page} and index_head_dim {index_head_dim}"
     )
     keys = buf[:, :k_bytes].view(torch.float8_e4m3fn).view(
-        buf.shape[0], page_size, index_head_dim
+        buf.shape[0], slots_per_page, index_head_dim
     )
     scale = buf[:, k_bytes:].reshape(-1).view(torch.float32).view(
-        buf.shape[0], page_size
+        buf.shape[0], slots_per_page
     )
     return keys, scale
 
@@ -69,20 +73,26 @@ def index_rows(
     *,
     index_head_dim: int,
     quant_block_size: int,
-    page_size: int,
+    slots_per_page: int,
 ) -> torch.Tensor:
-    """Dequantised index keys for `slots`, [n, index_head_dim] fp32.
+    """Dequantised index keys at `slots` of this buffer, [n, dim] fp32.
 
-    A gather, which is what the [n_slots, ROW] indexing it replaces also was.
+    `slots` index THIS buffer, which is not the token slot space when the
+    indexer pools. With index_kpool > 1 the write kernel stores one entry per
+    group -- it runs only where ``pos % POOL_SIZE == POOL_SIZE - 1`` and the
+    value is a max over the group's scores plus a positional bias -- so a token
+    slot does not name a row here and three quarters of such reads are zero.
+    Callers wanting a token's salience must go through the block table at the
+    pooled position; this function does not guess which space it was handed.
     """
     keys, scale = index_page_views(
         buf,
         index_head_dim=index_head_dim,
         quant_block_size=quant_block_size,
-        page_size=page_size,
+        slots_per_page=slots_per_page,
     )
-    p = torch.div(slots, page_size, rounding_mode="floor")
-    t = slots - p * page_size
+    p = torch.div(slots, slots_per_page, rounding_mode="floor")
+    t = slots - p * slots_per_page
     return keys[p, t].float() * scale[p, t][:, None]
 
 
@@ -92,7 +102,7 @@ def index_sigma(
     slots: torch.Tensor,
     index_head_dim: int,
     quant_block_size: int,
-    page_size: int,
+    slots_per_page: int,
     block: int = D.CLOSE_BLOCK,
 ) -> torch.Tensor:
     """Tier-1 sigma of `slots` (whole blocks) read from the index-k cache.
@@ -112,6 +122,6 @@ def index_sigma(
         slots,
         index_head_dim=index_head_dim,
         quant_block_size=quant_block_size,
-        page_size=page_size,
+        slots_per_page=slots_per_page,
     )
     return blockwise_sigma(rows, block)

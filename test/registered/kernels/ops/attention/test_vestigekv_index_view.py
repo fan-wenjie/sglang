@@ -59,7 +59,7 @@ class TestIndexViewLayout(CustomTestCase):
         slots = torch.tensor([0, 1, 63, 64, 65, 127, 128, 191], device="cuda")
         got = index_rows(
             self.buf, slots, index_head_dim=DIM, quant_block_size=DIM,
-            page_size=PAGE,
+            slots_per_page=PAGE,
         )
         p, t = slots // PAGE, slots % PAGE
         want = self.keys[p, t] * self.scales[p, t][:, None]
@@ -76,7 +76,7 @@ class TestIndexViewLayout(CustomTestCase):
         slots = torch.arange(PAGE * self.P, device="cuda")
         good = index_rows(
             self.buf, slots, index_head_dim=DIM, quant_block_size=DIM,
-            page_size=PAGE,
+            slots_per_page=PAGE,
         )
         flat = self.buf.reshape(-1, DIM + 4)
         bad_k = flat.view(torch.float8_e4m3fn)[:, :DIM].float()
@@ -104,7 +104,7 @@ class TestIndexViewLayout(CustomTestCase):
 
         with self.assertRaises(AssertionError):
             index_page_views(
-                self.buf, index_head_dim=DIM, quant_block_size=DIM, page_size=32
+                self.buf, index_head_dim=DIM, quant_block_size=DIM, slots_per_page=32
             )
 
     def test_sigma_is_finite_on_a_canonical_buffer(self):
@@ -114,7 +114,7 @@ class TestIndexViewLayout(CustomTestCase):
         slots = torch.arange(PAGE * self.P, device="cuda")
         sig = index_sigma(
             buf=self.buf, slots=slots, index_head_dim=DIM, quant_block_size=DIM,
-            page_size=PAGE, block=PAGE,
+            slots_per_page=PAGE, block=PAGE,
         )
         self.assertTrue(bool(torch.isfinite(sig).all()), f"sigma not finite: {sig}")
         # One sigma per TOKEN, not per block: "blockwise" is the transform
