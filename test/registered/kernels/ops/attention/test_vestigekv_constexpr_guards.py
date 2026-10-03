@@ -31,11 +31,26 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-VESTIGEKV = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))))),
-    "python", "sglang", "srt", "layers", "attention", "vestigekv",
-)
+def _vestigekv_dir():
+    """Locate the package by walking up, not by counting directories.
+
+    v0.5.21 renames test/registered/kernel/attention to
+    test/registered/kernels/ops/attention, one level deeper, and a fixed chain
+    of dirname() calls then resolved to test/python/sglang/... so this guard
+    silently stopped reading the modules it exists to check.
+    """
+    d = os.path.dirname(os.path.abspath(__file__))
+    while d != os.path.dirname(d):
+        cand = os.path.join(
+            d, "python", "sglang", "srt", "layers", "attention", "vestigekv"
+        )
+        if os.path.isdir(cand):
+            return cand
+        d = os.path.dirname(d)
+    raise RuntimeError("vestigekv package not found above %s" % __file__)
+
+
+VESTIGEKV = _vestigekv_dir()
 
 
 def _bound(nodes):

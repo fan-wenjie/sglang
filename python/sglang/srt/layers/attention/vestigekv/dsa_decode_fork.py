@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _no_async_copy,
     _row_strides,
     _sparse_mla_block_k,
+    _sparse_mla_reduce_kernel,
 )
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _FP8_MAX,
@@ -35,7 +36,6 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     LOG2E,
     _cu_count,
     _kv_splits_heuristic,
-    _sparse_mla_decode_reduce_kernel,
 )
 
 
@@ -416,7 +416,7 @@ def vk_dsa_decode(
         )
     D_CHUNK = 64
     grid_reduce = (bs, H, (d_v + D_CHUNK - 1) // D_CHUNK)
-    _sparse_mla_decode_reduce_kernel[grid_reduce](
+    _sparse_mla_reduce_kernel[grid_reduce](
         lse_partial,
         acc_partial,
         out,

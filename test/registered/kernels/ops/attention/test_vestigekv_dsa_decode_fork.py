@@ -91,8 +91,15 @@ class TestDsaDecodeFork(CustomTestCase):
             buf.fill_(float("nan"))
         b = self._fork(q, kv, vk, 64, 0.0442)
         m._get_splitk_bufs(1, 64, 16, DV, q.device)
-        for buf in m._splitk_bufs[q.device]:
-            buf.fill_(float("nan"))
+        # v0.5.21 keys this cache on (device, stream_id) and stores
+        # (lse, acc) pairs, so poison every workspace on this device rather
+        # than index one stream's.
+        for (dev, _sid), workspace in m._splitk_bufs.items():
+            if dev != q.device:
+                continue
+            for lse_buf, acc_buf in workspace:
+                lse_buf.fill_(float("nan"))
+                acc_buf.fill_(float("nan"))
         a = _dsa(q, kv, rows, 64, 0.0442)
         torch.cuda.synchronize()
         self.assertFalse(bool(torch.isnan(b).any()), "an empty split leaked a stale partial")
