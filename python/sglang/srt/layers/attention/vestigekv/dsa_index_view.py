@@ -192,3 +192,72 @@ def group_sigma_window(block: int, pool_size: int) -> int:
         f"sigma window {block} must be a multiple of pool_size {pool_size}"
     )
     return block // pool_size
+
+
+def indexer_query(indexer, q_lora: torch.Tensor) -> torch.Tensor:
+    """The indexer's own query, [n_tokens, index_n_heads, index_head_dim] bf16.
+
+    Mirrors DSA's _get_q_k_bf16 for the rope-less case: wq_b, reshape to heads,
+    then rotate_activation. Not a reimplementation of the scoring path -- only
+    the query, because the lean decode path skips the GEMMs that would produce
+    it and a selector scoring pooled index keys needs one.
+
+    The rotation matters and is why this is safe to compare against the stored
+    keys: the write kernel Hadamard-rotates the pooled key and this rotates the
+    query by the same orthogonal transform, so the inner product is the one the
+    model computes. Dropping either rotation would leave a score that looks
+    plausible and ranks differently.
+    """
+    from einops import rearrange
+
+    from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+
+    assert indexer.rope_head_dim == 0 or not getattr(indexer, "apply_rope", False), (
+        "indexer_query handles the rope-less geometry only; a rotated query "
+        "needs the positions and the rotary cache"
+    )
+    q, _ = indexer.wq_b(q_lora)
+    q = rearrange(q, "l (h d) -> l h d", d=indexer.head_dim)
+    return rotate_activation(q)
+
+
+def group_scores(
+    group_keys: torch.Tensor, q_idx: torch.Tensor, head_weights=None
+) -> torch.Tensor:
+    """One score per group for the whole layer, [n_groups].
+
+    Best over index heads, which is the granularity DSA selects at and the
+    granularity select_recall_telemetry already measures the oracle against:
+    a row any head wants is a row the layer wants. With `head_weights` the
+    heads are combined by the model's own gate instead, summed rather than
+    maxed, because a gate is a weighting and not a tie-break.
+    """
+    # [n_heads, n_groups]
+    logits = q_idx.float() @ group_keys.T.float()
+    if head_weights is None:
+        return logits.amax(dim=0)
+    w = head_weights.float().reshape(-1, 1)
+    return (logits * w).sum(dim=0)
+
+
+def select_groups(scores: torch.Tensor, n_rows: int, pool_size: int) -> torch.Tensor:
+    """Top `n_rows // pool_size` group ids by score, [k] int64.
+
+    A FIXED budget, not a threshold: that is the whole difference from the
+    certificate, and it is what makes the pooled unit usable at all
+    (archive_pool.py: tier 2 "cannot [pool] because it certifies a threshold",
+    and pooling "requires tier 2 to change its fire rule to a fixed budget
+    first"). A budget cannot overflow, so there is no fallback by
+    construction -- and no fallback RATE to read as a quality proxy either,
+    which is why the oracle-recall telemetry has to replace it.
+
+    n_rows is in ROWS so the budget is stated in DSA's units: index_topk = 2048
+    rows is 512 groups of 4, which is exactly what DSA itself selects.
+    """
+    assert n_rows % pool_size == 0, (
+        f"budget {n_rows} rows must be a multiple of pool_size {pool_size}"
+    )
+    k = min(n_rows // pool_size, scores.shape[0])
+    if k <= 0:
+        return scores.new_zeros(0, dtype=torch.int64)
+    return scores.topk(k).indices.to(torch.int64)

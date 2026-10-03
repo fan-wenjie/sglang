@@ -241,3 +241,68 @@ class TestGroupSigmaWindow(CustomTestCase):
 
         with self.assertRaises(AssertionError):
             group_sigma_window(4094, POOL)
+
+
+class TestGroupSelector(CustomTestCase):
+    """Tier 2 as a fixed budget over groups, in DSA's units.
+
+    archive_pool.py's conclusion was that pooling "requires tier 2 to change
+    its fire rule to a fixed budget first", because a threshold with a sound
+    bound cannot survive pooling. These pin the budget arithmetic and the
+    per-layer reduction, which are the two places the parity with DSA lives:
+    index_topk = 2048 ROWS is 512 groups of 4, and DSA selects one row set per
+    layer rather than a per-head union.
+    """
+
+    def test_the_budget_is_stated_in_rows_and_spent_in_groups(self):
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import select_groups
+
+        scores = torch.randn(4096, device="cuda")
+        sel = select_groups(scores, 2048, POOL)
+        self.assertEqual(sel.numel(), 2048 // POOL)
+        self.assertEqual(sel.numel(), 512)
+        # and it really is the top, not an arbitrary 512
+        want = scores.topk(512).indices.sort().values
+        torch.testing.assert_close(sel.sort().values, want)
+
+    def test_a_budget_that_is_not_a_multiple_of_the_pool_is_refused(self):
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import select_groups
+
+        with self.assertRaises(AssertionError):
+            select_groups(torch.randn(64, device="cuda"), 2047, POOL)
+
+    def test_fewer_groups_than_budget_is_not_an_error(self):
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import select_groups
+
+        sel = select_groups(torch.randn(10, device="cuda"), 2048, POOL)
+        self.assertEqual(sel.numel(), 10)
+
+    def test_the_layer_score_is_best_over_heads(self):
+        """One set per layer: a group any head wants is a group the layer wants."""
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import group_scores
+
+        G, H = 32, 8
+        keys = torch.randn(G, DIM, device="cuda")
+        q = torch.randn(H, DIM, device="cuda")
+        got = group_scores(keys, q)
+        want = (q.float() @ keys.T.float()).amax(dim=0)
+        torch.testing.assert_close(got, want)
+        self.assertEqual(tuple(got.shape), (G,))
+
+    def test_a_head_gate_weights_rather_than_tie_breaks(self):
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import group_scores
+
+        G, H = 16, 4
+        keys = torch.randn(G, DIM, device="cuda")
+        q = torch.randn(H, DIM, device="cuda")
+        w = torch.rand(H, device="cuda")
+        got = group_scores(keys, q, head_weights=w)
+        want = ((q.float() @ keys.T.float()) * w.reshape(-1, 1)).sum(dim=0)
+        torch.testing.assert_close(got, want)
+        # a gate is not a max: zeroing all but one head must leave that head's row
+        w0 = torch.zeros(H, device="cuda")
+        w0[2] = 1.0
+        torch.testing.assert_close(
+            group_scores(keys, q, head_weights=w0),
+            (q[2].float() @ keys.T.float()),
+        )

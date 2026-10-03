@@ -1694,14 +1694,28 @@ class VestigeKVDSABackend(AttentionBackend):
         path = envs.SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG.get()
         return bool(path) and os.path.exists(path)
 
-    def write_salience(self, *, layer_id: int, forward_batch, key: torch.Tensor):
+    def write_salience(
+        self,
+        *,
+        layer_id: int,
+        forward_batch,
+        key: torch.Tensor,
+        indexer=None,
+        q_lora: torch.Tensor = None,
+    ):
         """Nothing to store: the salience key is DSA's own indexer key, and the
         indexer has already written it to the index-k cache by the time this
         runs (dsa_indexer_kpool hands it over from the same forward).
 
         The indexer calls this unconditionally for whichever VestigeKV backend
         is bound, and the MLA backend still files a ring, so the hook stays.
-        Filing a second copy here cost a write per token per layer per step."""
+        Filing a second copy here cost a write per token per layer per step.
+
+        `indexer` and `q_lora` arrive only from the lean decode path, which
+        skips the scoring GEMMs and therefore has no query to hand over --
+        these are what a selector scoring pooled index keys would need to
+        build one (indexer_query). Both default to None so every other caller
+        and the MLA backend are unaffected."""
         if key.shape[0] != forward_batch.positions.shape[0]:
             raise ValueError(
                 f"salience keys ({key.shape[0]}) and positions "

@@ -1793,7 +1793,20 @@ class IndexerKPool(MultiPlatformOp):
             key = self._get_k_bf16(x, positions)
             vk = _vestigekv_decode_backend()
             if vk is not None:
-                vk.write_salience(layer_id=layer_id, forward_batch=forward_batch, key=key)
+                # `indexer` and `q_lora` so VestigeKV can build the indexer
+                # QUERY when it needs one. This path deliberately skips the
+                # scoring GEMMs, the paged-MQA logits and the top-k, so the
+                # query does not exist here -- and a selector scoring pooled
+                # index keys cannot work without it. Handing over the module
+                # and its input keeps the decision in VestigeKV rather than
+                # making this path compute something it has no use for.
+                vk.write_salience(
+                    layer_id=layer_id,
+                    forward_batch=forward_batch,
+                    key=key,
+                    indexer=self,
+                    q_lora=q_lora,
+                )
             self._compress_write(
                 x=x,
                 key=key,
