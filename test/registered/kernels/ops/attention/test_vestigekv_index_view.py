@@ -125,3 +125,119 @@ class TestIndexViewLayout(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+POOL = 4
+
+
+class TestPooledGroupRead(CustomTestCase):
+    """Reaching a token's salience when the indexer pools 4:1.
+
+    `_kpool_decode_update_and_maybe_write_cache_kernel` writes one entry per
+    group and addresses it as
+
+        pool_id        = pos // pool_size
+        token_page_row = (pool_id // slots_per_page) * pool_size
+        page           = block_tables[req, token_page_row]
+        offset         = pool_id % slots_per_page
+
+    so one index page holds slots_per_page * pool_size tokens' worth of entries
+    and three of every four token pages hold none. These build a buffer by that
+    rule and check the read finds it -- the per-token read cannot, which is the
+    second half of the index-k defect.
+    """
+
+    def setUp(self):
+        torch.manual_seed(1)
+        self.n_groups = 3 * PAGE                 # 3 index pages' worth
+        self.pages = 4 * 3 + 1                   # token pages, 4 per index page
+        self.buf = torch.zeros(
+            self.pages, PAGE * DIM + PAGE * 4, dtype=torch.uint8, device="cuda"
+        )
+        # block table: token page j -> some scattered physical page
+        g = torch.Generator(device="cuda").manual_seed(2)
+        self.block_row = torch.randperm(
+            self.pages, device="cuda", generator=g
+        )
+        self.truth = torch.zeros(self.n_groups, DIM, device="cuda")
+        scale = 0.015625
+        for pid in range(self.n_groups):
+            page = int(self.block_row[(pid // PAGE) * POOL])
+            off = pid % PAGE
+            v = (torch.randint(-8, 9, (DIM,), device="cuda").float() / 8.0)
+            k8 = v.to(torch.float8_e4m3fn).view(torch.uint8)
+            self.buf[page, off * DIM : (off + 1) * DIM] = k8
+            sb = PAGE * DIM + off * 4
+            self.buf[page, sb : sb + 4] = torch.tensor(
+                [scale], device="cuda"
+            ).view(torch.uint8)
+            self.truth[pid] = v.to(torch.float8_e4m3fn).float() * scale
+
+    def _read(self, pool_ids):
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+            index_group_keys,
+        )
+
+        return index_group_keys(
+            self.buf, pool_ids, self.block_row,
+            index_head_dim=DIM, slots_per_page=PAGE, pool_size=POOL,
+        )
+
+    def test_the_group_read_finds_what_the_writer_stored(self):
+        pool_ids = torch.arange(self.n_groups, device="cuda")
+        torch.testing.assert_close(self._read(pool_ids), self.truth,
+                                   rtol=0, atol=0)
+
+    def test_it_crosses_index_page_boundaries(self):
+        """The `* pool_size` in the block-table index is the easy thing to drop."""
+        pool_ids = torch.tensor(
+            [PAGE - 1, PAGE, PAGE + 1, 2 * PAGE - 1, 2 * PAGE], device="cuda"
+        )
+        torch.testing.assert_close(self._read(pool_ids),
+                                   self.truth[pool_ids.cpu()], rtol=0, atol=0)
+
+    def test_the_per_token_read_finds_mostly_nothing(self):
+        """The symptom that led here: 3 of 4 token-slot reads are zero."""
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_rows
+
+        # token slots as the old path used them: positions, not pool ids
+        slots = torch.arange(self.n_groups * POOL, device="cuda")
+        got = index_rows(
+            self.buf, slots, index_head_dim=DIM, quant_block_size=DIM,
+            slots_per_page=PAGE,
+        )
+        zero_frac = float((got.norm(dim=1) == 0).float().mean())
+        self.assertGreater(
+            zero_frac, 0.5,
+            f"only {zero_frac:.2f} of per-token reads were zero; if this "
+            "buffer is readable per token the pooling assumption is wrong",
+        )
+
+
+class TestGroupSigmaWindow(CustomTestCase):
+    def test_the_physical_cutoff_does_not_move(self):
+        """kappa counts bins, so the same token span keeps the same cutoff.
+
+        4096 tokens at kappa 16 cuts below 4096/16 = 256 tokens. 1024 groups of
+        4 at kappa 16 cuts below 1024/16 = 64 groups, which is the same 256
+        tokens. If this ever needs a kappa rescale, the window rule is wrong.
+        """
+        from sglang.srt.layers.attention.vestigekv import defaults as D
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+            group_sigma_window,
+        )
+
+        w = group_sigma_window(D.CLOSE_BLOCK, POOL)
+        self.assertEqual(w, D.CLOSE_BLOCK // POOL)
+        tokens_per_bin_flat = D.CLOSE_BLOCK / D.LOWPASS_KAPPA
+        tokens_per_bin_grouped = (w / D.LOWPASS_KAPPA) * POOL
+        self.assertAlmostEqual(tokens_per_bin_flat, tokens_per_bin_grouped,
+                               places=9)
+
+    def test_a_window_that_is_not_a_multiple_of_the_pool_is_refused(self):
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+            group_sigma_window,
+        )
+
+        with self.assertRaises(AssertionError):
+            group_sigma_window(4094, POOL)

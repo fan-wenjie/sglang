@@ -1777,24 +1777,67 @@ class VestigeKVDSABackend(AttentionBackend):
             "slots_min_max": (int(rows.min()), int(rows.max())),
         }
 
+    def _page_table_row(self, slot: int) -> torch.Tensor:
+        """One request's page table, indexed in TOKEN pages.
+
+        Built from req_to_token rather than carried: the writer takes
+        metadata.get_page_table_64(), which is this same mapping, and sigma
+        runs at block close where one derived read costs nothing. A page's
+        positions occupy consecutive pool slots, so the page index is the
+        slot of its first position divided by the page size.
+        """
+        ps = self.token_to_kv_pool.page_size
+        r2t = self.req_to_token_pool.req_to_token[slot]
+        return torch.div(r2t[::ps], ps, rounding_mode="floor")
+
     def _index_sigma(self, slot, lid, c0, c1):
-        """Tier-1 sigma of positions [c0, c1) (whole blocks) from DSA's index-k
-        cache.
+        """Tier-1 sigma of positions [c0, c1) from DSA's pooled index-k cache.
 
-        Every live position is present, so unlike the ring this replaces there
-        is no missing-key case to score +inf and no stamp to check: DSA cannot
-        attend a row whose index key it does not hold."""
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_sigma
+        One value per GROUP of index_kpool positions, repeated to its members
+        so callers keep a per-position array. The granularity is not a choice:
+        the indexer stores one entry per group (dsa_index_view.index_group_keys
+        has the addressing), so there is no per-position salience to read on
+        this geometry. Reading it per position is what returned zeros for three
+        quarters of them.
 
-        slots = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
-        return index_sigma(
-            buf=self.token_to_kv_pool.get_index_k_with_scale_buffer(lid),
-            slots=slots,
-            index_head_dim=self._index_head_dim,
-            quant_block_size=self._index_quant_block,
-            slots_per_page=self.token_to_kv_pool.slots_per_page,
-            block=D.CLOSE_BLOCK,
+        The window shrinks by the same factor and kappa does not move -- the
+        token span and therefore the physical cutoff are unchanged
+        (group_sigma_window).
+        """
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+            group_sigma_window,
+            index_group_keys,
         )
+        from sglang.srt.layers.attention.vestigekv.eviction import blockwise_sigma
+
+        pool_size = self._text_cfg_index_kpool
+        assert c0 % pool_size == 0, (
+            f"sigma must advance on a group boundary; c0={c0} is not a multiple "
+            f"of index_kpool={pool_size}"
+        )
+        n = ((c1 - c0) // pool_size) * pool_size
+        if n == 0:
+            return self.req_to_token_pool.req_to_token.new_zeros(
+                0, dtype=torch.float32
+            )
+        pool_ids = torch.arange(
+            c0 // pool_size,
+            (c0 + n) // pool_size,
+            device=self.req_to_token_pool.req_to_token.device,
+        )
+        keys = index_group_keys(
+            self.token_to_kv_pool.get_index_k_with_scale_buffer(lid),
+            pool_ids,
+            self._page_table_row(slot),
+            index_head_dim=self._index_head_dim,
+            slots_per_page=self.token_to_kv_pool.slots_per_page,
+            pool_size=pool_size,
+        )
+        sig = blockwise_sigma(keys, group_sigma_window(D.CLOSE_BLOCK, pool_size))
+        # One sigma per group, repeated to its positions: every consumer
+        # downstream indexes by position, and a group's members share its
+        # salience by construction.
+        return sig.repeat_interleave(pool_size)
 
     def _advance_sigma(self, slot, lid, cl, seq_len, kbuf):
         """Extend the request's sigma record over every block that completed

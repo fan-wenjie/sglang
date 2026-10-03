@@ -125,3 +125,70 @@ def index_sigma(
         slots_per_page=slots_per_page,
     )
     return blockwise_sigma(rows, block)
+
+def index_group_keys(
+    buf: torch.Tensor,
+    pool_ids: torch.Tensor,
+    block_table_row: torch.Tensor,
+    *,
+    index_head_dim: int,
+    slots_per_page: int,
+    pool_size: int,
+) -> torch.Tensor:
+    """Dequantised POOLED index keys for `pool_ids`, [n, index_head_dim] fp32.
+
+    This is the only correct way to reach a token's salience when the indexer
+    pools. The write kernel
+    (kpool_fp8_index._kpool_decode_update_and_maybe_write_cache_kernel) stores
+    one entry per group of `pool_size` tokens and derives its address as
+
+        pool_id        = pos // pool_size
+        token_page_row = (pool_id // slots_per_page) * pool_size
+        page           = block_tables[req, token_page_row]
+        offset         = pool_id % slots_per_page
+
+    so one index page carries slots_per_page * pool_size tokens' worth of
+    entries and three of every four token pages hold none. That is why reading
+    this buffer at token slots returns zeros for three quarters of them.
+
+    The stored value is not a raw key: it is the softmax-weighted mean of the
+    group's `pool_size` keys, weighted by (slot_score + positional bias), then
+    Hadamard-rotated and fp8-quantised. The weighting is the model's own gate,
+    which is the whole reason this pooling is cheaper to accept than one we
+    would impose -- archive_pool.py's vacuous spread term came from pooling the
+    rank-64 sketch by an UNWEIGHTED mean and bounding it by Cauchy-Schwarz.
+
+    `block_table_row` is one request's row of the page table, indexed in token
+    pages (what metadata.get_page_table_64() hands the writer).
+    """
+    keys, scale = index_page_views(
+        buf,
+        index_head_dim=index_head_dim,
+        quant_block_size=index_head_dim,
+        slots_per_page=slots_per_page,
+    )
+    pool_ids = pool_ids.to(torch.int64)
+    row = torch.div(pool_ids, slots_per_page, rounding_mode="floor") * pool_size
+    row = row.clamp_(0, block_table_row.shape[0] - 1)
+    page = block_table_row.index_select(0, row).to(torch.int64)
+    off = pool_ids - torch.div(
+        pool_ids, slots_per_page, rounding_mode="floor"
+    ) * slots_per_page
+    return keys[page, off].float() * scale[page, off][:, None]
+
+
+def group_sigma_window(block: int, pool_size: int) -> int:
+    """Sigma's window in GROUPS for a token-space window of `block`.
+
+    kappa counts frequency bins and bin k is period window/k, so sampling once
+    per group over the same token span leaves the physical cutoff untouched:
+    4096 tokens at kappa 16 cuts below 256 tokens, and 1024 groups at kappa 16
+    cuts below 64 groups, which is the same 256 tokens. kappa therefore does
+    NOT get rescaled. What does change is Nyquist -- the grouped signal cannot
+    see structure finer than 2*pool_size tokens -- and at a 256-token cutoff
+    that is not where sigma's information is.
+    """
+    assert block % pool_size == 0, (
+        f"sigma window {block} must be a multiple of pool_size {pool_size}"
+    )
+    return block // pool_size

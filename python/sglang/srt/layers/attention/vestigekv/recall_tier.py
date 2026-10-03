@@ -803,7 +803,10 @@ class RecallTier:
         qsk = qe[:, : D.KV_LORA_RANK] @ self.V.T
         qres = (qe[:, : D.KV_LORA_RANK] - qsk @ self.V).norm(dim=-1)
         idxs = (self._q_query(qsk)[0].float() @ self._deq_csk(self.csk).T) * sc_
-        if D.SIDECAR_DIM:
+        # geom.side_dim, not D.SIDECAR_DIM: a rope-less MLA has NO in-row
+        # sidecar (side_dim == 0) and self.side would read a tail the row
+        # does not have. The constant is the Kimi geometry's value.
+        if self.geom.side_dim:
             idxs = idxs + (qe[:, D.KV_LORA_RANK :].to(torch.bfloat16).float() @ self.side.float().T) * sc_
         cert = (qres[:, None] * self.rho[None, :]) * sc_ / (D.KV_LORA_RANK - self.r) ** 0.5
         fire = ((idxs + zp * cert) > (max1 - self.margin)[:, None]).sum(-1)
