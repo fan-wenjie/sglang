@@ -2347,6 +2347,7 @@ class DeepseekSparseAttnBackend(
                 slots=slots[:n_sigma].to(torch.int64),
                 index_head_dim=pool.index_head_dim,
                 quant_block_size=pool.quant_block_size,
+                page_size=pool.page_size,
                 block=D.CLOSE_BLOCK,
             )
         self.select_recall_telemetry.observe(

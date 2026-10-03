@@ -1737,17 +1737,45 @@ class VestigeKVDSABackend(AttentionBackend):
             side = kbuf.index_select(0, rows)[:, g.sigma_offset : g.sigma_offset + g.sigma_dim]
         else:
             from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
-                index_key_views,
+                index_rows,
             )
 
-            keys, scale = index_key_views(
+            rows = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
+            side = index_rows(
                 self.token_to_kv_pool.get_index_k_with_scale_buffer(lid),
+                rows,
                 index_head_dim=self._index_head_dim,
                 quant_block_size=self._index_quant_block,
+                page_size=self.token_to_kv_pool.page_size,
             )
-            rows = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
-            side = keys[rows][:, : self._index_head_dim].float() * scale[rows][:, None]
         self._spectrum.observe(side, D.CLOSE_BLOCK, lid=lid)
+
+    def _dump_index_keys(self, lid, row_slots):
+        """Dequantised indexer keys for `row_slots`, [T, index_head_dim], or None.
+
+        In-row geometries keep their salience in the latent row, which `rows`
+        already carries; out-of-row ones keep it in DSA's index-k cache, and
+        nothing else in the snapshot reaches it.
+        """
+        if self.geom.sigma_in_row:
+            return None
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_rows
+
+        buf = self.token_to_kv_pool.get_index_k_with_scale_buffer(lid)
+        rows = row_slots.to(torch.int64)
+        return {
+            "deq": index_rows(
+                buf,
+                rows,
+                index_head_dim=self._index_head_dim,
+                quant_block_size=self._index_quant_block,
+                page_size=self.token_to_kv_pool.page_size,
+            ).cpu(),
+            "row_bytes": int(self._index_head_dim + 4),
+            "pool_page_size": int(getattr(self.token_to_kv_pool, "page_size", -1)),
+            "buf_shape": tuple(buf.shape),
+            "slots_min_max": (int(rows.min()), int(rows.max())),
+        }
 
     def _index_sigma(self, slot, lid, c0, c1):
         """Tier-1 sigma of positions [c0, c1) (whole blocks) from DSA's index-k
@@ -1764,6 +1792,7 @@ class VestigeKVDSABackend(AttentionBackend):
             slots=slots,
             index_head_dim=self._index_head_dim,
             quant_block_size=self._index_quant_block,
+            page_size=self.token_to_kv_pool.page_size,
             block=D.CLOSE_BLOCK,
         )
 
@@ -2872,11 +2901,21 @@ class VestigeKVDSABackend(AttentionBackend):
                 "V": tier.V.cpu(),
                 "scale": tier.scale,
                 "index_rank": self.index_rank,
+                # The LIVE geometry, not the module defaults. The constants
+                # describe Kimi Linear; recording them beside a rope-less
+                # model's tensors said side_dim=64 for rows that have none,
+                # so every offline reader was told the wrong layout.
                 "geom": {
-                    "kv_lora_rank": D.KV_LORA_RANK,
-                    "side_dim": D.SIDECAR_DIM,
-                    "latent_dim": D.LATENT_DIM,
+                    "kv_lora_rank": self.geom.kv_lora_rank,
+                    "side_dim": self.geom.side_dim,
+                    "latent_dim": self.geom.latent_dim,
+                    "sigma_dim": self.geom.sigma_dim,
+                    "sigma_in_row": self.geom.sigma_in_row,
                 },
+                # Out-of-row geometries score tier 2 on nothing the latent row
+                # carries, so a dump without these cannot evaluate this model's
+                # selector at all: at index_rank 0 every row would score 0.
+                "index_k": self._dump_index_keys(lid, job["row_slots"]),
                 "stats": stats,
             },
             os.path.join(
