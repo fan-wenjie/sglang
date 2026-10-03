@@ -1513,7 +1513,7 @@ class VestigeKVDSABackend(AttentionBackend):
             start += n
 
     def _calibration_inputs(self, slot, lid, st):
-        """(latent queries, positions, indexer queries) in one order.
+        """(latent queries, positions, indexer queries, head gates) in one order.
 
         Prefill queries first (older positions), then the decode ones. The
         indexer-query list is padded with None over the prefill part, which
@@ -1526,7 +1526,9 @@ class VestigeKVDSABackend(AttentionBackend):
         qpos = list(pc["pos"]) + list(st["qpos"])
         qidx = [None] * len(pc["q"]) + list(st.get("qidx") or [])
         qidx += [None] * (len(qcal) - len(qidx))
-        return qcal, qpos, qidx
+        qgate = [None] * len(pc["q"]) + list(st.get("qgate") or [])
+        qgate += [None] * (len(qcal) - len(qgate))
+        return qcal, qpos, qidx, qgate
 
     def _maybe_prefill_build(self, *, slot, lid, seq_len, closed):
         # Prefill-time calibrated build, paced by the prefix (the last chunk is
@@ -1562,6 +1564,7 @@ class VestigeKVDSABackend(AttentionBackend):
             "qcal": [],
             "qpos": [],
             "qidx": [],
+            "qgate": [],
             "target": D.N_CAL_START,
         }
 
@@ -1867,20 +1870,40 @@ class VestigeKVDSABackend(AttentionBackend):
             "slots_min_max": (int(rows.min()), int(rows.max())),
         }
 
-    def _indexer_query_for(self, lid: int, slot: int):
-        """This step's indexer query for `slot`, [n_heads, dim] fp32, or None.
+    def record_index_gate(self, *, layer_id: int, weights: torch.Tensor) -> None:
+        """DSA's resolved per-head gate for this layer's latest scoring step.
 
-        Resolves the lean step's deferred projection. Returns None rather than
-        a stale query: a query from an earlier step would rank differently and
-        nothing downstream could tell.
+        Separate from write_salience because it fires at a different point: the
+        gate is resolved after the query, and the one write_salience can see is
+        None unless dual-stream precomputed it. Reducing over heads by max
+        where DSA weights and sums is a different selector, so a study that
+        wants DSA's rule needs this one.
+        """
+        rec = self._index_q.get(layer_id)
+        if rec is not None and weights is not None:
+            rec["w"] = weights.detach()
+
+    def _indexer_query_for(self, lid: int, slot: int):
+        """(query, gate) for `slot` this step: [n_heads, dim] and [n_heads].
+
+        Both row-selected here, in one place, so they cannot drift apart -- the
+        query is indexed by batch row and the gate by the same row, and a
+        caller that selected one and not the other would weight one request's
+        heads onto another's query.
+
+        Resolves the lean step's deferred projection. Returns (None, None)
+        rather than a stale query: one from an earlier step would rank
+        differently and nothing downstream could tell. On a lean step the gate
+        is None by construction -- that path resolves no gate -- so a caller
+        gets a query it can reduce by max and knows the gate is absent.
         """
         rec = self._index_q.get(lid)
         if rec is None:
-            return None
+            return None, None
         q = rec["q"]
         if q is None:
             if rec["lazy"] is None:
-                return None
+                return None, None
             from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
                 indexer_query,
             )
@@ -1890,8 +1913,17 @@ class VestigeKVDSABackend(AttentionBackend):
             rec["q"] = q.detach()
         row = (rec["slots"] == int(slot)).nonzero().flatten()
         if row.numel() == 0:
-            return None
-        return q[int(row[0])].float()
+            return None, None
+        r = int(row[0])
+        w = rec.get("w")
+        if w is not None and w.shape[0] == q.shape[0]:
+            w = w[r].reshape(-1).float()
+        else:
+            # A gate whose leading dimension does not match the query's cannot
+            # be row-selected against it; refuse rather than broadcast one
+            # request's heads onto another's query.
+            w = None
+        return q[r].float(), w
 
     def _page_table_row(self, slot: int) -> torch.Tensor:
         """One request's page table, indexed in TOKEN pages.
@@ -2805,9 +2837,9 @@ class VestigeKVDSABackend(AttentionBackend):
                 # selectors can only be compared against one oracle if all
                 # three come from the same step; a query stashed per layer and
                 # read later belongs to whatever step ran last.
-                st.setdefault("qidx", []).append(
-                    self._indexer_query_for(lid, slot)
-                )
+                _q, _w = self._indexer_query_for(lid, slot)
+                st.setdefault("qidx", []).append(_q)
+                st.setdefault("qgate", []).append(_w)
                 if st["tier"] is None:
                     # The provisional build stays SYNCHRONOUS: it is ~0.7 ms
                     # (sketch basis cached) and tier 2 must serve from the
@@ -2880,6 +2912,7 @@ class VestigeKVDSABackend(AttentionBackend):
             "qcal": _cal_in[0],
             "qpos": _cal_in[1],
             "qidx": _cal_in[2],
+            "qgate": _cal_in[3],
             "operands_from": self._reusable_operands(slot, lid, st, seq_len),
             "ready": torch.cuda.Event(),
             "done": threading.Event(),
@@ -2977,7 +3010,7 @@ class VestigeKVDSABackend(AttentionBackend):
                     job["error"],
                     exc_info=job["error"],
                 )
-                st["qcal"] = st["qpos"] = st["qidx"] = None
+                st["qcal"] = st["qpos"] = st["qidx"] = st["qgate"] = None
                 continue
             stats = job["stats"]
             if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
@@ -3023,7 +3056,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 # that did not record it would let a later rebuild at a
                 # different prefix adopt a cache that does not cover it.
                 st["operands_seq_len"] = job["seq_len"]
-                st["qcal"] = st["qpos"] = st["qidx"] = None
+                st["qcal"] = st["qpos"] = st["qidx"] = st["qgate"] = None
                 installed = True
         self._build_jobs = remaining
         return installed
@@ -3085,6 +3118,10 @@ class VestigeKVDSABackend(AttentionBackend):
                 "qidx": [
                     None if t is None else t.float().cpu()
                     for t in (job.get("qidx") or [])
+                ],
+                "qgate": [
+                    None if t is None else t.float().cpu()
+                    for t in (job.get("qgate") or [])
                 ],
                 "V": tier.V.cpu(),
                 "scale": tier.scale,

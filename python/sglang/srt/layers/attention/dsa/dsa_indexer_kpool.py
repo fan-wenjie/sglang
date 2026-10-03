@@ -1911,6 +1911,17 @@ class IndexerKPool(MultiPlatformOp):
         if not return_indices:
             return None
 
+        # The RESOLVED head gate, after q_scale and the softmax scale. The gate
+        # handed over with the query earlier is the pre-resolution one and is
+        # None unless dual-stream precomputed it, so a selector scoring pooled
+        # index keys with that would be reducing over heads by max where DSA
+        # weights and sums. Both branches above have converged here and
+        # return_indices is established, so this is the one place the real gate
+        # exists for every scoring step.
+        vk = _vestigekv_decode_backend()
+        if vk is not None and hasattr(vk, "record_index_gate"):
+            vk.record_index_gate(layer_id=layer_id, weights=weights)
+
         if is_cuda() or is_hip():
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
