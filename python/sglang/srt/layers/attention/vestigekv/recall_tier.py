@@ -84,6 +84,22 @@ def zp_from_pooled(z_parts, n_cal_q, recall_target):
     return min(float(pooled.kthvalue(k).values), D.Z_MAX)
 
 
+def _km_gram(kbuf, row_slots, arch_idx, kv: int) -> torch.Tensor:
+    """Uncentered [kv, kv] second moment of the ARCHIVED content rows.
+
+    Chunked for the same reason the sketch build is: materialising the whole
+    [A, kv] fp32 copy to form one gram matrix is the allocation that made an
+    in-server build cost several times its isolated time.
+    """
+    pos = row_slots.index_select(0, arch_idx.to(torch.int64)).to(torch.int64)
+    g = torch.zeros(kv, kv, device=kbuf.device, dtype=torch.float32)
+    step = 8192
+    for i in range(0, pos.numel(), step):
+        blk = kbuf.index_select(0, pos[i : i + step])[:, :kv].float()
+        g += blk.T @ blk
+    return g
+
+
 class RecallTier:
     def __init__(
         self,
@@ -459,7 +475,25 @@ class RecallTier:
             # left another model family's queries with 2x the residual norm of
             # their own PCA and
             # the certificate fired the whole archive (fallback 0.6-0.8).
-            evals, evecs = torch.linalg.eigh(qcal_c.T @ qcal_c)
+            basis = envs.SGLANG_VESTIGEKV_SKETCH_BASIS.get()
+            if basis == "kmom":
+                # Uncentered second moment of this request's OWN content rows.
+                # The rows carry a large mean component (key_mean_energy 0.44
+                # to 0.78 across GLM's DSA layers), and centering on the query
+                # distribution spends the basis elsewhere: qpca captures 0.22
+                # of key energy where this captures 0.93. The residual is what
+                # the certificate inflates by, so that ratio is the fire count.
+                # Uncentered on purpose -- subtracting the key mean would
+                # discard the very direction this exists to keep.
+                g = _km_gram(kbuf, row_slots, arch_idx, self.geom.kv_lora_rank)
+                evals, evecs = torch.linalg.eigh(g)
+            elif basis == "qpca":
+                evals, evecs = torch.linalg.eigh(qcal_c.T @ qcal_c)
+            else:
+                raise ValueError(
+                    f"SGLANG_VESTIGEKV_SKETCH_BASIS must be qpca or kmom, got "
+                    f"{basis!r}"
+                )
             V = evecs[:, -self.r :].T.flip(0)  # descending singular value order
         self.V = V
         # Chunked, and the pool rows are never materialized in fp32 as a whole.

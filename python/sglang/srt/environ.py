@@ -679,6 +679,21 @@ class Envs:
     # spread term, so this stays at 1 until that lands (see
     # vestigekv/archive_pool.py for the measurements).
     SGLANG_VESTIGEKV_ARCHIVE_POOL = EnvInt(1)
+    # Which basis the rank-r sketch is fitted on. The certificate is sound for
+    # ANY orthonormal basis (recall_tier.build says so); only its tightness
+    # changes, and tightness is what the fire count and therefore the fallback
+    # rate are made of.
+    #   qpca  centered PCA of this request's calibration queries (the shipped
+    #         fit, and what every recorded number was measured on)
+    #   kmom  uncentered second moment of this request's own content rows,
+    #         which keeps the key mean that centering on the queries discards
+    # Measured offline on GLM-5.3-Flash calibration dumps, rank 64, 11 DSA
+    # layers x 2 TP ranks: qpca captures 0.22 of key energy against kmom's
+    # 0.93, and on the three layers whose fire count exceeds the 2048 recall
+    # capacity (19, 23, 27) kmom fires 10x to 366x fewer rows. Not yet
+    # confirmed on decode-step queries, which is the comparison that decides
+    # it -- calibration queries are the prompt's last few.
+    SGLANG_VESTIGEKV_SKETCH_BASIS = EnvStr("qpca")
     # Telemetry only: blocks between VKSPECTRUM reports per layer (0 = off).
     # At each block close, where the salience branch puts its above-cutoff
     # energy (vestigekv/spectrum.py): one rFFT per block per layer, off the
