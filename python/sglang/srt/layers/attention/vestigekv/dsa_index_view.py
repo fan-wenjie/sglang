@@ -96,36 +96,6 @@ def index_rows(
     return keys[p, t].float() * scale[p, t][:, None]
 
 
-def index_sigma(
-    *,
-    buf: torch.Tensor,
-    slots: torch.Tensor,
-    index_head_dim: int,
-    quant_block_size: int,
-    slots_per_page: int,
-    block: int = D.CLOSE_BLOCK,
-) -> torch.Tensor:
-    """Tier-1 sigma of `slots` (whole blocks) read from the index-k cache.
-
-    Every live slot is present: DSA needs the same keys to attend at all, so
-    there is no missing-key case to score +inf and no stamp to check.
-
-    Gathers and reduces unfused on purpose. sigma_fused_from_pool strides a
-    row-major [n_slots, ROW] pool and this buffer is paged with a split key and
-    scale block, so the fused addressing does not apply; this runs at block
-    close, not per step.
-    """
-    from sglang.srt.layers.attention.vestigekv.eviction import blockwise_sigma
-
-    rows = index_rows(
-        buf,
-        slots,
-        index_head_dim=index_head_dim,
-        quant_block_size=quant_block_size,
-        slots_per_page=slots_per_page,
-    )
-    return blockwise_sigma(rows, block)
-
 def index_group_keys(
     buf: torch.Tensor,
     pool_ids: torch.Tensor,

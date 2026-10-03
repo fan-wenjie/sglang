@@ -1745,24 +1745,48 @@ class VestigeKVDSABackend(AttentionBackend):
         """Telemetry (SGLANG_DEBUG_VESTIGEKV_SPECTRUM): the closing blocks'
         above-cutoff peak. Reads the same branch sigma just read; nothing
         downstream consumes it (vestigekv/spectrum.py)."""
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+            group_sigma_window,
+        )
+
         g = self.geom
         if g.sigma_in_row:
             rows = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
             side = kbuf.index_select(0, rows)[:, g.sigma_offset : g.sigma_offset + g.sigma_dim]
         else:
             from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
-                index_rows,
+                index_group_keys,
             )
 
-            rows = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
-            side = index_rows(
-                self.token_to_kv_pool.get_index_k_with_scale_buffer(lid),
-                rows,
-                index_head_dim=self._index_head_dim,
-                quant_block_size=self._index_quant_block,
-                slots_per_page=self.token_to_kv_pool.slots_per_page,
+            # Groups, like the sigma this watches: a token slot does not name a
+            # row in a pooled index cache, so a per-token read here reported the
+            # spectrum of one group in four and zeros between them.
+            ps = max(1, self._text_cfg_index_kpool)
+            n = ((c1 - c0) // ps) * ps
+            if n == 0:
+                return
+            pool_ids = torch.arange(
+                c0 // ps, (c0 + n) // ps,
+                device=self.req_to_token_pool.req_to_token.device,
             )
-        self._spectrum.observe(side, D.CLOSE_BLOCK, lid=lid)
+            side = index_group_keys(
+                self.token_to_kv_pool.get_index_k_with_scale_buffer(lid),
+                pool_ids,
+                self._page_table_row(slot),
+                index_head_dim=self._index_head_dim,
+                slots_per_page=self.token_to_kv_pool.slots_per_page,
+                pool_size=ps,
+            )
+        # The window must match `side`'s unit. When the salience is pooled,
+        # `side` is one row per group and a token-space window of 4096 makes
+        # n_blocks zero -- the observer then returns without emitting and the
+        # telemetry looks switched off rather than broken.
+        block = (
+            D.CLOSE_BLOCK
+            if g.sigma_in_row
+            else group_sigma_window(D.CLOSE_BLOCK, max(1, self._text_cfg_index_kpool))
+        )
+        self._spectrum.observe(side, block, lid=lid)
 
     def _dump_index_keys(self, lid, row_slots):
         """Dequantised indexer keys for `row_slots`, [T, index_head_dim], or None.
@@ -1773,17 +1797,26 @@ class VestigeKVDSABackend(AttentionBackend):
         """
         if self.geom.sigma_in_row:
             return None
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_rows
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+            index_group_keys,
+        )
 
         buf = self.token_to_kv_pool.get_index_k_with_scale_buffer(lid)
         rows = row_slots.to(torch.int64)
+        # GROUP keys, one per index_kpool positions: that is the unit stored
+        # and the unit both tiers work in. A per-slot dump here was three
+        # quarters zeros and would silently poison any offline study.
+        ps = max(1, self._text_cfg_index_kpool)
+        n_groups = rows.numel() // ps
         return {
-            "deq": index_rows(
+            "pool_size": ps,
+            "deq": index_group_keys(
                 buf,
-                rows,
+                torch.arange(n_groups, device=rows.device),
+                self._page_table_row(slot),
                 index_head_dim=self._index_head_dim,
-                quant_block_size=self._index_quant_block,
                 slots_per_page=self.token_to_kv_pool.slots_per_page,
+                pool_size=ps,
             ).cpu(),
             "row_bytes": int(self._index_head_dim + 4),
             "pool_page_size": int(getattr(self.token_to_kv_pool, "page_size", -1)),

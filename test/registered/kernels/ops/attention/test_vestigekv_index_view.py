@@ -107,24 +107,22 @@ class TestIndexViewLayout(CustomTestCase):
                 self.buf, index_head_dim=DIM, quant_block_size=DIM, slots_per_page=32
             )
 
-    def test_sigma_is_finite_on_a_canonical_buffer(self):
-        """The symptom that was visible and unexamined: inf key norms."""
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_sigma
+    def test_dequantised_keys_are_finite_on_a_canonical_buffer(self):
+        """The symptom that was visible and unexamined: inf key norms.
+
+        The interleaved read produced inf on a written page because it took key
+        bytes for a scale. Reading the canonical layout gives norms of order
+        the key's own magnitude.
+        """
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_rows
 
         slots = torch.arange(PAGE * self.P, device="cuda")
-        sig = index_sigma(
-            buf=self.buf, slots=slots, index_head_dim=DIM, quant_block_size=DIM,
-            slots_per_page=PAGE, block=PAGE,
+        got = index_rows(
+            self.buf, slots, index_head_dim=DIM, quant_block_size=DIM,
+            slots_per_page=PAGE,
         )
-        self.assertTrue(bool(torch.isfinite(sig).all()), f"sigma not finite: {sig}")
-        # One sigma per TOKEN, not per block: "blockwise" is the transform
-        # window. _advance_sigma concatenates these and takes topk over them
-        # as the keep decision, which only type-checks per token.
-        self.assertEqual(int(sig.numel()), PAGE * self.P)
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+        self.assertTrue(bool(torch.isfinite(got).all()), "dequantised keys not finite")
+        self.assertLess(float(got.abs().max()), 1e3)
 
 
 POOL = 4

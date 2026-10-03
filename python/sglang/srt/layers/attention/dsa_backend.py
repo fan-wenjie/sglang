@@ -2335,21 +2335,39 @@ class DeepseekSparseAttnBackend(
         # salience ring went away sigma needs nothing but that cache, so both
         # selectors can be compared on one step rather than across two runs.
         from sglang.srt.layers.attention.vestigekv import defaults as D
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_sigma
+        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+            group_sigma_window,
+            index_group_keys,
+        )
+        from sglang.srt.layers.attention.vestigekv.eviction import blockwise_sigma
 
         sigma, n_far = None, 0
         n_sigma = (seq // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
         n_far = ((seq - D.CLOSE_BLOCK) // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
         if n_far > 0:
             pool = self.token_to_kv_pool
-            sigma = index_sigma(
-                buf=pool.get_index_k_with_scale_buffer(lid),
-                slots=slots[:n_sigma].to(torch.int64),
-                index_head_dim=pool.index_head_dim,
-                quant_block_size=pool.quant_block_size,
-                slots_per_page=pool.slots_per_page,
-                block=D.CLOSE_BLOCK,
+            # Tier 1's sigma over GROUPS, repeated to positions. This used to
+            # pass token slots, which on a pooled index cache reads the written
+            # row of one group in four and zeros for the rest -- so the tier-1
+            # arm of this comparison was measuring a salience nobody serves.
+            # dsa_index_view.index_group_keys has the addressing and why.
+            ps = max(1, int(getattr(pool, "index_kpool", 1)))
+            n_sigma = (n_sigma // ps) * ps
+            pool_ids = torch.arange(n_sigma // ps, device=slots.device)
+            ptab = torch.div(
+                slots[:: pool.page_size], pool.page_size, rounding_mode="floor"
             )
+            keys = index_group_keys(
+                pool.get_index_k_with_scale_buffer(lid),
+                pool_ids,
+                ptab,
+                index_head_dim=pool.index_head_dim,
+                slots_per_page=pool.slots_per_page,
+                pool_size=ps,
+            )
+            sigma = blockwise_sigma(
+                keys, group_sigma_window(D.CLOSE_BLOCK, ps)
+            ).repeat_interleave(ps)
         self.select_recall_telemetry.observe(
             rows=rows.float(),
             q=q.reshape(-1, rows.shape[1]).float(),
