@@ -70,8 +70,13 @@ class TestFusedPrologue(CustomTestCase):
         sc = 1 / 24.0
         got = fused_prologue(q, kr, v, nk_len, thr, sc)
         ref = _reference(q, kr, v, nk_len, thr, sc)
-        g1, gs, gk, gr = got
+        # fused_prologue returns the qsk scale as a fifth value (1.0 on the
+        # fp16 path, the fp8 scale otherwise). This case is fp16, so the
+        # comparisons below hold unscaled -- asserted, not assumed, because
+        # an fp8 default would make every allclose here meaningless.
+        g1, gs, gk, gr, gscale = got
         r1, rs, rk, rr = ref
+        self.assertTrue(torch.equal(gscale, torch.ones_like(gscale)))
         # query transposes: exact casts
         self.assertTrue(torch.equal(gs, rs))
         # qsk: same ieee GEMM, allow fp32-order noise then fp16 cast
@@ -92,7 +97,7 @@ class TestFusedPrologue(CustomTestCase):
         from sglang.srt.layers.attention.vestigekv.fused_prologue import fused_prologue
 
         q, kr, v, nk_len, thr = _case(P=3, NKm=256, seed=2, empty=(0, 2))
-        g1, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, 1 / 24.0)
+        g1, _, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, 1 / 24.0)
         self.assertTrue(bool((g1[0] == -float("inf")).all()))
         self.assertTrue(bool((g1[2] == -float("inf")).all()))
         self.assertTrue(
@@ -110,7 +115,8 @@ class TestFusedPrologue(CustomTestCase):
         q, kr, v, nk_len, thr = _case(P=5, NKm=640, seed=3, width=KV)
         got = fused_prologue(q, kr, v, nk_len, thr, 1 / 16.0, kv=KV)
         ref = _reference(q, kr, v, nk_len, thr, 1 / 16.0)
-        g1, gs, gk, gr = got
+        g1, gs, gk, gr, gscale = got
+        self.assertTrue(torch.equal(gscale, torch.ones_like(gscale)))
         r1, rs, rk, rr = ref
         self.assertEqual(tuple(gs.shape), (5, 0, H))
         self.assertTrue(torch.equal(gs, rs))
@@ -145,12 +151,12 @@ class TestKeptStatsCombine(CustomTestCase):
         for lo, hi in ((0, cut), (cut, kr.shape[1])):
             n = (nk_len - lo).clamp(0, hi - lo)
             mst = q.new_zeros(P, H, 3)
-            m1, _, _, _ = fused_prologue(
+            m1, _, _, _, _ = fused_prologue(
                 q, kr[:, lo:hi].contiguous(), v, n, thr, sc, mst=mst
             )
             parts.append(mst)
             locals_.append(m1.clone())
-        whole, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, sc)
+        whole, _, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, sc)
         return parts, locals_, whole
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
@@ -163,7 +169,7 @@ class TestKeptStatsCombine(CustomTestCase):
         q, kr, v, nk_len, thr = _case(P=5, NKm=512, seed=7)
         sc = 1 / 24.0
         mst = q.new_zeros(5, H, 3)
-        m1, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, sc, mst=mst)
+        m1, _, _, _, _ = fused_prologue(q, kr, v, nk_len, thr, sc, mst=mst)
         merged = combine_kept_stats([mst], thr[:, None], 0.0, False)
         self.assertTrue(torch.equal(torch.isfinite(merged), torch.isfinite(m1)))
         f = torch.isfinite(m1)

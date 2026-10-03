@@ -61,9 +61,13 @@ def index_page_views(buf: torch.Tensor, *, index_head_dim: int,
     keys = buf[:, :k_bytes].view(torch.float8_e4m3fn).view(
         buf.shape[0], slots_per_page, index_head_dim
     )
-    scale = buf[:, k_bytes:].reshape(-1).view(torch.float32).view(
-        buf.shape[0], slots_per_page
-    )
+    # .view(torch.float32), not .reshape(-1).view(...): the scale block is a
+    # COLUMN slice, contiguous along the row but strided across pages, so a
+    # reshape to 1-D cannot be a view and silently copies the whole block on
+    # every call. A dtype view needs only the last dimension contiguous, which
+    # this slice has, so it aliases -- which is what the name promises and what
+    # the caller reading per page wants.
+    scale = buf[:, k_bytes:].view(torch.float32)
     return keys, scale
 
 

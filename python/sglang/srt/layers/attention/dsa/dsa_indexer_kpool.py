@@ -1110,6 +1110,18 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
 
+        # VestigeKV branch rule (GLM): the pooled logits are tier 2's score.
+        # Handed over before DSA's own top-k so the recall and the selection
+        # read one set of logits; the backend decides whether it is on.
+        vk = _vestigekv_decode_backend()
+        if vk is not None and hasattr(vk, "group_fetch"):
+            vk.group_fetch(
+                layer_id=layer_id,
+                logits=logits,
+                pool_lens=pool_seqlens,
+                page_table=block_tables,
+                forward_batch=forward_batch,
+            )
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
         topk_result = self._topk_from_kpool_logits(
             logits,

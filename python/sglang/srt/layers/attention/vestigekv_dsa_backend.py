@@ -412,7 +412,10 @@ class VestigeKVDSABackend(AttentionBackend):
         from sglang.srt.layers.attention.graph_variants import VK_LEAN, VK_TOPK
 
         probe = self._ovf_probe
-        if probe is None or self._dsa is None or self._full_arm():
+        if (
+            probe is None or self._dsa is None or self._full_arm()
+            or self._branch_q() is not None
+        ):
             self.lean_step = False
             return VK_TOPK
         dev, host, event = probe
@@ -676,6 +679,8 @@ class VestigeKVDSABackend(AttentionBackend):
         0.75 ms/step for 5 layers, results bit-identical."""
         if key is None or self._full_arm() or self._scan_capture_failed:
             return False
+        if self._indexer_only():
+            return False  # no tier to pack; the eager path is a no-op too
         if key == self._scan_key_cur:
             real = forward_batch.out_cache_loc.shape[0]
             if self._pack_epoch != self._pack_epoch_synced:
@@ -1102,7 +1107,8 @@ class VestigeKVDSABackend(AttentionBackend):
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
             "pack=%.2fms/step "
             "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
-            "attended_frac=%.4f variant[lean=%d topk=%d] ovf_by_layer=%s",
+            "attended_frac=%.4f bytes[step=%.2fMB dsa=%.2fMB ratio=%.3f per_tok=%.1fB] "
+            "variant[lean=%d topk=%d] ovf_by_layer=%s",
             st["steps"],
             len(self._mla_lids),
             100.0 * st["replays"] / n,
@@ -1128,6 +1134,14 @@ class VestigeKVDSABackend(AttentionBackend):
             st["kept"] / c,
             st["seq"] / c,
             (st["fetched"] + st["kept"]) / max(st["seq"], 1),
+            # bytes per layer-step, bf16 latent rows (512 x 2 B) and DSA's pooled
+            # index-k read (33 B/token): the deliverable on this geometry is bytes,
+            # measured off the same per-scan sums as attended_frac, not arithmetic.
+            (33.0 * st["seq"] + (st["kept"] + st["fetched"]) * 1024.0) / c / 1e6,
+            (33.0 * st["seq"] + self._dsa_topk * 1024.0 * c) / c / 1e6,
+            (33.0 * st["seq"] + (st["kept"] + st["fetched"]) * 1024.0)
+            / max(33.0 * st["seq"] + self._dsa_topk * 1024.0 * c, 1.0),
+            (33.0 * st["seq"] + (st["kept"] + st["fetched"]) * 1024.0) / max(st["seq"], 1.0),
             st["lean"],
             st["topk"],
             self._ovf_count_stack.tolist() if self._ovf_count_stack is not None else [],
@@ -1537,6 +1551,8 @@ class VestigeKVDSABackend(AttentionBackend):
         # installs at the first decode prologue, ahead of the provisional index.
         if not self.config.prefill_calibration or closed <= 0:
             return
+        if self._indexer_only():
+            return
         pc = self._pcal.get((slot, lid))
         st = self._recall.get((slot, lid))
         if pc is None or st is None or "job" in st or st.get("qcal") is None:
@@ -1710,6 +1726,19 @@ class VestigeKVDSABackend(AttentionBackend):
         path = envs.SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG.get()
         return bool(path) and os.path.exists(path)
 
+    def _indexer_only(self) -> bool:
+        # Benchmark A/B: tier 1 only (see SGLANG_VESTIGEKV_INDEXER_ONLY). A
+        # plain env read, not a file stat like _full_arm -- this arm is picked
+        # at launch and never flips mid-run, because the tier-2 state it
+        # declines to build cannot be conjured for a request already decoding.
+        return (
+            envs.SGLANG_VESTIGEKV_INDEXER_ONLY.get()
+            or envs.SGLANG_VESTIGEKV_BRANCH_Q.get() is not None
+        )
+
+    def _branch_q(self):
+        return envs.SGLANG_VESTIGEKV_BRANCH_Q.get()
+
     def write_salience(
         self,
         *,
@@ -1882,6 +1911,65 @@ class VestigeKVDSABackend(AttentionBackend):
         rec = self._index_q.get(layer_id)
         if rec is not None and weights is not None:
             rec["w"] = weights.detach()
+
+    def group_fetch(self, *, layer_id, logits, pool_lens, page_table, forward_batch):
+        """Tier 2 under the branch rule (SGLANG_VESTIGEKV_BRANCH_Q): fire every
+        archive GROUP of DSA's pooled index whose logit beats the q-quantile
+        of the kept groups' logits; a step firing more groups than the fence
+        trigger raises the overflow flag and the NEXT step's pack fences the
+        lane to DSA's own top-k (fork: a fenced lane attends the indexer's
+        selection and nothing else). No top-k of ours and no sketch: the
+        operators are vestigekv/dsa_branch.py (threshold off a histogram of
+        the kept groups' logits, fire mask, the Kimi line's compaction), all
+        fixed-shape so the decode graph captures them. Stale by one step, like
+        the scan this replaces. Groups holding a kept row are excluded: the
+        pack concatenates kept and fetched rows without dedup.
+        """
+        q = self._branch_q()
+        if q is None or layer_id not in self._qbuf or self._full_arm():
+            return
+        from sglang.srt.layers.attention.vestigekv.dsa_branch import branch_fire
+
+        li = self._li_map[layer_id]
+        bs, G = logits.shape
+        slots = forward_batch.req_pool_indices[:bs].to(torch.int64)
+        branch_fire(
+            logits=logits,
+            pool_lens=pool_lens[:bs],
+            page_table=page_table[:bs],
+            slots=slots,
+            kept=self._kept_stack[li],
+            klen=self._kept_len_stack[li],
+            q=q,
+            scratch=self._branch_scratch(bs, logits.device, G=G),
+            fetch_buf=self._fetch_stack[li],
+            fetch_len=self._fetch_len_stack[li],
+            fetch_ovf=self._fetch_ovf_stack[li],
+            r2t=self.req_to_token_pool.req_to_token,
+            pool=self._text_cfg_index_kpool,
+            page_size=self.token_to_kv_pool.page_size,
+            fence_groups=envs.SGLANG_VESTIGEKV_BRANCH_FENCE_GROUPS.get(),
+        )
+
+    def _branch_scratch(self, bs, dev, G):
+        # Fixed-address scratch per (batch width, logits width): nothing is
+        # allocated inside the captured step (dsa_branch.branch_scratch).
+        from sglang.srt.layers.attention.vestigekv.dsa_branch import branch_scratch
+
+        key = (bs, G)
+        d = self.__dict__.setdefault("_branch_scratch_bufs", {})
+        if key not in d:
+            pool_tokens = getattr(self.token_to_kv_pool, "size", None)
+            r2t = self.req_to_token_pool.req_to_token
+            if not isinstance(pool_tokens, int) or pool_tokens <= 0:
+                pool_tokens = r2t.shape[0] * r2t.shape[1]
+            d[key] = branch_scratch(
+                bs=bs, G=G, nslot=r2t.shape[0], fetch_w=self._fetch_w,
+                pool=self._text_cfg_index_kpool,
+                fence_groups=envs.SGLANG_VESTIGEKV_BRANCH_FENCE_GROUPS.get(),
+                dev=dev, n_pages=pool_tokens // self.token_to_kv_pool.page_size + 2,
+            )
+        return d[key]
 
     def _indexer_query_for(self, lid: int, slot: int):
         """(query, gate) for `slot` this step: [n_heads, dim] and [n_heads].
@@ -2624,6 +2712,8 @@ class VestigeKVDSABackend(AttentionBackend):
         # the packed CSR splices next.
         if lid not in self._qbuf or self._full_arm() or lid in self.dsa_only_layers:
             return
+        if self._indexer_only():
+            return  # tier 1 is the whole attended set on this arm
         real = forward_batch.out_cache_loc.shape[0]
         for i in range(real):
             slot = reqs[i]
@@ -2808,6 +2898,21 @@ class VestigeKVDSABackend(AttentionBackend):
         conservative rung with the gate open, which over-fetches, costing
         latency and never recall.
         """
+        if self._indexer_only():
+            # Nothing downstream of here exists on this arm. Gating the BUILD
+            # instead looks equivalent and is not: st["tier"] then stays None
+            # forever, so the `tier is None` branch below fires on every step
+            # of every request -- appending a cloned query per layer per step
+            # (unbounded) and re-arming _capture_asap each time. The collector
+            # is the seam; the build is downstream of it.
+            #
+            # Clear _collecting on the way out: the caller gates this call on
+            # it, and the assignment that normally retires it is at the far end
+            # of this function. Returning without it leaves the arm paying a
+            # call per decode step for a function that does nothing -- small,
+            # but this arm exists to be timed.
+            self._collecting = False
+            return False
         real = forward_batch.out_cache_loc.shape[0]
         pending = False
         # A build finished during prefill installs here, ahead of the loop, so

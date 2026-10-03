@@ -703,6 +703,28 @@ class Envs:
 
     SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG = EnvStr(None)
 
+    # VestigeKV indexer-only arm (benchmark A/B, default off). True serves
+    # selection from tier 1 alone -- the salience record this geometry reads
+    # out of DSA's pooled index-k cache -- and builds no tier-2 sketch, runs
+    # no per-step recall and fetches no row. It is the arm that separates what
+    # selection costs from what the tier-2 chain costs, and it is the whole
+    # method on a geometry with no in-row sidecar if tier 2 does not pay.
+    SGLANG_VESTIGEKV_INDEXER_ONLY = EnvBool(False)
+
+    # VestigeKV branch rule on DSA models (the GLM design): tier 2 recalls
+    # GROUPS of the indexer's pooled index-k, scored by DSA's own pooled
+    # logits, above the q-quantile of the kept groups' scores, capped at the
+    # fetch width. Unset = off. Set, it also turns the sketch tier off (no
+    # build, no scan graph, no calibration) and pins the full decode graph,
+    # since the rule needs the indexer's logits every step. The literal
+    # "above the best kept group" rule is q=1.0 and fires almost nothing: the
+    # recent window tops the indexer's ranking (branch_curve.py, 2026-10-03).
+    SGLANG_VESTIGEKV_BRANCH_Q = EnvFloat(None)
+    # Branch rule: fire count (in groups) above which a step falls back to
+    # DSA's own selection (the lane is fenced). Unset = the fetch budget
+    # (recall_capacity / index_kpool); lower values fence sooner.
+    SGLANG_VESTIGEKV_BRANCH_FENCE_GROUPS = EnvInt(None)
+
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
     # rows the KV pool already holds. Unset picks the fastest form that runs on
     # the device (a TMA row gather where that compiles, an indirect load

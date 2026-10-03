@@ -366,6 +366,11 @@ class TestBatchedEmptyKept(CustomTestCase):
             t.scale = 1.0 / (D.LATENT_DIM**0.5)
             t.r = 16
             t.version = 0
+            # The sketch's storage scale (1.0 = fp16 path, SGLANG_VESTIGEKV_CSK_FP8
+            # off); the stub predates the attribute and this test was red
+            # for it -- the second time this guard stopped guarding (see the
+            # geom note below).
+            t.csk_scale = 1.0
             # BatchedScanPack reads the geometry off its first tier; the stub
             # predates that and the test has been red since, which is how a
             # crash-regression guard stops guarding anything.
