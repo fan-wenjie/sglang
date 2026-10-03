@@ -3064,6 +3064,16 @@ class VestigeKVDSABackend(AttentionBackend):
                 "rows": kbuf.index_select(0, job["row_slots"].to(torch.int64)).cpu(),
                 "row_slots": job["row_slots"].cpu(),
                 "kept": job["kept"].cpu(),
+                # Tier 1's RANKING, not just its keep set. A budget-matched
+                # union needs tier 1's top-Delta, and `kept` alone is the
+                # whole resident set -- comparing that against a 2048-row
+                # channel budget would reward tier 1 for spending more, which
+                # is the mistake far_region_stats' docstring calls out.
+                "sigma": (
+                    None
+                    if (slot, lid) not in self._close_state
+                    else self._close_state[(slot, lid)]["sigma"].float().cpu()
+                ),
                 "qcal": torch.stack(job["qcal"]).cpu(),
                 "qpos": torch.tensor(job["qpos"], dtype=torch.long),
                 # One indexer query per CALIBRATION QUERY, same step, same
