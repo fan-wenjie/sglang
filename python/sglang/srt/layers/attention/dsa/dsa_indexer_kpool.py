@@ -1856,7 +1856,17 @@ class IndexerKPool(MultiPlatformOp):
         # _forward_cuda_skip_logits). No VestigeKV backend means a plain DSA run.
         vk = _vestigekv_decode_backend()
         if vk is not None:
-            vk.write_salience(layer_id=layer_id, forward_batch=forward_batch, key=key)
+            # `query` and `head_weights` cost nothing here -- this path has just
+            # computed them -- and they are what a selector scoring pooled index
+            # keys needs. Handing over the existing tensors beats having
+            # VestigeKV rebuild the projection from q_lora.
+            vk.write_salience(
+                layer_id=layer_id,
+                forward_batch=forward_batch,
+                key=key,
+                query=query,
+                head_weights=head_weights,
+            )
 
         has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
         is_prefill = forward_batch.forward_mode.is_extend_without_speculative()

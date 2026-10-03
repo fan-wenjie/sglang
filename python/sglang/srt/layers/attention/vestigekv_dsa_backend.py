@@ -336,6 +336,7 @@ class VestigeKVDSABackend(AttentionBackend):
         self._index_head_dim = 0
         self._index_quant_block = 0
         self._salience_seen = False
+        self._index_q: dict = {}  # lid -> (indexer query, head gate), latest step
         if not self.geom.sigma_in_row:
             pool = base.token_to_kv_pool
             self._index_head_dim = pool.index_head_dim
@@ -1702,6 +1703,8 @@ class VestigeKVDSABackend(AttentionBackend):
         key: torch.Tensor,
         indexer=None,
         q_lora: torch.Tensor = None,
+        query: torch.Tensor = None,
+        head_weights: torch.Tensor = None,
     ):
         """Nothing to store: the salience key is DSA's own indexer key, and the
         indexer has already written it to the index-k cache by the time this
@@ -1721,6 +1724,16 @@ class VestigeKVDSABackend(AttentionBackend):
                 f"salience keys ({key.shape[0]}) and positions "
                 f"({forward_batch.positions.shape[0]}) disagree; hidden states "
                 "must be one row per token of the batch"
+            )
+        if query is not None:
+            # Stash, do not consume: the selector and the calibration dump both
+            # want the indexer query, and this is the only place it exists
+            # without rebuilding wq_b. One tensor per layer, overwritten each
+            # step, never grown -- the ring this replaced cost a write per
+            # token per layer per step and that lesson stands.
+            self._index_q[layer_id] = (
+                query.detach(),
+                None if head_weights is None else head_weights.detach(),
             )
         if not self._salience_seen:
             self._salience_seen = True
@@ -1788,7 +1801,7 @@ class VestigeKVDSABackend(AttentionBackend):
         )
         self._spectrum.observe(side, block, lid=lid)
 
-    def _dump_index_keys(self, lid, row_slots):
+    def _dump_index_keys(self, slot, lid, row_slots):
         """Dequantised indexer keys for `row_slots`, [T, index_head_dim], or None.
 
         In-row geometries keep their salience in the latent row, which `rows`
@@ -1821,6 +1834,22 @@ class VestigeKVDSABackend(AttentionBackend):
             "row_bytes": int(self._index_head_dim + 4),
             "pool_page_size": int(getattr(self.token_to_kv_pool, "page_size", -1)),
             "buf_shape": tuple(buf.shape),
+            # The indexer query and head gate for this layer's latest scoring
+            # step, stashed by write_salience. Without them a dump cannot
+            # evaluate a selector that scores pooled index keys at all -- the
+            # score would be identically zero, which is how an offline study
+            # reports "no difference" for a reason that has nothing to do with
+            # the method.
+            "index_q": (
+                None
+                if lid not in self._index_q
+                else self._index_q[lid][0].float().cpu()
+            ),
+            "index_head_w": (
+                None
+                if lid not in self._index_q or self._index_q[lid][1] is None
+                else self._index_q[lid][1].float().cpu()
+            ),
             "slots_min_max": (int(rows.min()), int(rows.max())),
         }
 
@@ -3005,7 +3034,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 # Out-of-row geometries score tier 2 on nothing the latent row
                 # carries, so a dump without these cannot evaluate this model's
                 # selector at all: at index_rank 0 every row would score 0.
-                "index_k": self._dump_index_keys(lid, job["row_slots"]),
+                "index_k": self._dump_index_keys(slot, lid, job["row_slots"]),
                 "stats": stats,
             },
             os.path.join(
