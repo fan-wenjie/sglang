@@ -158,3 +158,53 @@ class TestDsaDecodeFork(CustomTestCase):
         others = torch.ones(R1, dtype=torch.bool, device="cuda")
         others[slot] = False
         self.assertEqual(float(qbuf[others].abs().sum()), 0.0)
+
+
+class TestSplitKBufsOutliveTheirGraphs(CustomTestCase):
+    """A buffer handed to a captured graph must stay allocated.
+
+    The fork caches the split-K partials per device and grows them when a
+    later call needs more room. Growing by REPLACING the cache entry drops the
+    last reference to the old allocation, and a decode graph captured against
+    it then replays against memory the caching allocator has already reissued.
+    Nothing in a score or a latency number shows that; it shows up as garbage
+    in whichever request replays the oldest graph. Upstream's own
+    _get_splitk_bufs keeps its old allocations alive for exactly this reason.
+    """
+
+    def test_growing_the_workspace_keeps_the_earlier_buffer_alive(self):
+        import torch
+
+        from sglang.srt.layers.attention.vestigekv import dsa_decode_fork as f
+
+        dev = torch.device("cuda", 0)
+        f._vk_splitk.pop(dev, None)
+        small_lse, _ = f._vk_splitk_bufs(1, 8, 16, 512, dev)
+        first = small_lse.untyped_storage().data_ptr()
+
+        # A later, larger call must not invalidate what the first one returned.
+        f._vk_splitk_bufs(1, 64, 16, 512, dev)
+
+        alive = [
+            lse.untyped_storage().data_ptr() for lse, _acc in f._vk_splitk[dev]
+        ]
+        self.assertIn(
+            first, alive,
+            "the allocation handed to an earlier (possibly captured) call was "
+            "dropped when the workspace grew",
+        )
+        # And the earlier tensor must still address its own storage.
+        self.assertEqual(small_lse.untyped_storage().data_ptr(), first)
+
+    def test_a_fitting_buffer_is_reused_rather_than_reallocated(self):
+        import torch
+
+        from sglang.srt.layers.attention.vestigekv import dsa_decode_fork as f
+
+        dev = torch.device("cuda", 0)
+        f._vk_splitk.pop(dev, None)
+        f._vk_splitk_bufs(1, 64, 16, 512, dev)
+        n = len(f._vk_splitk[dev])
+        # Smaller than what is already cached: no new allocation.
+        f._vk_splitk_bufs(1, 8, 16, 512, dev)
+        self.assertEqual(len(f._vk_splitk[dev]), n, "reallocated for a smaller call")

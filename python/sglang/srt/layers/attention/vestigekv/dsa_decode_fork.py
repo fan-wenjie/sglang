@@ -289,6 +289,11 @@ def _vk_dsa_decode_split_kernel(
         )
 
 
+# device -> list of (lse_buf, acc_buf), oldest first. A list, not one entry:
+# a captured graph bakes in the pointer it was given, so replacing the
+# allocation when a later call needs a bigger one leaves every graph captured
+# against the old buffer reading memory the allocator has handed to someone
+# else. Upstream's _get_splitk_bufs carries the same note for the same reason.
 _vk_splitk = {}
 
 
@@ -297,19 +302,25 @@ def _vk_splitk_bufs(bs, kv_splits, h_padded, d_v, device):
     # the first call; the tiers' split count is up to three times DSA's
     # (max_rows is the kept capacity plus the fetch width), and that
     # reservation was 0.4 GB of the graph pool at bs=1 on GLM-5.3-Flash. The
-    # partials are scratch within one launch, so a buffer sized to the largest
-    # call so far serves every graph.
+    # partials are scratch within one launch, so the smallest buffer that fits
+    # serves the call -- but the ones already handed out stay alive.
     needed_lse = bs * kv_splits * h_padded
     needed_acc = needed_lse * d_v
-    bufs = _vk_splitk.get(device)
-    if bufs is None or bufs[0].numel() < needed_lse or bufs[1].numel() < needed_acc:
-        bufs = (
-            torch.empty(needed_lse, dtype=torch.float32, device=device),
-            torch.empty(needed_acc, dtype=torch.bfloat16, device=device),
-        )
-        _vk_splitk[device] = bufs
-    lse = bufs[0][:needed_lse].view(bs, kv_splits, h_padded)
-    acc = bufs[1][:needed_acc].view(bs, kv_splits, h_padded, d_v)
+    workspace = _vk_splitk.setdefault(device, [])
+    for lse_buf, acc_buf in reversed(workspace):
+        if lse_buf.numel() >= needed_lse and acc_buf.numel() >= needed_acc:
+            lse = lse_buf[:needed_lse].view(bs, kv_splits, h_padded)
+            acc = acc_buf[:needed_acc].view(bs, kv_splits, h_padded, d_v)
+            return lse, acc
+    # Round up so a growing shape sequence adds O(log range) buffers rather
+    # than one per distinct shape; the pool on this model is small enough that
+    # the count matters as much as the peak.
+    capacity_lse = 1 << max(0, needed_lse - 1).bit_length()
+    lse_buf = torch.empty(capacity_lse, dtype=torch.float32, device=device)
+    acc_buf = torch.empty(capacity_lse * d_v, dtype=torch.bfloat16, device=device)
+    workspace.append((lse_buf, acc_buf))
+    lse = lse_buf[:needed_lse].view(bs, kv_splits, h_padded)
+    acc = acc_buf[:needed_acc].view(bs, kv_splits, h_padded, d_v)
     return lse, acc
 
 
