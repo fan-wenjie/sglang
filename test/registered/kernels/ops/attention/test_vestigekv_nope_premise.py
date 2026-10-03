@@ -19,8 +19,23 @@ from sglang.test.ci.ci_register import register_cpu_ci
 # runner would spend a device to parse two files.
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu-intel")
 
-SRT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                   "..", "..", "..", "..", "python", "sglang", "srt")
+def _srt():
+    """Locate python/sglang/srt by walking up, not by counting directories.
+
+    A fixed "../../.." broke when upstream renamed test/registered/kernel/
+    attention to test/registered/kernels/ops/attention: the walk landed on
+    test/python/sglang/srt and the test errored instead of reading the model.
+    """
+    d = os.path.dirname(os.path.abspath(__file__))
+    while d != os.path.dirname(d):
+        cand = os.path.join(d, "python", "sglang", "srt")
+        if os.path.isdir(cand):
+            return cand
+        d = os.path.dirname(d)
+    raise RuntimeError("python/sglang/srt not found above %s" % __file__)
+
+
+SRT = _srt()
 
 
 def _source(rel):
