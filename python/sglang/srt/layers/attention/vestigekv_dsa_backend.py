@@ -304,6 +304,11 @@ class VestigeKVDSABackend(AttentionBackend):
         # host sync on the critical path.
         self._kept_buf: dict = {}  # lid -> [max_reqs, cap] fm.kv_indices dtype
         self._kept_pos: dict = {}  # lid -> [max_reqs, cap]: positions of those rows
+        # Stacked views of the above, allocated at the first prefill. Set here
+        # so a None check works before that (.claude/rules/no-getattr-defensive).
+        self._kept_stack = None
+        self._kept_pos_stack = None
+        self._kept_len_stack = None
         self._kept_len: dict = {}
         self._kmax: dict = {}  # lid -> host-side upper bound on kept_len
         self._close_state: dict = {}  # (slot, lid) -> {closed, sigma}
@@ -515,6 +520,7 @@ class VestigeKVDSABackend(AttentionBackend):
         reqs, _ = self._decode_prologue(forward_batch)
         for lid in self._local_mla_lids:
             self._recall_step(lid, forward_batch, reqs)
+        self._append_step_row(forward_batch)
         # The eager step never reaches _account_step, so the recall audit's
         # host read has to be issued from here or it is never issued at all.
         self._eager_steps += 1
@@ -584,6 +590,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 return
             for lid in self._mla_lids:
                 self._recall_step(lid, forward_batch, reqs)
+            self._append_step_row(forward_batch)
 
     def _out_graph_metadata_lite(self, forward_batch) -> bool:
         """Replay-prep without the dense kv_indices fill (in-graph decode).
@@ -735,6 +742,7 @@ class VestigeKVDSABackend(AttentionBackend):
         replayed = False
         for lid in self._mla_lids:
             self._recall_step(lid, forward_batch, reqs)
+        self._append_step_row(forward_batch)
         tl = _t.perf_counter()  # queue drained on entry -> t0..tl is pure
         torch.cuda.synchronize()  # host dispatch; tl..t1 is GPU-bound tail
         t1 = _t.perf_counter()
@@ -1344,6 +1352,27 @@ class VestigeKVDSABackend(AttentionBackend):
             return 0
         return (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
 
+    def _append_step_row(self, forward_batch):
+        """This step's new pool row, appended to every layer's kept table.
+
+        The deleted CSR pack carried this append (see dsa_branch.kept_append);
+        without it the kept table stops growing between closes. One launch for
+        all layers: each layer's table is independent, so batching the appends
+        after the per-layer recall loop is equivalent to the old interleaving.
+        """
+        from sglang.srt.layers.attention.vestigekv.dsa_branch import kept_append
+
+        if self._kept_stack is None:
+            return
+        loc = forward_batch.out_cache_loc
+        real_bs = loc.shape[0]
+        kept_append(
+            slots=forward_batch.req_pool_indices[:real_bs].to(torch.int64),
+            loc=loc,
+            kept_stack=self._kept_stack,
+            klen_stack=self._kept_len_stack,
+        )
+
     def _append_kept(self, lid, slot, n_prev: int, rows, pos) -> int:
         """Extend a kept table by the rows this chunk added to the tail."""
         buf = self._kept_buf[lid]
@@ -1383,9 +1412,9 @@ class VestigeKVDSABackend(AttentionBackend):
     def _ensure_kept_stacks(self, max_reqs, cap, dev):
         # Stacked kept tables ([L, R1, CAP] etc.) with the per-lid dict
         # entries as views (the _qbuf_stack pattern): eager call sites keep
-        # their dict interface, while the graph-replayed CSR pack addresses
-        # every layer from two kernels (see vestigekv/pack_csr.py).
-        if getattr(self, "_kept_stack", None) is not None:
+        # their dict interface, while the per-step append addresses every
+        # layer from one kernel (see dsa_branch.kept_append).
+        if self._kept_stack is not None:
             return
         n = len(self._local_mla_lids)
         li_map = {L: i for i, L in enumerate(self._local_mla_lids)}
