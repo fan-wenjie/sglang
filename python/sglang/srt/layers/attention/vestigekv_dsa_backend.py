@@ -1,6 +1,7 @@
 """VestigeKV for DSA models (GLM-5.3-Flash): the decode side of the split pair.
 
-A copy of vestigekv_mla_backend.py taken 2026-09-22 so the DSA-specific work --
+Forked from the MLA-line backend on 2026-09-22 (that file is deleted on this
+branch) so the DSA-specific work --
 the DSA sibling's decode metadata, the fenced arm that attends the indexer's
 selection, the salience ring, and the decode-kernel and scheduling
 optimisations that follow -- can be done without touching the Kimi Linear
