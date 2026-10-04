@@ -1187,6 +1187,18 @@ class VestigeKVDSABackend(AttentionBackend):
                 _tm("kept")
                 n = self._write_kept(lid, slot, kept, kept_pos)
             cl["kept_n"], cl["kept_closed"] = n, closed_now
+            if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
+                import logging
+
+                logging.getLogger(__name__).info(
+                    "VKKEPT lid=%s slot=%s seq=%d closed_now=%s rho=%s "
+                    "CLOSE_BLOCK=%d amt=%d n=%d  -> sinks+m+tail = %d+%d+%d",
+                    lid, slot, seq_len, closed_now, self.rho, D.CLOSE_BLOCK,
+                    self.config.activation_min_tokens, n,
+                    min(D.SINKS, closed_now or 0),
+                    max(1, round(self.rho * (closed_now or 0))) if closed_now else 0,
+                    seq_len - (closed_now or 0),
+                )
             _tm("write")
             # Arm decode-time closes: the prefix counts as closed (ranked).
             # Below the activation threshold nothing is closed yet -- the first
