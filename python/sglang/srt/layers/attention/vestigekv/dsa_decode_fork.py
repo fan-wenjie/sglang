@@ -465,7 +465,7 @@ def vk_dsa_decode(
     qk_scale = float(sm_scale) * LOG2E
     lse_partial, acc_partial = _vk_splitk_bufs(bs, kv_splits, h_padded, d_v, q.device)
     topk = vk.topk
-    qbuf = vk.qbuf
+    qbuf = vk.qbuf if (vk.qbuf is not None and vk.tiers) else None
     grid_split = (bs, n_head_blocks, kv_splits)
     with _no_async_copy():
         _vk_dsa_decode_split_kernel[grid_split](

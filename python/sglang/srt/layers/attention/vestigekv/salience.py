@@ -80,9 +80,10 @@ def vestigekv_backend_of(backend):
         HybridLinearAttnBackend,
     )
     from sglang.srt.layers.attention.vestigekv_dsa_backend import VestigeKVDSABackend
+    from sglang.srt.layers.attention.vestigekv_mla_backend import VestigeKVMLABackend
 
     # A split pair (--prefill-attention-backend dsa --decode-attention-backend
-    # vestigekv_dsa) arrives as a HybridAttnBackend; VestigeKV is its decode
+    # vestigekv_mla) arrives as a HybridAttnBackend; VestigeKV is its decode
     # side, and that is the side the prefill-time writers (salience keys,
     # calibration queries) must reach, whichever side is computing attention.
     # Either nesting order, to a fixed point. The engine composes the
@@ -98,4 +99,8 @@ def vestigekv_backend_of(backend):
             backend = backend.full_attn_backend
         else:
             break
-    return backend if isinstance(backend, VestigeKVDSABackend) else None
+    return (
+        backend
+        if isinstance(backend, (VestigeKVMLABackend, VestigeKVDSABackend))
+        else None
+    )
