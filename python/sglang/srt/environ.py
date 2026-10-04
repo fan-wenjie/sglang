@@ -662,6 +662,16 @@ class Envs:
     # A study knob: unset means defaults.RHO, and any quoted number must say
     # which value produced it.
     SGLANG_VESTIGEKV_RHO = EnvFloat(None)
+    # Decoded tokens per compression event, overriding defaults.CLOSE_BLOCK
+    # DOWNWARD only. It sets two things at once, which is why it is a study
+    # knob and not a tuning dial: the cadence of the close, and the LENGTH of
+    # the window sigma's low-pass projection is built over (the basis is
+    # 2*kappa-1 = 31 dims of T, so 31/4096 and 31/256 are different
+    # statistics). It also sets the un-closed tail, which is what kept costs
+    # beyond rho*closed: the tail averages CLOSE_BLOCK/2 rows and is zero only
+    # when the prompt is an exact multiple. Buffers stay sized from the
+    # compiled-in default, so downward is always safe.
+    SGLANG_VESTIGEKV_CLOSE_BLOCK = EnvInt(None)
     # Store the tier-2 sketch as fp8 e4m3 with one power-of-two scale per
     # tier instead of fp16, halving the scan's dominant load. The dot becomes
     # fp8 x fp8 (Triton has no mixed fp8 dot on SM120), so the query is

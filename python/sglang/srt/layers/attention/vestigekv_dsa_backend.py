@@ -224,6 +224,29 @@ class VestigeKVDSABackend(AttentionBackend):
                     "latter. Raise defaults.RHO instead."
                 )
             logger.info("VestigeKV: rho overridden to %.6g (default %.6g)", self.rho, rho)
+        _cb = envs.SGLANG_VESTIGEKV_CLOSE_BLOCK.get()
+        self.close_block = int(_cb) if _cb else D.CLOSE_BLOCK
+        if _cb:
+            # Downward only, for the same reason rho is: _nkm and _kept_cap size
+            # the kept table and the scan arena from defaults.CLOSE_BLOCK, so a
+            # smaller window leaves them oversized and safe while a larger one
+            # would undersize the tail they have to hold.
+            if self.close_block > D.CLOSE_BLOCK:
+                raise ValueError(
+                    f"SGLANG_VESTIGEKV_CLOSE_BLOCK={self.close_block} exceeds the "
+                    f"compiled-in {D.CLOSE_BLOCK}; the kept table is sized from the "
+                    "latter. Raise defaults.CLOSE_BLOCK instead."
+                )
+            if self.close_block & (self.close_block - 1):
+                raise ValueError(
+                    f"SGLANG_VESTIGEKV_CLOSE_BLOCK={self.close_block} is not a power "
+                    "of two; sigma's basis and the block grid assume one."
+                )
+            logger.info(
+                "VestigeKV: close block overridden to %d (default %d); sigma's "
+                "low-pass window changes with it",
+                self.close_block, D.CLOSE_BLOCK,
+            )
         self.index_rank = index_rank
         # Route the base's stage-1 decode at the tiers instead of a packed CSR.
         # `decode_attention_fwd` is an instance attribute of the base, so the
@@ -997,8 +1020,8 @@ class VestigeKVDSABackend(AttentionBackend):
                 if lid in self._fetch_len:
                     n = n + self._fetch_len[lid].gather(0, slots)
                 mask = seq > max(
-                    D.CHECK_MIN_SEQ_BLOCKS * D.CLOSE_BLOCK,
-                    self.config.activation_min_tokens + D.CLOSE_BLOCK,
+                    D.CHECK_MIN_SEQ_BLOCKS * self.close_block,
+                    self.config.activation_min_tokens + self.close_block,
                 )
                 bad = ((n > (seq * D.CHECK_MAX_KEPT_FRACTION).to(n.dtype)) & mask).sum()
                 if int(bad):
@@ -1193,7 +1216,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 logging.getLogger(__name__).info(
                     "VKKEPT lid=%s slot=%s seq=%d closed_now=%s rho=%s "
                     "CLOSE_BLOCK=%d amt=%d n=%d  -> sinks+m+tail = %d+%d+%d",
-                    lid, slot, seq_len, closed_now, self.rho, D.CLOSE_BLOCK,
+                    lid, slot, seq_len, closed_now, self.rho, self.close_block,
                     self.config.activation_min_tokens, n,
                     min(D.SINKS, closed_now or 0),
                     max(1, round(self.rho * (closed_now or 0))) if closed_now else 0,
@@ -1205,7 +1228,7 @@ class VestigeKVDSABackend(AttentionBackend):
             # decode-time close past it ranks the whole prefix in one pass, from
             # the sigma record that kept growing meanwhile.
             cl["closed"] = (
-                (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
+                (seq_len // self.close_block) * self.close_block
                 if seq_len >= self.config.activation_min_tokens
                 else 0
             )
@@ -1362,7 +1385,7 @@ class VestigeKVDSABackend(AttentionBackend):
         where the request is served dense and nothing is closed."""
         if seq_len < self.config.activation_min_tokens:
             return 0
-        return (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
+        return (seq_len // self.close_block) * self.close_block
 
     def _append_step_row(self, forward_batch):
         """This step's new pool row, appended to every layer's kept table.
@@ -1600,7 +1623,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 "per pool row; use _index_sigma"
             )
         return blockwise_sigma_from_pool(
-            kbuf, slots, D.CLOSE_BLOCK, offset=g.sigma_offset, dim=g.sigma_dim
+            kbuf, slots, self.close_block, offset=g.sigma_offset, dim=g.sigma_dim
         )
 
 
@@ -1806,7 +1829,7 @@ class VestigeKVDSABackend(AttentionBackend):
             slots_per_page=self.token_to_kv_pool.slots_per_page,
             pool_size=pool_size,
         )
-        sig = blockwise_sigma(keys, group_sigma_window(D.CLOSE_BLOCK, pool_size))
+        sig = blockwise_sigma(keys, group_sigma_window(self.close_block, pool_size))
         # One sigma per group, repeated to its positions: every consumer
         # downstream indexes by position, and a group's members share its
         # salience by construction.
@@ -1828,7 +1851,7 @@ class VestigeKVDSABackend(AttentionBackend):
         Runs per prefill chunk and per decode step, so a key is always scored
         before its ring row is reused.
         """
-        target = (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
+        target = (seq_len // self.close_block) * self.close_block
         if target <= cl["sigmaed"]:
             return
         c0 = cl["sigmaed"]
@@ -1868,7 +1891,7 @@ class VestigeKVDSABackend(AttentionBackend):
         # See eviction.blockwise_sigma for why the whole-prefix transform was
         # wrong: an S-dependent cutoff, and the only formulation that would
         # ever have needed an incremental FFT.
-        closed = (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
+        closed = (seq_len // self.close_block) * self.close_block
         if closed == 0:
             # too short to close anything: attend everything
             return row_slots, _all_positions(row_slots)
@@ -2403,7 +2426,7 @@ class VestigeKVDSABackend(AttentionBackend):
     def _maybe_close_blocks(self, forward_batch, reqs):
         """Decode-time compression events (reference policy semantics).
 
-        Every D.CLOSE_BLOCK decoded tokens per request, the newest block is
+        Every `self.close_block` decoded tokens per request, the newest block is
         closed: sigma over its sidecars joins the request's global sigma
         record, tier-1 re-selects top-(rho * closed) over ALL closed rows
         (global rebalance -- rows move both ways, matching the reference
@@ -2442,7 +2465,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 # identical to having compressed from the start.
                 while (
                     seq_len >= self.config.activation_min_tokens
-                    and seq_len - cl["closed"] >= D.CLOSE_BLOCK
+                    and seq_len - cl["closed"] >= self.close_block
                 ):
                     self._close_one_block(slot, lid, cl, seq_len)
 
@@ -2451,7 +2474,7 @@ class VestigeKVDSABackend(AttentionBackend):
         kbuf = kbuf.reshape(-1, kbuf.shape[-1])
         r2t = self.req_to_token_pool.req_to_token
         c0 = cl["closed"]
-        c1 = c0 + D.CLOSE_BLOCK
+        c1 = c0 + self.close_block
         # The record is advanced by the caller, and by the prefill path, so by
         # here this block's sigma is already in it; this only has to catch a
         # record that has not reached c1 yet (the pass that crosses the
