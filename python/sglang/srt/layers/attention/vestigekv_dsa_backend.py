@@ -30,7 +30,7 @@ from sglang.srt.layers.attention.vestigekv.eviction import (
 from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
 from sglang.srt.runtime_context import get_parallel, get_schedule
-from sglang.srt.layers.attention.vestigekv.tier_decode import rows_for_layer
+from sglang.srt.layers.attention.vestigekv.dsa_rows import rows_for_layer
 from sglang.srt.layers.attention.vestigekv.geometry import KIMI_LINEAR, Geometry
 
 if TYPE_CHECKING:
@@ -229,7 +229,7 @@ class VestigeKVDSABackend(AttentionBackend):
         # whole redirection is this assignment and nothing upstream is edited;
         # a layer with no entry in `rows` falls through to the base's own
         # function, which is how eager steps keep the CSR path.
-        from sglang.srt.layers.attention.vestigekv.tier_decode import DsaTierDecodeRouter
+        from sglang.srt.layers.attention.vestigekv.dsa_rows import DsaTierDecodeRouter
 
         # The AFFINE fenced arm addresses a request's rows as base + offset,
         # which holds only when its slots are one contiguous run -- true at
@@ -381,16 +381,6 @@ class VestigeKVDSABackend(AttentionBackend):
         if self._mem_dir is not None:
             torch.cuda.memory._record_memory_history(max_entries=200000)
         self._fetch_hist = None  # stats only: [W + 1] int64 device histogram
-        _spec_every = envs.SGLANG_DEBUG_VESTIGEKV_SPECTRUM.get()
-        if _spec_every:
-            from sglang.srt.layers.attention.vestigekv.spectrum import SpectrumTelemetry
-
-            self._spectrum = SpectrumTelemetry(D.LOWPASS_KAPPA, every=_spec_every)
-            logger.info(
-                "VestigeKV spectrum telemetry on: one rFFT per closing block per "
-                "layer, reported as VKSPECTRUM every %d blocks; nothing reads it back",
-                _spec_every,
-            )
         self._stat_acc = None  # stats only: [fetched, kept, seq] int64 device sums
         self._scan_graph = None
         self._scan_key_cur = self._scan_key_seen = None
@@ -524,7 +514,6 @@ class VestigeKVDSABackend(AttentionBackend):
         reqs, _ = self._decode_prologue(forward_batch)
         for lid in self._local_mla_lids:
             self._recall_step(lid, forward_batch, reqs)
-            self._refresh_graph_bufs(lid, forward_batch, reqs)
         # The eager step never reaches _account_step, so the recall audit's
         # host read has to be issued from here or it is never issued at all.
         self._eager_steps += 1
@@ -538,11 +527,6 @@ class VestigeKVDSABackend(AttentionBackend):
             self._check_row_invariant(forward_batch)
         reqs, key = self._step_slots(forward_batch)
         self._maybe_close_blocks(forward_batch, reqs)
-        # Collecting a calibration query is five 74 KB clones; it does not
-        # need the eager scan path, and tying it to that path cost 16 eager
-        # steps per request at 11.3 ms each against 1.5 ms for a replay.
-        if self._collecting:
-            self._collect_calibration(forward_batch, reqs)
         return reqs, key
 
     def init_forward_metadata_out_graph(
@@ -566,7 +550,20 @@ class VestigeKVDSABackend(AttentionBackend):
         # the per-layer fixed buffers here (copies/syncs are legal outside
         # capture); inside capture forward_decode only swaps pointers to them.
         if in_capture and forward_batch.forward_mode.is_decode():
-            self._prefill_graph_bufs_for_capture(forward_batch)
+            # Runs BEFORE `with graph.capture()`: allocate and pre-fill the
+            # per-layer fixed buffers here (copies and syncs are legal outside
+            # capture); inside capture forward_decode only swaps pointers.
+            fm = self.base.forward_metadata
+            bs = forward_batch.seq_lens.shape[0]
+            n = int(fm.kv_indptr[bs])
+            self._ensure_graph_bufs()
+            for lid in self._local_mla_lids:
+                bufs = self._graph_bufs[lid]
+                bufs["indptr"][: bs + 1].copy_(fm.kv_indptr[: bs + 1])
+                bufs["indptr"][bs + 1 :].fill_(fm.kv_indptr[bs])
+                if n > 0:
+                    bufs["indices"][:n].copy_(fm.kv_indices[:n])
+            self._ensure_stage(max(self._graph_max_bs, 1), self._qbuf_stack.device)
             return
         # Graph replay path: forward_decode's python never runs, so refresh the
         # buffers here (outside the graph) with this step's compressed indices.
@@ -584,11 +581,8 @@ class VestigeKVDSABackend(AttentionBackend):
             if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
                 self._step_with_stats(forward_batch, reqs, key)
                 return
-            if self._replay_scan(forward_batch, reqs, key):
-                return
             for lid in self._mla_lids:
                 self._recall_step(lid, forward_batch, reqs)
-                self._refresh_graph_bufs(lid, forward_batch, reqs)
 
     def _out_graph_metadata_lite(self, forward_batch) -> bool:
         """Replay-prep without the dense kv_indices fill (in-graph decode).
@@ -677,262 +671,8 @@ class VestigeKVDSABackend(AttentionBackend):
         # were key misses).
         return ("bs", forward_batch.seq_lens.shape[0], real) + tuple(sorted(pairs))
 
-    def _replay_scan(self, forward_batch, reqs, key) -> bool:
-        """Run this step's tier-2 scan from a captured graph. Returns False if
-        the caller must fall back to the eager per-layer path.
 
-        query_fixed is capturable because every shape it touches is frozen for
-        the life of a request: the archive is fixed at prefill (a decoded token
-        joins the recent window, which is tier-1 kept, never the archive), and
-        both its input (_qbuf) and its outputs (_fetch_buf, _fetch_len) are
-        preallocated fixed-address buffers indexed by pool slot. So the capture
-        reads and writes them in place -- no staging copies, one launch per
-        step instead of 43 per (layer, request). Measured in isolation: 1.69 ->
-        0.75 ms/step for 5 layers, results bit-identical."""
-        if key is None or self._full_arm() or self._scan_capture_failed:
-            return False
-        if self._indexer_only():
-            return False  # no tier to pack; the eager path is a no-op too
-        if key == self._scan_key_cur:
-            real = forward_batch.out_cache_loc.shape[0]
-            if self._pack_epoch != self._pack_epoch_synced:
-                # Slow path only when a host-side tier mutation happened
-                # (install/close/prefill): rebuild the pair list and resync
-                # the pack. Steady-state decode skips all of this -- the
-                # per-step tuple build over id()/version was measurable host
-                # time for bookkeeping that could not have changed.
-                tiers, pairs = [], []
-                for lid in self._mla_lids:
-                    if lid in self._qbuf:
-                        for i in range(real):
-                            pairs.append((self._li_map[lid], reqs[i]))
-                            tiers.append(self._recall[(reqs[i], lid)]["tier"])
-                order = sorted(range(len(pairs)), key=lambda k: pairs[k])
-                pairs = [pairs[k] for k in order]
-                tiers = [tiers[k] for k in order]
-                if self._scan_batched.tier_ids != tuple(
-                    (id(t), getattr(t, "version", 0)) for t in tiers
-                ):
-                    if not self._scan_batched.fits(pairs, tiers):
-                        return self._capture_scan(key, forward_batch, reqs)
-                    self._scan_batched.update(pairs, tiers)
-                self._pack_epoch_synced = self._pack_epoch
-            self._stage_step(forward_batch, forward_batch.seq_lens.shape[0])
-            for lid in self._mla_lids:
-                if lid in self._kept_buf:
-                    self._kmax[lid] = self._kmax.get(lid, 0) + 1
-            self._scan_graph.replay()
-            return True
-        # LRU graph cache: chunked-prefill interleave oscillates the decode
-        # composition (e.g. bs 1 <-> 4), and a single graph slot thrashed on
-        # the ping-pong (VKKEYMISS showed two shape classes evicting each
-        # other 137 times). A hit swaps the active references; capture puts
-        # the outgoing entry into the cache instead of discarding it.
-        ent = self._scan_cache.get(key) if self._scan_cache is not None else None
-        if ent is not None:
-            self._scan_cache.move_to_end(key)
-            self._stash_active()
-            self._scan_graph, self._scan_batched = ent["graph"], ent["pack"]
-            self._scan_key_cur = key
-            # Epoch sync is global but pack contents are per-entry: force one
-            # resync pass so a reactivated pack refreshes via fits()/update()
-            # before its first replay (stale tiers otherwise).
-            self._pack_epoch_synced = self._pack_epoch - 1
-            self._cap_lru_hit += 1
-            return self._replay_scan(forward_batch, reqs, key)
-        # Amortization guard: capturing costs a warmup plus the capture itself,
-        # so a short generation must not pay for a graph it replays twice.
-        self._scan_steps = self._scan_steps + 1 if key == self._scan_key_seen else 1
-        self._scan_key_seen = key
-        # _capture_asap is set when an index build just completed: the deferral
-        # would otherwise be reset by the key change the build itself caused.
-        if not self._capture_asap and self._scan_steps < D.SCAN_CAPTURE_AFTER:
-            return False
-        self._capture_asap = False
-        self._cap_keymiss += 1
-        if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get() and self._cap_keymiss % 20 == 1:
-            import logging
 
-            logging.getLogger(__name__).info(
-                "VKKEYMISS old=%s new=%s", self._scan_key_cur, key
-            )
-        return self._capture_scan(key, forward_batch, reqs)
-
-    def _capture_scan(self, key, forward_batch, reqs) -> bool:
-        import time as _t
-
-        _t0 = _t.perf_counter()
-        ok = self._capture_scan_timed(key, forward_batch, reqs)
-        self._stats["t_capture"] += _t.perf_counter() - _t0
-        self._stats["n_capture"] += 1
-        if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
-            import logging
-
-            logging.getLogger(__name__).info(
-                "VKCAP total=%.1fms pack=%.1f warm=%.1f rec=%.1f",
-                1e3 * (_t.perf_counter() - _t0),
-                1e3 * self._stats.pop("_ph_pack", 0.0),
-                1e3 * self._stats.pop("_ph_warm", 0.0),
-                1e3 * self._stats.pop("_ph_rec", 0.0),
-            )
-        return ok
-
-    def _capture_scan_timed(self, key, forward_batch, reqs) -> bool:
-        real = forward_batch.out_cache_loc.shape[0]
-        bs = forward_batch.seq_lens.shape[0]
-        # slots and out_cache_loc arrive in a fresh ForwardBatch every step, so
-        # the capture cannot read them where they land; stage them into fixed
-        # buffers the graph can bake.
-        self._ensure_stage(bs, forward_batch.req_pool_indices.device)
-        self._stage_step(forward_batch, bs)
-        slots = self._stage_slots[:real]
-
-        # Stack every (layer, slot) pair once, outside capture. The batched
-        # step then runs ~34 kernels where the per-pair loop ran 180 -- the
-        # per-node dispatch floor was both the replay time and most of the
-        # ~40 ms capture cost. Fire sets are bit-identical (registered test).
-        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
-
-        pack_pairs, pack_tiers = [], []
-        for lid in self._mla_lids:
-            if lid in self._qbuf:
-                for i in range(real):
-                    pack_pairs.append((self._li_map[lid], reqs[i]))
-                    pack_tiers.append(self._recall[(reqs[i], lid)]["tier"])
-        import time as _t
-
-        # Stash the outgoing graph into the LRU (the ping-pong partner will
-        # want it back) instead of discarding; evict beyond capacity to keep
-        # the pack-memory footprint bounded, then free before building the
-        # replacement (the OOM transient lesson).
-        self._stash_active()
-        if self._scan_cache is not None and len(self._scan_cache) > 1:
-            # The evicted pack's LAST replay may still be executing: freeing
-            # its buffers lets the allocator hand those addresses to the new
-            # pack while the in-flight GEMM still reads them (coredump: warp
-            # illegal address inside the skept cutlass bmm -- a use-after-free
-            # introduced by the free-before-rebuild OOM fix). Synchronize
-            # before dropping the references; eviction is rare (LRU miss
-            # beyond 2 shape classes), so the sync is off the steady path.
-            torch.cuda.synchronize()
-            while len(self._scan_cache) > 1:
-                _, old = self._scan_cache.popitem(last=False)
-                old["graph"] = old["pack"] = None
-        self._scan_graph = None
-        self._scan_batched = None
-        torch.cuda.empty_cache()
-
-        _p0 = _t.perf_counter()
-        batched = BatchedScanPack(
-            pack_pairs,
-            pack_tiers,
-            self._qbuf_stack,
-            self._fetch_stack,
-            self._fetch_len_stack,
-            self._fetch_ovf_stack,
-            self._ovf_count_stack,
-            self._q_heads,
-            margin=self.config.recall_margin,
-            thr_lse=self.config.recall_threshold == "lse",
-        )
-        torch.cuda.synchronize()
-        self._stats["_ph_pack"] = _t.perf_counter() - _p0
-
-        # Each pack appends one row to every layer's kept table. Count the
-        # runs so both the failure path below and the success path can rewind
-        # exactly the appends this capture performed.
-        appended = [0]
-
-        def _run():
-            batched.run()
-            self._pack_all_layers(bs)
-            appended[0] += 1
-
-        self._scan_key_cur = None
-        try:
-            _p1 = _t.perf_counter()
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(2):
-                    _run()
-            torch.cuda.current_stream().wait_stream(side)
-            torch.cuda.synchronize()
-            self._stats["_ph_warm"] = _t.perf_counter() - _p1
-            _p2 = _t.perf_counter()
-            # capture_begin/capture_end rather than the torch.cuda.graph context
-            # manager: that manager calls torch.cuda.empty_cache() on entry,
-            # which drops every cached allocator block. Under a serving
-            # mem-fraction that costs ~97 ms per capture and then makes the
-            # model re-acquire memory from the driver. sglang's own graph runner
-            # takes this same low-level path for the same reason.
-            # Each capture takes its own private pool. Sharing one across
-            # captures (either graph.pool() from the first capture or a handle
-            # from graph_pool_handle()) makes capture_begin trip
-            # "use_count > 0 INTERNAL ASSERT FAILED" in the caching allocator
-            # once the graph that created it is replaced; the old graph's pool
-            # is released when the graph itself is, so a private pool per
-            # capture costs one graph's intermediates, not a leak.
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.stream(side):
-                graph.capture_begin(capture_error_mode="thread_local")
-                try:
-                    _run()
-                finally:
-                    graph.capture_end()
-            torch.cuda.current_stream().wait_stream(side)
-            torch.cuda.synchronize()
-            self._stats["_ph_rec"] = _t.perf_counter() - _p2
-        except (RuntimeError, torch.OutOfMemoryError) as e:
-            # Capture is an optimization, never a correctness requirement: on
-            # any refusal (OOM for the graph pool, a stream still busy) fall
-            # back to the eager path permanently for this key and say so once.
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "VestigeKV: tier-2 scan graph capture failed (%s); "
-                "falling back to the eager scan path",
-                e,
-            )
-            # Rewind whatever appends the failed warmups/capture already made
-            # (batched.run() may have died before any pack), so the eager
-            # fallback starts from an untouched kept table.
-            self._rewind_appends(slots, appended[0])
-            self._scan_graph = None
-            # A single refusal can be transient (a busy stream, a momentary
-            # OOM), and latching on the first one costs every later step of the
-            # process; three in a row is a property of the deployment.
-            self._scan_fails += 1
-            self._scan_capture_failed = self._scan_fails >= D.SCAN_CAPTURE_MAX_FAILS
-            return False
-        self._scan_graph, self._scan_key_cur = graph, key
-        self._pack_epoch_synced = self._pack_epoch
-        if self._scan_cache is None:
-            import collections
-
-            self._scan_cache = collections.OrderedDict()
-        self._scan_cache[key] = {"graph": graph, "pack": batched}
-        self._scan_cache.move_to_end(key)
-        while len(self._scan_cache) > 2:
-            _, old = self._scan_cache.popitem(last=False)
-            old["graph"] = old["pack"] = None
-        self._scan_batched = batched  # the graph reads/writes its tensors
-        self._scan_fails = 0
-        # _run executed three times so far (two warmups plus the capture), and
-        # each execution APPENDED this step's row to every request's kept table.
-        # Left alone, that leaves duplicate rows in the attended set -- which
-        # changes softmax weights, NoPE's multiset invariance notwithstanding --
-        # and desynchronizes the host-side kmax bound, which under-counts and
-        # eventually makes the pack gather fewer columns than kept_len holds.
-        # Rewind the extra appends (the count is tracked, not assumed, so a
-        # partial failure mid-capture cannot skew the table); the replay below
-        # then performs this step's single real append.
-        self._rewind_appends(slots, appended[0])
-        for lid in self._local_mla_lids:
-            if lid in self._kept_buf:
-                self._kmax[lid] = self._kmax.get(lid, 0) + 1
-        graph.replay()
-        return True
 
     def _rewind_appends(self, slots, n):
         # The pack's prep kernel appends to every layer of the kept stack; the
@@ -991,10 +731,9 @@ class VestigeKVDSABackend(AttentionBackend):
         # captured graph, i.e. instrument a path the server no longer runs.
         torch.cuda.synchronize()
         t0 = _t.perf_counter()
-        replayed = self._replay_scan(forward_batch, reqs, key)
-        if not replayed:
-            for lid in self._mla_lids:
-                self._recall_step(lid, forward_batch, reqs)
+        replayed = False
+        for lid in self._mla_lids:
+            self._recall_step(lid, forward_batch, reqs)
         tl = _t.perf_counter()  # queue drained on entry -> t0..tl is pure
         torch.cuda.synchronize()  # host dispatch; tl..t1 is GPU-bound tail
         t1 = _t.perf_counter()
@@ -1014,11 +753,6 @@ class VestigeKVDSABackend(AttentionBackend):
         # this instrument produced after the pack was captured described a
         # corrupted configuration -- the same "instrument takes a different
         # branch than production" defect as before.
-        if not replayed:
-            for lid in self._mla_lids:
-                self._refresh_graph_bufs(lid, forward_batch, reqs)
-            torch.cuda.synchronize()
-            st["t_pack"] += _t.perf_counter() - t1
         self._account_step(forward_batch)
 
     def _account_step(self, forward_batch):
@@ -1270,8 +1004,6 @@ class VestigeKVDSABackend(AttentionBackend):
         dsa = self._dsa_sibling()
         if dsa is not None and forward_batch.forward_mode.is_decode_or_idle():
             dsa.init_forward_metadata_in_graph(forward_batch)
-        if self._ingraph_pack is not None and forward_batch.forward_mode.is_decode():
-            self._ingraph_device_step(forward_batch.seq_lens.shape[0])
         # NOTE: there used to be a bs==1 in-graph kept-table append here from
         # the original "bs=1 graphs read kept_buf directly" design. Every live
         # path now appends through the CSR pack instead (pack_csr prep kernel
@@ -1489,7 +1221,6 @@ class VestigeKVDSABackend(AttentionBackend):
                 # fill costs 0.7 ms.
                 self._fetch_len[lid][slot : slot + 1].fill_(0)
                 self._fetch_ovf[lid][slot : slot + 1].fill_(0)
-            self._maybe_prefill_build(slot=slot, lid=lid, seq_len=seq_len, closed=cl["closed"])
             _tm("book")
             # Deliberately NOT built here: under chunked prefill seq_lens is the
             # running total, not the request length, so "is this the last chunk?"
@@ -1563,23 +1294,6 @@ class VestigeKVDSABackend(AttentionBackend):
         qgate += [None] * (len(qcal) - len(qgate))
         return qcal, qpos, qidx, qgate
 
-    def _maybe_prefill_build(self, *, slot, lid, seq_len, closed):
-        # Prefill-time calibrated build, paced by the prefix (the last chunk is
-        # not identifiable under chunked prefill); needs an archive to index and
-        # enough absorbed prompt queries. The build runs on the side stream and
-        # installs at the first decode prologue, ahead of the provisional index.
-        if not self.config.prefill_calibration or closed <= 0:
-            return
-        if self._indexer_only():
-            return
-        pc = self._pcal.get((slot, lid))
-        st = self._recall.get((slot, lid))
-        if pc is None or st is None or "job" in st or st.get("qcal") is None:
-            return
-        if len(pc["q"]) < D.N_CAL_START or seq_len < max(D.PREFILL_BUILD_MIN, 2 * pc["built_at"]):
-            return
-        pc["built_at"] = seq_len
-        st["job"] = self._enqueue_build(slot, lid, seq_len, st)
 
     def _reset_slot_state(self, *, slot, lid):
         # The state dict and its in-flight build job reference each other
@@ -1847,52 +1561,6 @@ class VestigeKVDSABackend(AttentionBackend):
             kbuf, slots, D.CLOSE_BLOCK, offset=g.sigma_offset, dim=g.sigma_dim
         )
 
-    def _observe_spectrum(self, slot, lid, kbuf, c0, c1):
-        """Telemetry (SGLANG_DEBUG_VESTIGEKV_SPECTRUM): the closing blocks'
-        above-cutoff peak. Reads the same branch sigma just read; nothing
-        downstream consumes it (vestigekv/spectrum.py)."""
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
-            group_sigma_window,
-        )
-
-        g = self.geom
-        if g.sigma_in_row:
-            rows = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
-            side = kbuf.index_select(0, rows)[:, g.sigma_offset : g.sigma_offset + g.sigma_dim]
-        else:
-            from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
-                index_group_keys,
-            )
-
-            # Groups, like the sigma this watches: a token slot does not name a
-            # row in a pooled index cache, so a per-token read here reported the
-            # spectrum of one group in four and zeros between them.
-            ps = max(1, self._text_cfg_index_kpool)
-            n = ((c1 - c0) // ps) * ps
-            if n == 0:
-                return
-            pool_ids = torch.arange(
-                c0 // ps, (c0 + n) // ps,
-                device=self.req_to_token_pool.req_to_token.device,
-            )
-            side = index_group_keys(
-                self.token_to_kv_pool.get_index_k_with_scale_buffer(lid),
-                pool_ids,
-                self._page_table_row(slot),
-                index_head_dim=self._index_head_dim,
-                slots_per_page=self.token_to_kv_pool.slots_per_page,
-                pool_size=ps,
-            )
-        # The window must match `side`'s unit. When the salience is pooled,
-        # `side` is one row per group and a token-space window of 4096 makes
-        # n_blocks zero -- the observer then returns without emitting and the
-        # telemetry looks switched off rather than broken.
-        block = (
-            D.CLOSE_BLOCK
-            if g.sigma_in_row
-            else group_sigma_window(D.CLOSE_BLOCK, max(1, self._text_cfg_index_kpool))
-        )
-        self._spectrum.observe(side, block, lid=lid)
 
     def _dump_index_keys(self, slot, lid, row_slots):
         """Dequantised indexer keys for `row_slots`, [T, index_head_dim], or None.
@@ -2127,8 +1795,6 @@ class VestigeKVDSABackend(AttentionBackend):
             sigma = self._block_sigma(kbuf, rows, lid=lid)
         else:
             sigma = self._index_sigma(slot, lid, c0, target)
-        if self._spectrum is not None:
-            self._observe_spectrum(slot, lid, kbuf, c0, target)
         cl["sigma"] = torch.cat([cl["sigma"], sigma])
         cl["sigmaed"] = target
 
@@ -2390,7 +2056,7 @@ class VestigeKVDSABackend(AttentionBackend):
         # bounded by max_reqs, rows by the KV pool (a lane attends at most its
         # own tokens, fenced or not) plus one row per padded lane. +1: the
         # eager torch pack scatters masked-out entries into a trash slot at
-        # the end (see _refresh_graph_bufs); the Triton pack masks.
+        # the end; the Triton pack masks.
         if self._graph_bufs:
             return
         fm = self.base.forward_metadata
@@ -2417,30 +2083,6 @@ class VestigeKVDSABackend(AttentionBackend):
                 "indices": self._gb_indices_stack[li],
             }
 
-    def _prefill_graph_bufs_for_capture(self, forward_batch):
-        # The dummy batch's base metadata is copied in so capture records sane
-        # contents at the fixed addresses.
-        fm = self.base.forward_metadata
-        bs = forward_batch.seq_lens.shape[0]
-        n = int(fm.kv_indptr[bs])
-        self._ensure_graph_bufs()
-        for lid in self._local_mla_lids:
-            bufs = self._graph_bufs[lid]
-            bufs["indptr"][: bs + 1].copy_(fm.kv_indptr[: bs + 1])
-            bufs["indptr"][bs + 1 :].fill_(fm.kv_indptr[bs])
-            if n > 0:
-                bufs["indices"][:n].copy_(fm.kv_indices[:n])
-        # The per-lane staging buffers are read by forward_decode on BOTH
-        # paths, so they cannot be allocated only inside _build_ingraph_pack:
-        # with the in-graph scan switched off nothing allocated them and the
-        # decode dereferenced None. That made a documented kill-switch
-        # unusable, which is the one thing a kill-switch must not be.
-        self._ensure_stage(max(self._graph_max_bs, 1), self._qbuf_stack.device)
-        if (
-            envs.SGLANG_ENABLE_VESTIGEKV_INGRAPH_SCAN.get()
-            and self._ingraph_pack is None
-        ):
-            self._build_ingraph_pack()
 
     # ---- in-graph scan: the recall step as nodes of the decode model graph ----
     #
@@ -2459,116 +2101,8 @@ class VestigeKVDSABackend(AttentionBackend):
     # 3. Stale-by-one is preserved: the scan sits at the top of the captured
     #    step, before any layer overwrites qbuf.
 
-    def _build_ingraph_pack(self):
-        from sglang.srt.layers.attention.vestigekv.batched_step import BatchedScanPack
 
-        dev = self._qbuf_stack.device
-        maxbs = max(self._graph_max_bs, 1)
-        self._ensure_stage(maxbs, dev)
-        max_ctx = self.base.max_context_len
-        nkm = self._nkm(max_ctx)
-        # Archive rows are the tokens tier-1 did NOT keep, so per layer their
-        # sum over the running batch is bounded by the KV pool itself, not by
-        # max_bs x max_context -- a batch cannot hold more tokens than the pool
-        # has slots. Sizing the shared arena by that bound is exact whenever
-        # the pool is the binding constraint (long context, small max_bs is
-        # where it is not, and there the min falls back to the old product).
-        n_lids = len(self._local_mla_lids)
-        pool_tokens = getattr(self.token_to_kv_pool, "size", None)
-        arena = n_lids * maxbs * max_ctx
-        if isinstance(pool_tokens, int) and pool_tokens > 0:
-            arena = min(arena, n_lids * (pool_tokens + D.CLOSE_BLOCK))
-        # Kept rows are scored in place in the KV pool: the pack carries the
-        # pool row ids (4 bytes each) instead of a bf16 copy of every row,
-        # which was 87% of it at bs16. The pool is one allocation per layer,
-        # so the kernel needs a base pointer per layer; it is allocated once
-        # for the server's life, so those addresses survive graph capture.
-        kbufs = [
-            self.token_to_kv_pool.get_key_buffer(lid) for lid in self._local_mla_lids
-        ]
-        pool_bases, pool_row, pool_rows = None, None, None
-        # The stride is elements per TOKEN ROW, not the last dimension: a pool
-        # shaped [size, 1, 576] gives the same number, one shaped [size, 2, 288]
-        # does not, and only the first is what the kernel can address.
-        row_elems = [k[0].numel() if k.numel() else 0 for k in kbufs]
-        if all(
-            k.is_contiguous() and k.dtype == torch.bfloat16 and n == self._q_dim
-            for k, n in zip(kbufs, row_elems)
-        ):
-            pool_bases = [k.data_ptr() for k in kbufs]
-            pool_row = row_elems[0]
-            pool_rows = kbufs[0].shape[0]
-        else:
-            # A pool this path cannot address (a non-contiguous view, a dtype
-            # the scan does not read, a row that is not the latent row) falls
-            # back to the snapshot rather than guessing a stride.
-            logger.warning(
-                "vestigekv: KV pool is not addressable row-wise "
-                "(contig=%s dtype=%s row_elems=%s); keeping the kept-row snapshot",
-                [k.is_contiguous() for k in kbufs],
-                [str(k.dtype) for k in kbufs],
-                row_elems,
-            )
-        self._ingraph_pack = BatchedScanPack.at_capacity(
-            n_lids * maxbs,
-            max(1, min(nkm, max_ctx)),
-            max_ctx,
-            self.index_rank,
-            self._q_heads,
-            self._qbuf_stack,
-            self._fetch_stack,
-            self._fetch_len_stack,
-            self._fetch_ovf_stack,
-            self._ovf_count_stack,
-            self._trash_slot,
-            geom=self.geom,
-            arena=arena,
-            pool_bases=pool_bases,
-            pool_row=pool_row,
-            pool_rows=pool_rows,
-            # The sidecar is the archived row's own tail and arch names the
-            # row, so the packed [arena, 64] table stores what the pool still
-            # holds. Dropping it is only possible when the pool is addressable
-            # at all, hence the same condition as the kept rows.
-            side_from_pool=pool_bases is not None,
-            # The sketch projections are a selection over the tier's
-            # closed-prefix cache, so the pack carries the row index and reads
-            # through it rather than holding a compacted copy of the same
-            # numbers. Unlike the pool, that cache is reallocated at every
-            # block close, which update() handles by refreshing the address.
-            csk_from_tier=True,
-            margin=self.config.recall_margin,
-            thr_lse=self.config.recall_threshold == "lse",
-        )
 
-    def _ingraph_device_step(self, bs):
-        # Runs inside run_once during capture, so the whole recall step --
-        # scan + fetch + the all-layer CSR pack -- replays as nodes of the
-        # ONE decode graph launch. No host code runs here at replay time.
-        self._ingraph_pack.run(p_live=len(self._local_mla_lids) * bs)
-        self._pack_all_layers(bs)
-
-    def _pack_all_layers(self, bs):
-        # The one CSR pack both captured paths replay (in-graph and the scan
-        # graph): reads the staged lanes, writes every layer's graph buffers.
-        from sglang.srt.layers.attention.vestigekv.pack_csr import pack_csr_all_layers
-
-        fence = self.config.overflow_fallback
-        pack_csr_all_layers(
-            self._stage_slots[:bs],
-            self._stage_loc[:bs],
-            self._kept_stack,
-            self._kept_len_stack,
-            self._fetch_len_stack,
-            self._fetch_stack,
-            self._gb_indices_stack,
-            self._gb_indptr_stack,
-            seq=self._stage_seq[:bs] if fence else None,
-            fetch_ovf=self._fetch_ovf_stack if fence else None,
-            req_to_token=self.req_to_token_pool.req_to_token if fence else None,
-            topk=self._dsa_topk,
-            kpool=self._dsa_kpool,
-        )
 
     def _ensure_stage(self, n, dev):
         # Fixed-address per-lane inputs of the packed step (pool slot, this
@@ -2911,301 +2445,9 @@ class VestigeKVDSABackend(AttentionBackend):
             tier.refresh_membership(keep, kbuf)
             self._pack_epoch += 1
 
-    def _collect_calibration(self, forward_batch, reqs):
-        """Keep tier 2 serving from the first decode step while calibrating it
-        on real queries.
 
-        Calibration needs queries whose best-scoring row was evicted -- that is
-        the `hard` set the z-ladder and the entropy gate are fitted on. The
-        reference engine takes strided PREFILL queries, but an sglang attention
-        backend cannot: MLA prefill runs the un-absorbed path, so q arrives as
-        [tokens, H, 192] and absorbing 128 -> 512 needs W_kc, a model weight the
-        backend never sees. Decode queries ARE absorbed ([bs, H, 576]) and the
-        in-graph hook writes them into _qbuf every step, so a request's first
-        n_cal decode steps supply them at no extra cost.
 
-        Waiting n_cal steps to build anything would leave tier 2 off at the start
-        of every request, and tier 2 has no off state -- at long context the kept
-        tier alone is exactly what the method claims is insufficient. So the
-        index is built twice: a provisional one on the first decode step from
-        cache-row proxies, and the real one once n_cal live queries exist.
 
-        The proxies are degenerate as calibration -- a cache row used as its own
-        query has itself as causal argmax, and its own position is always inside
-        the recent window, hence always kept. Measured, they returned zp anywhere
-        from 0.0 to 8.0 for the same layer across consecutive requests, and
-        zp=0 means no certificate inflation at all, i.e. firing too little. So
-        the provisional index does not pretend to calibrate: it takes the most
-        conservative rung with the gate open, which over-fetches, costing
-        latency and never recall.
-        """
-        if self._indexer_only():
-            # Nothing downstream of here exists on this arm. Gating the BUILD
-            # instead looks equivalent and is not: st["tier"] then stays None
-            # forever, so the `tier is None` branch below fires on every step
-            # of every request -- appending a cloned query per layer per step
-            # (unbounded) and re-arming _capture_asap each time. The collector
-            # is the seam; the build is downstream of it.
-            #
-            # Clear _collecting on the way out: the caller gates this call on
-            # it, and the assignment that normally retires it is at the far end
-            # of this function. Returning without it leaves the arm paying a
-            # call per decode step for a function that does nothing -- small,
-            # but this arm exists to be timed.
-            self._collecting = False
-            return False
-        real = forward_batch.out_cache_loc.shape[0]
-        pending = False
-        # A build finished during prefill installs here, ahead of the loop, so
-        # its request never gets the provisional index.
-        if self._install_finished_builds():
-            self._needs_recapture = True
-        for lid in self._mla_lids:
-            if lid not in self._qbuf:
-                continue
-            for i in range(real):
-                slot = reqs[i]
-                st = self._recall.get((slot, lid))
-                if st is None or st.get("qcal") is None:
-                    continue
-                prefix_len = int(self._seq_lens_host(forward_batch)[i]) - 1
-                if prefix_len + 1 < self.config.activation_min_tokens:
-                    # Below the activation threshold there is no archive and
-                    # no index to calibrate (the request runs dense). Keep it
-                    # marked pending so the provisional build fires on the
-                    # step the threshold is crossed -- the block close that
-                    # creates the archive runs earlier in this same hook.
-                    pending = True
-                    continue
-                st["qcal"].append(self._qbuf[lid][slot].clone())
-                st["qpos"].append(prefix_len)
-                # The indexer query for THIS step, beside the latent one. Two
-                # selectors can only be compared against one oracle if all
-                # three come from the same step; a query stashed per layer and
-                # read later belongs to whatever step ran last.
-                _q, _w = self._indexer_query_for(lid, slot)
-                st.setdefault("qidx", []).append(_q)
-                st.setdefault("qgate", []).append(_w)
-                if st["tier"] is None:
-                    # The provisional build stays SYNCHRONOUS: it is ~0.7 ms
-                    # (sketch basis cached) and tier 2 must serve from the
-                    # first decode step.
-                    self._build_index(slot, lid, prefix_len + 1, st, proxy=True)
-                    self._capture_asap = True
-                    pending = True
-                elif len(st["qcal"]) >= st["target"] and "job" not in st:
-                    # The CALIBRATED build's label GEMM is O(n_cal*H*S) -- 7 ms
-                    # at 64k, 28 ms at 256k, ten builds per request -- and on
-                    # the decode critical path it was the whole difference
-                    # between the measured and the theoretical speedup. It goes
-                    # to the side-stream worker; the provisional index keeps
-                    # serving until the result is installed (next step, main
-                    # thread, atomic).
-                    st["job"] = self._enqueue_build(slot, lid, prefix_len + 1, st)
-                    pending = True
-                else:
-                    pending = True
-        if self._install_finished_builds():
-            # Sticky: the install may land on a step whose collection scan
-            # already counted this layer as pending; the recapture then fires
-            # on the first later step with nothing left in flight.
-            self._needs_recapture = True
-        self._collecting = pending or bool(self._build_jobs)
-        if self._needs_recapture and not self._collecting:
-            # ONE recapture per request, once every layer's calibration has
-            # settled. Firing per-install (or on a momentary empty job queue
-            # between predictive-window rounds) cost ~4 captures/request at
-            # 256k, ~60 ms each -- most of the residual S-slope.
-            self._needs_recapture = False
-            # Content swap, not a shape change: bump the epoch so the replay
-            # fast path resyncs via fits()->update() in place. Dropping the
-            # graph here caused capture churn under concurrency (bs4: 139
-            # captures / 27 s over 4050 steps -- the whole ITL collapse);
-            # update() cannot handle a shape-class change, and fits() failing
-            # falls back to a real recapture on its own.
-            self._pack_epoch += 1
-            # The step cache may hold key=None from before this tier existed
-            # (the recovery _invalidate_scan used to provide): drop it so the
-            # next step recomputes the key. Without this, a stable bs=1
-            # signature cached None forever and decode stayed eager for the
-            # whole request (bs1 ITL 8.2 -> 17.6 regression).
-            self._step_cache = None
-            self._capture_asap = True
-
-    def _enqueue_build(self, slot, lid, seq_len, st):
-        """Snapshot the build inputs on the MAIN stream and hand them to the
-        side-stream worker.
-
-        The snapshot is what makes this safe: the kept table row is appended
-        in-graph every step, so the worker gets a CLONE taken here (ordered
-        after this step's replay on the main stream, fenced by an event), and
-        the pool rows it reads (row_slots[:seq_len]) are prefix rows, immutable
-        after prefill. The worker touches nothing on the backend; installation
-        happens back on the main thread in _install_finished_builds.
-        """
-        import threading
-
-        r2t = self.req_to_token_pool.req_to_token
-        n_kept = int(self._kept_len[lid][slot])
-        _cal_in = self._calibration_inputs(slot, lid, st)
-        job = {
-            "slot": slot,
-            "lid": lid,
-            "seq_len": seq_len,
-            "row_slots": r2t[slot, :seq_len].to(torch.int64).clone(),
-            "kept": self._kept_buf[lid][slot, :n_kept].to(torch.int64).clone(),
-            "st": st,  # identity token: a re-prefill REPLACES the state dict
-            "qcal": _cal_in[0],
-            "qpos": _cal_in[1],
-            "qidx": _cal_in[2],
-            "qgate": _cal_in[3],
-            "operands_from": self._reusable_operands(slot, lid, st, seq_len),
-            "ready": torch.cuda.Event(),
-            "done": threading.Event(),
-            "tier": None,
-            "stats": None,
-            "error": None,
-        }
-        job["ready"].record()  # snapshot visible to the side stream after this
-        if self._build_worker is None:
-            self._build_stream = torch.cuda.Stream()
-            self._build_worker = threading.Thread(
-                target=self._build_worker_loop, daemon=True
-            )
-            self._build_worker.start()
-        self._build_jobs.append(job)
-        self._build_queue.put(job)
-        return job
-
-    def _build_worker_loop(self):
-        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
-
-        while True:
-            job = self._build_queue.get()
-            try:
-                with torch.cuda.stream(self._build_stream):
-                    self._build_stream.wait_event(job["ready"])
-                    kbuf = self.token_to_kv_pool.get_key_buffer(job["lid"])
-                    kbuf = kbuf.reshape(-1, kbuf.shape[-1])
-                    keep = torch.isin(job["row_slots"], job["kept"])
-                    q_cal = torch.stack(job["qcal"]).float()
-                    q_pos = torch.tensor(
-                        job["qpos"], device=kbuf.device, dtype=torch.long
-                    )
-                    tier = RecallTier(
-                        r=self.index_rank,
-                        margin=self.config.recall_margin,
-                        threshold=self.config.recall_threshold,
-                        geom=self.geom,
-                    )
-                    tier._audit_lid = job["lid"]
-                    stats = tier.build(
-                        kbuf,
-                        job["row_slots"],
-                        keep,
-                        q_cal.contiguous(),
-                        q_pos,
-                        conservative=False,
-                        operands_from=job["operands_from"],
-                        diag=envs.SGLANG_DEBUG_VESTIGEKV_STATS.get(),
-                    )
-                self._build_stream.synchronize()
-                if isinstance(stats, dict):
-                    stats["reused"] = job["operands_from"] is not None
-                job["tier"], job["stats"] = tier, stats
-            except Exception as e:  # provisional keeps serving; never crash
-                job["error"] = e
-            job["done"].set()
-
-    def _install_finished_builds(self):
-        """Main-thread half of the async build: adopt finished tiers.
-
-        Runs once per decode step. Installation is what the capture lifecycle
-        keys off (_invalidate_scan drops the old graph; the next step's
-        _capture_scan restacks the batched pack from the NEW tier), so it must
-        happen here and never in the worker.
-        """
-        if not self._build_jobs:
-            return False
-        installed = False
-        remaining = []
-        for job in self._build_jobs:
-            if not job["done"].is_set():
-                remaining.append(job)
-                continue
-            slot, lid = job["slot"], job["lid"]
-            st = self._recall.get((slot, lid))
-            if st is not job["st"] or st.get("qcal") is None:
-                # The slot was re-prefilled while the build ran: prefill
-                # replaces the state dict, so an identity mismatch means this
-                # tier belongs to the slot's PREVIOUS occupant. Installing it
-                # would hand the new request the old request's archive.
-                job.clear()  # the worker is done with it: release its tier now
-                continue
-            st.pop("job", None)
-            if job["error"] is not None:
-                import logging
-
-                # The worker swallows the exception and the slot never retries,
-                # so a coding error here degrades every request silently;
-                # the traceback is the only trace it leaves.
-                logging.getLogger(__name__).warning(
-                    "VestigeKV: async calibrated build failed (%r); the "
-                    "provisional index keeps serving (over-fetches, never "
-                    "under-recalls)",
-                    job["error"],
-                    exc_info=job["error"],
-                )
-                st["qcal"] = st["qpos"] = st["qidx"] = st["qgate"] = None
-                continue
-            stats = job["stats"]
-            if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
-                import logging
-
-                logging.getLogger(__name__).info(
-                    "VKCAL lid=%s slot=%s seq=%s proxy=False async=True %s",
-                    lid,
-                    slot,
-                    job["seq_len"],
-                    stats,
-                )
-            window = len(job["qcal"])
-            need_more = stats.get("need_more_hard") and window < D.N_CAL_MAX
-            if need_more:
-                # Predict the window from the measured hard-rate instead of
-                # blind doubling: at S=256k the rate is ~0.3%, so 8->16->32->64
-                # ran four expensive rebuilds only to end at the same Z_MAX
-                # clamp the provisional index already served with. If the
-                # conformal requirement is not reachable within N_CAL_MAX,
-                # install the clamped-but-real-basis tier NOW and stop.
-                import math
-
-                n_hard = max(int(stats.get("n_hard") or 0), 1)
-                needed = math.ceil(D.min_hard() * window / n_hard)
-                if needed > D.N_CAL_MAX:
-                    need_more = False  # unreachable: adopt the clamped tier
-                else:
-                    st["target"] = min(
-                        max(2 ** math.ceil(math.log2(needed)), window * 2),
-                        D.N_CAL_MAX,
-                    )
-            if not need_more:
-                # Install silently: the captured graph replays against the
-                # batched pack's own stacked COPIES, so serving stays on the
-                # previous parameters until the single coalesced recapture
-                # below -- one capture for all layers instead of one each
-                # (5 extra ~100 ms captures per request at 256k).
-                st["tier"], st["built_at"] = job["tier"], job["seq_len"]
-                if envs.SGLANG_DEBUG_VESTIGEKV_DUMP_DIR.get() is not None:
-                    self._dump_calibration(job=job, slot=slot, lid=lid, stats=stats)
-                # The reuse guard compares against this; an async build
-                # that did not record it would let a later rebuild at a
-                # different prefix adopt a cache that does not cover it.
-                st["operands_seq_len"] = job["seq_len"]
-                st["qcal"] = st["qpos"] = st["qidx"] = st["qgate"] = None
-                installed = True
-        self._build_jobs = remaining
-        return installed
 
     def _trace_request_memory(self, new_requests):
         # Allocator bookkeeping only (no device sync): what the caching
@@ -3316,103 +2558,8 @@ class VestigeKVDSABackend(AttentionBackend):
             return None  # prefix grew; the cache no longer covers it
         return prev
 
-    def _build_index(self, slot, lid, seq_len, st, proxy: bool):
-        import time as _t
 
-        _t0 = _t.perf_counter()
-        stats = self._build_index_timed(slot, lid, seq_len, st, proxy)
-        dt = _t.perf_counter() - _t0
-        self._stats["t_build"] += dt
-        self._stats["n_build"] += 1
-        if isinstance(stats, dict):
-            stats["ms"] = round(dt * 1e3, 1)
-        if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
-            import logging
 
-            logging.getLogger(__name__).info(
-                "VKBUILDMS lid=%s slot=%s proxy=%s ms=%.1f", lid, slot, proxy, dt * 1e3
-            )
-        return stats
-
-    def _build_index_timed(self, slot, lid, seq_len, st, proxy: bool):
-        """Build (or rebuild) the tier-2 index. Runs off the token path, where
-        a sync costs nothing. See _collect_calibration for what `proxy` means."""
-        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
-
-        kbuf = self.token_to_kv_pool.get_key_buffer(lid)
-        kbuf = kbuf.reshape(-1, kbuf.shape[-1])
-        r2t = self.req_to_token_pool.req_to_token
-        row_slots = r2t[slot, :seq_len].to(torch.int64)
-        n_kept = int(self._kept_len[lid][slot])
-        kept = self._kept_buf[lid][slot, :n_kept].to(torch.int64)
-        keep = torch.isin(row_slots, kept)
-        if proxy:
-            n_cal = min(D.N_CAL_START, max(seq_len - 1, 1))
-            q_cal = (
-                kbuf[row_slots[-n_cal:]]
-                .float()
-                .unsqueeze(1)
-                .expand(n_cal, self._q_heads, self._q_dim)
-            )
-            q_pos = torch.arange(
-                seq_len - n_cal, seq_len, device=row_slots.device, dtype=torch.long
-            )
-        else:
-            q_cal = torch.stack(st["qcal"]).float()  # [n_cal, H, 576]
-            q_pos = torch.tensor(st["qpos"], device=row_slots.device, dtype=torch.long)
-        tier = RecallTier(
-            r=self.index_rank,
-            margin=self.config.recall_margin,
-            threshold=self.config.recall_threshold,
-            geom=self.geom,
-        )
-        tier._audit_lid = lid
-        stats = tier.build(
-            kbuf,
-            row_slots,
-            keep,
-            q_cal.contiguous(),
-            q_pos,
-            conservative=proxy,
-            operands_from=self._reusable_operands(slot, lid, st, seq_len),
-            diag=envs.SGLANG_DEBUG_VESTIGEKV_STATS.get(),
-        )
-        if envs.SGLANG_DEBUG_VESTIGEKV_STATS.get():
-            import logging
-
-            logging.getLogger(__name__).info(
-                "VKCAL lid=%s slot=%s seq=%s proxy=%s %s",
-                lid,
-                slot,
-                seq_len,
-                proxy,
-                stats,
-            )
-        # Update in place: replacing the dict would drop the qcal/qpos keys the
-        # calibration collector uses, so the provisional index would install
-        # itself and then never be replaced (observed: proxy=True builds only).
-        st["tier"], st["built_at"] = tier, seq_len
-        cs = self._close_state.get((slot, lid))
-        st["operands_closed"] = cs.get("closed") if cs is not None else None
-        st["operands_seq_len"] = seq_len
-        self._pack_epoch += 1  # content swap; see _install_finished_builds
-        self._step_cache = None  # may hold key=None from the pre-tier step
-        return stats
-
-    def _refresh_graph_bufs(self, lid, forward_batch, reqs):
-        bs = forward_batch.seq_lens.shape[0]
-        loc = forward_batch.out_cache_loc
-        real_bs = loc.shape[0]
-        slots = forward_batch.req_pool_indices[:real_bs].to(torch.int64)
-        self._pack_csr(
-            lid,
-            slots,
-            loc,
-            real_bs,
-            bs,
-            self._kmax_step(lid),
-            dense=self._dense_rows(lid, forward_batch, slots, loc, reqs),
-        )
 
     def _dense_rows(self, lid, forward_batch, slots, loc, reqs):
         # Eager-step lanes packed as their full row set (req_to_token[slot,
@@ -3452,105 +2599,3 @@ class VestigeKVDSABackend(AttentionBackend):
         self._kmax[lid] = kmax
         return kmax
 
-    def _pack_csr(self, lid, slots, loc, real_bs, bs, kmax, dense=None):
-        # Eager step: append this step's slot to each request's kept table,
-        # then repack the CSR into the fixed-address buffers the decode graph
-        # reads. Vectorized (~12 tensor ops per layer); the previous
-        # per-request python loop cost ~4 ms/step at bs=16. `dense` (rows
-        # [real_bs, seqmax], seq [real_bs], fenced [real_bs]) is the overflow
-        # fence: a fenced lane packs its full row set in place of kept +
-        # fetched; the append stands either way.
-        # seq_lens is padded to the captured graph bs; out_cache_loc carries only
-        # the real (unpadded) requests -- see build_replay_fb_view. Padded CSR
-        # slots get one reserved pad row (slot 0); their output is discarded.
-        bufs = self._graph_bufs[lid]
-        kept_buf, kept_len = self._kept_buf[lid], self._kept_len[lid]
-        cap = kept_buf.shape[1]
-        # batched append of this step's slot: kept_buf[slot, n_slot] = loc;
-        # kept_len[slot] += 1. This is the ONE append per step on every live
-        # path (the in-graph pack's prep kernel owns it there).
-        dev = kept_buf.device
-        n = kept_len.gather(0, slots)
-        kept_buf.view(-1).scatter_(
-            0, (slots * cap + n).to(torch.int64), loc.to(kept_buf.dtype)
-        )
-        lens = n + 1
-        kept_len.scatter_(0, slots, lens)
-        # pack: gather each request's kept rows [slot, :len] plus its fired
-        # recall rows [slot, :fetch_len] into one contiguous CSR. Intra-request
-        # order is irrelevant (NoPE multiset invariance), so the two segments
-        # concatenate per request.
-        #
-        # Every shape here is a host-side constant and every offset is computed
-        # on the device: the previous form read back lens.max(), f_lens.max()
-        # and lens_tot.sum(), and selected with a boolean mask (a fourth,
-        # implicit readback), which is 4 pipeline drains per layer -- 3.5 of the
-        # 4.5 ms/step of host-side cost once the tier-2 scan was captured
-        # (VKSTATS, S=64k bs=1). Masked-out entries scatter into the trash slot
-        # reserved at the end of the indices buffer.
-        if lid in self._fetch_len:
-            f_lens = self._fetch_len[lid].gather(0, slots)
-            fw = self._fetch_buf[lid].shape[1]
-            fetch_flat = self._fetch_buf[lid].view(-1)
-        else:  # recall buffers not allocated (unit fakes): zero-fetch
-            f_lens = torch.zeros_like(lens)
-            fw = 0
-            fetch_flat = None
-        lens_tot = (lens + f_lens).to(torch.int64)
-        packed = True  # lanes packing kept + fetched (all of them, unfenced)
-        if dense is not None:
-            d_rows, d_len, fenced = dense
-            lens_tot = torch.where(fenced, d_len, lens_tot)
-            packed = ~fenced[:, None]
-        starts = torch.zeros_like(lens_tot)
-        starts[1:] = lens_tot.cumsum(0)[:-1]
-        total = lens_tot.sum()
-        trash = bufs["indices"].shape[0] - 1
-
-        col = torch.arange(kmax, device=dev)
-        src = (
-            kept_buf.view(-1)
-            .gather(0, (slots[:, None] * cap + col[None, :]).reshape(-1))
-            .view(real_bs, kmax)
-        )
-        dst = torch.where(
-            (col[None, :] < lens[:, None]) & packed,
-            starts[:, None] + col[None, :],
-            trash,
-        )
-        if fw:
-            fcol = torch.arange(fw, device=dev)
-            src_f = fetch_flat.gather(
-                0, (slots[:, None] * fw + fcol[None, :]).reshape(-1)
-            ).view(real_bs, fw)
-            dst_f = torch.where(
-                (fcol[None, :] < f_lens[:, None]) & packed,
-                starts[:, None] + lens[:, None] + fcol[None, :],
-                trash,
-            )
-            src = torch.cat([src.reshape(-1), src_f.reshape(-1)])
-            dst = torch.cat([dst.reshape(-1), dst_f.reshape(-1)])
-        if dense is not None:
-            dcol = torch.arange(d_rows.shape[1], device=dev)
-            dst_d = torch.where(
-                (dcol[None, :] < d_len[:, None]) & fenced[:, None],
-                starts[:, None] + dcol[None, :],
-                trash,
-            )
-            src = torch.cat([src.reshape(-1), d_rows.reshape(-1).to(src.dtype)])
-            dst = torch.cat([dst.reshape(-1), dst_d.reshape(-1)])
-        bufs["indices"].scatter_(
-            0, dst.reshape(-1), src.reshape(-1).to(bufs["indices"].dtype)
-        )
-        n_pad = bs - real_bs
-        if n_pad > 0:
-            pad_dst = total + torch.arange(n_pad, device=dev)
-            bufs["indices"].scatter_(
-                0, pad_dst, torch.zeros(n_pad, dtype=kept_buf.dtype, device=dev)
-            )
-        indptr = torch.zeros(bs + 1, dtype=torch.int64, device=dev)
-        indptr[1 : real_bs + 1] = lens_tot.cumsum(0)
-        if n_pad > 0:
-            indptr[real_bs + 1 :] = total + torch.arange(1, n_pad + 1, device=dev)
-        bufs["indptr"][: bs + 1].copy_(indptr)
-        bufs["indptr"][bs + 1 :] = total + n_pad

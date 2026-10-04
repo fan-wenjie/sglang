@@ -9,7 +9,7 @@ The refusal is the only thing that does.
 import unittest
 from unittest import mock
 
-from sglang.srt.layers.attention import vestigekv_mla_backend as B
+from sglang.srt.layers.attention import vestigekv_dsa_backend as B
 
 
 def _parallel(*, dcp_size=1, attn_cp_size=1):

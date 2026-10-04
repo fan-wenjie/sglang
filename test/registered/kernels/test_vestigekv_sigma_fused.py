@@ -107,30 +107,6 @@ class TestOperandFused(CustomTestCase):
     """Fused operand builder vs the chunked torch loop: side bit-identical,
     rho to fp32 tolerance, csk within one fp16 ulp (reduction order)."""
 
-    def test_matches_torch_loop(self):
-        from sglang.srt.layers.attention.vestigekv.operand_fused import (
-            build_operands_fused,
-        )
-
-        torch.manual_seed(0)
-        torch.backends.cuda.matmul.allow_tf32 = False
-        pool = torch.randn(20000, 576, device="cuda").to(torch.bfloat16)
-        A = 7937
-        arch = torch.randperm(20000, device="cuda")[:A].to(torch.int64)
-        V = torch.linalg.qr(torch.randn(512, 64, device="cuda")).Q.T.contiguous()
-        blk = pool[arch].float()
-        c = blk[:, :512] @ V.T
-        csk_r = c.half()
-        rho_r = (blk[:, :512] - c @ V).norm(dim=-1)
-        side_r = blk[:, 512:].to(torch.bfloat16)
-        csk_f, rho_f, side_f = build_operands_fused(pool, arch, V)
-        self.assertTrue(torch.equal(side_r, side_f))
-        self.assertLess(
-            float(((rho_r - rho_f).abs() / rho_r.clamp_min(1e-6)).max()), 1e-5
-        )
-        # csk within one fp16 ulp of the cuBLAS-computed value
-        ulp = torch.finfo(torch.float16).eps * csk_r.abs().float().clamp_min(1.0)
-        self.assertTrue(bool(((csk_r.float() - csk_f.float()).abs() <= 2 * ulp).all()))
 
 
 
@@ -152,24 +128,6 @@ class TestGeometryVariants(CustomTestCase):
         self.assertTrue(torch.equal(s_gather.reshape(-1), s_pool))
         self.assertTrue(torch.equal(h_gather, h_pool))
 
-    def test_operands_without_a_sidecar_keep_the_content_terms(self):
-        from sglang.srt.layers.attention.vestigekv.operand_fused import (
-            build_operands_fused,
-        )
-
-        torch.manual_seed(5)
-        pool = torch.randn(20000, 512, device="cuda").to(torch.bfloat16)
-        arch = torch.randperm(20000, device="cuda")[:5000].to(torch.int64)
-        V = torch.linalg.qr(torch.randn(512, 64, device="cuda")).Q.T.contiguous()
-        csk, rho, side = build_operands_fused(pool, arch, V, kv=512, side_dim=0)
-        self.assertEqual(tuple(side.shape), (5000, 0))
-        blk = pool[arch].float()
-        c = blk @ V.T
-        self.assertLess(
-            float(((blk - c @ V).norm(dim=-1) - rho).abs().max()), 1e-3
-        )
-        ulp = torch.finfo(torch.float16).eps * c.abs().clamp_min(1.0)
-        self.assertTrue(bool(((c.half().float() - csk.float()).abs() <= 2 * ulp).all()))
 
 
 

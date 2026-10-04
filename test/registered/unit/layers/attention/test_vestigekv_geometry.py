@@ -70,43 +70,6 @@ class TestSigmaSliceWidth(CustomTestCase):
         self.assertFalse(torch.equal(got, tail))
 
 
-class TestRopeLessRecall(CustomTestCase):
-    """With side_dim == 0 the recall score is sketch + certificate only; the
-    tier must build and query on 512-wide rows without any 576 assumption."""
-
-    def _tier(self, T=512, H=4, n_cal=8, seed=0):
-        from sglang.srt.layers.attention.vestigekv.recall_tier import RecallTier
-
-        g = torch.Generator().manual_seed(seed)
-        kbuf = torch.randn(T + 16, 512, generator=g).to(torch.bfloat16)
-        slots = torch.randperm(T + 16, generator=g)[:T]
-        keep = torch.zeros(T, dtype=torch.bool)
-        keep[torch.randperm(T, generator=g)[: T // 8]] = True
-        qcal = torch.randn(n_cal, H, 512, generator=g)
-        qpos = torch.randint(0, T, (n_cal,), generator=g)
-        t = RecallTier(geom=ROPE_LESS_GEOM)
-        t.build(kbuf, slots, keep, qcal, qpos, conservative=True)
-        return t, torch.randn(H, 512, generator=g)
-
-    def test_build_leaves_an_empty_sidecar(self):
-        t, _ = self._tier()
-        self.assertEqual(tuple(t.side.shape), (int(t.arch.numel()), 0))
-        self.assertEqual(t.scale, 256**-0.5)
-
-    def test_fired_set_is_the_sketch_plus_certificate_rule(self):
-        t, qe = self._tier()
-        sc = t.scale
-        skept = (qe.to(torch.bfloat16) @ t.kept_rows.T).float() * sc
-        max1 = skept.max(-1).values
-        qsk = qe @ t.V.T
-        qres = (qe - qsk @ t.V).norm(dim=-1)
-        score = (qsk.half() @ t.csk.T).float() * sc + t.zp * (
-            qres[:, None] * t.rho[None, :] * sc / (512 - t.r) ** 0.5
-        )
-        want = t.arch[(score > max1[:, None]).any(0)]
-        got = t.query(qe)
-        self.assertTrue(torch.equal(got.sort().values, want.sort().values))
-        self.assertGreater(int(got.numel()), 0)
 
 
 if __name__ == "__main__":

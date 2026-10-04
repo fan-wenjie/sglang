@@ -83,7 +83,7 @@ def create_vestigekv_dsa_backend(runner):
     # specialised without touching the Kimi Linear backend.
     _glm = glm5_next_config(runner.model_config)
     if _glm is None:
-        raise ValueError("vestigekv_dsa is the GLM-5.3 (DSA) backend; Kimi Linear uses vestigekv_mla.")
+        raise ValueError("vestigekv_dsa is the GLM-5.3 (DSA) backend.")
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     if _glm.qk_rope_head_dim != 0 or not is_deepseek_dsa(_glm):
@@ -105,89 +105,6 @@ def create_vestigekv_dsa_backend(runner):
     config = VestigeKVConfig.from_kernel_config(get_exec().kernel)
     return VestigeKVDSABackend(base, runner, config=config)
 
-
-@register_attention_backend("vestigekv_mla")
-def create_vestigekv_mla_backend(runner):
-    # VestigeKV wraps an MLA backend; for Kimi Linear the hybrid adopts this as
-    # its full_attn_backend, so MLA-layer decode flows through VestigeKV and KDA
-    # layers are untouched. See VESTIGEKV_PORT.md.
-    if not runner.use_mla_backend:
-        raise ValueError("vestigekv_mla backend can only be used with MLA models.")
-    # The eviction signal exists only in a NoPE-MLA cache: the decoupled branch
-    # must never be rotated. On a RoPE MLA model (DeepSeek-style) the identical
-    # operator collapses (measured 0.89 -> 0.08 needle retrieval at 32x), so
-    # refuse anything but the validated NoPE-MLA family instead of silently
-    # degrading quality.
-    _kimi = kimi_linear_config(runner.model_config)
-    _glm = glm5_next_config(runner.model_config)
-    if _kimi is None and _glm is None:
-        raise ValueError(
-            "vestigekv_mla is validated only for NoPE-MLA models (Kimi Linear "
-            "family; GLM-5.3-Flash with the DSA indexer's top-k switched off). "
-            "On RoPE-MLA models the sidecar eviction signal does not exist and "
-            "quality collapses; use a stock MLA backend instead."
-        )
-    # NoPE is the load-bearing precondition, not just the model family: the
-    # eviction signal lives in the decoupled branch precisely because NoPE
-    # leaves it unrotated. Refuse any MLA config that applies a positional
-    # encoding to the query/key path (mla_use_nope=False, or a non-null
-    # partial-rotary dim), even inside the validated family, rather than
-    # silently degrade -- the method is undefined the moment a position
-    # function touches the branch.
-    if _kimi is not None and getattr(_kimi, "mla_use_nope", True) is False:
-        raise ValueError(
-            "vestigekv_mla requires a NoPE-MLA cache (mla_use_nope=True): the "
-            "query-independent eviction signal exists only when no positional "
-            "encoding rotates the decoupled branch. This config applies one."
-        )
-    if _glm is not None:
-        from sglang.srt.configs.model_config import is_deepseek_dsa
-
-        if _glm.qk_rope_head_dim != 0:
-            raise ValueError(
-                "vestigekv_mla on GLM-5.3 requires a rope-less MLA "
-                f"(qk_rope_head_dim == 0, got {_glm.qk_rope_head_dim})."
-            )
-        if is_deepseek_dsa(_glm) and not (
-            runner.prefill_attention_backend_str == "dsa"
-            and runner.decode_attention_backend_str in ("vestigekv_mla", "vestigekv_dsa")
-        ):
-            # As the sole backend VestigeKV would receive DSA's top-k on a dense
-            # base and attend densely at prefill anyway (measured: +5.6 s TTFT
-            # at 32k against DSA's sparse prefill). The supported shape keeps
-            # DSA on the prefill side and VestigeKV on decode.
-            raise ValueError(
-                "vestigekv_mla with DSA on: use --prefill-attention-backend dsa "
-                "--decode-attention-backend vestigekv_mla, or switch the indexer's "
-                "top-k off with --json-model-override-args "
-                "'{\"text_config\": {\"index_topk\": null}}'."
-            )
-    # Any page size. The kept and fetch tables hold token slots, and both the
-    # fork and upstream's stage 1 derive page and offset from a slot
-    # (kv_loc // PAGE_SIZE, kv_loc % PAGE_SIZE), so a paged pool changes only
-    # the strides the fork is launched with. DSA resolves the pool to 64 and
-    # the split pair has to live there; the refusal this replaces was the
-    # single-backend era's caution, and the affine fenced capture is the one
-    # thing it protected (guarded at the router now).
-    if get_spec().speculative_algorithm is not None:
-        raise ValueError(
-            "vestigekv_mla does not support speculative decoding yet: the "
-            "verify path's multi-token reads are not wired to the kept-index "
-            "tables."
-        )
-    from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
-    from sglang.srt.layers.attention.vestigekv_mla_backend import VestigeKVMLABackend
-
-    # Wrap the Triton MLA backend (SM120-safe; flashinfer's MLA JIT needs
-    # CUDA>=12.9). A base override could pick another MLA backend on capable HW.
-    base = create_triton_backend(runner)  # TritonAttnBackend (MLA-capable)
-    # Selecting this backend IS the enable switch: tier-1 eviction and tier-2
-    # recall are both required components and have no per-run off switch. The
-    # dense control arm is `--attention-backend triton`, i.e. `base` alone.
-    # The --vestigekv-* flags are read once here and cross-checked in the
-    # backend against the model's geometry.
-    config = VestigeKVConfig.from_kernel_config(get_exec().kernel)
-    return VestigeKVMLABackend(base, runner, config=config)
 
 
 @register_attention_backend("trtllm_mla")
