@@ -65,5 +65,52 @@ class TestKeptAppend(CustomTestCase):
         self.assertTrue(bool(torch.equal(a, b)))
 
 
+
+class TestKeptPositionsMatchTheirRows(CustomTestCase):
+    """The branch rule reads a kept row's request-relative POSITION from a table
+    parallel to the row table, so position[i] must name row[i]: a mismatch marks
+    the wrong groups kept, which moves the threshold and therefore the fire
+    count, with nothing in any count or latency to show it.
+
+    The kernel tests build both tables directly and so cannot see a mismatch
+    introduced by the WRITERS, which is where it would come from.
+    """
+
+    def test_kept_rows_returns_positions_that_name_its_rows(self):
+        from sglang.srt.layers.attention.vestigekv.eviction import kept_rows
+
+        torch.manual_seed(0)
+        for seq, closed in ((BLOCK + 512, BLOCK), (3 * BLOCK, 2 * BLOCK), (BLOCK, BLOCK)):
+            # row_slots is a SHUFFLED pool mapping, as req_to_token is: a
+            # position-ordered table would hide an off-by-one.
+            rows = torch.randperm(1 << 15)[:seq]
+            sigma = torch.rand(closed)
+            got, pos = kept_rows(sigma, rows, rho=RHO, closed=closed,
+                                 sinks=D.SINKS, return_pos=True)
+            self.assertEqual(got.shape, pos.shape)
+            self.assertTrue(torch.equal(rows[pos], got))
+            # the tail is kept whole, in order, and the sinks are always in
+            if seq > closed:
+                self.assertTrue(torch.equal(pos[closed - seq:], torch.arange(closed, seq)))
+            self.assertTrue(set(range(D.SINKS)).issubset(set(pos.tolist())))
+            self.assertTrue(bool((pos[1:] > pos[:-1]).all()))  # strictly ascending
+
+    def test_the_close_paths_positions_name_its_rows(self):
+        """The close path derives positions with keep.nonzero() beside rows with
+        closed_slots[keep]; the two orders have to agree."""
+        torch.manual_seed(1)
+        seq, c1 = 3 * BLOCK + 777, 3 * BLOCK
+        r2t_row = torch.randperm(1 << 15)[:seq]
+        sigma = torch.rand(c1)
+        m = max(1, round(RHO * c1))
+        keep = torch.zeros(c1, dtype=torch.bool)
+        keep[sigma[:c1].topk(min(m, c1)).indices] = True
+        keep[: D.SINKS] = True
+        closed_slots = r2t_row[:c1]
+        new_kept = torch.cat([closed_slots[keep], r2t_row[c1:seq]])
+        new_pos = torch.cat([keep.nonzero().flatten(), torch.arange(c1, seq)])
+        self.assertEqual(new_kept.shape, new_pos.shape)
+        self.assertTrue(torch.equal(r2t_row[new_pos], new_kept))
+
 if __name__ == "__main__":
     unittest.main()
