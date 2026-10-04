@@ -861,7 +861,7 @@ class VestigeKVDSABackend(AttentionBackend):
             "mem[alloc=%.2fGB reserved=%.2fGB] "
             "replay=%.3fms(host %.3f) eager=%.2fms scan=%.2fms/step (dispatch %.2f) "
             "pack=%.2fms/step "
-            "scan_calls=%.1f/step fetched=%.0f/call kept=%.0f/call seq=%.0f/call "
+            "scan_calls=%.1f/step fetched=%.1f/call kept=%.1f/call seq=%.1f/call "
             "attended_frac=%.4f bytes[step=%.2fMB dsa=%.2fMB ratio=%.3f per_tok=%.1fB] "
             "variant[lean=%d topk=%d] ovf_by_layer=%s",
             st["steps"],
