@@ -106,6 +106,12 @@ def _all_positions(row_slots):
     return torch.arange(row_slots.shape[0], device=row_slots.device)
 
 
+# 33 B/token is DSA's pooled index-k read, which our arm makes once and shares.
+# 9 B per group of 4 is the branch chain's own sweep (dsa_branch.py: km in
+# _branch_hist_kernel, logits + km + hit in _branch_hit_kernel, hit in
+# _branch_commit_kernel), so our fixed per-token read is 33 + 9/4.
+_VK_FIXED_B = 33.0 + 9.0 / 4.0
+
 class VestigeKVDSABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.
 
@@ -1140,14 +1146,18 @@ class VestigeKVDSABackend(AttentionBackend):
             st["kept"] / c,
             st["seq"] / c,
             (st["fetched"] + st["kept"]) / max(st["seq"], 1),
-            # bytes per layer-step, bf16 latent rows (512 x 2 B) and DSA's pooled
-            # index-k read (33 B/token): the deliverable on this geometry is bytes,
-            # measured off the same per-scan sums as attended_frac, not arithmetic.
-            (33.0 * st["seq"] + (st["kept"] + st["fetched"]) * 1024.0) / c / 1e6,
+            # bytes per layer-step, bf16 latent rows (512 x 2 B), DSA's pooled
+            # index-k read (33 B/token, which both arms make and we do not repeat)
+            # and, for our arm only, the 9 B per GROUP the branch chain sweeps:
+            # km in hist, a full logits pass plus km reset in hit, the hit write,
+            # and the hit read in commit. The deliverable on this geometry is
+            # bytes, measured off the same per-scan sums as attended_frac.
+            (_VK_FIXED_B * st["seq"] + (st["kept"] + st["fetched"]) * 1024.0) / c / 1e6,
             (33.0 * st["seq"] + self._dsa_topk * 1024.0 * c) / c / 1e6,
-            (33.0 * st["seq"] + (st["kept"] + st["fetched"]) * 1024.0)
+            (_VK_FIXED_B * st["seq"] + (st["kept"] + st["fetched"]) * 1024.0)
             / max(33.0 * st["seq"] + self._dsa_topk * 1024.0 * c, 1.0),
-            (33.0 * st["seq"] + (st["kept"] + st["fetched"]) * 1024.0) / max(st["seq"], 1.0),
+            (_VK_FIXED_B * st["seq"] + (st["kept"] + st["fetched"]) * 1024.0)
+            / max(st["seq"], 1.0),
             st["lean"],
             st["topk"],
             self._ovf_count_stack.tolist() if self._ovf_count_stack is not None else [],
