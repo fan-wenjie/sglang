@@ -1,34 +1,64 @@
 # SPDX-License-Identifier: Apache-2.0
 """The GLM branch rule's operators: threshold over the kept groups, fire mask,
-compaction. Forked in shape from the Kimi line's scan (batched_step.py:
-per-bucket fused counts into compact_fired) rather than written from the
-torch chain, because the torch chain was 85 kernels per layer-step and its
-cost was the node count, not any one op (profile 2026-10-03: 136 us of GPU
-time behind 283 us of graph replay per layer).
+compaction, and the fallback -- five kernels, no host-side glue.
 
-Five launches per layer-step plus compact_fired's two (and three torch nodes):
+Forked in shape from the Kimi line's scan (batched_step.py: per-bucket fused
+counts feeding fused_prologue.compact_fired) rather than written from the torch
+chain, because the torch chain was 85 kernels per layer-step and its cost was
+the node count, not any one op. Node-level nsys of the chain version
+(2026-10-03, 11 layers, one device): +498 us/step over DSA = 198 us of Triton
++ 137 us of torch glue + ~127 us of graph-node floor for +178 nodes.
 
-  _branch_kept_kernel   one program per lane: every kept row -> its group
-                        (through a page-table inverse built by one scatter),
+The fallback and the recall are TWO ARMS OF ONE KERNEL, as in the MLA version
+(_compact_write_kernel publishes out_len and out_ovf from the same program):
+_branch_commit_kernel decides per lane whether the fire exceeded the trigger,
+publishes (fetch_len, fetch_ovf) either way from the same store addresses, and
+runs the row expansion only on the recall arm. Splitting the decision from the
+act was what the chain version did -- the count in one kernel, the fence flag
+in a second, the rows in a third -- and it cost two launches and a reread of
+the same counter.
+
+Per layer-step:
+
+  _branch_kept_kernel   grid over kept ROWS: each kept row -> its group, from
+                        the POSITION tier 1 recorded (no page-table inverse),
                         km[g] = 1, and the range of the kept groups' logits.
-  _branch_hist_kernel   grid over group buckets: the kept groups' logits binned.
-  _branch_thr_kernel    one program per lane: the q-quantile off the histogram.
-  _branch_hit_kernel    one program per (bucket, lane): hit[g] = valid &
-                        ~km[g] & (logit[g] > thr), with the bucket's count
-                        stored for compact_fired's prefix.
-  compact_fired         (fused_prologue.py) group ids -> a prefix, fetch_len
-                        in groups, the overflow flag.
-  _branch_rows_kernel   one program per lane: fired groups x pool -> request
-                        positions -> physical rows through req_to_token, into
-                        the fetch buffer; fetch_len = 0 and fetch_ovf = 1 on
-                        an overflowed lane (the pack fences it to DSA).
+  _branch_hist_kernel   grid over groups: the kept groups' logits, binned.
+  _branch_hit_kernel    grid over groups: the q-quantile off the histogram
+                        (recomputed per CTA -- 256 loads and a scan, cheaper
+                        than the launch a separate kernel costs), then
+                        hit[g] = valid & ~km[g] & (logit[g] > thr) with the
+                        bucket's count for the prefix. Resets km on its way out.
+  _compact_scan_kernel  (fused_prologue, unchanged) exclusive bucket prefix.
+  _branch_commit_kernel the two arms above, plus the compaction and the
+                        expansion of each fired group to its POOL contiguous
+                        rows through req_to_token. Resets the quantile scratch
+                        for the next layer.
 
-The threshold is read off a histogram of the kept groups' logits, so it is
-the q-quantile to within one bin (NBIN bins over the kept scores' range),
-always rounded DOWN (the bin's lower edge): the rule fires at least what the
-exact quantile would. The quantile is a knob (SGLANG_VESTIGEKV_BRANCH_Q), and
-a knob known to one part in NBIN is still the knob.
+Nothing is zeroed from the host: km is reset by its last reader
+(_branch_hit_kernel), the histogram and the range by _branch_commit_kernel for
+the NEXT call, and the bucket counts by _compact_scan_kernel (its own rule).
+branch_scratch seeds them once, outside any graph.
+
+Upstream considered for the threshold, and why it is not called: DSA's own
+`kpool_topk_transform.cuh` selects by exactly this algorithm -- a radix
+histogram, a threshold bin, then a compact (`s_histogram`,
+`s_threshold_bin_id`) -- and `dsa/topk_threshold_telemetry.py` already states
+the design, that handing the selection a pivot turns it into "a count plus a
+compact". It cannot be called here: its K is a compile-time constant
+(`SGL_GROUP_TOPK`) over the whole candidate row, while this rule needs the
+r-th largest of the KEPT subset with r = floor((1-q) n_kept) varying per lane
+per step. So the histogram phase is re-expressed in Triton over a masked
+subset with a runtime rank; the selection phase is not duplicated -- the
+compaction is the Kimi line's `compact_fired`, reused.
+
+The threshold is read off a histogram of the kept groups' logits, so it is the
+q-quantile to within one bin (NBIN bins over the kept scores' range), always
+rounded DOWN to the bin's lower edge: the rule fires at least what the exact
+quantile would. The quantile is a knob (SGLANG_VESTIGEKV_BRANCH_Q), and a knob
+known to one part in NBIN is still the knob.
 """
+
 import torch
 import triton
 import triton.language as tl
@@ -40,37 +70,39 @@ NBIN = 256
 
 @triton.jit
 def _branch_kept_kernel(
-    kept_ptr,      # [NSLOT, CAPK] int32 physical rows
+    keptpos_ptr,   # [NSLOT, CAPK] int32: request-relative position of each kept row
     klen_ptr,      # [NSLOT] int32
-    slot_ptr,      # [B] int32 pool slot per lane
-    inv_ptr,       # [B, NP] int64: physical page -> request-relative page (torch scatter)
+    slot_ptr,      # [B] int pool slot per lane
     logits_ptr,    # [B, G] fp32
-    km_ptr,        # [B, G] int8 out (pre-zeroed): 1 = group holds a kept row
-    range_ptr,     # [B, 2] fp32 out: (lo, hi) of the kept groups' logits
-    CAPK, NP, G,
-    PAGE: tl.constexpr, POOL: tl.constexpr, BK: tl.constexpr,
+    km_ptr,        # [B, G] int8 out (zero on entry): 1 = group holds a kept row
+    range_ptr,     # [B, 2] fp32 in/out: (+inf, -inf) on entry, (lo, hi) after
+    CAPK, G,
+    POOL: tl.constexpr, BK: tl.constexpr,
 ):
-    # One program per lane over its kept ROWS (<= capK, ~1-4k live): each row
-    # -> its group, km[g] = 1, and the range of the groups' logits (the min and
-    # max over rows equal those over the groups the rows name).
-    b = tl.program_id(0)
-    slot = tl.load(slot_ptr + b)
+    # Grid over the lane's kept ROWS, not one CTA per lane: a single CTA costs
+    # 74.7 us/layer-step at 128k and grows with the kept set, which is what
+    # makes the tax scale with context instead of staying flat.
+    #
+    # A kept row's group is its POSITION // POOL. Tier 1 records the position
+    # when it writes the table (eviction.kept_rows produces it), so there is no
+    # page-table inverse here: the physical row is not even read. The inverse
+    # cost a torch scatter per step and one served crash (the page table is
+    # sized by max_context_len and the inverse by the KV pool, and on this
+    # geometry the pool is the smaller).
+    b = tl.program_id(1)
+    pid = tl.program_id(0)
+    slot = tl.load(slot_ptr + b).to(tl.int64)
     n = tl.load(klen_ptr + slot)
-    jj = tl.arange(0, BK)
-    lo = float("inf")
-    hi = float("-inf")
-    for j0 in range(0, n, BK):
-        j = j0 + jj
-        mj = j < n
-        row = tl.load(kept_ptr + slot * CAPK + j, mask=mj, other=0).to(tl.int64)
-        rel = tl.load(inv_ptr + b * NP + tl.minimum(row // PAGE, NP - 1), mask=mj, other=0)
-        g = tl.minimum((rel * PAGE + row % PAGE) // POOL, G - 1)
-        tl.store(km_ptr + b * G + g, tl.full([BK], 1, tl.int8), mask=mj)
-        s = tl.load(logits_ptr + b * G + g, mask=mj, other=0.0)
-        lo = tl.minimum(lo, tl.min(tl.where(mj, s, float("inf")), 0))
-        hi = tl.maximum(hi, tl.max(tl.where(mj, s, float("-inf")), 0))
-    tl.store(range_ptr + b * 2, lo)
-    tl.store(range_ptr + b * 2 + 1, hi)
+    j = pid * BK + tl.arange(0, BK)
+    mj = j < n
+    pos = tl.load(keptpos_ptr + slot * CAPK + j, mask=mj, other=0).to(tl.int64)
+    g = tl.minimum(pos // POOL, G - 1)
+    tl.store(km_ptr + b * G + g, tl.full([BK], 1, tl.int8), mask=mj)
+    # The range of the kept GROUPS' logits: the min and max over the rows equal
+    # those over the groups the rows name, so one pass serves both.
+    s = tl.load(logits_ptr + b * G + g, mask=mj, other=0.0)
+    tl.atomic_min(range_ptr + b * 2, tl.min(tl.where(mj, s, float("inf")), 0))
+    tl.atomic_max(range_ptr + b * 2 + 1, tl.max(tl.where(mj, s, float("-inf")), 0))
 
 
 @triton.jit
@@ -80,170 +112,207 @@ def _branch_hist_kernel(
     G,
     BLOCK: tl.constexpr, NB: tl.constexpr,
 ):
-    # One program per (bucket, lane): the kept groups in this bucket, binned.
-    bk = tl.program_id(0)
     b = tl.program_id(1)
-    offs = bk * BLOCK + tl.arange(0, BLOCK)
+    blk = tl.program_id(0)
+    offs = blk * BLOCK + tl.arange(0, BLOCK)
     m = offs < G
     km = tl.load(km_ptr + b * G + offs, mask=m, other=0) != 0
     s = tl.load(logits_ptr + b * G + offs, mask=km, other=0.0)
     lo = tl.load(range_ptr + b * 2)
     hi = tl.load(range_ptr + b * 2 + 1)
     width = tl.maximum(hi - lo, 1e-6)
-    bin_ = tl.minimum(((s - lo) / width * NB).to(tl.int32), NB - 1)
+    bin_ = tl.minimum(
+        tl.maximum(((s - lo) / width * NB).to(tl.int32), 0), NB - 1
+    )
     tl.atomic_add(hist_ptr + b * NB + bin_, 1, mask=km)
 
 
 @triton.jit
-def _branch_thr_kernel(
-    hist_ptr, range_ptr, thr_ptr, q,
-    NB: tl.constexpr,
+def _branch_hit_kernel(
+    logits_ptr, km_ptr, hist_ptr, range_ptr, plen_ptr,
+    hit_ptr,       # [B, GP] int8 out
+    counts_ptr,    # [B, NBK] int32 out, one per bucket
+    thr_ptr,       # [B] fp32 out: the resolved threshold (observability/tests)
+    q,
+    G, GP,
+    BLOCK: tl.constexpr, NB: tl.constexpr,
 ):
-    # One program per lane: the (r+1)-th largest kept-group logit, r =
-    # floor((1-q) n), read off the histogram and rounded DOWN to its bin's
-    # lower edge; the histogram is reset for the next step.
-    b = tl.program_id(0)
+    b = tl.program_id(1)
+    blk = tl.program_id(0)
+    nb = GP // BLOCK
+    # The threshold, per CTA, off the 256-bin histogram: the (r+1)-th largest
+    # kept-group logit, r = floor((1-q) n), rounded DOWN to its bin's lower
+    # edge. 256 loads and a scan per CTA is cheaper than the launch a separate
+    # threshold kernel costs (11.9 us/layer-step as its own kernel).
     bb = tl.arange(0, NB)
     h = tl.load(hist_ptr + b * NB + bb)
-    n = tl.sum(h, 0)
-    r = tl.floor((1.0 - q) * n.to(tl.float32)).to(tl.int32)
-    above = n - tl.cumsum(h, 0)  # entries in bins strictly above
+    nkg = tl.sum(h, 0)
+    r = tl.floor((1.0 - q) * nkg.to(tl.float32)).to(tl.int32)
+    above = nkg - tl.cumsum(h, 0)  # entries in bins strictly above
     is_bin = (above <= r) & (above + h > r)
     sel = tl.max(tl.where(is_bin, bb, 0), 0)
     lo = tl.load(range_ptr + b * 2)
     hi = tl.load(range_ptr + b * 2 + 1)
     width = tl.maximum(hi - lo, 1e-6)
-    tl.store(thr_ptr + b, lo + sel.to(tl.float32) / NB * width)
-    tl.store(hist_ptr + b * NB + bb, tl.zeros([NB], dtype=tl.int32))
-
-
-@triton.jit
-def _branch_hit_kernel(
-    logits_ptr, km_ptr, thr_ptr, plen_ptr,
-    hit_ptr,       # [B, GP] int8 out
-    counts_ptr,    # [B, NBK] int32 out (per bucket)
-    G, GP,
-    BLOCK: tl.constexpr,
-):
-    bk = tl.program_id(0)
-    b = tl.program_id(1)
-    offs = bk * BLOCK + tl.arange(0, BLOCK)
+    # A lane with no kept group has no threshold to stand on: everything fires,
+    # which overflows and fences the lane to DSA. That is the right degenerate
+    # answer -- there is no resident set to rank against.
+    thr = tl.where(nkg > 0, lo + sel.to(tl.float32) / NB * width, float("-inf"))
+    if blk == 0:
+        tl.store(thr_ptr + b, thr)
+    offs = blk * BLOCK + tl.arange(0, BLOCK)
     m = offs < G
     plen = tl.load(plen_ptr + b)
-    thr = tl.load(thr_ptr + b)
     s = tl.load(logits_ptr + b * G + offs, mask=m, other=float("-inf"))
     km = tl.load(km_ptr + b * G + offs, mask=m, other=1)
     fired = m & (offs < plen) & (km == 0) & (s > thr)
+    # hit covers the padded width so the compaction's tail buckets read zeros.
     tl.store(hit_ptr + b * GP + offs, fired.to(tl.int8), mask=offs < GP)
-    nbk = (GP + BLOCK - 1) // BLOCK
-    tl.store(counts_ptr + b * nbk + bk, tl.sum(fired.to(tl.int32), 0))
+    tl.store(counts_ptr + b * nb + blk, tl.sum(fired.to(tl.int32), 0))
+    # Reset km for the next (layer, step): this kernel is its last reader, so
+    # the reset rides on a store that is already in flight instead of a memset.
+    tl.store(km_ptr + b * G + offs, tl.zeros([BLOCK], dtype=tl.int8), mask=m)
 
 
 @triton.jit
-def _branch_rows_kernel(
-    gbuf_ptr,      # [NSLOT, WF] int32 compacted group ids (compact_fired out, li=0)
-    glen_ptr,      # [NSLOT] int32 fired groups (<= WF)
-    govf_ptr,      # [NSLOT] int32 overflow flag
-    slot_ptr,      # [B] int32
+def _branch_commit_kernel(
+    hit_ptr,       # [B, GP] int8 (hit kernel)
+    offsets_ptr,   # [B, NBK] int32 exclusive bucket prefix (compact scan)
+    total_ptr,     # [B] int32 fired group count (compact scan)
+    slot_ptr,      # [B] int pool slot per lane
     r2t_ptr,       # [NSLOT, MAXCTX] int64
-    fetch_ptr,     # [NSLOT, W] int32 out (this layer's slice)
+    fetch_ptr,     # [NSLOT, W] int32 out
     flen_ptr,      # [NSLOT] int32 out
     fovf_ptr,      # [NSLOT] int32 out
-    WF, W, MAXCTX,
-    POOL: tl.constexpr, BW: tl.constexpr,
+    ovf_count_ptr, # [1] int32 running fence tally
+    hist_ptr,      # [B, NB] int32: reset here for the NEXT call
+    range_ptr,     # [B, 2] fp32: reset here for the NEXT call
+    G, GP, WG, WF, MAXCTX,
+    POOL: tl.constexpr, BLOCK: tl.constexpr, NB: tl.constexpr,
 ):
-    b = tl.program_id(0)
-    slot = tl.load(slot_ptr + b)
-    ng = tl.load(glen_ptr + slot)
-    ovf = tl.load(govf_ptr + slot)
-    k = tl.arange(0, BW)  # fetch row index
-    for k0 in range(0, W, BW):
-        kk = k0 + k
-        gi = kk // POOL
-        mk = (kk < W) & (gi < ng)
-        g = tl.load(gbuf_ptr + slot * WF + tl.minimum(gi, WF - 1), mask=mk, other=0).to(tl.int64)
-        pos = tl.minimum(g * POOL + (kk % POOL), MAXCTX - 1)
-        row = tl.load(r2t_ptr + slot.to(tl.int64) * MAXCTX + pos, mask=mk, other=0)
-        tl.store(fetch_ptr + slot * W + kk, row.to(tl.int32), mask=kk < W)
-    n_rows = tl.where(ovf > 0, 0, ng * POOL)
-    tl.store(flen_ptr + slot, n_rows)
-    tl.store(fovf_ptr + slot, ovf)
+    """The fallback and the recall, one kernel, two arms (see the module
+    docstring). Fork of fused_prologue._compact_write_kernel: the arena
+    indirection is gone (a group's id IS its index), and a compacted entry
+    becomes POOL contiguous rows instead of one."""
+    b = tl.program_id(1)
+    pid = tl.program_id(0)
+    NPROG = tl.num_programs(0)  # capped grid; live buckets stride over it
+    nb = GP // BLOCK
+    slot = tl.load(slot_ptr + b).to(tl.int64)
+    ng = tl.load(total_ptr + b)
+    fenced = ng > WF
+    W = WG * POOL
+
+    if pid == 0:
+        # Both arms publish the same two words at the same addresses, so the
+        # pack reads one shape and the lanes of a batch may disagree: the
+        # fenced lane gets length 0 and the flag the pack fences on (the fork
+        # then attends the indexer's own top-k and NOT the kept rows), the
+        # recalling lane gets its row count. fetch_len is consumed every step
+        # even by a lane that fires nothing, so this write cannot ride on
+        # bucket 0 existing in the (capped) grid.
+        tl.store(flen_ptr + slot, tl.where(fenced, 0, ng * POOL))
+        tl.store(fovf_ptr + slot, fenced.to(tl.int32))
+        if fenced:
+            tl.atomic_add(ovf_count_ptr, 1)
+        # The quantile scratch for the next (layer, step). Nothing reads it
+        # after this kernel; resetting here costs no launch where a standalone
+        # memset would cost one per layer. branch_scratch seeds the first call.
+        bb = tl.arange(0, NB)
+        tl.store(hist_ptr + b * NB + bb, tl.zeros([NB], dtype=tl.int32))
+        tl.store(range_ptr + b * 2, float("inf"))
+        tl.store(range_ptr + b * 2 + 1, float("-inf"))
+
+    if not fenced:
+        # The recall arm. The fenced arm does NONE of this -- the point of a
+        # fallback is to delete work -- so the branch sits outside the loop
+        # rather than predicating the loads off: both arms' address tensors
+        # would otherwise stay live across the loop and the allocator spills
+        # (.claude/rules/disassemble-check-for-spills.md). The fenced arm is
+        # empty, so no loop body is duplicated.
+        j = tl.arange(0, POOL)
+        trips = (tl.maximum(nb - pid, 0) + NPROG - 1) // NPROG
+        for i in range(trips):
+            blk = pid + i * NPROG
+            offs = blk * BLOCK + tl.arange(0, BLOCK)
+            m = offs < G
+            h = tl.load(hit_ptr + b * GP + offs, mask=m, other=0) != 0
+            base = tl.load(offsets_ptr + b * nb + blk)
+            pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
+            ok = h & (pos < WG)
+            # a fired group's POOL token positions -> this request's physical
+            # rows, landing at pos*POOL in the fetch buffer
+            tpos = tl.minimum(offs[:, None] * POOL + j[None, :], MAXCTX - 1)
+            row = tl.load(
+                r2t_ptr + slot * MAXCTX + tpos, mask=ok[:, None], other=0
+            )
+            dst = pos[:, None] * POOL + j[None, :]
+            tl.store(
+                fetch_ptr + slot * W + dst, row.to(tl.int32), mask=ok[:, None]
+            )
 
 
 def branch_fire(
-    *, logits, pool_lens, page_table, slots, kept, klen, q, scratch, fetch_buf,
-    fetch_len, fetch_ovf, r2t, pool, page_size, fence_groups,
+    *, logits, pool_lens, slots, kept_pos, klen, q, scratch, fetch_buf,
+    fetch_len, fetch_ovf, r2t, pool, fence_groups,
 ):
-    """One layer-step of the branch rule. scratch: dict from branch_scratch().
-    fetch_buf [NSLOT, W], fetch_len/fetch_ovf [NSLOT] are this layer's slices."""
-    from sglang.srt.layers.attention.vestigekv.fused_prologue import compact_fired
+    """One layer-step of the branch rule. `scratch` comes from branch_scratch;
+    fetch_buf [NSLOT, W], fetch_len/fetch_ovf [NSLOT] are this layer's slices.
+    `kept_pos` is tier 1's position table, parallel to its row table."""
+    from sglang.srt.layers.attention.vestigekv.fused_prologue import (
+        _compact_scan_kernel,
+    )
 
     B, G = logits.shape
-    NSLOT, CAPK = kept.shape
-    P = page_table.shape[1]
+    NSLOT, CAPK = kept_pos.shape
     sc = scratch
     GP = sc["hit"].shape[1]
-    sc["km"].zero_()
-    sc["slot"].copy_(slots.to(torch.int32))
-    inv = sc["inv"]
-    inv.zero_()
-    # Scatter in REVERSE column order so that, where a physical page id
-    # repeats, the LOWEST request-relative index wins: the page table is
-    # padded (with zeros) past the request's pages, and a plain scatter let
-    # the padding overwrite physical page 0's true index whenever page 0 was
-    # in use (caught by test_vestigekv_dsa_branch, not by the ad-hoc check).
-    pt = page_table[:B].to(torch.int64).clamp_(min=0, max=inv.shape[1] - 1).flip(1)
-    inv.scatter_(1, pt, torch.arange(P - 1, -1, -1, device=inv.device)[None, :].expand(B, -1))
-    _branch_kept_kernel[(B,)](
-        kept, klen, sc["slot"], inv, logits, sc["km"], sc["range"],
-        CAPK, inv.shape[1], G, PAGE=page_size, POOL=pool, BK=256, num_warps=4,
-    )
-    nbk = GP // D.SCAN_BUCKET
-    _branch_hist_kernel[(nbk, B)](
-        logits, sc["km"], sc["range"], sc["hist"], G, BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
-    )
-    _branch_thr_kernel[(B,)](sc["hist"], sc["range"], sc["thr"], float(q), NB=NBIN, num_warps=1)
-    nbk = GP // D.SCAN_BUCKET
-    _branch_hit_kernel[(nbk, B)](
-        logits, sc["km"], sc["thr"], pool_lens.to(torch.int32), sc["hit"], sc["counts"],
-        G, GP, BLOCK=D.SCAN_BUCKET, num_warps=4,
-    )
-    compact_fired(
-        sc["hit"].view(-1), sc["ids"].view(-1), sc["a_len"], sc["a_off"], sc["li"], sc["slot"],
-        sc["gbuf"], sc["glen"], sc["govf"], sc["ovf_count"],
-        (sc["counts"], sc["offsets"], sc["total"]), GP,
-    )
-    W = fetch_buf.shape[1]
-    _branch_rows_kernel[(B,)](
-        sc["gbuf"][0], sc["glen"][0], sc["govf"][0], sc["slot"], r2t,
-        fetch_buf, fetch_len, fetch_ovf,
-        sc["gbuf"].shape[-1], W, r2t.shape[1], POOL=pool, BW=512, num_warps=4,
-    )
-
-
-def branch_scratch(*, bs, G, nslot, fetch_w, pool, fence_groups, dev, n_pages):
-    """Fixed-address scratch for one (batch width, logits width)."""
-    WG = fetch_w // pool
+    NBK = GP // D.SCAN_BUCKET
+    WG = fetch_buf.shape[1] // pool
     WF = WG if fence_groups is None else max(1, min(WG, int(fence_groups)))
-    GP = (G + D.SCAN_BUCKET - 1) // D.SCAN_BUCKET * D.SCAN_BUCKET
+
+    _branch_kept_kernel[(triton.cdiv(CAPK, 256), B)](
+        kept_pos, klen, slots, logits, sc["km"], sc["range"],
+        CAPK, G, POOL=pool, BK=256, num_warps=4,
+    )
+    _branch_hist_kernel[(NBK, B)](
+        logits, sc["km"], sc["range"], sc["hist"], G,
+        BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
+    )
+    _branch_hit_kernel[(NBK, B)](
+        logits, sc["km"], sc["hist"], sc["range"], pool_lens,
+        sc["hit"], sc["counts"], sc["thr"], float(q), G, GP,
+        BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
+    )
+    _compact_scan_kernel[(B,)](
+        sc["counts"], sc["offsets"], sc["total"], NBK,
+        NB2=triton.next_power_of_2(NBK),
+    )
+    _branch_commit_kernel[(min(NBK, D.SCAN_GRID_CAP), B)](
+        sc["hit"], sc["offsets"], sc["total"], slots, r2t,
+        fetch_buf, fetch_len, fetch_ovf, sc["ovf_count"], sc["hist"], sc["range"],
+        G, GP, WG, WF, r2t.shape[1],
+        POOL=pool, BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
+    )
+
+
+def branch_scratch(*, bs, G, nslot, fetch_w, pool, fence_groups, dev):
+    """Fixed-address scratch for one (batch width, logits width). The histogram,
+    the range and the bucket counts are seeded here and thereafter reset by the
+    kernels themselves, so a captured step allocates nothing and memsets
+    nothing."""
+    GP = triton.cdiv(G, D.SCAN_BUCKET) * D.SCAN_BUCKET
     NBK = GP // D.SCAN_BUCKET
     return {
-        "inv": torch.zeros(bs, n_pages, dtype=torch.int64, device=dev),
         "km": torch.zeros(bs, G, dtype=torch.int8, device=dev),
         "hist": torch.zeros(bs, NBIN, dtype=torch.int32, device=dev),
+        "range": torch.tensor(
+            [[float("inf"), float("-inf")]] * bs, dtype=torch.float32, device=dev
+        ),
         "thr": torch.zeros(bs, dtype=torch.float32, device=dev),
-        "range": torch.zeros(bs, 2, dtype=torch.float32, device=dev),
-        "slot": torch.zeros(bs, dtype=torch.int32, device=dev),
         "hit": torch.zeros(bs, GP, dtype=torch.int8, device=dev),
-        "ids": torch.arange(GP, dtype=torch.int32, device=dev).repeat(bs, 1),
         "counts": torch.zeros(bs, NBK, dtype=torch.int32, device=dev),
         "offsets": torch.zeros(bs, NBK, dtype=torch.int32, device=dev),
         "total": torch.zeros(bs, dtype=torch.int32, device=dev),
-        "a_len": torch.full((bs,), G, dtype=torch.int32, device=dev),
-        "a_off": (torch.arange(bs, device=dev) * GP).to(torch.int64),
-        "li": torch.zeros(bs, dtype=torch.int32, device=dev),
-        "gbuf": torch.zeros(1, nslot, WF, dtype=torch.int32, device=dev),
-        "glen": torch.zeros(1, nslot, dtype=torch.int32, device=dev),
-        "govf": torch.zeros(1, nslot, dtype=torch.int32, device=dev),
         "ovf_count": torch.zeros(1, dtype=torch.int32, device=dev),
     }

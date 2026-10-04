@@ -1119,7 +1119,6 @@ class IndexerKPool(MultiPlatformOp):
                 layer_id=layer_id,
                 logits=logits,
                 pool_lens=pool_seqlens,
-                page_table=block_tables,
                 forward_batch=forward_batch,
             )
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)

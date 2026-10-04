@@ -61,7 +61,8 @@ def kept_rows(
     rho: float,
     closed: int,
     sinks: int = D.SINKS,
-) -> torch.Tensor:
+    return_pos: bool = False,
+):
     """select_kept's row set, with a size the host already knows.
 
     `row_slots[:closed][select_kept(...).nonzero()]` costs a device sync per
@@ -86,7 +87,15 @@ def kept_rows(
         0, dtype=torch.long
     )
     pos = torch.cat([torch.arange(n_sink, device=sigma.device), picked])
-    return torch.cat([row_slots[:closed][pos], row_slots[closed:]])
+    tail = torch.arange(closed, row_slots.shape[0], device=row_slots.device)
+    rows = torch.cat([row_slots[:closed][pos], row_slots[closed:]])
+    if return_pos:
+        # The POSITIONS, not just the rows: a consumer that has to get from a
+        # kept row back to its request-relative position would otherwise invert
+        # the page table, and the position is free here because the ranking
+        # produced it.
+        return rows, torch.cat([pos, tail])
+    return rows
 
 
 def blockwise_sigma_from_pool(

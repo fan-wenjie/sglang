@@ -1,134 +1,242 @@
 """The GLM branch rule's operators (vestigekv/dsa_branch.py) against a torch
-reference of the rule: threshold = q-quantile of the kept groups' logits,
-fire every archive group above it, fence the lane past the budget.
+reference of the rule: threshold = q-quantile of the kept groups' logits, fire
+every archive group above it, fence the lane past the trigger.
 
-Pinned here: the kept-group mask is exact; the threshold is the exact
-quantile rounded DOWN by at most one histogram bin; below the budget the
-fetched rows are exactly the fired groups' rows (4 per group, hottest-first
-is NOT promised -- position order); past the budget fetch_len is 0 and the
-overflow flag is raised, so the pack fences the lane.
+Pinned here: the kept-group mask is exact; the threshold is the exact quantile
+rounded DOWN by at most one histogram bin; below the trigger the fetched rows
+are exactly the fired groups' rows, POOL per group; past it fetch_len is 0 and
+the overflow flag is raised, so the pack fences the lane to DSA's own top-k.
+
+And the property the fused commit kernel exists for: the fallback and the
+recall are two arms of ONE kernel, so two lanes of one call can take different
+arms. TestBranchMixedBatch drives exactly that -- a hot lane that fences beside
+a cold lane that recalls -- which a chain that decides in one kernel and acts
+in another could not express without a host-side readback of the count.
+
+An earlier case guarded a page-table inverse (a table wider than the KV pool
+crashed graph capture). Tier 1 now records each kept row's request-relative
+POSITION, so no kernel here reads a page table and that failure cannot occur.
+The shuffled physical pages in the fixture still guard the replacement: a
+regression to row-derived groups would not resolve to this request's own rows.
+
+The scratch is also checked to come back the way the kernels promise: nothing
+is zeroed from the host between calls, so a second call on one scratch must
+agree with the first.
 """
+
 import unittest
 
 import torch
 
-from sglang.srt.layers.attention.vestigekv import defaults as D
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, suite="base-a-test-cuda")
+register_cuda_ci(est_time=25, suite="base-a-test-cuda")
 
-T, PAGE, POOL, W, NSLOT = 20000, 64, 4, 2048, 4
+T, PAGE, POOL, W, NSLOT, CAPK, NPAGE = 20000, 64, 4, 2048, 4, 4096, 1024
 
 
-def _request(seed):
-    torch.manual_seed(seed)
-    dev = "cuda"
+def _lane(seed, slot, r2t, kept, klen, n_hot_kept=600):
+    """Lay one request of T tokens into `slot` over SHUFFLED physical pages and
+    give it a kept set of sinks + sigma picks + the recent window. The tables
+    are filled the way tier 1 fills them -- the POSITION, not the physical row,
+    is what the rule reads. Returns the kept positions."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
     n_pages = T // PAGE + 1
-    phys_pages = torch.randperm(1024, device=dev)[:n_pages]
+    phys = torch.randperm(NPAGE, device="cuda", generator=g)[:n_pages]
+    pos = torch.arange(T, device="cuda")
+    r2t[slot, :T] = phys[pos // PAGE] * PAGE + pos % PAGE
+    kept_pos = torch.cat([
+        torch.arange(4, device="cuda"),
+        torch.randperm(T - 300, device="cuda", generator=g)[:n_hot_kept],
+        torch.arange(T - 256, T, device="cuda"),
+    ]).unique()
+    kept[slot, : len(kept_pos)] = kept_pos.to(torch.int32)
+    klen[slot] = len(kept_pos)
+    return kept_pos
+
+
+def _fixture(seeds_slots):
+    dev = "cuda"
     r2t = torch.zeros(NSLOT, 24576, dtype=torch.int64, device=dev)
-    pos = torch.arange(T, device=dev)
-    r2t[2, :T] = phys_pages[pos // PAGE] * PAGE + pos % PAGE
-    page_table = torch.zeros(1, 512, dtype=torch.int32, device=dev)
-    page_table[0, :n_pages] = phys_pages.to(torch.int32)
-    G = (24576 // PAGE // POOL + 1) * PAGE
-    pool_lens = torch.tensor([T // POOL], device=dev)
-    kept_pos = torch.cat([torch.arange(4, device=dev),
-                          torch.randperm(T - 300, device=dev)[:600],
-                          torch.arange(T - 256, T, device=dev)]).unique()
-    capK = 4096
-    kept = torch.zeros(NSLOT, capK, dtype=torch.int32, device=dev)
-    kept[2, :len(kept_pos)] = r2t[2, kept_pos].to(torch.int32)
+    kept = torch.zeros(NSLOT, CAPK, dtype=torch.int32, device=dev)
     klen = torch.zeros(NSLOT, dtype=torch.int32, device=dev)
-    klen[2] = len(kept_pos)
-    return dev, r2t, page_table, G, pool_lens, kept_pos, kept, klen
+    kepts = [_lane(seed, slot, r2t, kept, klen) for seed, slot in seeds_slots]
+    G = (24576 // PAGE // POOL + 1) * PAGE
+    slots = torch.tensor([s for _, s in seeds_slots], device=dev)
+    pool_lens = torch.full((len(seeds_slots),), T // POOL, dtype=torch.int32, device=dev)
+    return dev, r2t, kept, klen, slots, pool_lens, G, kepts
 
 
-def _run(dev, r2t, page_table, G, pool_lens, kept, klen, logits, q, fence_groups=None):
-    from sglang.srt.layers.attention.vestigekv.dsa_branch import branch_fire, branch_scratch
+def _scratch(bs, G, fence_groups=None):
+    from sglang.srt.layers.attention.vestigekv.dsa_branch import branch_scratch
 
-    sc = branch_scratch(bs=1, G=G, nslot=NSLOT, fetch_w=W, pool=POOL,
-                        fence_groups=fence_groups, dev=dev, n_pages=1024 + 2)
-    fb = torch.zeros(NSLOT, W, dtype=torch.int32, device=dev)
-    fl = torch.zeros(NSLOT, dtype=torch.int32, device=dev)
-    fo = torch.zeros(NSLOT, dtype=torch.int32, device=dev)
-    branch_fire(logits=logits, pool_lens=pool_lens, page_table=page_table,
-                slots=torch.tensor([2], device=dev), kept=kept, klen=klen, q=q,
-                scratch=sc, fetch_buf=fb, fetch_len=fl, fetch_ovf=fo, r2t=r2t,
-                pool=POOL, page_size=PAGE, fence_groups=fence_groups)
+    return branch_scratch(bs=bs, G=G, nslot=NSLOT, fetch_w=W, pool=POOL,
+                          fence_groups=fence_groups, dev="cuda")
+
+
+def _run(sc, logits, pool_lens, slots, kept_pos, klen, r2t, q,
+         fence_groups=None, out=None):
+    from sglang.srt.layers.attention.vestigekv.dsa_branch import branch_fire
+
+    if out is None:
+        out = (
+            torch.zeros(NSLOT, W, dtype=torch.int32, device="cuda"),
+            torch.zeros(NSLOT, dtype=torch.int32, device="cuda"),
+            torch.zeros(NSLOT, dtype=torch.int32, device="cuda"),
+        )
+    fb, fl, fo = out
+    branch_fire(logits=logits, pool_lens=pool_lens, slots=slots,
+                kept_pos=kept_pos, klen=klen, q=q, scratch=sc,
+                fetch_buf=fb, fetch_len=fl, fetch_ovf=fo, r2t=r2t, pool=POOL,
+                fence_groups=fence_groups)
     torch.cuda.synchronize()
-    return sc, fb, fl, fo
+    return fb, fl, fo
 
 
-def _reference(logits, kept_pos, G, q, pool_lens):
-    kg = (kept_pos // POOL).unique()
-    ks = logits[0, kg]
+def _kept_groups(kept_pos):
+    return (kept_pos // POOL).unique()
+
+
+def _exact(logits, b, kept_pos, G, q, plen):
+    """The rule in torch: the exact q-quantile of the kept GROUPS' logits, then
+    every valid archive group above it."""
+    kg = _kept_groups(kept_pos)
+    ks = logits[b, kg]
     thr = ks.sort(descending=True).values[int((1 - q) * len(kg))]
     arch = torch.ones(G, dtype=torch.bool, device=logits.device)
     arch[kg] = False
-    valid = torch.arange(G, device=logits.device) < int(pool_lens[0])
-    fired = ((logits[0] > thr) & arch & valid).nonzero().flatten()
-    binw = float((ks.max() - ks.min()) / 256)
-    return kg, float(thr), binw, fired
+    valid = torch.arange(G, device=logits.device) < plen
+    fired = ((logits[b] > thr) & arch & valid).nonzero().flatten()
+    return kg, float(thr), float((ks.max() - ks.min()) / 256), fired
+
+
+def _cold(G, kg, n_hot, dev, seed):
+    """Logits where the kept groups dominate and exactly n_hot archive groups
+    beat them: a lane that recalls a known set without overflowing."""
+    g = torch.Generator(device=dev).manual_seed(seed)
+    lg = torch.randn(G, device=dev, generator=g) - 3.0
+    lg[kg] = torch.randn(len(kg), device=dev, generator=g) + 2.0
+    pool = torch.randperm(T // POOL - 80, device=dev, generator=g)
+    keep = set(kg.tolist())
+    hot = torch.tensor([x for x in pool.tolist() if x not in keep][:n_hot], device=dev)
+    lg[hot] = 8.0
+    return lg, hot
+
+
+def _positions(rows, r2t, slot):
+    """The request positions of physical rows, by inverting this slot's r2t."""
+    return torch.tensor(
+        [(r2t[slot] == r).nonzero()[0, 0].item() for r in rows.tolist()],
+        device=rows.device,
+    )
+
+
+def _fired_by(logits_row, thr, kg, G, plen, dev):
+    arch = torch.ones(G, dtype=torch.bool, device=dev)
+    arch[kg] = False
+    valid = torch.arange(G, device=dev) < plen
+    return ((logits_row > thr) & arch & valid).nonzero().flatten()
 
 
 class TestBranchOperators(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_kept_mask_and_threshold(self):
-        dev, r2t, page_table, G, pool_lens, kept_pos, kept, klen = _request(0)
+        dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(0, 2)])
         logits = torch.randn(1, G, device=dev)
         for q in (0.9, 0.75, 0.5):
-            sc, fb, fl, fo = _run(dev, r2t, page_table, G, pool_lens, kept, klen, logits, q)
-            kg, thr, binw, _ = _reference(logits, kept_pos, G, q, pool_lens)
-            km_ref = torch.zeros(G, dtype=torch.bool, device=dev)
-            km_ref[kg] = True
-            self.assertTrue(torch.equal(sc["km"][0].bool(), km_ref))
+            sc = _scratch(1, G)
+            _run(sc, logits, plen, slots, kept, klen, r2t, q)
+            _, thr, binw, _ = _exact(logits, 0, kepts[0], G, q, int(plen[0]))
+            # km is reset by its last reader, so it is zero AFTER the call; the
+            # mask is checked through the threshold it produced, which is a
+            # function of exactly the kept groups' logits.
+            self.assertTrue(torch.equal(sc["km"][0], torch.zeros_like(sc["km"][0])))
             got = float(sc["thr"][0])
-            self.assertLessEqual(got, thr + 1e-6)          # never above the exact quantile
+            self.assertLessEqual(got, thr + 1e-6)            # never above the exact quantile
             self.assertGreaterEqual(got, thr - binw - 1e-6)  # by at most one bin
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_below_budget_fetches_exactly_the_fired_groups(self):
-        dev, r2t, page_table, G, pool_lens, kept_pos, kept, klen = _request(1)
-        kg = (kept_pos // POOL).unique()
-        logits = torch.randn(1, G, device=dev) - 3.0
-        logits[0, kg] = torch.randn(len(kg), device=dev) + 2.0
-        hot = torch.tensor([g for g in torch.randperm(T // POOL - 80, device=dev)[:300].tolist()
-                            if g not in set(kg.tolist())][:50], device=dev)
-        logits[0, hot] = 8.0
-        sc, fb, fl, fo = _run(dev, r2t, page_table, G, pool_lens, kept, klen, logits, 0.75)
-        n, ovf = int(fl[2]), int(fo[2])
-        self.assertEqual(ovf, 0)
-        thr = float(sc["thr"][0])
-        valid = torch.arange(G, device=dev) < int(pool_lens[0])
-        arch = torch.ones(G, dtype=torch.bool, device=dev)
-        arch[kg] = False
-        fired = ((logits[0] > thr) & arch & valid).nonzero().flatten()
-        self.assertEqual(n, 4 * fired.numel())
-        rows = fb[2, :n].to(torch.int64)
-        pos = torch.tensor([(r2t[2] == r).nonzero()[0, 0].item() for r in rows.tolist()], device=dev)
-        self.assertEqual(sorted(set((pos // POOL).tolist())), sorted(fired.tolist()))
-        self.assertTrue(torch.isin(hot, pos // POOL).all())
-        # every fetched row's group is a fired group, 4 rows each, none kept
-        self.assertEqual(len(set(pos.tolist()) & set(kept_pos.tolist())), 0)
+    def test_below_the_trigger_fetches_exactly_the_fired_groups(self):
+        dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(1, 2)])
+        kg = _kept_groups(kepts[0])
+        logits, hot = _cold(G, kg, 50, dev, 7)
+        sc = _scratch(1, G)
+        fb, fl, fo = _run(sc, logits[None], plen, slots, kept, klen, r2t, 0.75)
+        n = int(fl[2])
+        self.assertEqual(int(fo[2]), 0)
+        fired = _fired_by(logits, float(sc["thr"][0]), kg, G, int(plen[0]), dev)
+        self.assertEqual(n, POOL * fired.numel())
+        p = _positions(fb[2, :n].to(torch.int64), r2t, 2)
+        self.assertEqual(sorted(set((p // POOL).tolist())), sorted(fired.tolist()))
+        self.assertEqual(p.numel(), POOL * fired.numel())
+        self.assertEqual(len(set(p.tolist()) & set(kepts[0].tolist())), 0)
+        self.assertTrue(torch.isin(hot, p // POOL).all())
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_past_the_budget_the_lane_is_fenced(self):
-        dev, r2t, page_table, G, pool_lens, kept_pos, kept, klen = _request(2)
-        logits = torch.randn(1, G, device=dev)  # archive as hot as kept: thousands fire
-        sc, fb, fl, fo = _run(dev, r2t, page_table, G, pool_lens, kept, klen, logits, 0.75)
+    def test_past_the_trigger_the_lane_is_fenced(self):
+        dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(2, 2)])
+        logits = torch.randn(1, G, device=dev)  # archive as hot as kept
+        sc = _scratch(1, G)
+        fb, fl, fo = _run(sc, logits, plen, slots, kept, klen, r2t, 0.75)
         self.assertEqual(int(fo[2]), 1)
         self.assertEqual(int(fl[2]), 0)
-        # and with a low fence trigger a modest fire fences too
-        logits = torch.randn(1, G, device=dev) - 3.0
-        kg = (kept_pos // POOL).unique()
-        logits[0, kg] = torch.randn(len(kg), device=dev) + 2.0
-        hot = torch.tensor([g for g in torch.randperm(T // POOL - 80, device=dev)[:300].tolist()
-                            if g not in set(kg.tolist())][:50], device=dev)
-        logits[0, hot] = 8.0
-        sc, fb, fl, fo = _run(dev, r2t, page_table, G, pool_lens, kept, klen, logits, 0.75, fence_groups=16)
+        # and a modest fire fences too when the trigger is lowered
+        logits, _ = _cold(G, _kept_groups(kepts[0]), 50, dev, 11)
+        sc = _scratch(1, G, fence_groups=16)
+        fb, fl, fo = _run(sc, logits[None], plen, slots, kept, klen, r2t, 0.75,
+                          fence_groups=16)
         self.assertEqual(int(fo[2]), 1)
         self.assertEqual(int(fl[2]), 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_the_scratch_is_reusable_without_a_host_memset(self):
+        # The histogram, range and counts are reset by the kernels themselves,
+        # so call N+1 on one scratch must equal call 1. A missed reset shows up
+        # as a drifting threshold, which no single call can reveal.
+        dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(3, 2)])
+        logits, _ = _cold(G, _kept_groups(kepts[0]), 40, dev, 13)
+        sc = _scratch(1, G)
+        first = None
+        for _ in range(4):
+            fb, fl, fo = _run(sc, logits[None], plen, slots, kept, klen, r2t, 0.75)
+            cur = (float(sc["thr"][0]), int(fl[2]), int(fo[2]),
+                   fb[2, : int(fl[2])].clone())
+            if first is None:
+                first = cur
+            else:
+                self.assertEqual(cur[:3], first[:3])
+                self.assertTrue(torch.equal(cur[3], first[3]))
+
+
+class TestBranchMixedBatch(CustomTestCase):
+    """Two lanes, one call: the fallback and the recall are arms of one kernel,
+    so a batch may take both."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_one_lane_fences_while_the_other_recalls(self):
+        dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(4, 1), (5, 2)])
+        hot_lane = torch.randn(G, device=dev)                            # fences
+        cold_lane, hot = _cold(G, _kept_groups(kepts[1]), 30, dev, 17)   # recalls
+        logits = torch.stack([hot_lane, cold_lane])
+        sc = _scratch(2, G)
+        fb, fl, fo = _run(sc, logits, plen, slots, kept, klen, r2t, 0.75)
+
+        self.assertEqual(int(fo[1]), 1)
+        self.assertEqual(int(fl[1]), 0)
+        self.assertEqual(int(fo[2]), 0)
+        n = int(fl[2])
+        self.assertGreater(n, 0)
+        self.assertEqual(n % POOL, 0)
+
+        fired = _fired_by(cold_lane, float(sc["thr"][1]), _kept_groups(kepts[1]),
+                          G, int(plen[1]), dev)
+        self.assertEqual(n, POOL * fired.numel())
+        p = _positions(fb[2, :n].to(torch.int64), r2t, 2)
+        self.assertEqual(sorted(set((p // POOL).tolist())), sorted(fired.tolist()))
+        self.assertTrue(torch.isin(hot, p // POOL).all())
+        # the fenced lane's buffer was not written by the recalling lane
+        self.assertTrue(torch.equal(fb[1], torch.zeros_like(fb[1])))
 
 
 if __name__ == "__main__":

@@ -101,6 +101,11 @@ def _no_bucket(_name):
     """The prefill breakdown's off state; see SGLANG_DEBUG_VESTIGEKV_PREFILL_MS."""
 
 
+def _all_positions(row_slots):
+    """0..n-1: the request-relative positions of a dense row set."""
+    return torch.arange(row_slots.shape[0], device=row_slots.device)
+
+
 class VestigeKVDSABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.
 
@@ -291,6 +296,7 @@ class VestigeKVDSABackend(AttentionBackend):
         # (one sync there is free); decode refresh is then pure GPU ops, no
         # host sync on the critical path.
         self._kept_buf: dict = {}  # lid -> [max_reqs, cap] fm.kv_indices dtype
+        self._kept_pos: dict = {}  # lid -> [max_reqs, cap]: positions of those rows
         self._kept_len: dict = {}
         self._kmax: dict = {}  # lid -> host-side upper bound on kept_len
         self._close_state: dict = {}  # (slot, lid) -> {closed, sigma}
@@ -1419,13 +1425,16 @@ class VestigeKVDSABackend(AttentionBackend):
             # per close (8 times instead of 64 on a 32k prompt).
             closed_now = self._closed_for(seq_len)
             if cl.get("kept_n") is not None and cl.get("kept_closed") == closed_now:
-                n = self._append_kept(lid, slot, cl["kept_n"], row_slots[prev_seq:seq_len])
+                n = self._append_kept(
+                    lid, slot, cl["kept_n"], row_slots[prev_seq:seq_len],
+                    torch.arange(prev_seq, seq_len, device=row_slots.device),
+                )
             else:
-                kept = self._arm_aware_kept(
+                kept, kept_pos = self._arm_aware_kept(
                     row_slots, kbuf, seq_len, layer.v_head_dim, lid=lid, sigma=cl["sigma"]
                 )
                 _tm("kept")
-                n = self._write_kept(lid, slot, kept)
+                n = self._write_kept(lid, slot, kept, kept_pos)
             cl["kept_n"], cl["kept_closed"] = n, closed_now
             _tm("write")
             # Arm decode-time closes: the prefix counts as closed (ranked).
@@ -1610,7 +1619,7 @@ class VestigeKVDSABackend(AttentionBackend):
             return 0
         return (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
 
-    def _append_kept(self, lid, slot, n_prev: int, rows) -> int:
+    def _append_kept(self, lid, slot, n_prev: int, rows, pos) -> int:
         """Extend a kept table by the rows this chunk added to the tail."""
         buf = self._kept_buf[lid]
         k = rows.numel()
@@ -1623,10 +1632,11 @@ class VestigeKVDSABackend(AttentionBackend):
                 f"{n} requested (layer {lid}, slot {slot})"
             )
         buf[slot, n_prev:n] = rows.to(buf.dtype)
+        self._kept_pos[lid][slot, n_prev:n] = pos.to(buf.dtype)
         self._kept_len[lid][slot : slot + 1].fill_(n)
         return n
 
-    def _write_kept(self, lid, slot, rows) -> int:
+    def _write_kept(self, lid, slot, rows, pos) -> int:
         # The one host-side writer of a kept-table row; the in-graph CSR
         # append is the other and is bounded by the close cadence (_kept_cap).
         buf = self._kept_buf[lid]
@@ -1639,6 +1649,9 @@ class VestigeKVDSABackend(AttentionBackend):
                 "to serve dense row sets"
             )
         buf[slot, :n] = rows.to(buf.dtype)
+        # The parallel position table: the branch rule reads it instead of
+        # inverting the page table (dsa_branch).
+        self._kept_pos[lid][slot, :n] = pos.to(buf.dtype)
         self._kept_len[lid][slot : slot + 1].fill_(n)
         return n
 
@@ -1654,11 +1667,19 @@ class VestigeKVDSABackend(AttentionBackend):
         self._kept_stack = torch.zeros(
             n, max_reqs + 1, cap, dtype=D.INDEX_DTYPE, device=dev
         )
+        # Parallel to the kept table, same shape: the request-relative POSITION
+        # of each kept row. The branch rule needs the position and the table
+        # stores the physical row; recording it here costs one int32 per kept
+        # row and removes a page-table inversion from every decode step.
+        self._kept_pos_stack = torch.zeros(
+            n, max_reqs + 1, cap, dtype=D.INDEX_DTYPE, device=dev
+        )
         self._kept_len_stack = torch.zeros(
             n, max_reqs + 1, dtype=D.INDEX_DTYPE, device=dev
         )
         for lid, i in li_map.items():
             self._kept_buf[lid] = self._kept_stack[i]
+            self._kept_pos[lid] = self._kept_pos_stack[i]
             self._kept_len[lid] = self._kept_len_stack[i]
 
     def _alloc_recall_bufs(self, lid, max_reqs, dev):
@@ -1912,18 +1933,20 @@ class VestigeKVDSABackend(AttentionBackend):
         if rec is not None and weights is not None:
             rec["w"] = weights.detach()
 
-    def group_fetch(self, *, layer_id, logits, pool_lens, page_table, forward_batch):
+    def group_fetch(self, *, layer_id, logits, pool_lens, forward_batch):
         """Tier 2 under the branch rule (SGLANG_VESTIGEKV_BRANCH_Q): fire every
         archive GROUP of DSA's pooled index whose logit beats the q-quantile
         of the kept groups' logits; a step firing more groups than the fence
-        trigger raises the overflow flag and the NEXT step's pack fences the
-        lane to DSA's own top-k (fork: a fenced lane attends the indexer's
-        selection and nothing else). No top-k of ours and no sketch: the
-        operators are vestigekv/dsa_branch.py (threshold off a histogram of
-        the kept groups' logits, fire mask, the Kimi line's compaction), all
-        fixed-shape so the decode graph captures them. Stale by one step, like
-        the scan this replaces. Groups holding a kept row are excluded: the
-        pack concatenates kept and fetched rows without dedup.
+        trigger raises the overflow flag and the pack fences the lane to DSA's
+        own top-k (fork: a fenced lane attends the indexer's selection and NOT
+        the kept rows). No top-k of ours and no sketch: the operators are
+        vestigekv/dsa_branch.py, all fixed-shape so the decode graph captures
+        them. NOT stale by one, unlike the sketch scan this replaces: the
+        indexer runs before the attention within a layer's forward, so the rows
+        written here are consumed by this same step's fork -- which is also why
+        DSA's own top-k cannot be skipped on the strength of last step's fence
+        count. Groups holding a kept row are excluded: the pack concatenates
+        kept and fetched rows without dedup.
         """
         q = self._branch_q()
         if q is None or layer_id not in self._qbuf or self._full_arm():
@@ -1936,9 +1959,8 @@ class VestigeKVDSABackend(AttentionBackend):
         branch_fire(
             logits=logits,
             pool_lens=pool_lens[:bs],
-            page_table=page_table[:bs],
             slots=slots,
-            kept=self._kept_stack[li],
+            kept_pos=self._kept_pos_stack[li],
             klen=self._kept_len_stack[li],
             q=q,
             scratch=self._branch_scratch(bs, logits.device, G=G),
@@ -1947,7 +1969,6 @@ class VestigeKVDSABackend(AttentionBackend):
             fetch_ovf=self._fetch_ovf_stack[li],
             r2t=self.req_to_token_pool.req_to_token,
             pool=self._text_cfg_index_kpool,
-            page_size=self.token_to_kv_pool.page_size,
             fence_groups=envs.SGLANG_VESTIGEKV_BRANCH_FENCE_GROUPS.get(),
         )
 
@@ -1959,15 +1980,11 @@ class VestigeKVDSABackend(AttentionBackend):
         key = (bs, G)
         d = self.__dict__.setdefault("_branch_scratch_bufs", {})
         if key not in d:
-            pool_tokens = getattr(self.token_to_kv_pool, "size", None)
-            r2t = self.req_to_token_pool.req_to_token
-            if not isinstance(pool_tokens, int) or pool_tokens <= 0:
-                pool_tokens = r2t.shape[0] * r2t.shape[1]
             d[key] = branch_scratch(
-                bs=bs, G=G, nslot=r2t.shape[0], fetch_w=self._fetch_w,
-                pool=self._text_cfg_index_kpool,
+                bs=bs, G=G, nslot=self.req_to_token_pool.req_to_token.shape[0],
+                fetch_w=self._fetch_w, pool=self._text_cfg_index_kpool,
                 fence_groups=envs.SGLANG_VESTIGEKV_BRANCH_FENCE_GROUPS.get(),
-                dev=dev, n_pages=pool_tokens // self.token_to_kv_pool.page_size + 2,
+                dev=dev,
             )
         return d[key]
 
@@ -2106,6 +2123,9 @@ class VestigeKVDSABackend(AttentionBackend):
         cl["sigmaed"] = target
 
     def _arm_aware_kept(self, row_slots, kbuf, seq_len, v_dim, lid=None, sigma=None):
+        # Returns (rows, positions): the positions are what lets a consumer go
+        # from a kept row back to its request-relative index without inverting
+        # the page table, and every branch here has them for free.
         # The kept row set for one request, shared by the bs==1 kept-table build
         # and the bs>1 tier-2 build so both honor the same arm. Benchmark arm
         # switch, read per prefill: /tmp/vestige_full present -> FULL prefix (arm
@@ -2114,7 +2134,7 @@ class VestigeKVDSABackend(AttentionBackend):
         if self._full_arm() or self._ingraph_dead:
             # FULL arm, or the in-graph pack was disabled (capacity defect):
             # dense is the only safe row set when nothing will recall.
-            return row_slots
+            return row_slots, _all_positions(row_slots)
         if seq_len < self.config.activation_min_tokens:
             # Below the activation threshold the recall pipeline's fixed
             # per-step cost outweighs anything tier 1 could save: keep every
@@ -2122,7 +2142,7 @@ class VestigeKVDSABackend(AttentionBackend):
             # Crossing the threshold closes the whole prefix in one pass, and
             # the global top-m rebalance commutes with close order, so the
             # kept set then is identical to having compressed from the start.
-            return row_slots
+            return row_slots, _all_positions(row_slots)
         # BLOCKWISE sigma (reference policy semantics): only full CLOSE_BLOCK
         # windows are closed and ranked; the remainder is the unclosed tail,
         # unconditionally attended -- it subsumes the recent-window role
@@ -2132,7 +2152,8 @@ class VestigeKVDSABackend(AttentionBackend):
         # ever have needed an incremental FFT.
         closed = (seq_len // D.CLOSE_BLOCK) * D.CLOSE_BLOCK
         if closed == 0:
-            return row_slots  # too short to close anything: attend everything
+            # too short to close anything: attend everything
+            return row_slots, _all_positions(row_slots)
         # Spec conformance (found by the fused kernel's fixed 64-dim shape):
         # this call sliced [:, v_head_dim:] -- 448 dims at prefill, where the
         # un-absorbed layer has v_head_dim=128 -- while the decode-time close
@@ -2146,7 +2167,8 @@ class VestigeKVDSABackend(AttentionBackend):
         if sigma is None:
             sigma = self._block_sigma(kbuf, row_slots, lid=lid)
         return kept_rows(
-            sigma[:closed], row_slots, rho=self.rho, closed=closed, sinks=D.SINKS
+            sigma[:closed], row_slots, rho=self.rho, closed=closed, sinks=D.SINKS,
+            return_pos=True,
         )
 
     # ---- decode: evict (tier-1) + recall (tier-2), both unconditional ----
@@ -2703,7 +2725,10 @@ class VestigeKVDSABackend(AttentionBackend):
                 continue
             for i in range(real):
                 slot, n = reqs[i], int(lens[i])
-                self._write_kept(lid, slot, r2t[slot, :n])
+                self._write_kept(
+                    lid, slot, r2t[slot, :n],
+                    torch.arange(n, device=r2t.device),
+                )
 
     def _recall_step(self, lid, forward_batch, reqs):
         # Per-step recall: a required part of the algorithm, with no switch.
@@ -2856,7 +2881,13 @@ class VestigeKVDSABackend(AttentionBackend):
         kept_slots = closed_slots[keep]
         tail_slots = r2t[slot, c1:seq_len].to(torch.int64)
         new_kept = torch.cat([kept_slots, tail_slots])
-        n = self._write_kept(lid, slot, new_kept)
+        # keep.nonzero() adds no sync this path does not already pay: the
+        # closed_slots[keep] gather above is already data-dependent in shape.
+        new_pos = torch.cat([
+            keep.nonzero().flatten(),
+            torch.arange(c1, seq_len, device=keep.device),
+        ])
+        n = self._write_kept(lid, slot, new_kept, new_pos)
         # exact host-side bound: the close is the one place kept_len is fully
         # known on the host again, so the +1-per-step estimate resets here
         self._kmax[lid] = max(self._kmax.get(lid, 0), n)
