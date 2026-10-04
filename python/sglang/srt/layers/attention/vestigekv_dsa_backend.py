@@ -543,7 +543,7 @@ class VestigeKVDSABackend(AttentionBackend):
         reqs, _ = self._decode_prologue(forward_batch)
         for lid in self._local_mla_lids:
             self._recall_step(lid, forward_batch, reqs)
-        self._append_step_row(forward_batch)
+            self._refresh_graph_bufs(lid, forward_batch, reqs)
         # The eager step never reaches _account_step, so the recall audit's
         # host read has to be issued from here or it is never issued at all.
         self._eager_steps += 1
@@ -613,7 +613,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 return
             for lid in self._mla_lids:
                 self._recall_step(lid, forward_batch, reqs)
-            self._append_step_row(forward_batch)
+                self._refresh_graph_bufs(lid, forward_batch, reqs)
 
     def _out_graph_metadata_lite(self, forward_batch) -> bool:
         """Replay-prep without the dense kv_indices fill (in-graph decode).
@@ -765,7 +765,7 @@ class VestigeKVDSABackend(AttentionBackend):
         replayed = False
         for lid in self._mla_lids:
             self._recall_step(lid, forward_batch, reqs)
-        self._append_step_row(forward_batch)
+            self._refresh_graph_bufs(lid, forward_batch, reqs)
         tl = _t.perf_counter()  # queue drained on entry -> t0..tl is pure
         torch.cuda.synchronize()  # host dispatch; tl..t1 is GPU-bound tail
         t1 = _t.perf_counter()
@@ -1387,26 +1387,124 @@ class VestigeKVDSABackend(AttentionBackend):
             return 0
         return (seq_len // self.close_block) * self.close_block
 
-    def _append_step_row(self, forward_batch):
-        """This step's new pool row, appended to every layer's kept table.
-
-        The deleted CSR pack carried this append (see dsa_branch.kept_append);
-        without it the kept table stops growing between closes. One launch for
-        all layers: each layer's table is independent, so batching the appends
-        after the per-layer recall loop is equivalent to the old interleaving.
-        """
-        from sglang.srt.layers.attention.vestigekv.dsa_branch import kept_append
-
-        if self._kept_stack is None:
-            return
+    def _refresh_graph_bufs(self, lid, forward_batch, reqs):
+        bs = forward_batch.seq_lens.shape[0]
         loc = forward_batch.out_cache_loc
         real_bs = loc.shape[0]
-        kept_append(
-            slots=forward_batch.req_pool_indices[:real_bs].to(torch.int64),
-            loc=loc,
-            kept_stack=self._kept_stack,
-            klen_stack=self._kept_len_stack,
+        slots = forward_batch.req_pool_indices[:real_bs].to(torch.int64)
+        self._pack_csr(
+            lid,
+            slots,
+            loc,
+            real_bs,
+            bs,
+            self._kmax_step(lid),
+            dense=self._dense_rows(lid, forward_batch, slots, loc, reqs),
         )
+
+    def _pack_csr(self, lid, slots, loc, real_bs, bs, kmax, dense=None):
+        # Eager step: append this step's slot to each request's kept table,
+        # then repack the CSR into the fixed-address buffers the decode graph
+        # reads. Vectorized (~12 tensor ops per layer); the previous
+        # per-request python loop cost ~4 ms/step at bs=16. `dense` (rows
+        # [real_bs, seqmax], seq [real_bs], fenced [real_bs]) is the overflow
+        # fence: a fenced lane packs its full row set in place of kept +
+        # fetched; the append stands either way.
+        # seq_lens is padded to the captured graph bs; out_cache_loc carries only
+        # the real (unpadded) requests -- see build_replay_fb_view. Padded CSR
+        # slots get one reserved pad row (slot 0); their output is discarded.
+        bufs = self._graph_bufs[lid]
+        kept_buf, kept_len = self._kept_buf[lid], self._kept_len[lid]
+        cap = kept_buf.shape[1]
+        # batched append of this step's slot: kept_buf[slot, n_slot] = loc;
+        # kept_len[slot] += 1. This is the ONE append per step on every live
+        # path (the in-graph pack's prep kernel owns it there).
+        dev = kept_buf.device
+        n = kept_len.gather(0, slots)
+        kept_buf.view(-1).scatter_(
+            0, (slots * cap + n).to(torch.int64), loc.to(kept_buf.dtype)
+        )
+        lens = n + 1
+        kept_len.scatter_(0, slots, lens)
+        # pack: gather each request's kept rows [slot, :len] plus its fired
+        # recall rows [slot, :fetch_len] into one contiguous CSR. Intra-request
+        # order is irrelevant (NoPE multiset invariance), so the two segments
+        # concatenate per request.
+        #
+        # Every shape here is a host-side constant and every offset is computed
+        # on the device: the previous form read back lens.max(), f_lens.max()
+        # and lens_tot.sum(), and selected with a boolean mask (a fourth,
+        # implicit readback), which is 4 pipeline drains per layer -- 3.5 of the
+        # 4.5 ms/step of host-side cost once the tier-2 scan was captured
+        # (VKSTATS, S=64k bs=1). Masked-out entries scatter into the trash slot
+        # reserved at the end of the indices buffer.
+        if lid in self._fetch_len:
+            f_lens = self._fetch_len[lid].gather(0, slots)
+            fw = self._fetch_buf[lid].shape[1]
+            fetch_flat = self._fetch_buf[lid].view(-1)
+        else:  # recall buffers not allocated (unit fakes): zero-fetch
+            f_lens = torch.zeros_like(lens)
+            fw = 0
+            fetch_flat = None
+        lens_tot = (lens + f_lens).to(torch.int64)
+        packed = True  # lanes packing kept + fetched (all of them, unfenced)
+        if dense is not None:
+            d_rows, d_len, fenced = dense
+            lens_tot = torch.where(fenced, d_len, lens_tot)
+            packed = ~fenced[:, None]
+        starts = torch.zeros_like(lens_tot)
+        starts[1:] = lens_tot.cumsum(0)[:-1]
+        total = lens_tot.sum()
+        trash = bufs["indices"].shape[0] - 1
+
+        col = torch.arange(kmax, device=dev)
+        src = (
+            kept_buf.view(-1)
+            .gather(0, (slots[:, None] * cap + col[None, :]).reshape(-1))
+            .view(real_bs, kmax)
+        )
+        dst = torch.where(
+            (col[None, :] < lens[:, None]) & packed,
+            starts[:, None] + col[None, :],
+            trash,
+        )
+        if fw:
+            fcol = torch.arange(fw, device=dev)
+            src_f = fetch_flat.gather(
+                0, (slots[:, None] * fw + fcol[None, :]).reshape(-1)
+            ).view(real_bs, fw)
+            dst_f = torch.where(
+                (fcol[None, :] < f_lens[:, None]) & packed,
+                starts[:, None] + lens[:, None] + fcol[None, :],
+                trash,
+            )
+            src = torch.cat([src.reshape(-1), src_f.reshape(-1)])
+            dst = torch.cat([dst.reshape(-1), dst_f.reshape(-1)])
+        if dense is not None:
+            dcol = torch.arange(d_rows.shape[1], device=dev)
+            dst_d = torch.where(
+                (dcol[None, :] < d_len[:, None]) & fenced[:, None],
+                starts[:, None] + dcol[None, :],
+                trash,
+            )
+            src = torch.cat([src.reshape(-1), d_rows.reshape(-1).to(src.dtype)])
+            dst = torch.cat([dst.reshape(-1), dst_d.reshape(-1)])
+        bufs["indices"].scatter_(
+            0, dst.reshape(-1), src.reshape(-1).to(bufs["indices"].dtype)
+        )
+        n_pad = bs - real_bs
+        if n_pad > 0:
+            pad_dst = total + torch.arange(n_pad, device=dev)
+            bufs["indices"].scatter_(
+                0, pad_dst, torch.zeros(n_pad, dtype=kept_buf.dtype, device=dev)
+            )
+        indptr = torch.zeros(bs + 1, dtype=torch.int64, device=dev)
+        indptr[1 : real_bs + 1] = lens_tot.cumsum(0)
+        if n_pad > 0:
+            indptr[real_bs + 1 :] = total + torch.arange(1, n_pad + 1, device=dev)
+        bufs["indptr"][: bs + 1].copy_(indptr)
+        bufs["indptr"][bs + 1 :] = total + n_pad
+
 
     def _append_kept(self, lid, slot, n_prev: int, rows, pos) -> int:
         """Extend a kept table by the rows this chunk added to the tail."""
