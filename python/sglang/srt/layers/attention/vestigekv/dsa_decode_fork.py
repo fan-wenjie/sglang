@@ -40,6 +40,126 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
 
 
 @triton.jit
+def _vk_dsa_row_loop(
+    acc0, acc1, acc2, acc3, m_i, l_i,
+    q0, q1, q2, q3, q_tail,
+    kv_ptr, vk_topk, vk_r2t, vk_kept_buf, vk_fetch_buf,
+    t, slot_t, loc_t, nk, n_t, seq_t,
+    tile_start, tile_end, qk_scale, fp8_max,
+    H: tl.constexpr, KV_DIM: tl.constexpr, D_V: tl.constexpr,
+    D_TAIL: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    USE_FP8_DOT: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_K: tl.constexpr,
+    VK_CAP: tl.constexpr, VK_FW: tl.constexpr, VK_R2T: tl.constexpr,
+    VK_TOPK: tl.constexpr, FENCED: tl.constexpr,
+):
+    """One pass over a lane's rows. FENCED picks where a row id comes from and is
+    the only difference between the two arms; the attention math below it is the
+    same, so it is written once and Triton inlines a specialised copy per call
+    site -- the shape decode_fork.py uses for its own two arms.
+
+    Why not one loop with tl.where over three predicated loads, which is what
+    this kernel did before: all three arms' address tensors then stay live
+    across the loop and NEITHER arm can be specialised. Giving the fallback its
+    own code lets the compiler drop the kept/fetch addressing, the `k_pos < nk`
+    split and the nested select from it entirely, and the recall arm loses the
+    selection load in turn (.claude/rules/disassemble-check-for-spills.md: the
+    arms must be separate code when one exists to REMOVE an instruction, and
+    the branch must sit outside the loop).
+    """
+    g = tl.arange(0, _G)
+    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+    if USE_FP8_DOT:
+        p_dot_scale = 1.0 / fp8_max
+    else:
+        p_dot_scale = 1.0
+    neg_large = -3.4028234663852886e38
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
+    k_offs = tl.arange(0, BLOCK_K)
+    # num_stages=2, not DSA's 3: duplicating the body for the two arms costs
+    # registers, and at 3 stages it spills (REG 255, STACK 80, LDL 36/STL 23)
+    # and the recall arm loses 5%. At 2 it is REG 200 STACK 0 and the recall
+    # arm GAINS 9% over the single value-select loop (6.07 -> 5.51 us at
+    # 1120+473 rows). Lowering stages alone makes the single loop worse
+    # (6.07 -> 6.78), so the two changes only pay together. stages=1 ties on
+    # recall and is faster fenced (3.02) but sits at REG 254, one change from
+    # the cliff.
+    for j in tl.range(tile_start, tile_end, num_stages=2):
+        k_start = j * BLOCK_K
+        k_pos = k_start + k_offs
+        valid = k_pos < n_t
+
+        # ---- the row source: ONE arm's worth, nothing predicated off ----
+        if FENCED:
+            if VK_TOPK > 0:
+                slot = tl.load(vk_topk + t * VK_TOPK + k_pos, mask=valid, other=-1)
+            else:
+                slot = tl.load(
+                    vk_r2t + slot_t * VK_R2T + k_pos, mask=valid, other=-1
+                )
+                slot = tl.where(k_pos == seq_t - 1, loc_t.to(slot.dtype), slot)
+        else:
+            kept = tl.load(
+                vk_kept_buf + slot_t * VK_CAP + k_pos,
+                mask=valid & (k_pos < nk),
+                other=-1,
+            )
+            fired = tl.load(
+                vk_fetch_buf + slot_t * VK_FW + (k_pos - nk),
+                mask=valid & (k_pos >= nk),
+                other=-1,
+            )
+            slot = tl.where(k_pos < nk, kept, fired)
+        valid = valid & (slot >= 0)
+        page = tl.where(valid, slot, 0).to(tl.int64)
+
+        kv_base = kv_ptr + page[:, None] * KV_DIM
+        kv0 = tl.load(kv_base + g[None, :], mask=valid[:, None], other=0.0).to(input_type)
+        if NUM_GROUPS >= 2:
+            kv1 = tl.load(kv_base + (_G + g)[None, :], mask=valid[:, None], other=0.0).to(input_type)
+        if NUM_GROUPS >= 3:
+            kv2 = tl.load(kv_base + (2 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(input_type)
+        if NUM_GROUPS >= 4:
+            kv3 = tl.load(kv_base + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(input_type)
+
+        scores = tl.dot(q0, tl.trans(kv0))
+        if NUM_GROUPS >= 2:
+            scores += tl.dot(q1, tl.trans(kv1))
+        if NUM_GROUPS >= 3:
+            scores += tl.dot(q2, tl.trans(kv2))
+        if NUM_GROUPS >= 4:
+            scores += tl.dot(q3, tl.trans(kv3))
+        if D_TAIL > 0:
+            kv_tail = tl.load(
+                kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+            ).to(input_type)
+            scores += tl.dot(q_tail, tl.trans(kv_tail))
+        scores = scores * qk_scale
+        scores = tl.where(valid[None, :], scores, neg_large)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(scores - m_new[:, None])
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        if USE_FP8_DOT:
+            p_dot = (p * fp8_max).to(input_type)
+        else:
+            p_dot = p.to(input_type)
+        acc0 = acc0 * alpha[:, None] + tl.dot(p_dot, kv0).to(tl.float32) * p_dot_scale
+        if NUM_GROUPS >= 2:
+            acc1 = acc1 * alpha[:, None] + tl.dot(p_dot, kv1).to(tl.float32) * p_dot_scale
+        if NUM_GROUPS >= 3:
+            acc2 = acc2 * alpha[:, None] + tl.dot(p_dot, kv2).to(tl.float32) * p_dot_scale
+        if NUM_GROUPS >= 4:
+            acc3 = acc3 * alpha[:, None] + tl.dot(p_dot, kv3).to(tl.float32) * p_dot_scale
+        m_i = m_new
+        l_i = l_new
+    return acc0, acc1, acc2, acc3, m_i, l_i
+
+
+@triton.jit
 def _vk_dsa_decode_split_kernel(
     q_nope_ptr,  # [N, H, D_V]
     q_rope_ptr,  # [N, H, D_TAIL]
@@ -177,75 +297,43 @@ def _vk_dsa_decode_split_kernel(
     if NUM_GROUPS >= 4:
         acc3 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
 
-    k_offs = tl.arange(0, BLOCK_K)
-    for j in tl.range(tile_start, tile_end, num_stages=3):
-        k_start = j * BLOCK_K
-        k_pos = k_start + k_offs
-        valid = k_pos < n_t
-
-        # ---- the row source (the fork's third change) ----
-        if VK_TOPK > 0:
-            sel = tl.load(vk_topk + t * VK_TOPK + k_pos, mask=valid & fenced, other=-1)
-        else:
-            sel = tl.load(vk_r2t + slot_t * VK_R2T + k_pos, mask=valid & fenced, other=-1)
-            sel = tl.where(k_pos == seq_t - 1, loc_t.to(sel.dtype), sel)
-        kept = tl.load(
-            vk_kept_buf + slot_t * VK_CAP + k_pos,
-            mask=valid & (k_pos < nk) & (not fenced),
-            other=-1,
+    # The accumulators the inactive groups never use, and q_tail when this
+    # geometry has no tail, are passed and never read: a jit helper's signature
+    # is fixed while NUM_GROUPS and D_TAIL are not (decode_fork.py does the same).
+    if NUM_GROUPS < 2:
+        acc1 = acc0
+    if NUM_GROUPS < 3:
+        acc2 = acc0
+    if NUM_GROUPS < 4:
+        acc3 = acc0
+    if NUM_GROUPS < 2:
+        q1 = q0
+    if NUM_GROUPS < 3:
+        q2 = q0
+    if NUM_GROUPS < 4:
+        q3 = q0
+    if D_TAIL == 0:
+        q_tail = q0
+    if fenced:
+        acc0, acc1, acc2, acc3, m_i, l_i = _vk_dsa_row_loop(
+            acc0, acc1, acc2, acc3, m_i, l_i, q0, q1, q2, q3, q_tail,
+            kv_ptr, vk_topk, vk_r2t, vk_kept_buf, vk_fetch_buf,
+            t, slot_t, loc_t, nk, n_t, seq_t, tile_start, tile_end, qk_scale, fp8_max,
+            H=H, KV_DIM=KV_DIM, D_V=D_V, D_TAIL=D_TAIL, NUM_GROUPS=NUM_GROUPS,
+            USE_FP8_DOT=USE_FP8_DOT, BLOCK_H=BLOCK_H, BLOCK_K=BLOCK_K,
+            VK_CAP=VK_CAP, VK_FW=VK_FW, VK_R2T=VK_R2T, VK_TOPK=VK_TOPK,
+            FENCED=True,
         )
-        fired = tl.load(
-            vk_fetch_buf + slot_t * VK_FW + (k_pos - nk),
-            mask=valid & (k_pos >= nk) & (not fenced),
-            other=-1,
+    else:
+        acc0, acc1, acc2, acc3, m_i, l_i = _vk_dsa_row_loop(
+            acc0, acc1, acc2, acc3, m_i, l_i, q0, q1, q2, q3, q_tail,
+            kv_ptr, vk_topk, vk_r2t, vk_kept_buf, vk_fetch_buf,
+            t, slot_t, loc_t, nk, n_t, seq_t, tile_start, tile_end, qk_scale, fp8_max,
+            H=H, KV_DIM=KV_DIM, D_V=D_V, D_TAIL=D_TAIL, NUM_GROUPS=NUM_GROUPS,
+            USE_FP8_DOT=USE_FP8_DOT, BLOCK_H=BLOCK_H, BLOCK_K=BLOCK_K,
+            VK_CAP=VK_CAP, VK_FW=VK_FW, VK_R2T=VK_R2T, VK_TOPK=VK_TOPK,
+            FENCED=False,
         )
-        slot = tl.where(fenced, sel, tl.where(k_pos < nk, kept, fired))
-        valid = valid & (slot >= 0)
-        page = tl.where(valid, slot, 0).to(tl.int64)
-
-        kv_base = kv_ptr + page[:, None] * KV_DIM
-        kv0 = tl.load(kv_base + g[None, :], mask=valid[:, None], other=0.0).to(input_type)
-        if NUM_GROUPS >= 2:
-            kv1 = tl.load(kv_base + (_G + g)[None, :], mask=valid[:, None], other=0.0).to(input_type)
-        if NUM_GROUPS >= 3:
-            kv2 = tl.load(kv_base + (2 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(input_type)
-        if NUM_GROUPS >= 4:
-            kv3 = tl.load(kv_base + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0).to(input_type)
-
-        scores = tl.dot(q0, tl.trans(kv0))
-        if NUM_GROUPS >= 2:
-            scores += tl.dot(q1, tl.trans(kv1))
-        if NUM_GROUPS >= 3:
-            scores += tl.dot(q2, tl.trans(kv2))
-        if NUM_GROUPS >= 4:
-            scores += tl.dot(q3, tl.trans(kv3))
-        if D_TAIL > 0:
-            kv_tail = tl.load(
-                kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-            ).to(input_type)
-            scores += tl.dot(q_tail, tl.trans(kv_tail))
-        scores = scores * qk_scale
-        scores = tl.where(valid[None, :], scores, neg_large)
-
-        m_block = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp2(m_i - m_new)
-        p = tl.exp2(scores - m_new[:, None])
-        l_new = l_i * alpha + tl.sum(p, axis=1)
-
-        if USE_FP8_DOT:
-            p_dot = (p * fp8_max).to(input_type)
-        else:
-            p_dot = p.to(input_type)
-        acc0 = acc0 * alpha[:, None] + tl.dot(p_dot, kv0).to(tl.float32) * p_dot_scale
-        if NUM_GROUPS >= 2:
-            acc1 = acc1 * alpha[:, None] + tl.dot(p_dot, kv1).to(tl.float32) * p_dot_scale
-        if NUM_GROUPS >= 3:
-            acc2 = acc2 * alpha[:, None] + tl.dot(p_dot, kv2).to(tl.float32) * p_dot_scale
-        if NUM_GROUPS >= 4:
-            acc3 = acc3 * alpha[:, None] + tl.dot(p_dot, kv3).to(tl.float32) * p_dot_scale
-        m_i = m_new
-        l_i = l_new
 
     # An empty split (a lane shorter than the partition) writes its partials
     # -- lse = neg_large, acc = 0 -- rather than returning: the reduce reads
