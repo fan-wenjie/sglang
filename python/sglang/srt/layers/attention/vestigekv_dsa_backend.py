@@ -3042,8 +3042,16 @@ class VestigeKVDSABackend(AttentionBackend):
                 # three come from the same step; a query stashed per layer and
                 # read later belongs to whatever step ran last.
                 _q, _w = self._indexer_query_for(lid, slot)
-                st.setdefault("qidx", []).append(_q)
-                st.setdefault("qgate", []).append(_w)
+                # CLONE both, as qcal above is cloned: _indexer_query_for row-
+                # selects out of a fixed-address per-layer buffer, so appending
+                # the view aliases it and every entry ends up holding whatever
+                # the LAST step wrote. The dumps carried eight bit-identical
+                # queries at eight different qpos for as long as this field has
+                # existed, which silently reduced an offline selector study's
+                # sample from 192 queries to 24. Analysis-only -- the build
+                # reads qcal, never these.
+                st.setdefault("qidx", []).append(None if _q is None else _q.clone())
+                st.setdefault("qgate", []).append(None if _w is None else _w.clone())
                 if st["tier"] is None:
                     # The provisional build stays SYNCHRONOUS: it is ~0.7 ms
                     # (sketch basis cached) and tier 2 must serve from the
