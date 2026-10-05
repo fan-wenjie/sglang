@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 def _fused_prologue_kernel(
     q_ptr,  # [P, H, QD] fp32 (gathered query, expanded form)
     kr_ptr,  # [P, NKm, QD] bf16 kept rows
-    v_ptr,  # [P, R, KV] fp32 sketch basis
+    v_ptr,  # [P, KV, R] fp32 sketch basis, stored K-major: see the load below
     nk_len_ptr,  # [P] int64
     thr_ptr,  # [P] fp32 gate threshold
     max1g_ptr,  # [P, H] fp32 out: max kept score, +inf closed gate, -inf empty
@@ -77,8 +77,14 @@ def _fused_prologue_kernel(
     for d0 in range(0, KV, BLOCK_D):
         d = d0 + tl.arange(0, BLOCK_D)
         qc = tl.load(q_ptr + p * H * QD + h[:, None] * QD + d[None, :])
-        vc = tl.load(v_ptr + p * R * KV + r[:, None] * KV + d[None, :])
-        qsk += tl.dot(qc, tl.trans(vc), input_precision="ieee")
+        # v is held K-major so this load IS the dot's right operand. An
+        # in-register tl.trans here cost 31.67 -> 12.57 us for the eight
+        # chunks at the served geometry (P=11, H=32, R=64, KV=512): the ieee
+        # dot cannot fold a transpose into the MMA and materialises it every
+        # chunk. bf16/tf32 dots can, which is why the kept-row dot below keeps
+        # its trans. Same values either way -- this is a layout change.
+        vt = tl.load(v_ptr + p * KV * R + d[:, None] * R + r[None, :])
+        qsk += tl.dot(qc, vt, input_precision="ieee")
         qnorm2 += tl.sum(qc * qc, 1)
     qres2 = qnorm2 - tl.sum(qsk * qsk, 1)
     qres = tl.sqrt(tl.maximum(qres2, 0.0))
@@ -204,7 +210,7 @@ def fused_prologue(q, kr, v, nk_len, thr, sc, out=None, margin=0.0,
     caller overwrites it from the merged triple."""
     P, H, QD = q.shape
     NKm = kr.shape[1]
-    R = v.shape[1]
+    R = v.shape[2]
     dd = QD - kv
     if out is None:
         max1g = q.new_empty(P, H)
@@ -380,7 +386,7 @@ def _prologue_merge_kernel(
     slot_ptr,
     RR,
     margin,  # recall margin subtracted from the kept max (fp32 scalar)
-    v_ptr,
+    v_ptr,  # [P, KV, R] fp32 sketch basis, stored K-major: see the load below
     qside_t_ptr,
     qsk_t_ptr,
     qsk_scale_ptr,  # [P] fp32 out: the fp8 scale, 1.0 when fp16
@@ -410,8 +416,9 @@ def _prologue_merge_kernel(
     for d0 in range(0, KV, BLOCK_D):
         d = d0 + tl.arange(0, BLOCK_D)
         qc = tl.load(qb + h[:, None] * QD + d[None, :]).to(tl.float32)
-        vc = tl.load(v_ptr + p * R * KV + r[:, None] * KV + d[None, :])
-        qsk += tl.dot(qc, tl.trans(vc), input_precision="ieee")
+        # K-major v: see the same load in the unsplit kernel above.
+        vt = tl.load(v_ptr + p * KV * R + d[:, None] * R + r[None, :])
+        qsk += tl.dot(qc, vt, input_precision="ieee")
         qnorm2 += tl.sum(qc * qc, 1)
     tl.store(
         qres_ptr + p * H + h,
@@ -615,7 +622,7 @@ def fused_prologue_split(
     P = p_live if p_live is not None else li.shape[0]
     H = qbuf.shape[2]
     RR = qbuf.shape[1]
-    R = v.shape[1]
+    R = v.shape[2]
     QD = qbuf.shape[-1]
     dd = QD - kv
     max1g, qside_t, qsk_t, qres, qsk_scale = out

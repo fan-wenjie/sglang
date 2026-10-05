@@ -269,7 +269,7 @@ class BatchedScanPack:
         self.rank = r
         self._csk_rows = 0
         self._csk_refs = []
-        self.v = torch.zeros(P, r, g.kv_lora_rank, device=dev)
+        self.v = torch.zeros(P, g.kv_lora_rank, r, device=dev)  # K-major; see fused_prologue
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
         # is what the pool can hold rather than max_bs x max_context.
@@ -400,7 +400,7 @@ class BatchedScanPack:
             )
 
             self.side_mode = _pool_read_mode(dev) if side_from_pool else 0
-        self.v = torch.zeros(P, r, g.kv_lora_rank, device=dev)
+        self.v = torch.zeros(P, g.kv_lora_rank, r, device=dev)  # K-major; see fused_prologue
         # Archive tables are ONE arena, addressed by a_off[p] (see the scan
         # kernel): `arena` rows total instead of P x Am, which at long context
         # is what the pool can hold rather than max_bs x max_context.
@@ -565,7 +565,7 @@ class BatchedScanPack:
                 self.kslot[i, :nk] = t.kept_slots
                 self.kslot[i, nk:] = 0
                 self.kbase[i] = self._pool_bases[pairs[i][0]]
-            self.v[i] = t.V
+            self.v[i] = t.V.T  # [R, KV] -> the K-major layout the dot loads
             if self.side is not None:
                 self.side[o : o + av] = t.side
             # Select straight out of the tier's closed-prefix caches into
@@ -742,7 +742,7 @@ class BatchedScanPack:
             self._sc_arr,
             H=self.q_heads,
             DD=self.geom.side_dim,
-            R=self.v.shape[1],
+            R=self.v.shape[2],
             # from the same authority every other site reads: self.csk is None
             # on the indirect path, where the tier's cache is addressed by
             # pointer and no arena copy exists

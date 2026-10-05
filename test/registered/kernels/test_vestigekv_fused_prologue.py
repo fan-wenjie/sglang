@@ -26,9 +26,9 @@ def _reference(q, kr, v, nk_len, thr, sc):
     for p in range(P):
         nk = int(nk_len[p])
         qe = q[p]
-        qsk = qe[:, :KV] @ v[p].T
+        qsk = qe[:, :KV] @ v[p]
         qsk_all[p] = qsk
-        qres[p] = (qe[:, :KV] - qsk @ v[p]).norm(dim=-1)
+        qres[p] = (qe[:, :KV] - qsk @ v[p].T).norm(dim=-1)
         if nk == 0:
             max1g[p] = -float("inf")
             continue
@@ -50,7 +50,7 @@ def _case(P=4, NKm=512, seed=0, empty=(), width=576):
     kr = torch.randn(P, NKm, width, device=dev, dtype=torch.bfloat16)
     v = torch.stack(
         [
-            torch.linalg.qr(torch.randn(KV, R, device=dev))[0].T.contiguous()
+            torch.linalg.qr(torch.randn(KV, R, device=dev))[0].contiguous()
             for _ in range(P)
         ]
     )
