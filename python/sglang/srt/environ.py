@@ -741,6 +741,17 @@ class Envs:
     # DSA's own selection (the lane is fenced). Unset = the fetch budget
     # (recall_capacity / index_kpool); lower values fence sooner.
     SGLANG_VESTIGEKV_BRANCH_FENCE_GROUPS = EnvInt(None)
+    # Skip the sketch chain -- fused prologue, batched scan, compaction -- on a
+    # decode step, leaving only branch_fire and the CSR pack. A MEASUREMENT
+    # knob, default off, for one open question: on the branch arm those
+    # compacts write fetch_buf/fetch_len and branch_fire writes the same
+    # buffers every step, so one of the two is redundant and the chain costs
+    # ~86 us/step (prologue 48 + scan 33 + compacts 5, CUPTI at 36k). If
+    # quality holds with this on, the chain is the redundant half. Do NOT read
+    # a null here as proof on its own: VKSTATS gathers fetch_len on the host
+    # AFTER the step, so it reports whichever write landed last and cannot say
+    # which one the fork consumed -- the quality draw is the detector.
+    SGLANG_VESTIGEKV_DISABLE_SKETCH_CHAIN = EnvBool(False)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
     # rows the KV pool already holds. Unset picks the fastest form that runs on
