@@ -248,6 +248,17 @@ class VestigeKVDSABackend(AttentionBackend):
                 "low-pass cutoff moves with it, to window/kappa = %d tokens",
                 self.close_block, D.DSA_CLOSE_BLOCK, self.close_block // D.LOWPASS_KAPPA,
             )
+        # Unconditional, because the override lines above fire only when an
+        # env var is set: a run on the compiled-in pair otherwise left no
+        # record of what the kernel was given, and the byte ratio was the only
+        # evidence the default had taken effect at all. Both the cadence and
+        # sigma's cutoff are named, since one value sets both.
+        logger.info(
+            "VestigeKV tier 1: rho=%.6g close_block=%d (sigma low-pass cutoff "
+            "%d tokens, basis %d dims); sizing ceilings rho=%.6g block=%d",
+            self.rho, self.close_block, self.close_block // D.LOWPASS_KAPPA,
+            2 * D.LOWPASS_KAPPA - 1, D.RHO, D.CLOSE_BLOCK,
+        )
         self.index_rank = index_rank
         # Route the base's stage-1 decode at the tiers instead of a packed CSR.
         # `decode_attention_fwd` is an instance attribute of the base, so the

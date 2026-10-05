@@ -51,9 +51,11 @@ DSA_RHO = 1 / 128
 fixed per-token cost: kept costs exactly rho * 1024 B/token.
 
 Measured 2026-10-05 at 4k in / 32k out, 32750 steps, fallback 0.00000: with
-DSA_CLOSE_BLOCK this reads 0.614x DSA's bytes against 1.351x at RHO +
-CLOSE_BLOCK, and 0.645x on an aligned 32k prefill where the tail is zero and
-rho is the only term. Both knobs are needed -- rho alone reaches 1.174x.
+DSA_CLOSE_BLOCK this reads 0.607-0.614x DSA's bytes against 1.348-1.351x at RHO
++ CLOSE_BLOCK (two runs of each; kept reproduces to the row, fetch spreads ~6%,
+so the ratio carries ~0.01 of replicate noise and a move that small is not a
+result). On an aligned 32k prefill it reads 0.688x. Both knobs are needed on a
+long decode -- rho alone reaches 1.174x.
 
 Quality here is "not refuted", not verified: niah_multikey_3 reads 1.000 at
 every rho from 1/32 to 1/512, but tier 1 ALONE reads 0.000 on that task, so the
@@ -174,7 +176,16 @@ collapses the basis to its DC term.
 Fetch is not predictable from either knob alone. The tier-2 threshold is a
 quantile of the kept GROUPS' logits, so changing the kept set's composition
 moves it: at rho 1/32 fetch rises monotonically as the block shrinks
-(332 -> 392 -> 458 rows/step), at rho 1/128 it does not (283 -> 218 -> 290)."""
+(332 -> 392 -> 458 rows/step), at rho 1/128 it does not (283 -> 218 -> 290).
+
+Which makes the gain SHAPE-DEPENDENT, and this block is not free everywhere.
+On a prompt that is a whole multiple of either block the tail is already zero,
+so a smaller block buys no kept rows -- but it is still sigma's window, so it
+changes WHICH rows tier 1 keeps and moves the threshold anyway. Measured at a
+32768 prefill: kept is flat (379 -> 367 rows) while fetch rises 29% (507 ->
+654), taking the ratio from 0.645x at a 4096 block to 0.688x at 1024. The pair
+is still under 1x on both shapes, and the long decode it is chosen for gains
+far more (1.174x -> 0.607x) than this shape gives up."""
 
 CLOSE_BLOCK = 4096
 """Decoded tokens per compression event. Every CLOSE_BLOCK decode steps a
