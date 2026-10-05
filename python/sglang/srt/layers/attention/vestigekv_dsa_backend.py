@@ -2597,14 +2597,27 @@ class VestigeKVDSABackend(AttentionBackend):
         # Runs inside run_once during capture, so the whole recall step --
         # scan + fetch + the all-layer CSR pack -- replays as nodes of the
         # ONE decode graph launch. No host code runs here at replay time.
-        # The gate is an env read, so it is constant for the process and the
-        # capture bakes one shape either way (see
-        # SGLANG_VESTIGEKV_DISABLE_SKETCH_CHAIN). _pack_all_layers always runs:
-        # it is the CSR the fork reads, and branch_fire fills fetch_len for it
-        # unconditionally, so the pack has its inputs with or without the chain.
-        if not envs.SGLANG_VESTIGEKV_DISABLE_SKETCH_CHAIN.get():
+        # _pack_all_layers always runs: it is the CSR the fork reads, and
+        # branch_fire fills fetch_len for it unconditionally, so the pack has
+        # its inputs with or without the chain.
+        if not self._skip_sketch_chain():
             self._ingraph_pack.run(p_live=len(self._local_mla_lids) * bs)
         self._pack_all_layers(bs)
+
+    def _skip_sketch_chain(self) -> bool:
+        """Whether this decode step runs the sketch chain (prologue, scan,
+        compaction) at all.
+
+        Automatic on the branch arm: that rule computes its fired rows from
+        DSA's own logits and writes the same fetch_buf/fetch_len the chain's
+        compaction writes, so the chain is the selector it replaced rather than
+        a stage feeding it. Constant for the process either way, so the capture
+        bakes one shape.
+        """
+        ov = envs.SGLANG_VESTIGEKV_DISABLE_SKETCH_CHAIN.get()
+        if ov is not None:
+            return bool(ov)
+        return self._branch_q() is not None
 
     def _pack_all_layers(self, bs):
         # The one CSR pack both captured paths replay (in-graph and the scan

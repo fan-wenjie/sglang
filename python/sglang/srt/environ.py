@@ -742,16 +742,20 @@ class Envs:
     # (recall_capacity / index_kpool); lower values fence sooner.
     SGLANG_VESTIGEKV_BRANCH_FENCE_GROUPS = EnvInt(None)
     # Skip the sketch chain -- fused prologue, batched scan, compaction -- on a
-    # decode step, leaving only branch_fire and the CSR pack. A MEASUREMENT
-    # knob, default off, for one open question: on the branch arm those
-    # compacts write fetch_buf/fetch_len and branch_fire writes the same
-    # buffers every step, so one of the two is redundant and the chain costs
-    # ~86 us/step (prologue 48 + scan 33 + compacts 5, CUPTI at 36k). If
-    # quality holds with this on, the chain is the redundant half. Do NOT read
-    # a null here as proof on its own: VKSTATS gathers fetch_len on the host
-    # AFTER the step, so it reports whichever write landed last and cannot say
-    # which one the fork consumed -- the quality draw is the detector.
-    SGLANG_VESTIGEKV_DISABLE_SKETCH_CHAIN = EnvBool(False)
+    # decode step, leaving only branch_fire and the CSR pack. UNSET (None) is
+    # automatic: skipped whenever the branch rule is active, because the chain
+    # is the selector the branch rule replaced. 1 or 0 forces it either way,
+    # which is how the control arm is expressed.
+    #
+    # Measured before this became the default (jobs c521sk, c521sx at 36k):
+    # the five chain kernels leave the CUPTI trace entirely (-80.2 us/step),
+    # multikey reads 1.000 twice, the COPY probe -- the one instrument with
+    # range on a row-set change -- reads 1.0000 on all three of its scores,
+    # and the cost pair moves 0.983/0.981 to 0.9945/0.9918, i.e. tau 230 ->
+    # ~75 us. VKSTATS cannot settle this on its own: it gathers fetch_len on
+    # the host AFTER the step, so it reports whichever write landed last and
+    # never which one the fork consumed.
+    SGLANG_VESTIGEKV_DISABLE_SKETCH_CHAIN = EnvBool(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
     # rows the KV pool already holds. Unset picks the fastest form that runs on
