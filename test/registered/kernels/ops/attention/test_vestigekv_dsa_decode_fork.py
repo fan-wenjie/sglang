@@ -24,7 +24,7 @@ H, DV = 16, 512
 
 
 def _rows(gen, nk, nf, slot=1, seq=777):
-    from sglang.srt.layers.attention.vestigekv.dsa_rows import VestigeKVRows
+    from sglang.srt.layers.attention.vestigekv.decode_fork import VestigeKVRows
 
     kept_buf = torch.randint(0, POOL, (R1, CAP), dtype=torch.int32, device="cuda", generator=gen)
     fetch_buf = torch.randint(0, POOL, (R1, FW), dtype=torch.int32, device="cuda", generator=gen)
