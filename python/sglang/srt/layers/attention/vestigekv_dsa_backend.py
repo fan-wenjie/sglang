@@ -257,8 +257,8 @@ class VestigeKVDSABackend(AttentionBackend):
             "VestigeKV tier 1: budget=%s close_block=%d (sigma low-pass cutoff "
             "%d tokens, basis %d dims); sizing ceilings rho=%.6g block=%d",
             (
-                f"{self._kept_m_fixed()} rows FIXED"
-                if self._kept_m_fixed() is not None
+                f"{_kg} groups FIXED"
+                if (_kg := envs.SGLANG_VESTIGEKV_KEPT_GROUPS.get())
                 else f"rho={self.rho:.6g}"
             ),
             self.close_block, self.close_block // D.LOWPASS_KAPPA,
