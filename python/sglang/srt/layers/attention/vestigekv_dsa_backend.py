@@ -185,7 +185,7 @@ class VestigeKVDSABackend(AttentionBackend):
         model_runner: ModelRunner,
         *,
         config: VestigeKVConfig,
-        rho: float = D.RHO,
+        rho: float = D.DSA_RHO,
     ):
         _refuse_sharded_sequence()
         self.base = base
@@ -210,30 +210,33 @@ class VestigeKVDSABackend(AttentionBackend):
         _rho = envs.SGLANG_VESTIGEKV_RHO.get()
         self.rho = float(_rho) if _rho else rho
         if _rho:
-            # Only downward. The kept table and the scan arena are sized from
-            # defaults.RHO (_nkm), not from this value, so a smaller rho leaves
-            # them oversized and safe while a larger one would undersize them --
-            # and the first symptom would be _write_kept raising mid-request,
-            # after a capacity check that reads like a defect rather than a
+            # Bounded by defaults.RHO, which _nkm and the scan arena are sized
+            # from -- NOT by this arm's served default (defaults.DSA_RHO), so a
+            # control run can override back up to the sizing ceiling. Anything
+            # at or below it leaves the buffers oversized and safe; above it
+            # would undersize them, and the first symptom would be _write_kept
+            # raising mid-request, which reads like a defect rather than a
             # misconfiguration.
-            if self.rho > rho:
+            if self.rho > D.RHO:
                 raise ValueError(
-                    f"SGLANG_VESTIGEKV_RHO={self.rho:g} exceeds the compiled-in "
-                    f"{rho:g}; the kept table and scan arena are sized from the "
-                    "latter. Raise defaults.RHO instead."
+                    f"SGLANG_VESTIGEKV_RHO={self.rho:g} exceeds the sizing "
+                    f"ceiling {D.RHO:g}; the kept table and scan arena are "
+                    "allocated from the latter. Raise defaults.RHO instead."
                 )
             logger.info("VestigeKV: rho overridden to %.6g (default %.6g)", self.rho, rho)
         _cb = envs.SGLANG_VESTIGEKV_CLOSE_BLOCK.get()
-        self.close_block = int(_cb) if _cb else D.CLOSE_BLOCK
+        self.close_block = int(_cb) if _cb else D.DSA_CLOSE_BLOCK
         if _cb:
-            # Downward only, as rho is: _nkm and _kept_cap size the kept table
-            # from defaults.CLOSE_BLOCK, so a smaller window leaves them
-            # oversized while a larger one would undersize the tail they hold.
+            # Bounded by defaults.CLOSE_BLOCK, as rho is by defaults.RHO:
+            # _nkm and _kept_cap size the kept table from it, so a smaller
+            # window leaves them oversized while a larger one would undersize
+            # the tail they hold. This arm serves DSA_CLOSE_BLOCK, well under
+            # the ceiling, so every measured grid point stays expressible.
             if self.close_block > D.CLOSE_BLOCK:
                 raise ValueError(
                     f"SGLANG_VESTIGEKV_CLOSE_BLOCK={self.close_block} exceeds the "
-                    f"compiled-in {D.CLOSE_BLOCK}; the kept table is sized from the "
-                    "latter. Raise defaults.CLOSE_BLOCK instead."
+                    f"sizing ceiling {D.CLOSE_BLOCK}; the kept table is allocated "
+                    "from the latter. Raise defaults.CLOSE_BLOCK instead."
                 )
             if self.close_block & (self.close_block - 1):
                 raise ValueError(
@@ -243,7 +246,7 @@ class VestigeKVDSABackend(AttentionBackend):
             logger.info(
                 "VestigeKV: close block overridden to %d (default %d); sigma's "
                 "low-pass cutoff moves with it, to window/kappa = %d tokens",
-                self.close_block, D.CLOSE_BLOCK, self.close_block // D.LOWPASS_KAPPA,
+                self.close_block, D.DSA_CLOSE_BLOCK, self.close_block // D.LOWPASS_KAPPA,
             )
         self.index_rank = index_rank
         # Route the base's stage-1 decode at the tiers instead of a packed CSR.
@@ -1474,7 +1477,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 logging.getLogger(__name__).info(
                     "VKKEPT lid=%s slot=%s seq=%d closed_now=%s rho=%s "
                     "CLOSE_BLOCK=%d amt=%d n=%d",
-                    lid, slot, seq_len, closed_now, self.rho, D.CLOSE_BLOCK,
+                    lid, slot, seq_len, closed_now, self.rho, self.close_block,
                     self.config.activation_min_tokens, n,
                 )
             _tm("write")
@@ -1636,7 +1639,14 @@ class VestigeKVDSABackend(AttentionBackend):
 
     def _nkm(self, max_ctx: int) -> int:
         # Kept rows are bounded by tier-1's keep rate plus the un-closed tail
-        # (blocks close every CLOSE_BLOCK); the slack absorbs close latency.
+        # (blocks close every close_block); the slack absorbs close latency.
+        # Deliberately the SIZING ceilings, not self.rho / self.close_block:
+        # both may be overridden downward at launch, and sizing from the
+        # effective pair would make the allocation depend on an env var the
+        # buffers outlive. Oversized by 4x at the served pair (DSA_RHO,
+        # DSA_CLOSE_BLOCK), which is 2 int32 tables of 32768 rows per layer
+        # per slot at max_context -- ~70 MB at a 32-request pool, and the
+        # price of keeping every control arm expressible.
         return int(D.RHO * max_ctx) + 3 * D.CLOSE_BLOCK
 
     def _kept_cap(self, max_ctx: int) -> int:
@@ -1919,9 +1929,9 @@ class VestigeKVDSABackend(AttentionBackend):
         # n_blocks zero -- the observer then returns without emitting and the
         # telemetry looks switched off rather than broken.
         block = (
-            D.CLOSE_BLOCK
+            self.close_block
             if g.sigma_in_row
-            else group_sigma_window(D.CLOSE_BLOCK, max(1, self._text_cfg_index_kpool))
+            else group_sigma_window(self.close_block, max(1, self._text_cfg_index_kpool))
         )
         self._spectrum.observe(side, block, lid=lid)
 
@@ -2858,7 +2868,7 @@ class VestigeKVDSABackend(AttentionBackend):
     def _maybe_close_blocks(self, forward_batch, reqs):
         """Decode-time compression events (reference policy semantics).
 
-        Every D.CLOSE_BLOCK decoded tokens per request, the newest block is
+        Every self.close_block decoded tokens per request, the newest block is
         closed: sigma over its sidecars joins the request's global sigma
         record, tier-1 re-selects top-(rho * closed) over ALL closed rows
         (global rebalance -- rows move both ways, matching the reference

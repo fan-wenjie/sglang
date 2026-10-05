@@ -38,7 +38,26 @@ the tier-2 comparison lives on the same scale as attention's own logits."""
 # ---- tier 1: sidecar-residual eviction (frozen at prefill) ----
 
 RHO = 1 / 32
-"""Fraction of the prefix kept by anomaly rank. Sets the compression ratio."""
+"""Fraction of the prefix kept by anomaly rank. Sets the compression ratio.
+
+Also the SIZING ceiling for both arms: _nkm and the scan arena are allocated
+from this and the env override is refused above it, so every grid point at or
+below it stays expressible as a control. The vestigekv_mla arm has no override
+and serves this value directly -- the Kimi line's recorded results are all at
+this rho, which is why the dsa arm's new default is a separate constant."""
+
+DSA_RHO = 1 / 128
+"""Served keep rate for the vestigekv_dsa arm (GLM-5.3), the coefficient of the
+fixed per-token cost: kept costs exactly rho * 1024 B/token.
+
+Measured 2026-10-05 at 4k in / 32k out, 32750 steps, fallback 0.00000: with
+DSA_CLOSE_BLOCK this reads 0.614x DSA's bytes against 1.351x at RHO +
+CLOSE_BLOCK, and 0.645x on an aligned 32k prefill where the tail is zero and
+rho is the only term. Both knobs are needed -- rho alone reaches 1.174x.
+
+Quality here is "not refuted", not verified: niah_multikey_3 reads 1.000 at
+every rho from 1/32 to 1/512, but tier 1 ALONE reads 0.000 on that task, so the
+metric cannot resolve the component rho moves. No probe on this line can."""
 
 SINKS = 4
 """Leading rows kept unconditionally: attention sinks are never anomalous by
@@ -138,6 +157,25 @@ so that buffer keeps the base metadata's kv_indices dtype (int64)."""
 
 # ---- decode-time block closing ----
 
+DSA_CLOSE_BLOCK = 1024
+"""Close cadence for the vestigekv_dsa arm (GLM-5.3), the other term of
+kept = SINKS + rho * closed + tail: the un-closed tail averages half a block,
+so halving the cadence halves it. Neither knob reaches below 1x alone (rho
+1/128 at a 4096 block is 1.174x; a 1024 block at rho 1/32 is 0.848x).
+
+1024 is the SMALLEST block that leaves sigma intact. The window IS the close
+block and LOWPASS_KAPPA is fixed, so the low-pass cutoff is block/kappa: 64
+tokens here, with the 2*kappa-1 = 31 dim basis at 3% of the window. At 256 the
+cutoff is 16 and the basis is 48% of the window, and that configuration scored
+0.000 on niah_multikey_3 -- a collapse, not a degradation. kappa cannot
+compensate: a 256-token cutoff inside a 256-token window needs kappa=1, which
+collapses the basis to its DC term.
+
+Fetch is not predictable from either knob alone. The tier-2 threshold is a
+quantile of the kept GROUPS' logits, so changing the kept set's composition
+moves it: at rho 1/32 fetch rises monotonically as the block shrinks
+(332 -> 392 -> 458 rows/step), at rho 1/128 it does not (283 -> 218 -> 290)."""
+
 CLOSE_BLOCK = 4096
 """Decoded tokens per compression event. Every CLOSE_BLOCK decode steps a
 request's newest block is closed: sigma is computed for its rows, the global
@@ -145,7 +183,12 @@ top-(rho * closed) selection rebalances (matching the reference policy), the
 evicted rows join the tier-2 archive via the live caches, and the recall index
 refreshes by index selection. Without this, rows generated after prefill are
 never evicted (the attended set grows 1:1 with generation) and rows evicted by
-a close would be unrecallable -- both wrong at long generation."""
+a close would be unrecallable -- both wrong at long generation.
+
+Also the SIZING ceiling, as RHO is: the kept table holds a tail under one
+block, _nkm and _kept_cap are allocated from this value, and the env override
+is refused above it. The vestigekv_mla arm serves it directly; the dsa arm's
+served cadence is DSA_CLOSE_BLOCK and may be anything at or below this."""
 
 SCAN_GRID_CAP = 128
 """Cap on the capacity-baked block grid of the batched scan and compact-write

@@ -654,16 +654,21 @@ class Envs:
     # not even stable between runs of one config -- {23,39,27,3,19} once,
     # {3,7,11,15} another -- so such a set describes the run it was fitted on.
     SGLANG_VESTIGEKV_DSA_LAYERS = EnvTuple(tuple())
-    # Tier-1 keep rate, overriding defaults.RHO. The coefficient of the only
+    # Tier-1 keep rate, overriding the arm's served default DOWNWARD only
+    # (vestigekv_dsa serves defaults.DSA_RHO, vestigekv_mla defaults.RHO); the
+    # ceiling is defaults.RHO either way, because the kept table and the scan
+    # arena are allocated from it. The coefficient of the only
     # term that grows with context: the kept set is rho*S rows, scored densely
     # every step and attended every step. Lowering it cuts both, and raises
     # the fire rate -- the fire threshold is the best kept row's score, so a
     # smaller kept set lowers the bar every archived row has to clear.
-    # A study knob: unset means defaults.RHO, and any quoted number must say
+    # Unset means the arm's served default, so any quoted number must say
     # which value produced it.
     SGLANG_VESTIGEKV_RHO = EnvFloat(None)
-    # Decoded tokens per compression event, overriding defaults.CLOSE_BLOCK
-    # DOWNWARD only. A study knob, not a dial: it sets the cadence of the close
+    # Decoded tokens per compression event, overriding the arm's served default
+    # (vestigekv_dsa serves defaults.DSA_CLOSE_BLOCK = 1024, vestigekv_mla
+    # defaults.CLOSE_BLOCK) DOWNWARD only, bounded by defaults.CLOSE_BLOCK
+    # which the kept table is sized from. Not a dial: it sets the close cadence
     # AND the window sigma's low-pass projection is built over, so the cutoff
     # period is window/kappa and moves with it -- 256 tokens at 4096, 128 at
     # 2048, 64 at 1024, 16 at 256 -- while the 2*kappa-1 = 31 dim basis grows
