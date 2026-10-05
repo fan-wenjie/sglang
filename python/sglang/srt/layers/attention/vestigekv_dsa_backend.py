@@ -254,9 +254,14 @@ class VestigeKVDSABackend(AttentionBackend):
         # evidence the default had taken effect at all. Both the cadence and
         # sigma's cutoff are named, since one value sets both.
         logger.info(
-            "VestigeKV tier 1: rho=%.6g close_block=%d (sigma low-pass cutoff "
+            "VestigeKV tier 1: budget=%s close_block=%d (sigma low-pass cutoff "
             "%d tokens, basis %d dims); sizing ceilings rho=%.6g block=%d",
-            self.rho, self.close_block, self.close_block // D.LOWPASS_KAPPA,
+            (
+                f"{self._kept_m_fixed()} rows FIXED"
+                if self._kept_m_fixed() is not None
+                else f"rho={self.rho:.6g}"
+            ),
+            self.close_block, self.close_block // D.LOWPASS_KAPPA,
             2 * D.LOWPASS_KAPPA - 1, D.RHO, D.CLOSE_BLOCK,
         )
         self.index_rank = index_rank
@@ -2230,8 +2235,20 @@ class VestigeKVDSABackend(AttentionBackend):
             sigma = self._block_sigma(kbuf, row_slots, lid=lid)
         return kept_rows(
             sigma[:closed], row_slots, rho=self.rho, closed=closed, sinks=D.SINKS,
-            return_pos=True,
+            return_pos=True, m_fixed=self._kept_m_fixed(),
         )
+
+    def _kept_m_fixed(self):
+        """The constant tier-1 budget in ROWS, or None for rho * closed.
+
+        Read once per call rather than cached: it is an env value, constant for
+        the process, and the alternative is another field that has to be kept
+        in step with _nkm's sizing. _nkm and _kept_cap deliberately keep sizing
+        from defaults.RHO, so a constant budget only ever leaves the buffers
+        oversized.
+        """
+        g = envs.SGLANG_VESTIGEKV_KEPT_GROUPS.get()
+        return None if not g else int(g) * max(1, self._text_cfg_index_kpool)
 
     # ---- decode: evict (tier-1) + recall (tier-2), both unconditional ----
 
@@ -2954,7 +2971,8 @@ class VestigeKVDSABackend(AttentionBackend):
         self._advance_sigma(slot, lid, cl, c1, kbuf)
         cl["closed"] = c1
         # global rebalance over every closed row
-        m = max(1, round(self.rho * c1))
+        mf = self._kept_m_fixed()
+        m = mf if mf is not None else max(1, round(self.rho * c1))
         keep = torch.zeros(c1, dtype=torch.bool, device=cl["sigma"].device)
         keep[cl["sigma"][:c1].topk(min(m, c1)).indices] = True
         keep[: D.SINKS] = True

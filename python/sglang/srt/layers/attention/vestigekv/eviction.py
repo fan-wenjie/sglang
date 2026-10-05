@@ -62,6 +62,7 @@ def kept_rows(
     closed: int,
     sinks: int = D.SINKS,
     return_pos: bool = False,
+    m_fixed: int | None = None,
 ):
     """select_kept's row set, with a size the host already knows.
 
@@ -78,7 +79,11 @@ def kept_rows(
     would have won a top-m place, where this keeps the displaced non-sink row
     as well, at most `sinks` rows more out of ~rho*closed.
     """
-    m = max(1, round(rho * closed))
+    # m_fixed is a CONSTANT budget, as in select_kept: the count stays
+    # `n_sink + min(m, closed - n_sink) + tail`, so it is still a host-side
+    # expression and still needs no device sync, but it no longer tracks the
+    # context the way rho * closed does.
+    m = m_fixed if m_fixed is not None else max(1, round(rho * closed))
     n_sink = min(sinks, closed)
     ranked = sigma[:closed].clone()
     ranked[:n_sink] = float("-inf")  # kept anyway; do not let them win a place

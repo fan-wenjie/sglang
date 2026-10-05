@@ -756,6 +756,23 @@ class Envs:
     # the host AFTER the step, so it reports whichever write landed last and
     # never which one the fork consumed.
     SGLANG_VESTIGEKV_DISABLE_SKETCH_CHAIN = EnvBool(None)
+    # Tier-1 budget as a CONSTANT number of index groups rather than rho *
+    # closed; the row count is this times index_kpool. Unset keeps rho.
+    #
+    # Why a constant is the right shape. kept's remaining jobs on the branch
+    # arm are to carry attention mass and to supply the q-quantile sample, and
+    # both measured flat in the budget, not in the context: offline over real
+    # indexer queries, 32 groups carry 0.859 of DSA's in-budget attention mass
+    # against 0.888 at 512, so a 16x larger budget buys 2.9 points; and
+    # precision against DSA's own top-512 FALLS with the budget, 0.67 at 32
+    # groups to 0.24 at 512, so the rows a larger budget adds are increasingly
+    # ones DSA would not pick. Meanwhile rho * closed grows without bound and
+    # crosses DSA's flat 2048-row read near 158k tokens.
+    #
+    # It is also what makes the budget-derived fence a BOUND rather than an
+    # average: with rho proportional, worst-case kept at 131k is 4 + 1024 +
+    # 1023 = 2051 rows and leaves no room for any recall at all.
+    SGLANG_VESTIGEKV_KEPT_GROUPS = EnvInt(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
     # rows the KV pool already holds. Unset picks the fastest form that runs on
