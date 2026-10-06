@@ -142,8 +142,14 @@ def _fired_by(logits_row, thr, kg, G, plen, dev):
 class TestBranchOperators(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_kept_mask_and_threshold(self):
+        # A NON-overflowing fixture, deliberately: with `randn` logits and a
+        # two-row kept set the quantile fires 517-2490 groups against a 512-group
+        # buffer, so the capacity threshold binds and the quantile is no longer
+        # what `thr` reports. _cold is the fixture built to recall without
+        # overflowing, which is where the quantile property lives.
         dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(0, 2)])
-        logits = torch.randn(1, G, device=dev)
+        base, _ = _cold(G, _kept_groups(kepts[0]), 50, dev, 3)
+        logits = base[None]
         for q in (0.9, 0.75, 0.5):
             sc = _scratch(1, G)
             _run(sc, logits, plen, slots, kept, klen, r2t, q)
@@ -202,18 +208,65 @@ class TestBranchOperators(CustomTestCase):
         self.assertTrue(torch.isin(hot, p // POOL).all())
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_past_the_trigger_the_lane_is_fenced(self):
+    def test_past_the_trigger_the_lane_truncates_by_score(self):
+        """A would-be-overflowing lane keeps its OWN best groups, not DSA's.
+
+        The old behaviour was fovf=1 / flen=0, which handed the lane DSA's
+        index_topk selection -- the same 2048 rows the buffer holds, minus the
+        kept rows, and measured worse. The capacity threshold caps the fired count
+        instead, so the lane never has to be handed anything.
+
+        The decisive assertion is the ORDER: nothing dropped may outscore anything
+        kept. Truncating by position passes a count check and fails this one, and
+        position-order truncation was measured to retain 18.7% of what beats max1
+        against 80.3% by score.
+        """
         dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(2, 2)])
-        logits = torch.randn(1, G, device=dev)  # archive as hot as kept
+        kg = _kept_groups(kepts[0])
+        logits = torch.randn(1, G, device=dev)  # archive as hot as kept: overflows
+        WG = W // POOL
         sc = _scratch(1, G)
         fb, fl, fo = _run(sc, logits, plen, slots, kept, klen, r2t, 0.75)
-        self.assertEqual(int(fo[2]), 1)
-        self.assertEqual(int(fl[2]), 0)
-        # and a modest fire fences too when the trigger is lowered
-        logits, _ = _cold(G, _kept_groups(kepts[0]), 50, dev, 11)
+        self.assertEqual(int(fo[2]), 0)                       # not fenced any more
+        n = int(fl[2])
+        self.assertGreater(n, 0)
+        self.assertLessEqual(n, POOL * WG)                    # within the buffer
+        fired = _fired_by(logits[0], float(sc["thr"][0]), kg, G, int(plen[0]), dev)
+        self.assertEqual(n, POOL * fired.numel())
+        self.assertLessEqual(fired.numel(), WG)
+        arch = torch.ones(G, dtype=torch.bool, device=dev)
+        arch[kg] = False
+        cand = (arch & (torch.arange(G, device=dev) < int(plen[0]))).nonzero().flatten()
+        dropped = cand[~torch.isin(cand, fired)]
+        self.assertGreater(float(logits[0, fired].min()),
+                           float(logits[0, dropped].max()))
+        # and with the trigger lowered, the same holds at row granularity
+        lg, _ = _cold(G, kg, 50, dev, 11)
         sc = _scratch(1, G, fence_groups=16)
-        fb, fl, fo = _run(sc, logits[None], plen, slots, kept, klen, r2t, 0.75,
+        fb, fl, fo = _run(sc, lg[None], plen, slots, kept, klen, r2t, 0.75,
                           fence_groups=16)
+        self.assertEqual(int(fo[2]), 0)
+        n = int(fl[2])
+        self.assertLessEqual(n, POOL * 16)
+        fired = _fired_by(lg, float(sc["thr"][0]), kg, G, int(plen[0]), dev)
+        self.assertEqual(n, POOL * fired.numel())
+        p = _positions(fb[2, :n].to(torch.int64), r2t, 2)
+        self.assertEqual(sorted(set((p // POOL).tolist())), sorted(fired.tolist()))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_the_control_arm_still_fences(self):
+        """SGLANG_VESTIGEKV_FENCE_TRUNCATE=0 restores the fallback.
+
+        The old path stays reachable because it is the control that measures what
+        the fallback was worth; without this the A/B cannot be run.
+        """
+        from sglang.srt.environ import envs
+
+        dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(2, 2)])
+        logits = torch.randn(1, G, device=dev)
+        with envs.SGLANG_VESTIGEKV_FENCE_TRUNCATE.override(False):
+            sc = _scratch(1, G)
+            fb, fl, fo = _run(sc, logits, plen, slots, kept, klen, r2t, 0.75)
         self.assertEqual(int(fo[2]), 1)
         self.assertEqual(int(fl[2]), 0)
 
@@ -242,16 +295,20 @@ class TestBranchMixedBatch(CustomTestCase):
     so a batch may take both."""
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_one_lane_fences_while_the_other_recalls(self):
+    def test_one_lane_truncates_while_the_other_recalls(self):
         dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(4, 1), (5, 2)])
-        hot_lane = torch.randn(G, device=dev)                            # fences
+        hot_lane = torch.randn(G, device=dev)                            # truncates
         cold_lane, hot = _cold(G, _kept_groups(kepts[1]), 30, dev, 17)   # recalls
         logits = torch.stack([hot_lane, cold_lane])
         sc = _scratch(2, G)
         fb, fl, fo = _run(sc, logits, plen, slots, kept, klen, r2t, 0.75)
 
-        self.assertEqual(int(fo[1]), 1)
-        self.assertEqual(int(fl[1]), 0)
+        # The capped lane fills its buffer to the brim instead of emptying it, and
+        # the two arms still disagree within one call -- which is what this case
+        # is for.
+        self.assertEqual(int(fo[1]), 0)
+        self.assertGreater(int(fl[1]), 0)
+        self.assertLessEqual(int(fl[1]), W)
         self.assertEqual(int(fo[2]), 0)
         n = int(fl[2])
         self.assertGreater(n, 0)
@@ -263,8 +320,10 @@ class TestBranchMixedBatch(CustomTestCase):
         p = _positions(fb[2, :n].to(torch.int64), r2t, 2)
         self.assertEqual(sorted(set((p // POOL).tolist())), sorted(fired.tolist()))
         self.assertTrue(torch.isin(hot, p // POOL).all())
-        # the fenced lane's buffer was not written by the recalling lane
-        self.assertTrue(torch.equal(fb[1], torch.zeros_like(fb[1])))
+        # the capped lane's rows are its own: its buffer holds no row of the
+        # recalling lane's request (the two slots' page tables are disjoint)
+        n1 = int(fl[1])
+        self.assertEqual(len(set(fb[1, :n1].tolist()) & set(fb[2, :n].tolist())), 0)
 
 
 if __name__ == "__main__":
