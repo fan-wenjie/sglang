@@ -104,3 +104,45 @@ def vk_select_transform(
         ovf_counts,
     )
     return out
+
+
+@cache_once
+def _jit_vk_select_fetch_module(group_topk: int) -> Module:
+    return load_jit(
+        f"vk_select_fetch_{group_topk}",
+        cuda_files=["dsa/vk_select_transform.cuh"],
+        cuda_wrappers=[("vk_select_fetch", "VkSelectFetchKernel::select")],
+        extra_cuda_cflags=[f"-DSGL_GROUP_TOPK={group_topk}"],
+        extra_include_paths=_cuda_include_paths(),
+    )
+
+
+def vk_select_fetch(
+    *,
+    logits: torch.Tensor,
+    pool_lens: torch.Tensor,
+    thresholds: torch.Tensor,
+    kept_mask: torch.Tensor,
+    slots: torch.Tensor,
+    r2t: torch.Tensor,
+    fetch_buf: torch.Tensor,
+    fetch_len: torch.Tensor,
+    fetch_ovf: torch.Tensor,
+    ovf_counts: torch.Tensor,
+    group_budget: int,
+    pool: int,
+    group_topk: int = 512,
+) -> None:
+    """One layer-step of the branch rule, in VestigeKV's own row layout.
+
+    Drop-in for branch_fire's three later stages: same destination addresses,
+    same `fetch_len = n * pool` contract, `fetch_ovf` always 0 because the
+    overflow cut is exact and in budget. The kept rows are not touched -- they
+    stay in kept_buf, where tier 1 wrote them.
+    """
+    mod = _jit_vk_select_fetch_module(group_topk)
+    mod.vk_select_fetch(
+        logits, pool_lens.to(torch.int32), thresholds, kept_mask,
+        slots.to(torch.int32), r2t, fetch_buf, fetch_len, fetch_ovf,
+        ovf_counts, group_budget, pool,
+    )

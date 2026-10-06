@@ -807,6 +807,14 @@ class Envs:
     # 0.1143 on fenced steps), and created the dependency that keeps DSA's top-k
     # alive here -- 85.9 us a step at 36k, 157.4 at 124k. 0 restores the fallback.
     SGLANG_VESTIGEKV_FENCE_TRUNCATE = EnvBool(True)
+    # Serve tier 2 through the forked CUDA selection kernel (two kernels) rather
+    # than the five-stage Triton chain. Equivalent by construction -- same
+    # threshold, same emitted row set, same fetch_len -- and its overflow cut is
+    # an exact score-ordered sort where the chain quantises to 24 score levels.
+    # Off by default: measured a wash on latency (a graph launch costs 0.5 us, so
+    # 55 -> 22 launches is ~16 us/step against a 138 us chain whose cost is its
+    # work), so this is a code simplification and has to prove itself per arm.
+    SGLANG_VESTIGEKV_SELECT_FORK = EnvBool(False)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads

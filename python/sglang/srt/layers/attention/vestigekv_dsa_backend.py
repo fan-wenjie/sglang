@@ -2081,11 +2081,15 @@ class VestigeKVDSABackend(AttentionBackend):
         q = self._branch_q()
         if q is None or layer_id not in self._qbuf or self._full_arm():
             return
-        from sglang.srt.layers.attention.vestigekv.dsa.branch import branch_fire
-
         li = self._li_map[layer_id]
         bs, G = logits.shape
         slots = forward_batch.req_pool_indices[:bs].to(torch.int64)
+        if envs.SGLANG_VESTIGEKV_SELECT_FORK.get():
+            self._group_fetch_fork(li, logits, pool_lens[:bs], slots, q, bs, G)
+            return
+
+        from sglang.srt.layers.attention.vestigekv.dsa.branch import branch_fire
+
         branch_fire(
             logits=logits,
             pool_lens=pool_lens[:bs],
@@ -2102,6 +2106,61 @@ class VestigeKVDSABackend(AttentionBackend):
             fence_groups=envs.SGLANG_VESTIGEKV_BRANCH_FENCE_GROUPS.get(),
             kept_rows_max=self._kept_rows_bound()
         )
+
+    def _group_fetch_fork(self, li, logits, pool_lens, slots, q, bs, G):
+        """Tier 2 as two kernels: the threshold, then the forked selection.
+
+        Equivalent to branch_fire by construction and tested as such -- same
+        threshold to 1e-6, same emitted row set, same fetch_len. What differs is
+        the overflow cut, which sorts the candidates rather than quantising them
+        to 24 score levels, and the row ORDER within the fired set, which no
+        consumer reads (the chain emitted by position, this appends atomically,
+        and softmax does not care).
+        """
+        from sglang.kernels.ops.attention.dsa.vk_select_transform import (
+            vk_select_fetch,
+        )
+        from sglang.srt.layers.attention.vestigekv.dsa.select import kept_threshold
+
+        sc = self._select_scratch(bs, logits.device, G=G)
+        kg = self._kept_rows_bound() // self._text_cfg_index_kpool + 1
+        kept_threshold(
+            logits=logits,
+            kept_pos=self._kept_pos_stack[li],
+            klen=self._kept_len_stack[li],
+            slots=slots,
+            q=q,
+            pool=self._text_cfg_index_kpool,
+            scratch=sc,
+            kg_max=kg,
+        )
+        vk_select_fetch(
+            logits=logits,
+            pool_lens=pool_lens,
+            thresholds=sc["thr"],
+            kept_mask=sc["km"],
+            slots=slots.to(torch.int32),
+            r2t=self.req_to_token_pool.req_to_token,
+            fetch_buf=self._fetch_stack[li],
+            fetch_len=self._fetch_len_stack[li],
+            fetch_ovf=self._fetch_ovf_stack[li],
+            ovf_counts=sc["ovf"],
+            group_budget=self._fetch_w // self._text_cfg_index_kpool,
+            pool=self._text_cfg_index_kpool,
+            group_topk=self._fetch_w // self._text_cfg_index_kpool,
+        )
+
+    def _select_scratch(self, bs, dev, G):
+        # Same contract as _branch_scratch: fixed addresses, nothing allocated
+        # inside the captured step.
+        from sglang.srt.layers.attention.vestigekv.dsa.select import select_scratch
+
+        key = (bs, G)
+        d = self.__dict__.setdefault("_select_scratch_bufs", {})
+        if key not in d:
+            kg = self._kept_rows_bound() // self._text_cfg_index_kpool + 1
+            d[key] = select_scratch(bs=bs, G=G, kg_max=kg, dev=dev)
+        return d[key]
 
     def _branch_scratch(self, bs, dev, G):
         # Fixed-address scratch per (batch width, logits width): nothing is

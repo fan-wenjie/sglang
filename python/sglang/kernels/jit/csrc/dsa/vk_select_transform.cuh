@@ -455,6 +455,131 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_select_transform_kernel(
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// fetch_buf mode: the same rule, emitting into VestigeKV's own row buffer.
+//
+// Three of the five Triton stages collapse here (_branch_hit, _branch_cap_scan,
+// _branch_commit), and kept_threshold absorbs the other two. The point is not
+// launch cost -- merging two launches inside a captured graph was measured at
+// 0.01 us -- it is DEPENDENCY DEPTH: five serial stages x 11 layers are 55
+// points a step where the device drains and refills, worth +107 us/step of idle
+// against a 104 us gap. Two stages are 22 such points.
+//
+// The kept rows are NOT seeded here. They live in kept_buf, written by tier 1,
+// and attention reads both buffers -- so unlike the DSA-layout kernel above,
+// this one emits the fired set alone and its whole budget is WG.
+template <int K>
+__global__ __launch_bounds__(kThreadsPerBlock) void vk_select_fetch_kernel(
+    const float* __restrict__ score,
+    const int64_t score_stride,
+    const int32_t* __restrict__ lengths,
+    const float* __restrict__ thresholds,
+    const int8_t* __restrict__ kept_mask,
+    const int64_t kept_mask_stride,
+    const int32_t* __restrict__ slots,
+    const int32_t* __restrict__ r2t,
+    const int64_t r2t_stride,
+    int32_t* __restrict__ fetch,
+    const int64_t fetch_stride,
+    int32_t* __restrict__ flen,
+    int32_t* __restrict__ fovf,
+    int32_t* __restrict__ ovf_counts,
+    const int32_t group_budget,
+    const int32_t pool_size,
+    const int32_t maxctx) {
+  const auto bid = static_cast<uint64_t>(blockIdx.x);
+  const auto tid = static_cast<int>(threadIdx.x);
+  const auto length = lengths[bid];
+  const auto sc_row = score + bid * score_stride;
+  const auto slot = static_cast<uint64_t>(slots[bid]);
+  const auto thr = thresholds[bid];
+  const auto kmask = kept_mask == nullptr ? nullptr : kept_mask + bid * kept_mask_stride;
+
+  __shared__ int s_ncand;
+  __shared__ int s_spill;
+  if (tid == 0) {
+    s_ncand = 0;
+    s_spill = 0;
+  }
+  __syncthreads();
+
+  extern __shared__ int s_dyn[];
+  float* cand_score = reinterpret_cast<float*>(s_dyn);
+  int* cand_idx = reinterpret_cast<int*>(s_dyn) + kCandMax;
+
+  for (int idx = tid; idx < length; idx += kThreadsPerBlock) {
+    if (kmask != nullptr && kmask[idx] != 0) continue;
+    const auto v = sc_row[idx];
+    if (v > thr) {
+      const auto pos = ::atomicAdd(&s_ncand, 1);
+      if (pos < kCandMax) {
+        cand_score[pos] = v;
+        cand_idx[pos] = idx;
+      } else {
+        ::atomicAdd(&s_spill, 1);
+      }
+    }
+  }
+  __syncthreads();
+
+  const auto n_cand = s_ncand;
+  const auto held = n_cand < kCandMax ? n_cand : kCandMax;
+  if (n_cand > group_budget) {
+    // Overflow: keep the HIGHEST scoring, exactly. The served cap quantised
+    // this to 24 score levels; a sort does not. s_spill > 0 means the staging
+    // area itself overflowed, which only a threshold far looser than the
+    // quantile reaches -- it degrades to the best of what was held, and says so.
+    if (tid == 0 && ovf_counts != nullptr) {
+      ::atomicAdd(ovf_counts + bid, n_cand - group_budget);
+    }
+    for (int i = held + tid; i < kCandMax; i += kThreadsPerBlock) {
+      cand_score[i] = -INFINITY;
+      cand_idx[i] = -1;
+    }
+    __syncthreads();
+    for (int kk = 2; kk <= kCandMax; kk <<= 1) {
+      for (int jj = kk >> 1; jj > 0; jj >>= 1) {
+        for (int i = tid; i < kCandMax; i += kThreadsPerBlock) {
+          const int ixj = i ^ jj;
+          if (ixj > i) {
+            const bool down = (i & kk) != 0;
+            const bool sw = down ? (cand_score[i] > cand_score[ixj])
+                                 : (cand_score[i] < cand_score[ixj]);
+            if (sw) {
+              const auto fs = cand_score[i];
+              cand_score[i] = cand_score[ixj];
+              cand_score[ixj] = fs;
+              const auto ii = cand_idx[i];
+              cand_idx[i] = cand_idx[ixj];
+              cand_idx[ixj] = ii;
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+
+  const auto take = n_cand < group_budget ? n_cand : group_budget;
+  // Each selected group expands to its POOL contiguous token positions, mapped
+  // to this request's physical rows through r2t -- the same expansion
+  // _branch_commit_kernel did, at the same destination addresses.
+  for (int i = tid; i < take; i += kThreadsPerBlock) {
+    const auto g = cand_idx[i];
+    if (g < 0) continue;
+    for (int j = 0; j < pool_size; ++j) {
+      auto tpos = g * pool_size + j;
+      if (tpos > maxctx - 1) tpos = maxctx - 1;
+      fetch[slot * fetch_stride + i * pool_size + j] = r2t[slot * r2t_stride + tpos];
+    }
+  }
+  if (tid == 0) {
+    flen[slot] = take * pool_size;
+    fovf[slot] = 0;  // never fence: the cut above is exact and in-budget
+  }
+}
+
 template <auto* f, std::size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
@@ -624,6 +749,79 @@ struct VkSelectTransformKernel {
         ovf_counts_opt.has_value()
             ? static_cast<int32_t*>(ovf_counts_opt.value().data_ptr())
             : nullptr);
+  }
+};
+
+struct VkSelectFetchKernel {
+  static constexpr auto kernel = vk_select_fetch_kernel<kGroupTopK>;
+
+  static void select(
+      const tvm::ffi::TensorView score,
+      const tvm::ffi::TensorView lengths,
+      const tvm::ffi::TensorView thresholds,
+      const tvm::ffi::TensorView kept_mask,
+      const tvm::ffi::TensorView slots,
+      const tvm::ffi::TensorView r2t,
+      const tvm::ffi::TensorView fetch,
+      const tvm::ffi::TensorView flen,
+      const tvm::ffi::TensorView fovf,
+      const tvm::ffi::TensorView ovf_counts,
+      const int64_t group_budget,
+      const int64_t pool_size) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto S = SymbolicSize{"score_stride"};
+    auto KM = SymbolicSize{"kept_mask_stride"};
+    auto R = SymbolicSize{"r2t_stride"};
+    auto F = SymbolicSize{"fetch_stride"};
+    auto NSLOT = SymbolicSize{"nslot"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(score);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);
+    TensorMatcher({B}).with_dtype<float>().with_device(device).verify(thresholds);
+    TensorMatcher({B, -1}).with_strides({KM, 1}).with_dtype<int8_t>().with_device(device).verify(kept_mask);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(slots);
+    TensorMatcher({NSLOT, -1}).with_strides({R, 1}).with_dtype<int32_t>().with_device(device).verify(r2t);
+    TensorMatcher({NSLOT, -1}).with_strides({F, 1}).with_dtype<int32_t>().with_device(device).verify(fetch);
+    TensorMatcher({NSLOT}).with_dtype<int32_t>().with_device(device).verify(flen);
+    TensorMatcher({NSLOT}).with_dtype<int32_t>().with_device(device).verify(fovf);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ovf_counts);
+
+    RuntimeCheck(pool_size > 1, "pool_size must be > 1, got ", pool_size);
+    // The emit writes group_budget * pool_size entries at most; a wider budget
+    // than the buffer holds would run off the end of a lane's row.
+    const auto fetch_w = static_cast<int64_t>(fetch.shape()[1]);
+    RuntimeCheck(
+        group_budget * pool_size <= fetch_w,
+        "group_budget ", group_budget, " x pool ", pool_size,
+        " exceeds the fetch buffer width ", fetch_w);
+    RuntimeCheck(
+        group_budget <= kCandMax,
+        "group_budget ", group_budget, " exceeds the staging area ", kCandMax);
+
+    setup_kernel_smem_once<kernel, kSmem>();
+    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kThreadsPerBlock, device.unwrap(), kSmem)(
+        kernel,
+        static_cast<const float*>(score.data_ptr()),
+        static_cast<int64_t>(S.unwrap()),
+        static_cast<const int32_t*>(lengths.data_ptr()),
+        static_cast<const float*>(thresholds.data_ptr()),
+        static_cast<const int8_t*>(kept_mask.data_ptr()),
+        static_cast<int64_t>(KM.unwrap()),
+        static_cast<const int32_t*>(slots.data_ptr()),
+        static_cast<const int32_t*>(r2t.data_ptr()),
+        static_cast<int64_t>(R.unwrap()),
+        static_cast<int32_t*>(fetch.data_ptr()),
+        static_cast<int64_t>(F.unwrap()),
+        static_cast<int32_t*>(flen.data_ptr()),
+        static_cast<int32_t*>(fovf.data_ptr()),
+        static_cast<int32_t*>(ovf_counts.data_ptr()),
+        static_cast<int32_t>(group_budget),
+        static_cast<int32_t>(pool_size),
+        static_cast<int32_t>(r2t.shape()[1]));
   }
 };
 
