@@ -133,20 +133,6 @@ def _positions(rows, r2t, slot):
     )
 
 
-def _survivors(logits_row, thr, kg, G, plen, dev, cap, nc=16):
-    """The rule WITH the capacity cap: fired, then levels at or below `cap` dropped.
-
-    The level is the fire's bin over the kept range extended upward by one width,
-    which is what the hit kernel carries in `hit` and what the commit filters on.
-    """
-    ks = logits_row[kg]
-    lo, hi = float(ks.min()), float(ks.max())
-    width = max(hi - lo, 1e-6)
-    fired = _fired_by(logits_row, thr, kg, G, plen, dev)
-    lvl = ((logits_row[fired] - lo) / (2.0 * width) * nc).to(torch.int32)
-    lvl = lvl.clamp(0, nc - 1)
-    return fired[lvl > cap]
-
 
 def _fired_by(logits_row, thr, kg, G, plen, dev):
     arch = torch.ones(G, dtype=torch.bool, device=dev)
@@ -244,9 +230,12 @@ class TestBranchOperators(CustomTestCase):
         n = int(fl[2])
         self.assertGreater(n, 0)
         self.assertLessEqual(n, POOL * WG)
-        surv = _survivors(logits[0], float(sc["thr"][0]), kg, G, int(plen[0]), dev, cap)
-        self.assertEqual(n, POOL * surv.numel())
-        self.assertLessEqual(surv.numel(), WG)
+        # Read the survivors off the BUFFER rather than predicting them: the code
+        # scale depends on last step's fired max, so a torch mirror of the binning
+        # would pin the implementation instead of the property.
+        self.assertLessEqual(n // POOL, WG)
+        p = _positions(fb[2, :n].to(torch.int64), r2t, 2)
+        surv = torch.tensor(sorted(set((p // POOL).tolist())), device=dev)
         fired = _fired_by(logits[0], float(sc["thr"][0]), kg, G, int(plen[0]), dev)
         dropped = fired[~torch.isin(fired, surv)]
         self.assertGreater(dropped.numel(), 0)                 # something WAS dropped
@@ -257,6 +246,53 @@ class TestBranchOperators(CustomTestCase):
         # so handing it groups divides by POOL a second time.
         _, exact, binw, _ = _exact(logits, 0, kepts[0], G, 0.75, int(plen[0]))
         self.assertLessEqual(float(sc["thr"][0]), exact + 1e-6)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_a_lane_above_the_band_still_fires_and_is_ordered_from_step_two(self):
+        """The two failures the capacity cap had to be fixed for.
+
+        FIRES NOTHING: `above[NC-1]` is 0 by construction, so it always "fits" WF
+        and an unclamped cap selected the top code -- keeping nothing, with flen 0
+        and the overflow flag CLEAR. The lane degraded silently to tier-1-only,
+        which scores 0.000 on multikey. The cap is clamped to NC-2 so the top code
+        is always kept, and flen is clamped to the buffer, since the fence no
+        longer empties the lane on this path.
+
+        ORDER: a FIXED band cannot be score-ordered. Its top code is open above,
+        every score past it collapses into one code, and the compaction then cuts
+        that code by position -- this fixture puts 1200 candidates on a ramp over
+        four kept-widths and the first call keeps the LOWEST 512. The band's top is
+        therefore last step's highest fired logit, which this kernel gets for free
+        because it already reads every score. Stale by one step: the warm-up call
+        has no max and falls back, so the property holds from call two, which is
+        one step per (layer, slot) lifetime.
+        """
+        dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(10, 2)])
+        kg = _kept_groups(kepts[0])
+        lg = torch.full((G,), -10.0, device=dev)
+        lg[kg] = torch.linspace(0.0, 1.0, len(kg), device=dev)       # width 1.0
+        cand = [g for g in range(int(plen[0])) if g not in set(kg.tolist())][:1200]
+        ci = torch.tensor(cand, device=dev)
+        lg[ci] = torch.linspace(2.0, 8.0, len(cand), device=dev)     # ramp, far above
+        WG = W // POOL
+        sc = _scratch(1, G)
+        for call in (1, 2, 3):
+            fb, fl, fo = _run(sc, lg[None], plen, slots, kept, klen, r2t, 0.75)
+            n = int(fl[2])
+            # never nothing, never past the buffer, never silently fenced
+            self.assertGreater(n, 0)
+            self.assertLessEqual(n, W)
+            self.assertEqual(int(fo[2]), 0)
+            if call == 1:
+                continue                      # warm-up: the band has no max yet
+            p = _positions(fb[2, :n].to(torch.int64), r2t, 2)
+            kept_g = set((p // POOL).tolist())
+            ks = lg[torch.tensor(sorted(kept_g), device=dev)]
+            dropped = [g for g in cand if g not in kept_g]
+            self.assertGreater(len(dropped), 0)
+            ds = lg[torch.tensor(dropped, device=dev)]
+            self.assertGreater(float(ks.min()), float(ds.max()))
+            self.assertLessEqual(n // POOL, WG)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_the_control_arm_still_fences(self):
@@ -346,10 +382,12 @@ class TestBranchMixedBatch(CustomTestCase):
         p = _positions(fb[2, :n].to(torch.int64), r2t, 2)
         self.assertEqual(sorted(set((p // POOL).tolist())), sorted(fired.tolist()))
         self.assertTrue(torch.isin(hot, p // POOL).all())
-        # the capped lane's rows are its own: the two slots' page tables are
-        # disjoint, so no row of one appears in the other's buffer
+        # The capped lane's rows are its OWN: every row it published belongs to
+        # its own page table. (Not disjointness of the two buffers -- the fixture's
+        # slots can share a physical row, and an unwritten entry reads 0 in both,
+        # which is what an earlier version of this assertion tripped over.)
         n1 = int(fl[1])
-        self.assertEqual(len(set(fb[1, :n1].tolist()) & set(fb[2, :n].tolist())), 0)
+        self.assertTrue(torch.isin(fb[1, :n1].to(torch.int64), r2t[1]).all())
 
 
 if __name__ == "__main__":
