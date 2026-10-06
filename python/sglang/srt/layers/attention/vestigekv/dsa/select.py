@@ -34,11 +34,13 @@ def _kept_threshold_kernel(
     logits_ptr,    # [B, G] fp32
     km_ptr,        # [B, G] int8 out (zero on entry): 1 = group holds a kept row
     kg_ptr,        # [B, KG] int32 out: the distinct kept groups, for the seed
+    ks_ptr,        # [B, KG] fp32 scratch: their scores, compacted for binning
     kgn_ptr,       # [B] int32 out: how many of them
     thr_ptr,       # [B] fp32 out
     q,
     CAPK, G,
     POOL: tl.constexpr, BK: tl.constexpr, NB: tl.constexpr, KG: tl.constexpr,
+    KG2: tl.constexpr,
 ):
     b = tl.program_id(0)
     slot = tl.load(slot_ptr + b).to(tl.int64)
@@ -62,17 +64,28 @@ def _kept_threshold_kernel(
     nkg = tl.sum(first.to(tl.int32), 0)
     width = tl.maximum(hi - lo, 1e-6)
 
-    # Compact the distinct groups for the kernel's seed list, in order.
+    # Compact the distinct groups for the seed list, in order.
     slots_ = tl.cumsum(first.to(tl.int32), 0) - 1
     tl.store(kg_ptr + b * KG + slots_, g.to(tl.int32), mask=first & (slots_ < KG))
     tl.store(kgn_ptr + b, tl.minimum(nkg, KG))
 
+    # Bin the COMPACTED groups, not the row-wide block. tl.histogram's cost
+    # scales with the bin count AND the block width, and only nkg of the BK
+    # lanes carry a value: at 124k that is 289 of 2048. Measured 2.05 us of a
+    # 4.35 us kernel, and binning 512 lanes instead of 2048 removes it.
+    # Semantics are untouched -- the same values, the same NB bins, the same
+    # range -- which is what test_the_threshold_matches_the_served_rule pins.
+    tl.store(ks_ptr + b * KG + slots_, s, mask=first & (slots_ < KG))
+    tl.debug_barrier()
+    jg = tl.arange(0, KG2)
+    mg = jg < tl.minimum(nkg, KG)
+    sg = tl.load(ks_ptr + b * KG + jg, mask=mg, other=0.0)
     bin_ = tl.minimum(
-        tl.maximum(((s - lo) / width * NB).to(tl.int32), 0), NB - 1
+        tl.maximum(((sg - lo) / width * NB).to(tl.int32), 0), NB - 1
     )
-    h = tl.histogram(tl.where(first, bin_, 0), NB)
+    h = tl.histogram(tl.where(mg, bin_, 0), NB)
     # Lane 0's bin collects the masked-off entries; take them back out.
-    nz = tl.sum((~first).to(tl.int32), 0)
+    nz = tl.sum((~mg).to(tl.int32), 0)
     bb = tl.arange(0, NB)
     h = h - tl.where(bb == 0, nz, 0)
 
@@ -95,9 +108,11 @@ def kept_threshold(*, logits, kept_pos, klen, slots, q, pool, scratch, kg_max):
     assert BK <= 4096, f"kept bound {kg_max} groups needs BK={BK}, one CTA's limit"
     _kept_threshold_kernel[(B,)](
         kept_pos, klen, slots, logits,
-        scratch["km"], scratch["kg"], scratch["kgn"], scratch["thr"],
+        scratch["km"], scratch["kg"], scratch["ks"], scratch["kgn"],
+        scratch["thr"],
         float(q), CAPK, G,
-        POOL=pool, BK=BK, NB=NBIN, KG=scratch["kg"].shape[1], num_warps=8,
+        POOL=pool, BK=BK, NB=NBIN, KG=scratch["kg"].shape[1],
+        KG2=triton.next_power_of_2(scratch["kg"].shape[1]), num_warps=8,
     )
     return scratch["thr"]
 
@@ -111,6 +126,7 @@ def select_scratch(*, bs, G, kg_max, dev, cand_max=2048):
         "ncand": torch.zeros(bs, dtype=torch.int32, device=dev),
         "km": torch.zeros(bs, G, dtype=torch.int8, device=dev),
         "kg": torch.zeros(bs, int(kg_max), dtype=torch.int32, device=dev),
+        "ks": torch.zeros(bs, int(kg_max), dtype=torch.float32, device=dev),
         "kgn": torch.zeros(bs, dtype=torch.int32, device=dev),
         "thr": torch.zeros(bs, dtype=torch.float32, device=dev),
         "ovf": torch.zeros(bs, dtype=torch.int32, device=dev),
