@@ -57,7 +57,8 @@ Paired with CLOSE_BLOCK this reads 0.607-0.614x DSA's bytes against 1.348-1.351x
 at the ceiling. Superseded in practice by a CONSTANT budget (see KEPT_GROUPS):
 rho*closed grows with context, and at 128k it reaches 1035 rows while a constant
 32 groups stays at 128 -- which is what turns the byte ratio from 0.849 to 0.706
-at that shape. rho remains the fallback when no constant budget is set."""
+at that shape. rho is now reached only when KEPT_GROUPS is explicitly 0, since the served budget
+is the constant one. It is kept because that control still has to be expressible."""
 
 CLOSE_BLOCK = 1024
 """Decoded tokens per compression event, and sigma's window.
@@ -127,12 +128,23 @@ real leverage -- about 3x kappa's -- so it is the one to tune per deployment:
 bounded by that fence rate, since a fenced lane falls back to reading DSA's full 2048
 rows."""
 
-KEPT_GROUPS = None
-"""Constant hot set, in index-k GROUPS, or None for the proportional rho form.
+KEPT_GROUPS = 32
+"""Constant hot set, in index-k GROUPS. 0 selects the proportional rho form instead.
 
-A constant budget is the arm's long-context argument: the row term stops growing
-with context, so the byte ratio stops being dragged toward 1 by it. The sign of
-the trade flips with shape -- at 36k constant and proportional read 0.508 vs
-0.511, at 128k 0.706 vs 0.849 -- because a smaller kept set also lowers the
-tier-2 threshold, which is a quantile of the kept groups' logits, and fetch rises
-to meet it. Set per-run through SGLANG_VESTIGEKV_KEPT_GROUPS."""
+The served budget, not a knob with a neutral default: a constant budget IS this arm's
+long-context argument. The row term stops growing with context, so the byte ratio stops
+being dragged toward 1 by it -- at 36k constant and proportional read 0.508 vs 0.511,
+and at 128k 0.706 vs 0.849. The sign of the trade flips with shape because a smaller
+kept set also lowers the tier-2 threshold, a quantile of the kept groups' logits, and
+fetch rises to meet it.
+
+32 groups = 128 rows is the measured point; 16 and 64 were never run. At this budget the
+arm holds 0.404 of the real attention mass on 1252 attended rows, which is 3.23e-4 per
+row against DSA's 2.75e-4 on 2048 -- more mass-efficient per row than the baseline it
+approximates. niah_multikey_3 @65536 reads 1.00 here.
+
+Compiled in rather than left to the environment for the reason BRANCH_Q is: the
+submission branch keeps ONLY the branch rule and the constant hot set, so an unset
+variable must not silently serve the proportional form that was measured worse at long
+context. `_kept_m_fixed()` keeps the tri-state -- unset takes this value, an explicit 0
+asks for proportional rho, any other value overrides the count."""

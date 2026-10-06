@@ -2283,7 +2283,15 @@ class VestigeKVDSABackend(AttentionBackend):
         from defaults.RHO, so a constant budget only ever leaves the buffers
         oversized.
         """
-        g = envs.SGLANG_VESTIGEKV_KEPT_GROUPS.get()
+        # Tri-state, as _branch_q is: UNSET takes the served constant, because the
+        # constant hot set is the selected design and an unset variable must not
+        # silently serve the proportional form that measured worse at long context
+        # (0.849 vs 0.706 byte ratio at 128k). An explicit 0 asks for proportional
+        # rho, which is how a non-constant control is written.
+        if not envs.SGLANG_VESTIGEKV_KEPT_GROUPS.is_set():
+            g = D.KEPT_GROUPS
+        else:
+            g = envs.SGLANG_VESTIGEKV_KEPT_GROUPS.get()
         return None if not g else int(g) * max(1, self._text_cfg_index_kpool)
 
     # ---- decode: evict (tier-1) + recall (tier-2), both unconditional ----

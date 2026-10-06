@@ -45,3 +45,32 @@ class TestBranchThresholdHasAServedDefault(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKeptBudgetHasAServedDefault(unittest.TestCase):
+    """The constant hot set is the selected design, so it must be the default.
+
+    Same silent-selection shape as BRANCH_Q: `_kept_m_fixed()` read
+    SGLANG_VESTIGEKV_KEPT_GROUPS with no fallback, so an unset variable served the
+    PROPORTIONAL rho form -- measured worse at long context (0.849 vs 0.706 byte ratio
+    at 128k) and not what the submission branch keeps. An explicit 0 remains the way to
+    ask for proportional rho.
+    """
+
+    def test_default_is_a_constant_group_budget(self):
+        self.assertIsNotNone(D.KEPT_GROUPS)
+        self.assertGreater(D.KEPT_GROUPS, 0)
+
+    def test_the_accessor_distinguishes_unset_from_zero(self):
+        def kept_groups():
+            if not envs.SGLANG_VESTIGEKV_KEPT_GROUPS.is_set():
+                return D.KEPT_GROUPS
+            return envs.SGLANG_VESTIGEKV_KEPT_GROUPS.get()
+
+        envs.SGLANG_VESTIGEKV_KEPT_GROUPS.clear()
+        self.assertEqual(kept_groups(), D.KEPT_GROUPS)       # unset -> constant
+        with envs.SGLANG_VESTIGEKV_KEPT_GROUPS.override(0):
+            self.assertFalse(kept_groups())                  # 0 -> proportional rho
+        with envs.SGLANG_VESTIGEKV_KEPT_GROUPS.override(64):
+            self.assertEqual(kept_groups(), 64)              # override the count
+        self.assertEqual(kept_groups(), D.KEPT_GROUPS)
