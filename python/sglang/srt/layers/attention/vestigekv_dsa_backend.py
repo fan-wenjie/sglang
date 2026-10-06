@@ -105,10 +105,19 @@ def _all_positions(row_slots):
 
 
 # 33 B/token is DSA's pooled index-k read, which our arm makes once and shares.
-# 9 B per group of 4 is the branch chain's own sweep (dsa_branch.py: km in
+# 9 B per group of 4 is the branch chain's own sweep (dsa/branch.py: km in
 # _branch_hist_kernel, logits + km + hit in _branch_hit_kernel, hit in
-# _branch_commit_kernel), so our fixed per-token read is 33 + 9/4.
-_VK_FIXED_B = 33.0 + 9.0 / 4.0
+# _branch_commit_kernel). The capacity cap adds 0.5: the bucket counts carry one
+# int32 per COARSE LEVEL so the scan can filter before it prefixes, 16*4 B a
+# 256-group bucket written once and read once. So 33 + 9.5/4.
+#
+# This number is the SLOPE, and it is the one to price a change against. 33 of it
+# is shared with DSA, so the 2.375 B/token on top is where we are behind, and the
+# whole advantage is in the constant term -- which is why the byte ratio decays
+# toward 1 with context. A first cut at the cap cost 9 B/group here, taking the
+# slope to 37.5 and the 4k/124k ratio from 0.706 to 0.741, to buy a 1.34% latency
+# term. Keep this line honest or the ratio silently flatters the arm.
+_VK_FIXED_B = 33.0 + 9.5 / 4.0
 
 class VestigeKVDSABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.

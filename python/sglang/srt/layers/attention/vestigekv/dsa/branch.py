@@ -66,6 +66,13 @@ import triton.language as tl
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
 NBIN = 256
+# Coarse levels the capacity cap may be set at. The fired count has to be bounded
+# by the fetch buffer's width, and the bound must be known BEFORE the compaction's
+# offsets are built -- so the hit kernel tallies its fires per coarse level and the
+# scan picks a level, instead of a later pass re-counting them. 16 levels cost
+# 16*4 B per 256-group block each way, 0.5 B/group, against the 9 B/group a
+# candidate-range pass plus a candidate histogram cost.
+NCOARSE = 16
 
 
 @triton.jit
@@ -127,6 +134,25 @@ def _branch_hist_kernel(
     tl.atomic_add(hist_ptr + b * NB + bin_, 1, mask=km)
 
 
+def _fence_truncate():
+    """Whether a would-be-overflowing lane TRUNCATES its own fired set to the fetch
+    buffer's width instead of being handed DSA's selection.
+
+    On by default. The fence saved no bytes -- the buffer holds WF*pool rows and
+    DSA's index_topk is the same 2048, so it swapped one 2048-row budget for
+    another -- and measured worse, because the fallback drops the kept rows (0.3566
+    mass against 0.3635, worst head 0.1079 against 0.1143, on fenced steps). What it
+    bought was a dependency: the fenced lane is the only consumer of DSA's top-k on
+    this arm, and that top-k cannot be skipped speculatively because the indexer
+    runs before attention inside a layer's forward.
+
+    Off restores the fallback, which is the control that prices it.
+    """
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_VESTIGEKV_FENCE_TRUNCATE.get())
+
+
 def _coarse_proxy():
     """(C, keep_per_mille) for the coarse-filter proxy, or (0, 0) when unset.
 
@@ -145,12 +171,12 @@ def _coarse_proxy():
 @triton.jit
 def _branch_hit_kernel(
     logits_ptr, km_ptr, hist_ptr, range_ptr, plen_ptr,
-    hit_ptr,       # [B, GP] int8 out
-    counts_ptr,    # [B, NBK] int32 out, one per bucket
+    hit_ptr,       # [B, GP] int8 out: 0 = no fire, else the fire's level + 1
+    counts_ptr,    # [B, NBK, NC] int32 out, fires per bucket per coarse level
     thr_ptr,       # [B] fp32 out: the resolved threshold (observability/tests)
     q,
     G, GP,
-    BLOCK: tl.constexpr, NB: tl.constexpr,
+    BLOCK: tl.constexpr, NB: tl.constexpr, NC: tl.constexpr,
     CPX_C: tl.constexpr = 0, CPX_KEEP: tl.constexpr = 0,
 ):
     b = tl.program_id(1)
@@ -202,19 +228,85 @@ def _branch_hit_kernel(
         # type int32"), which failed at compile time, i.e. at server start.
         keep = ((cg.to(tl.int64) * 2654435761) % 1000) < CPX_KEEP
         fired = fired & keep
+    # The fire's COARSE LEVEL, carried in the byte `hit` already occupies (0 means
+    # no fire, so a level is stored as level+1). The capacity cap is applied later,
+    # by the scan and the commit, against this level -- which is why it costs no
+    # traffic: both of those already read this byte.
+    #
+    # Binned over the kept range EXTENDED upward by one width. `range` spans the
+    # kept groups' logits and a candidate beating every kept group is exactly what
+    # fires, so the kept range alone would clamp the whole fired set into one
+    # level. Doubling it covers the fired tail without a pass to measure it;
+    # whatever still clamps into the top level is handled by the fence, which stays
+    # as the backstop.
+    lvl = tl.minimum(
+        tl.maximum(((s - lo) / (2.0 * width) * NC).to(tl.int32), 0), NC - 1
+    )
     # hit covers the padded width so the compaction's tail buckets read zeros.
-    tl.store(hit_ptr + b * GP + offs, fired.to(tl.int8), mask=offs < GP)
-    tl.store(counts_ptr + b * nb + blk, tl.sum(fired.to(tl.int32), 0))
+    tl.store(
+        hit_ptr + b * GP + offs,
+        tl.where(fired, lvl + 1, 0).to(tl.int8),
+        mask=offs < GP,
+    )
+    for l in tl.static_range(NC):
+        tl.store(
+            counts_ptr + b * (nb * NC) + blk * NC + l,
+            tl.sum((fired & (lvl == l)).to(tl.int32), 0),
+        )
     # Reset km for the next (layer, step): this kernel is its last reader, so
     # the reset rides on a store that is already in flight instead of a memset.
     tl.store(km_ptr + b * G + offs, tl.zeros([BLOCK], dtype=tl.int8), mask=m)
 
 
 @triton.jit
+def _branch_cap_scan_kernel(
+    counts_ptr,    # [B, NBK, NC] int32: fires per bucket per coarse level
+    offsets_ptr,   # [B, NBK] int32 out: exclusive prefix of the FILTERED counts
+    total_ptr,     # [B] int32 out: filtered fired count
+    cap_ptr,       # [B] int32 out: levels at or below this one are dropped
+    WF,
+    NBK,
+    NB2: tl.constexpr, NC: tl.constexpr,
+):
+    """Replaces the sketch chain's _compact_scan_kernel on the branch path.
+
+    One launch does three things that used to need three: pick the capacity level,
+    filter the per-bucket counts by it, and prefix-sum the result. Doing it here is
+    what makes the cap free -- a later pass to re-count the survivors would be
+    1 B/group and two more launches a layer-step, and the break-even on the whole
+    change is only ~3.3 us per layer launch.
+
+    The cap is the LOWEST level whose strictly-above population already fits WF, so
+    dropping that level and everything under it leaves at most WF fires. -1 keeps
+    every level, which is the ordinary non-overflowing step.
+    """
+    b = tl.program_id(0)
+    r = tl.arange(0, NB2)
+    c = tl.arange(0, NC)
+    m = r < NBK
+    cnt = tl.load(
+        counts_ptr + b * (NBK * NC) + r[:, None] * NC + c[None, :],
+        mask=m[:, None],
+        other=0,
+    )
+    per_lvl = tl.sum(cnt, 0)                       # [NC]
+    tot = tl.sum(per_lvl, 0)
+    above = tot - tl.cumsum(per_lvl, 0)            # population strictly above level l
+    fits = above <= WF
+    cap = tl.where(tot <= WF, -1, tl.min(tl.where(fits, c, NC), 0))
+    tl.store(cap_ptr + b, cap)
+    keep = c > cap
+    fc = tl.sum(tl.where(keep[None, :], cnt, 0), 1)        # [NB2] filtered per bucket
+    tl.store(total_ptr + b, tl.sum(tl.where(m, fc, 0), 0))
+    tl.store(offsets_ptr + b * NBK + r, tl.cumsum(fc, 0) - fc, mask=m)
+
+
+@triton.jit
 def _branch_commit_kernel(
-    hit_ptr,       # [B, GP] int8 (hit kernel)
-    offsets_ptr,   # [B, NBK] int32 exclusive bucket prefix (compact scan)
-    total_ptr,     # [B] int32 fired group count (compact scan)
+    hit_ptr,       # [B, GP] int8 (hit kernel): 0, else the fire's level + 1
+    offsets_ptr,   # [B, NBK] int32 exclusive bucket prefix (cap scan)
+    total_ptr,     # [B] int32 fired group count, already filtered (cap scan)
+    cap_ptr,       # [B] int32 the cap scan's level; levels <= it are dropped
     slot_ptr,      # [B] int pool slot per lane
     r2t_ptr,       # [NSLOT, MAXCTX] int64
     fetch_ptr,     # [NSLOT, W] int32 out
@@ -236,6 +328,10 @@ def _branch_commit_kernel(
     nb = GP // BLOCK
     slot = tl.load(slot_ptr + b).to(tl.int64)
     ng = tl.load(total_ptr + b)
+    cap = tl.load(cap_ptr + b)
+    # ng is already capped, so this only trips when even the TOP coarse level
+    # overpopulates WF -- a lane whose fired scores all clamp into it. The fence
+    # stays as that backstop rather than as the ordinary overflow path.
     fenced = ng > WF
     W = WG * POOL
 
@@ -272,7 +368,9 @@ def _branch_commit_kernel(
             blk = pid + i * NPROG
             offs = blk * BLOCK + tl.arange(0, BLOCK)
             m = offs < G
-            h = tl.load(hit_ptr + b * GP + offs, mask=m, other=0) != 0
+            # The cap, applied in the read the compaction already makes: a byte
+            # of 0 gives level -1, which fails this for any cap >= -1.
+            h = (tl.load(hit_ptr + b * GP + offs, mask=m, other=0).to(tl.int32) - 1) > cap
             base = tl.load(offsets_ptr + b * nb + blk)
             pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
             ok = h & (pos < WG)
@@ -295,10 +393,6 @@ def branch_fire(
     """One layer-step of the branch rule. `scratch` comes from branch_scratch;
     fetch_buf [NSLOT, W], fetch_len/fetch_ovf [NSLOT] are this layer's slices.
     `kept_pos` is tier 1's position table, parallel to its row table."""
-    from sglang.srt.layers.attention.vestigekv.fused_prologue import (
-        _compact_scan_kernel,
-    )
-
     B, G = logits.shape
     NSLOT, CAPK = kept_pos.shape
     sc = scratch
@@ -319,15 +413,18 @@ def branch_fire(
     _branch_hit_kernel[(NBK, B)](
         logits, sc["km"], sc["hist"], sc["range"], pool_lens,
         sc["hit"], sc["counts"], sc["thr"], float(q), G, GP,
-        BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
+        BLOCK=D.SCAN_BUCKET, NB=NBIN, NC=NCOARSE, num_warps=4,
         CPX_C=_cpx[0], CPX_KEEP=_cpx[1],
     )
-    _compact_scan_kernel[(B,)](
-        sc["counts"], sc["offsets"], sc["total"], NBK,
-        NB2=triton.next_power_of_2(NBK),
+    # WF only caps when truncation is on; passing the full width leaves `cap` at
+    # -1 on every step, so the control arm reaches the fence exactly as before.
+    _branch_cap_scan_kernel[(B,)](
+        sc["counts"], sc["offsets"], sc["total"], sc["cap"],
+        WF if _fence_truncate() else (1 << 30), NBK,
+        NB2=triton.next_power_of_2(NBK), NC=NCOARSE,
     )
     _branch_commit_kernel[(min(NBK, D.SCAN_GRID_CAP), B)](
-        sc["hit"], sc["offsets"], sc["total"], slots, r2t,
+        sc["hit"], sc["offsets"], sc["total"], sc["cap"], slots, r2t,
         fetch_buf, fetch_len, fetch_ovf, sc["ovf_count"], sc["hist"], sc["range"],
         G, GP, WG, WF, r2t.shape[1],
         POOL=pool, BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
@@ -349,8 +446,12 @@ def branch_scratch(*, bs, G, nslot, fetch_w, pool, fence_groups, dev):
         ),
         "thr": torch.zeros(bs, dtype=torch.float32, device=dev),
         "hit": torch.zeros(bs, GP, dtype=torch.int8, device=dev),
-        "counts": torch.zeros(bs, NBK, dtype=torch.int32, device=dev),
+        # Per BUCKET per COARSE LEVEL, so the scan can filter before it prefixes.
+        # 16*4 B a 256-group bucket each way is 0.5 B/group, against the 9 B/group
+        # a candidate-range pass plus a candidate histogram would have cost.
+        "counts": torch.zeros(bs, NBK * NCOARSE, dtype=torch.int32, device=dev),
         "offsets": torch.zeros(bs, NBK, dtype=torch.int32, device=dev),
         "total": torch.zeros(bs, dtype=torch.int32, device=dev),
+        "cap": torch.full((bs,), -1, dtype=torch.int32, device=dev),
         "ovf_count": torch.zeros(1, dtype=torch.int32, device=dev),
     }
