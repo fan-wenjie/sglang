@@ -108,6 +108,7 @@ def blockwise_sigma_from_pool(
     slots: torch.Tensor,
     block: int = D.CLOSE_BLOCK,
     *,
+    kappa: int = D.LOWPASS_KAPPA,
     offset: int = D.KV_LORA_RANK,
     dim: int = D.SIDECAR_DIM,
     scale: torch.Tensor | None = None,
@@ -125,16 +126,18 @@ def blockwise_sigma_from_pool(
         )
 
         sig, _ = sigma_fused_from_pool(
-            kbuf, slots, block, offset=offset, dim=dim, scale=scale
+            kbuf, slots, block, kappa, offset=offset, dim=dim, scale=scale
         )
         return sig
     rows = kbuf[slots][:, offset : offset + dim]
     if scale is not None:
         rows = rows.float() * scale[slots][:, None]
-    return blockwise_sigma(rows, block)
+    return blockwise_sigma(rows, block, kappa=kappa)
 
 
-def blockwise_sigma(side: torch.Tensor, block: int = D.CLOSE_BLOCK) -> torch.Tensor:
+def blockwise_sigma(
+    side: torch.Tensor, block: int = D.CLOSE_BLOCK, *, kappa: int = D.LOWPASS_KAPPA
+) -> torch.Tensor:
     """sigma over full blocks only: one fixed-window rFFT per block.
 
     The cutoff kappa counts frequency BINS, and bin k corresponds to period
@@ -167,9 +170,12 @@ def blockwise_sigma(side: torch.Tensor, block: int = D.CLOSE_BLOCK) -> torch.Ten
         from sglang.srt.layers.attention.vestigekv.sigma_fused import sigma_fused
 
         sig, _ = sigma_fused(
-            side[: n_blocks * block].reshape(n_blocks, block, side.shape[1])
+            side[: n_blocks * block].reshape(n_blocks, block, side.shape[1]), kappa
         )
         return sig.reshape(-1)
     return torch.cat(
-        [sidecar_sigma(side[i * block : (i + 1) * block]) for i in range(n_blocks)]
+        [
+            sidecar_sigma(side[i * block : (i + 1) * block], kappa)
+            for i in range(n_blocks)
+        ]
     )

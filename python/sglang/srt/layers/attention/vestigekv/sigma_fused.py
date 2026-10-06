@@ -26,7 +26,9 @@ import triton.language as tl
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
 N_BINS = 1024
-_KB_PAD = 32  # 2*kappa-1 = 31 padded to a tl.dot-friendly 32 (zero column)
+# 2*kappa-1 columns padded to a tl.dot-friendly power of two; the cap this is
+# derived from is what the backend validates an overridden kappa against.
+_KB_PAD = 2 * D.LOWPASS_KAPPA_MAX
 
 _basis_cache: dict = {}
 

@@ -224,6 +224,25 @@ class VestigeKVDSABackend(AttentionBackend):
                     "allocated from the latter. Raise defaults.RHO instead."
                 )
             logger.info("VestigeKV: rho overridden to %.6g (default %.6g)", self.rho, rho)
+        _kap = envs.SGLANG_VESTIGEKV_LOWPASS_KAPPA.get()
+        self.lowpass_kappa = int(_kap) if _kap else D.LOWPASS_KAPPA
+        if _kap:
+            # Checked here, not at the first close: the projection kernel
+            # compiles on its first call, which is serve time, so an unbuildable
+            # basis would read as a dead server rather than a rejected setting.
+            if not 1 <= self.lowpass_kappa <= D.LOWPASS_KAPPA_MAX:
+                raise ValueError(
+                    f"SGLANG_VESTIGEKV_LOWPASS_KAPPA={self.lowpass_kappa} is outside "
+                    f"[1, {D.LOWPASS_KAPPA_MAX}]; the basis is 2*kappa-1 columns "
+                    "padded to twice the cap. Raise defaults.LOWPASS_KAPPA_MAX, "
+                    "which is a kernel change."
+                )
+            logger.info(
+                "VestigeKV: lowpass kappa overridden to %d (default %d); cutoff "
+                "period is window/kappa, basis %d of %d padded columns",
+                self.lowpass_kappa, D.LOWPASS_KAPPA,
+                2 * self.lowpass_kappa - 1, 2 * D.LOWPASS_KAPPA_MAX,
+            )
         _cb = envs.SGLANG_VESTIGEKV_CLOSE_BLOCK.get()
         self.close_block = int(_cb) if _cb else D.DSA_CLOSE_BLOCK
         if _cb:
@@ -246,7 +265,7 @@ class VestigeKVDSABackend(AttentionBackend):
             logger.info(
                 "VestigeKV: close block overridden to %d (default %d); sigma's "
                 "low-pass cutoff moves with it, to window/kappa = %d tokens",
-                self.close_block, D.DSA_CLOSE_BLOCK, self.close_block // D.LOWPASS_KAPPA,
+                self.close_block, D.DSA_CLOSE_BLOCK, self.close_block // self.lowpass_kappa,
             )
         # Unconditional, because the override lines above fire only when an
         # env var is set: a run on the compiled-in pair otherwise left no
@@ -261,8 +280,8 @@ class VestigeKVDSABackend(AttentionBackend):
                 if (_kg := envs.SGLANG_VESTIGEKV_KEPT_GROUPS.get())
                 else f"rho={self.rho:.6g}"
             ),
-            self.close_block, self.close_block // D.LOWPASS_KAPPA,
-            2 * D.LOWPASS_KAPPA - 1, D.RHO, D.CLOSE_BLOCK,
+            self.close_block, self.close_block // self.lowpass_kappa,
+            2 * self.lowpass_kappa - 1, D.RHO, D.CLOSE_BLOCK,
         )
         self.index_rank = index_rank
         # Route the base's stage-1 decode at the tiers instead of a packed CSR.
@@ -426,7 +445,7 @@ class VestigeKVDSABackend(AttentionBackend):
         if _spec_every:
             from sglang.srt.layers.attention.vestigekv.spectrum import SpectrumTelemetry
 
-            self._spectrum = SpectrumTelemetry(D.LOWPASS_KAPPA, every=_spec_every)
+            self._spectrum = SpectrumTelemetry(self.lowpass_kappa, every=_spec_every)
             logger.info(
                 "VestigeKV spectrum telemetry on: one rFFT per closing block per "
                 "layer, reported as VKSPECTRUM every %d blocks; nothing reads it back",
@@ -1901,7 +1920,12 @@ class VestigeKVDSABackend(AttentionBackend):
                 "per pool row; use _index_sigma"
             )
         return blockwise_sigma_from_pool(
-            kbuf, slots, self.close_block, offset=g.sigma_offset, dim=g.sigma_dim
+            kbuf,
+            slots,
+            self.close_block,
+            kappa=self.lowpass_kappa,
+            offset=g.sigma_offset,
+            dim=g.sigma_dim,
         )
 
     def _observe_spectrum(self, slot, lid, kbuf, c0, c1):
@@ -2153,7 +2177,11 @@ class VestigeKVDSABackend(AttentionBackend):
             slots_per_page=self.token_to_kv_pool.slots_per_page,
             pool_size=pool_size,
         )
-        sig = blockwise_sigma(keys, group_sigma_window(self.close_block, pool_size))
+        sig = blockwise_sigma(
+            keys,
+            group_sigma_window(self.close_block, pool_size),
+            kappa=self.lowpass_kappa,
+        )
         # One sigma per group, repeated to its positions: every consumer
         # downstream indexes by position, and a group's members share its
         # salience by construction.

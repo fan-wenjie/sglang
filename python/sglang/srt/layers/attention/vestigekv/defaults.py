@@ -69,6 +69,14 @@ RECENT_WINDOW = 256
 """Trailing rows kept unconditionally. Decoded tokens join here, which is why
 the archive is fixed at prefill and the tier-2 scan is capturable."""
 
+LOWPASS_KAPPA_MAX = 16
+"""Largest kappa the fused projection kernel can take.
+
+sigma_fused pads the 2*kappa-1 column basis to 2*LOWPASS_KAPPA_MAX for tl.dot,
+so this must stay a value whose double is tl.dot-friendly (32). Raising it
+widens every projection's K dimension, for every kappa, so it is a kernel
+change and not a configuration one."""
+
 LOWPASS_KAPPA = 16
 """rFFT cutoff for the low-pass whose residual defines sigma.
 

@@ -689,6 +689,16 @@ class Envs:
     # build failing in both arms (071e001491), so the provisional certificate
     # fired the whole archive and fp8 was halving a scan far larger than the
     # real one; a run that read 2.9% was truncated at 78k by the KV pool.
+    # rFFT bin cutoff of the low-pass whose residual IS sigma, overriding
+    # defaults.LOWPASS_KAPPA. Bin k is period window/k, so the cutoff period is
+    # close_block/kappa -- the pair sets it, and this is the half that moves
+    # without changing the close cadence or the un-closed tail. Capped at 16 by
+    # sigma_fused._KB_PAD: the basis is 2*kappa-1 columns padded to a
+    # tl.dot-friendly 32, so 17 would need a wider pad and a kernel change.
+    # The compiled-in 16 was chosen by attention mass at m = rho*T groups with
+    # rho = 1/32; a constant kept set is served at 32 groups, which is a
+    # different size and a selector has to be judged at the size it is used at.
+    SGLANG_VESTIGEKV_LOWPASS_KAPPA = EnvInt(None)
     SGLANG_VESTIGEKV_CSK_FP8 = EnvBool(False)
     # Rows per archived tier-2 entry, the A/B over the parity rule: DSA scans
     # its index cache 4:1 pooled, so the archive does too. 1 keeps the
