@@ -46,6 +46,13 @@ class TestVkSelectFetch(CustomTestCase):
         r2t = torch.randperm(maxctx, device=dev, dtype=torch.int32).repeat(bs, 1)
         return logits, pos, klen, slots, r2t
 
+    # The fetch buffers are ONE row taller than r2t in the served backend: that
+    # extra row is the trash slot (_alloc_recall_bufs does max_reqs + 1), where a
+    # lane with nothing to fetch writes harmlessly. Building the two at equal
+    # width here is what let a launcher that declared one row symbol for both
+    # pass every test and fail every served call.
+    FETCH_EXTRA_ROWS = 1
+
     def _old(self, logits, pos, klen, slots, r2t, q):
         from sglang.srt.layers.attention.vestigekv.dsa import branch as B
 
@@ -53,9 +60,10 @@ class TestVkSelectFetch(CustomTestCase):
         W = self.WG * self.POOL
         sc = B.branch_scratch(bs=bs, G=G * self.POOL, nslot=bs, fetch_w=W,
                               pool=self.POOL, fence_groups=None, dev=self.dev)
-        fetch = torch.full((bs, W), -1, dtype=torch.int32, device=self.dev)
-        flen = torch.zeros(bs, dtype=torch.int32, device=self.dev)
-        fovf = torch.zeros(bs, dtype=torch.int32, device=self.dev)
+        nf = bs + self.FETCH_EXTRA_ROWS
+        fetch = torch.full((nf, W), -1, dtype=torch.int32, device=self.dev)
+        flen = torch.zeros(nf, dtype=torch.int32, device=self.dev)
+        fovf = torch.zeros(nf, dtype=torch.int32, device=self.dev)
         plen = torch.full((bs,), G, dtype=torch.int32, device=self.dev)
         B.branch_fire(logits=logits, pool_lens=plen, slots=slots, kept_pos=pos,
                       klen=klen, q=q, scratch=sc, fetch_buf=fetch,
@@ -78,9 +86,10 @@ class TestVkSelectFetch(CustomTestCase):
         sel = select_scratch(bs=bs, G=G, kg_max=kg, dev=self.dev)
         kept_threshold(logits=logits, kept_pos=pos, klen=klen, slots=slots, q=q,
                        pool=self.POOL, scratch=sel, kg_max=kg)
-        fetch = torch.full((bs, W), -1, dtype=torch.int32, device=self.dev)
-        flen = torch.zeros(bs, dtype=torch.int32, device=self.dev)
-        fovf = torch.zeros(bs, dtype=torch.int32, device=self.dev)
+        nf = bs + self.FETCH_EXTRA_ROWS
+        fetch = torch.full((nf, W), -1, dtype=torch.int32, device=self.dev)
+        flen = torch.zeros(nf, dtype=torch.int32, device=self.dev)
+        fovf = torch.zeros(nf, dtype=torch.int32, device=self.dev)
         plen = torch.full((bs,), G, dtype=torch.int32, device=self.dev)
         vk_select_fetch(logits=logits, pool_lens=plen, thresholds=sel["thr"],
                         kept_mask=sel["km"], slots=slots, r2t=r2t,
@@ -104,9 +113,10 @@ class TestVkSelectFetch(CustomTestCase):
         sel = select_scratch(bs=bs, G=G, kg_max=kg, dev=self.dev)
         kept_threshold(logits=logits, kept_pos=pos, klen=klen, slots=slots, q=q,
                        pool=self.POOL, scratch=sel, kg_max=kg)
-        fetch = torch.full((bs, W), -1, dtype=torch.int32, device=self.dev)
-        flen = torch.zeros(bs, dtype=torch.int32, device=self.dev)
-        fovf = torch.zeros(bs, dtype=torch.int32, device=self.dev)
+        nf = bs + self.FETCH_EXTRA_ROWS
+        fetch = torch.full((nf, W), -1, dtype=torch.int32, device=self.dev)
+        flen = torch.zeros(nf, dtype=torch.int32, device=self.dev)
+        fovf = torch.zeros(nf, dtype=torch.int32, device=self.dev)
         plen = torch.full((bs,), G, dtype=torch.int32, device=self.dev)
         vk_collect_emit(logits=logits, pool_lens=plen, thresholds=sel["thr"],
                         kept_mask=sel["km"], cand_score=sel["cand_score"],

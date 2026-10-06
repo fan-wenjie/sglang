@@ -895,7 +895,12 @@ struct VkSelectFetchKernel {
     auto KM = SymbolicSize{"kept_mask_stride"};
     auto R = SymbolicSize{"r2t_stride"};
     auto F = SymbolicSize{"fetch_stride"};
-    auto NSLOT = SymbolicSize{"nslot"};
+    // r2t and the fetch buffers do NOT share a row count: _alloc_recall_bufs adds
+    // one row past the request pool for the trash slot, where a lane with nothing
+    // to fetch writes harmlessly. One symbol for both made every served call fail
+    // the match while the unit test passed, because the test built them equal.
+    auto NSLOT_R = SymbolicSize{"r2t_rows"};
+    auto NSLOT_F = SymbolicSize{"fetch_rows"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
@@ -904,13 +909,17 @@ struct VkSelectFetchKernel {
     TensorMatcher({B}).with_dtype<float>().with_device(device).verify(thresholds);
     TensorMatcher({B, -1}).with_strides({KM, 1}).with_dtype<int8_t>().with_device(device).verify(kept_mask);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(slots);
-    TensorMatcher({NSLOT, -1}).with_strides({R, 1}).with_dtype<int32_t>().with_device(device).verify(r2t);
-    TensorMatcher({NSLOT, -1}).with_strides({F, 1}).with_dtype<int32_t>().with_device(device).verify(fetch);
-    TensorMatcher({NSLOT}).with_dtype<int32_t>().with_device(device).verify(flen);
-    TensorMatcher({NSLOT}).with_dtype<int32_t>().with_device(device).verify(fovf);
+    TensorMatcher({NSLOT_R, -1}).with_strides({R, 1}).with_dtype<int32_t>().with_device(device).verify(r2t);
+    TensorMatcher({NSLOT_F, -1}).with_strides({F, 1}).with_dtype<int32_t>().with_device(device).verify(fetch);
+    TensorMatcher({NSLOT_F}).with_dtype<int32_t>().with_device(device).verify(flen);
+    TensorMatcher({NSLOT_F}).with_dtype<int32_t>().with_device(device).verify(fovf);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ovf_counts);
 
     RuntimeCheck(pool_size > 1, "pool_size must be > 1, got ", pool_size);
+    // `slot` indexes both tables, so the fetch side must be at least as tall.
+    RuntimeCheck(
+        static_cast<int64_t>(NSLOT_F.unwrap()) >= static_cast<int64_t>(NSLOT_R.unwrap()),
+        "fetch rows ", NSLOT_F.unwrap(), " < r2t rows ", NSLOT_R.unwrap());
     // The emit writes group_budget * pool_size entries at most; a wider budget
     // than the buffer holds would run off the end of a lane's row.
     const auto fetch_w = static_cast<int64_t>(fetch.shape()[1]);
@@ -971,7 +980,12 @@ struct VkCollectEmitKernel {
     auto CS = SymbolicSize{"cand_stride"};
     auto R = SymbolicSize{"r2t_stride"};
     auto F = SymbolicSize{"fetch_stride"};
-    auto NSLOT = SymbolicSize{"nslot"};
+    // r2t and the fetch buffers do NOT share a row count: _alloc_recall_bufs adds
+    // one row past the request pool for the trash slot, where a lane with nothing
+    // to fetch writes harmlessly. One symbol for both made every served call fail
+    // the match while the unit test passed, because the test built them equal.
+    auto NSLOT_R = SymbolicSize{"r2t_rows"};
+    auto NSLOT_F = SymbolicSize{"fetch_rows"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
@@ -983,14 +997,19 @@ struct VkCollectEmitKernel {
     TensorMatcher({B, -1}).with_strides({CS, 1}).with_dtype<int32_t>().with_device(device).verify(cand_idx);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ncand);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(slots);
-    TensorMatcher({NSLOT, -1}).with_strides({R, 1}).with_dtype<int32_t>().with_device(device).verify(r2t);
-    TensorMatcher({NSLOT, -1}).with_strides({F, 1}).with_dtype<int32_t>().with_device(device).verify(fetch);
-    TensorMatcher({NSLOT}).with_dtype<int32_t>().with_device(device).verify(flen);
-    TensorMatcher({NSLOT}).with_dtype<int32_t>().with_device(device).verify(fovf);
+    TensorMatcher({NSLOT_R, -1}).with_strides({R, 1}).with_dtype<int32_t>().with_device(device).verify(r2t);
+    TensorMatcher({NSLOT_F, -1}).with_strides({F, 1}).with_dtype<int32_t>().with_device(device).verify(fetch);
+    TensorMatcher({NSLOT_F}).with_dtype<int32_t>().with_device(device).verify(flen);
+    TensorMatcher({NSLOT_F}).with_dtype<int32_t>().with_device(device).verify(fovf);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ovf_counts);
 
     const auto cand_w = static_cast<int64_t>(cand_score.shape()[1]);
     RuntimeCheck(cand_w >= kCandMax, "candidate buffer ", cand_w, " < ", kCandMax);
+    // `slot` indexes both tables, so the fetch side must be at least as tall.
+    RuntimeCheck(
+        static_cast<int64_t>(NSLOT_F.unwrap()) >= static_cast<int64_t>(NSLOT_R.unwrap()),
+        "fetch rows ", NSLOT_F.unwrap(), " < r2t rows ", NSLOT_R.unwrap());
+
     RuntimeCheck(
         group_budget * pool_size <= static_cast<int64_t>(fetch.shape()[1]),
         "group_budget x pool exceeds the fetch buffer width");
