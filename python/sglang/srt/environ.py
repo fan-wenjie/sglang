@@ -800,14 +800,6 @@ class Envs:
     # and picks survivors by hash rather than by score, which is strictly worse
     # than the real filter. A pass here is evidence for the design; a failure
     # closes it at the cost of one job instead of an implementation.
-    # A would-be-overflowing branch lane truncates its own fired set to the fetch
-    # buffer's width instead of being handed DSA's index_topk selection. On by
-    # default: the old fallback read the SAME 2048 rows (the buffer holds WF*pool
-    # = 512*4 of them), delivered less attention mass because it drops the kept
-    # rows (0.3566 vs 0.3635, worst head 0.1079 vs 0.1143 on fenced steps), and
-    # created the dependency that keeps DSA's top-k alive on this arm -- 85.9 us a
-    # step at 36k, 157.4 at 124k. 0 restores the fallback, for the control arm.
-    SGLANG_VESTIGEKV_FENCE_TRUNCATE = EnvBool(True)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
