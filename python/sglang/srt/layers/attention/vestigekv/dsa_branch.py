@@ -197,7 +197,10 @@ def _branch_hit_kernel(
         # one, so a pass here is evidence for the design and a failure closes
         # it without the implementation cost.
         cg = offs // CPX_C
-        keep = ((cg * 2654435761) % 1000) < CPX_KEEP
+        # int64 before the multiply: offs is int32 and the Knuth constant
+        # does not fit it (Triton: "Scalar 2654435761 is out of range for
+        # type int32"), which failed at compile time, i.e. at server start.
+        keep = ((cg.to(tl.int64) * 2654435761) % 1000) < CPX_KEEP
         fired = fired & keep
     # hit covers the padded width so the compaction's tail buckets read zeros.
     tl.store(hit_ptr + b * GP + offs, fired.to(tl.int8), mask=offs < GP)

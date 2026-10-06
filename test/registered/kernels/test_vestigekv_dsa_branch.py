@@ -157,6 +157,34 @@ class TestBranchOperators(CustomTestCase):
             self.assertGreaterEqual(got, thr - binw - 1e-6)  # by at most one bin
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_the_coarse_proxy_compiles_and_only_ever_removes_fires(self):
+        """The proxy path must COMPILE, and must be a subset of the full fire set.
+
+        It did not compile: offs is int32 and the Knuth constant does not fit,
+        so `ValueError: Scalar 2654435761 is out of range for type int32` came
+        out of Triton at first call -- which is server start, so four queued
+        jobs died with "server did not start" before anything ran. A Triton
+        kernel behind an env flag has no compile-time coverage unless a test
+        sets the flag, and this one does.
+        """
+        from sglang.srt.environ import envs
+
+        dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(1, 2)])
+        kg = _kept_groups(kepts[0])
+        logits, _ = _cold(G, kg, 50, dev, 7)
+        sc = _scratch(1, G)
+        _, full_len, _ = _run(sc, logits[None], plen, slots, kept, klen, r2t, 0.75)
+        full = int(full_len[2])
+        for spec in ("16,0.5", "16,0.75", "8,0.5"):
+            with envs.SGLANG_VESTIGEKV_COARSE_PROXY.override(spec):
+                sc2 = _scratch(1, G)
+                _, fl, fo = _run(sc2, logits[None], plen, slots, kept, klen, r2t, 0.75)
+                n = int(fl[2])
+                self.assertEqual(int(fo[2]), 0, spec)
+                self.assertLessEqual(n, full, f"{spec}: the proxy added fires")
+                self.assertEqual(n % POOL, 0, spec)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_below_the_trigger_fetches_exactly_the_fired_groups(self):
         dev, r2t, kept, klen, slots, plen, G, kepts = _fixture([(1, 2)])
         kg = _kept_groups(kepts[0])
