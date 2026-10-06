@@ -292,10 +292,18 @@ def _branch_hit_kernel(
         tl.where(fired, lvl + 1, 0).to(tl.int8),
         mask=offs < GP,
     )
-    for l in tl.static_range(NC):
-        n_l = tl.sum((fired & (lvl == l)).to(tl.int32), 0)
-        if n_l > 0:
-            tl.atomic_add(counts_ptr + b * (NBK * NC) + bucket * NC + l, n_l)
+    # One atomic per FIRED lane, not one reduction per level. Firing is sparse --
+    # about 115 of 32768 groups a layer-step -- so a per-level tally costs NC
+    # whole-block reductions in every CTA whether or not that CTA fired at all:
+    # 512 CTAs x 24 = 12288 reductions to count ~115 events. Measured at 49.3 us
+    # a step, 80% of it this loop. The scatter spends one atomic per event and
+    # the masked-off lanes spend nothing. Lanes sharing a level collide on one
+    # address, which the hardware serialises -- at this density it does not bite.
+    tl.atomic_add(
+        counts_ptr + b * (NBK * NC) + bucket * NC + lvl,
+        1,
+        mask=fired,
+    )
     # Reset km for the next (layer, step): this kernel is its last reader, so
     # the reset rides on a store that is already in flight instead of a memset.
     tl.store(km_ptr + b * G + offs, tl.zeros([BLOCK], dtype=tl.int8), mask=m)
