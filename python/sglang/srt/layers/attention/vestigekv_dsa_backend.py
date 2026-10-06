@@ -1842,6 +1842,16 @@ class VestigeKVDSABackend(AttentionBackend):
         )
 
     def _branch_q(self):
+        # Tri-state, and all three states are load-bearing. UNSET falls back to the
+        # served default, because this arm has no other tier 2 and an unset variable
+        # previously meant "run the sketch chain instead" -- which on the submission
+        # branch, where the chain is deleted, would mean no tier 2 at all. Explicitly
+        # set to None still disables the branch rule, which is how a non-branch control
+        # is expressed and what keeps the VK_LEAN path reachable (_variant_for_step
+        # refuses lean while the branch rule is active, since the branch rule consumes
+        # the indexer's scores every step).
+        if not envs.SGLANG_VESTIGEKV_BRANCH_Q.is_set():
+            return D.BRANCH_Q
         return envs.SGLANG_VESTIGEKV_BRANCH_Q.get()
 
     def write_salience(

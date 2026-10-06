@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
+
 from sglang.srt.layers.attention.vestigekv_dsa_backend import VestigeKVDSABackend
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,10 +35,20 @@ def _be(n_layers=3):
 
 
 class TestOverflowProbe(CustomTestCase):
+    """VK_LEAN is a NON-branch-arm mechanism and these cases must say so.
+
+    `_variant_for_step` refuses lean while the branch rule is active, because the
+    branch rule thresholds the indexer's scores every step and lean is precisely the
+    variant that skips the indexer. Since BRANCH_Q acquired a served default, an unset
+    variable means the branch rule is ON, so a lean case has to disable it explicitly --
+    `override(None)` sets the explicit-None state the accessor distinguishes from unset.
+    """
+
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_lean_until_a_lane_overflows(self):
         from sglang.srt.layers.attention.graph_variants import VK_LEAN, VK_TOPK
 
+        self.enterContext(envs.SGLANG_VESTIGEKV_BRANCH_Q.override(None))
         be = _be()
         be._probe_overflow()
         torch.cuda.synchronize()

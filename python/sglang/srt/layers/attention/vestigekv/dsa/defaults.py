@@ -104,6 +104,29 @@ branch_q is roughly 3x the leverage of kappa on the same table -- at kappa 16, q
 q0.70 moves mass 0.4085 -> 0.4134 for 11 more fired groups -- so that is the knob to
 tune, bounded by the fence rate (0.194 / 0.246 / 0.342 at 96 / 110 / 130 fired)."""
 
+BRANCH_Q = 0.75
+"""Served tier-2 threshold: the quantile of the kept GROUPS' indexer scores that an
+archived group must beat to fire.
+
+A compiled-in default because this arm has no other tier 2. `_branch_q()` used to read
+`SGLANG_VESTIGEKV_BRANCH_Q` with no fallback, and `_skip_sketch_chain()` keys off
+`_branch_q() is not None` -- so on the research branch an unset variable meant "run the
+sketch chain instead", and on THIS branch, where the chain is deleted, it would mean no
+tier 2 at all. A 4k/256 smoke that omitted the variable duly served the sketch lineage
+and read overflow=722 / fallback=0.263 against the branch arm's 0 / 0.00000, which read
+as a kappa regression and was not one.
+
+0.75 rather than the maximum: the threshold is a quantile of the kept groups' scores,
+not their max, and the max was measured to fire almost nothing. It is also the knob with
+real leverage -- about 3x kappa's -- so it is the one to tune per deployment:
+
+    fired groups   96      110     130
+    att mass       0.4038  0.4103  0.4189     (kappa 4, 240 honest queries)
+    fence rate     0.19    0.24    0.34
+
+bounded by that fence rate, since a fenced lane falls back to reading DSA's full 2048
+rows."""
+
 KEPT_GROUPS = None
 """Constant hot set, in index-k GROUPS, or None for the proportional rho form.
 
