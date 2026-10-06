@@ -67,24 +67,42 @@ CLOSE_BLOCK/LOWPASS_KAPPA, and at 256 the basis reaches 48% of the window and
 niah_multikey_3 collapsed to 0.000. It is also the only knob on the un-closed
 tail, which averages CLOSE_BLOCK/2 rows attended unconditionally."""
 
-LOWPASS_KAPPA = 16
+LOWPASS_KAPPA = 4
 """rFFT bin cutoff of the low-pass whose residual is sigma, on THIS arm's signal.
 
-`_index_sigma` projects DSA's index-k in GROUP space, window CLOSE_BLOCK/pool --
-not the latent row's salience branch the mla arm transforms. Measured on the
-served signal at the served size (88 calibration dumps, 704 real queries, all 11
-DSA layers, mexp/glm53/kappa_m_grid.py), captured attention mass at a constant
-32-group budget falls monotonically with kappa:
+`_index_sigma` projects DSA's index-k in GROUP space, window CLOSE_BLOCK/pool -- not
+the latent row's salience branch the mla arm transforms. The compiled-in 16 came from
+the mla arm's fit and reached here by default argument.
 
-    kappa        1        2        3        4        8       16
-    mass    0.1578   0.1551   0.1539   0.1523   0.1480   0.1410
-    prec    0.6825   0.6626   0.6612   0.6555   0.6378   0.6264
+Chosen on a COST-MATCHED end-to-end criterion, on the re-collected dumps where qidx is
+distinct per step (240 honest queries, mexp/glm53/kappa_endtoend.py). The figure of
+merit is the real softmax mass over the rows the arm ACTUALLY attends -- kept + fired +
+sinks + un-closed tail -- because kept has two jobs and the earlier tier-1-only grids
+scored one: it is also what sets the tier-2 threshold, the q0.75 quantile of the kept
+groups' scores, so a kappa that picks high-scoring rows raises that quantile and
+suppresses the firing that does the retrieving. At equal fired-group count:
 
-kappa=1 keeps bin 0 alone, so its residual IS the row minus its block mean: on
-this signal the trigonometric basis buys nothing a mean and a norm could not.
-Held at 16 until the in-situ ladder (c521kap-*) reports, because offline tier-1
-evidence has never decided quality on this line. Capped at LOWPASS_KAPPA_MAX by
-the projection kernel's pad."""
+    fired   kappa 1   kappa 2   kappa 4   kappa 8   kappa 16   kappa 32
+      96     0.4038    0.4034    0.4034    0.4029     0.4016     0.3992
+     110     0.4103    0.4102    0.4100    0.4097     0.4089     0.4073
+     130     0.4189    0.4195    0.4187    0.4183     0.4176     0.4169
+
+Monotone against kappa at every cost point, so the low end wins -- and the opposite
+reading from an unmatched comparison was a cost artifact: kappa=32's higher raw mass
+came from firing 21% more groups.
+
+4 rather than 1 because kappa=1 keeps the DC term alone, which makes sigma a block-mean
+subtraction -- a structurally different object with no margin if the block statistics
+shift -- while 4 keeps 7 basis columns, lands within 0.0004 of kappa=1 at every cost
+point, and is 0.0018 above the old 16. The change is FREE: the basis is zero-padded to
+2*LOWPASS_KAPPA_MAX columns whatever kappa is.
+
+It is an offline-justified default, not a measured quality gain. +0.45% captured mass
+is far below the copy probe's resolution (same-config `lead` spread 0.137), so no
+in-situ draw can confirm or refute it; the c521kap-* batch tried and could not.
+branch_q is roughly 3x the leverage of kappa on the same table -- at kappa 16, q0.75 ->
+q0.70 moves mass 0.4085 -> 0.4134 for 11 more fired groups -- so that is the knob to
+tune, bounded by the fence rate (0.194 / 0.246 / 0.342 at 96 / 110 / 130 fired)."""
 
 KEPT_GROUPS = None
 """Constant hot set, in index-k GROUPS, or None for the proportional rho form.
