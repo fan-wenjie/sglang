@@ -477,7 +477,7 @@ def _branch_commit_kernel(
 
 def branch_fire(
     *, logits, pool_lens, slots, kept_pos, klen, q, scratch, fetch_buf,
-    fetch_len, fetch_ovf, r2t, pool, fence_groups,
+    fetch_len, fetch_ovf, r2t, pool, fence_groups, kept_rows_max=None,
 ):
     """One layer-step of the branch rule. `scratch` comes from branch_scratch;
     fetch_buf [NSLOT, W], fetch_len/fetch_ovf [NSLOT] are this layer's slices.
@@ -490,7 +490,18 @@ def branch_fire(
     WG = fetch_buf.shape[1] // pool
     WF = WG if fence_groups is None else max(1, min(WG, int(fence_groups)))
 
-    _branch_kept_kernel[(triton.cdiv(CAPK, 64), B)](
+    # Grid over the kept rows that can EXIST, not over the table that holds them.
+    # CAPK is the sizing ceiling -- rho_ceiling * max_ctx + 3 * close_block_ceiling,
+    # 16512 rows at this geometry -- while a constant hot set occupies
+    # sinks + m_fixed + close_block = 1156 at most. Sizing the grid from the table
+    # ran 65 CTAs to do the work of 5, which is why this kernel loaded 66 kB in
+    # 27.9 us (2.4 GB/s). The bound is a host-side constant; the kernel still masks
+    # on the device-side klen, so a tighter grid changes no result -- but it MUST be
+    # a true upper bound or kept rows past it would be silently dropped, hence the
+    # assert rather than a min().
+    nmax = CAPK if kept_rows_max is None else int(kept_rows_max)
+    assert nmax <= CAPK, f"kept_rows_max {nmax} exceeds the table's {CAPK}"
+    _branch_kept_kernel[(triton.cdiv(nmax, 64), B)](
         kept_pos, klen, slots, logits, sc["km"], sc["range"],
         CAPK, G, POOL=pool, BK=64, num_warps=4,
     )

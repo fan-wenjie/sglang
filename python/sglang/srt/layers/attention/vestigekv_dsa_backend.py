@@ -2078,6 +2078,7 @@ class VestigeKVDSABackend(AttentionBackend):
             r2t=self.req_to_token_pool.req_to_token,
             pool=self._text_cfg_index_kpool,
             fence_groups=envs.SGLANG_VESTIGEKV_BRANCH_FENCE_GROUPS.get(),
+            kept_rows_max=self._kept_rows_bound()
         )
 
     def _branch_scratch(self, bs, dev, G):
@@ -2282,6 +2283,21 @@ class VestigeKVDSABackend(AttentionBackend):
             sigma[:closed], row_slots, rho=self.rho, closed=closed, sinks=D.SINKS,
             return_pos=True, m_fixed=self._kept_m_fixed(),
         )
+
+    def _kept_rows_bound(self) -> int:
+        """Host-side upper bound on a lane's kept rows, for the kept kernel's grid.
+
+        kept_rows produces `sinks + min(m, closed - sinks) + tail`, and the tail is
+        shorter than one close block, so this bounds it without a device read. It is
+        NOT the table's width: that is sized from the ceilings (defaults.RHO_CEILING
+        and CLOSE_BLOCK_CEILING) so the allocation does not depend on an env var the
+        buffers outlive, which leaves it ~14x larger than a constant hot set needs.
+        Sizing the grid from the table ran 65 CTAs to do the work of 5.
+        """
+        m = self._kept_m_fixed()
+        if m is None:
+            m = int(self.rho * self.max_context_len) + 1
+        return int(D.SINKS + m + self.close_block)
 
     def _kept_m_fixed(self):
         """The constant tier-1 budget in ROWS, or None for rho * closed.
