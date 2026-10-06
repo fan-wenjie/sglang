@@ -72,6 +72,16 @@ NBIN = 256
 # scan picks a level, instead of a later pass re-counting them. 16 levels cost
 # 16*4 B per 256-group block each way, 0.5 B/group, against the 9 B/group a
 # candidate-range pass plus a candidate histogram cost.
+# Grid block for the two kernels that only need to SEE every group, decoupled from
+# the compaction's bucket. At 124k, G/pool = 32768 groups and a 256-wide block gives
+# NBK = 128 CTAs against 188 SMs -- so _branch_hit read 164 kB in 27.4 us, 6 GB/s,
+# about 0.4% of the device. These kernels were never bandwidth bound, their grid was
+# too small. 64 gives 512 CTAs. The compaction cannot follow: its `pos` comes from a
+# bucket's exclusive prefix plus a within-block cumsum, so BLOCK there must stay the
+# bucket width. A CTA of 64 sits entirely inside one 256-wide bucket, so the fire
+# tally is still one atomic per level per CTA rather than a scatter.
+GBLOCK = 64
+
 NCOARSE = 16
 # Sub-levels for the band ABOVE the main scale, so the retention rule stays
 # score-ordered there too. The main 16 levels span [lo, lo+2w) with w the kept
@@ -190,13 +200,16 @@ def _branch_hit_kernel(
     counts_ptr,    # [B, NBK, NC] int32 out, fires per bucket per coarse level
     thr_ptr,       # [B] fp32 out: the resolved threshold (observability/tests)
     q,
-    G, GP,
-    BLOCK: tl.constexpr, NB: tl.constexpr, NC: tl.constexpr,
+    G, GP, NBK,
+    BLOCK: tl.constexpr, BUCKET: tl.constexpr, NB: tl.constexpr, NC: tl.constexpr,
     CPX_C: tl.constexpr = 0, CPX_KEEP: tl.constexpr = 0,
 ):
     b = tl.program_id(1)
     blk = tl.program_id(0)
-    nb = GP // BLOCK
+    # The BUCKET this CTA falls in. GBLOCK divides BUCKET and the grid is aligned, so
+    # all BLOCK groups here share one bucket and the tally is a single atomic per
+    # level -- the compaction still reads per-bucket counts at its own width.
+    bucket = (blk * BLOCK) // BUCKET
     # The threshold, per CTA, off the 256-bin histogram: the (r+1)-th largest
     # kept-group logit, r = floor((1-q) n), rounded DOWN to its bin's lower
     # edge. 256 loads and a scan per CTA is cheaper than the launch a separate
@@ -279,11 +292,18 @@ def _branch_hit_kernel(
         tl.where(fired, lvl + 1, 0).to(tl.int8),
         mask=offs < GP,
     )
-    for l in tl.static_range(NC):
-        tl.store(
-            counts_ptr + b * (nb * NC) + blk * NC + l,
-            tl.sum((fired & (lvl == l)).to(tl.int32), 0),
-        )
+    # One atomic per FIRED lane, not one reduction per level. Firing is sparse --
+    # about 115 of 32768 groups a layer-step -- so a per-level tally costs NC
+    # whole-block reductions in every CTA whether or not that CTA fired at all:
+    # 512 CTAs x 24 = 12288 reductions to count ~115 events. Measured at 49.3 us
+    # a step, 80% of it this loop. The scatter spends one atomic per event and
+    # the masked-off lanes spend nothing. Lanes sharing a level collide on one
+    # address, which the hardware serialises -- at this density it does not bite.
+    tl.atomic_add(
+        counts_ptr + b * (NBK * NC) + bucket * NC + lvl,
+        1,
+        mask=fired,
+    )
     # Reset km for the next (layer, step): this kernel is its last reader, so
     # the reset rides on a store that is already in flight instead of a memset.
     tl.store(km_ptr + b * G + offs, tl.zeros([BLOCK], dtype=tl.int8), mask=m)
@@ -339,6 +359,14 @@ def _branch_cap_scan_kernel(
     fc = tl.sum(tl.where((keep & mc)[None, :], cnt, 0), 1)  # [NB2] filtered per bucket
     tl.store(total_ptr + b, tl.sum(tl.where(m, fc, 0), 0))
     tl.store(offsets_ptr + b * NBK + r, tl.cumsum(fc, 0) - fc, mask=m)
+    # Zero the tally for the next call. The hit kernel now ACCUMULATES into it (its
+    # grid is finer than a bucket), so it can no longer clear by overwriting, and
+    # doing it here costs nothing: the data is already in registers.
+    tl.store(
+        counts_ptr + b * (NBK * NC) + r[:, None] * NC + c[None, :],
+        tl.zeros([NB2, NC2], dtype=tl.int32),
+        mask=m[:, None] & mc[None, :],
+    )
 
 
 @triton.jit
@@ -352,7 +380,8 @@ def _branch_commit_kernel(
     fetch_ptr,     # [NSLOT, W] int32 out
     flen_ptr,      # [NSLOT] int32 out
     fovf_ptr,      # [NSLOT] int32 out
-    ovf_count_ptr, # [1] int32 running fence tally
+    ovf_count_ptr, # [1] int32 running tally of lanes that EXCEEDED capacity
+    ovf_rows_ptr,  # [1] int32 running tally of GROUPS dropped by the clamp
     hist_ptr,      # [B, NB] int32: reset here for the NEXT call
     range_ptr,     # [B, 2] fp32: reset here for the NEXT call
     smax_ptr,      # [B] fp32: this step's fired max rolls in here
@@ -398,8 +427,18 @@ def _branch_commit_kernel(
             tl.where(fenced, 0, tl.minimum(ng, WG) * POOL),
         )
         tl.store(fovf_ptr + slot, fenced.to(tl.int32))
-        if fenced:
+        # Two different events, and conflating them is what made the second one
+        # invisible. `fovf` means "fence this lane to DSA's selection" and must stay
+        # 0 on the truncate path, where WF arrives unreachable -- so the tally that
+        # used to live inside `if fenced` stopped counting anything at all while the
+        # capacity clamp below went on silently dropping rows. A silent row drop is
+        # the failure mode that once had attention reading the trash slot for ten
+        # hours with every byte, kept and ITL number reproducing, so it gets its own
+        # counters: how many lane-steps had to clamp, and how many GROUPS were lost.
+        over = ng - WG
+        if over > 0:
             tl.atomic_add(ovf_count_ptr, 1)
+            tl.atomic_add(ovf_rows_ptr, over)
         # The quantile scratch for the next (layer, step). Nothing reads it
         # after this kernel; resetting here costs no launch where a standalone
         # memset would cost one per layer. branch_scratch seeds the first call.
@@ -446,7 +485,7 @@ def _branch_commit_kernel(
 
 def branch_fire(
     *, logits, pool_lens, slots, kept_pos, klen, q, scratch, fetch_buf,
-    fetch_len, fetch_ovf, r2t, pool, fence_groups,
+    fetch_len, fetch_ovf, r2t, pool, fence_groups, kept_rows_max=None,
 ):
     """One layer-step of the branch rule. `scratch` comes from branch_scratch;
     fetch_buf [NSLOT, W], fetch_len/fetch_ovf [NSLOT] are this layer's slices.
@@ -459,21 +498,33 @@ def branch_fire(
     WG = fetch_buf.shape[1] // pool
     WF = WG if fence_groups is None else max(1, min(WG, int(fence_groups)))
 
-    _branch_kept_kernel[(triton.cdiv(CAPK, 256), B)](
+    # Grid over the kept rows that can EXIST, not over the table that holds them.
+    # CAPK is the sizing ceiling -- rho_ceiling * max_ctx + 3 * close_block_ceiling,
+    # 16512 rows at this geometry -- while a constant hot set occupies
+    # sinks + m_fixed + close_block = 1156 at most. Sizing the grid from the table
+    # ran 65 CTAs to do the work of 5, which is why this kernel loaded 66 kB in
+    # 27.9 us (2.4 GB/s). The bound is a host-side constant; the kernel still masks
+    # on the device-side klen, so a tighter grid changes no result -- but it MUST be
+    # a true upper bound or kept rows past it would be silently dropped, hence the
+    # assert rather than a min().
+    nmax = CAPK if kept_rows_max is None else int(kept_rows_max)
+    assert nmax <= CAPK, f"kept_rows_max {nmax} exceeds the table's {CAPK}"
+    _branch_kept_kernel[(triton.cdiv(nmax, 64), B)](
         kept_pos, klen, slots, logits, sc["km"], sc["range"],
-        CAPK, G, POOL=pool, BK=256, num_warps=4,
+        CAPK, G, POOL=pool, BK=64, num_warps=4,
     )
-    _branch_hist_kernel[(NBK, B)](
+    NG = triton.cdiv(GP, GBLOCK)
+    _branch_hist_kernel[(NG, B)](
         logits, sc["km"], sc["range"], sc["hist"], G,
-        BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
+        BLOCK=GBLOCK, NB=NBIN, num_warps=4,
     )
     _cap = _fence_truncate()
     _cpx = _coarse_proxy()
-    _branch_hit_kernel[(NBK, B)](
+    _branch_hit_kernel[(NG, B)](
         logits, sc["km"], sc["hist"], sc["range"], pool_lens,
         sc["smax"], sc["smaxn"],
-        sc["hit"], sc["counts"], sc["thr"], float(q), G, GP,
-        BLOCK=D.SCAN_BUCKET, NB=NBIN, NC=NCODE, num_warps=4,
+        sc["hit"], sc["counts"], sc["thr"], float(q), G, GP, NBK,
+        BLOCK=GBLOCK, BUCKET=D.SCAN_BUCKET, NB=NBIN, NC=NCODE, num_warps=4,
         CPX_C=_cpx[0], CPX_KEEP=_cpx[1],
     )
     # WF only caps when truncation is on; passing the full width leaves `cap` at
@@ -486,7 +537,8 @@ def branch_fire(
     )
     _branch_commit_kernel[(min(NBK, D.SCAN_GRID_CAP), B)](
         sc["hit"], sc["offsets"], sc["total"], sc["cap"], slots, r2t,
-        fetch_buf, fetch_len, fetch_ovf, sc["ovf_count"], sc["hist"], sc["range"],
+        fetch_buf, fetch_len, fetch_ovf, sc["ovf_count"], sc["ovf_rows"],
+        sc["hist"], sc["range"],
         sc["smax"], sc["smaxn"],
         G, GP, WG, WF if not _cap else (1 << 30), r2t.shape[1],
         POOL=pool, BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
@@ -517,5 +569,9 @@ def branch_scratch(*, bs, G, nslot, fetch_w, pool, fence_groups, dev):
         "cap": torch.full((bs,), -1, dtype=torch.int32, device=dev),
         "smax": torch.full((bs,), float("-inf"), dtype=torch.float32, device=dev),
         "smaxn": torch.full((bs,), float("-inf"), dtype=torch.float32, device=dev),
+        # Lane-steps that exceeded the fetch capacity, and the groups the clamp
+        # dropped. Separate from fetch_ovf, which is the pack's fence flag: on the
+        # truncate path that flag is always 0 and these are the only witnesses.
         "ovf_count": torch.zeros(1, dtype=torch.int32, device=dev),
+        "ovf_rows": torch.zeros(1, dtype=torch.int32, device=dev),
     }
