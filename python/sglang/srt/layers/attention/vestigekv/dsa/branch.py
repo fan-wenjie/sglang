@@ -372,7 +372,8 @@ def _branch_commit_kernel(
     fetch_ptr,     # [NSLOT, W] int32 out
     flen_ptr,      # [NSLOT] int32 out
     fovf_ptr,      # [NSLOT] int32 out
-    ovf_count_ptr, # [1] int32 running fence tally
+    ovf_count_ptr, # [1] int32 running tally of lanes that EXCEEDED capacity
+    ovf_rows_ptr,  # [1] int32 running tally of GROUPS dropped by the clamp
     hist_ptr,      # [B, NB] int32: reset here for the NEXT call
     range_ptr,     # [B, 2] fp32: reset here for the NEXT call
     smax_ptr,      # [B] fp32: this step's fired max rolls in here
@@ -418,8 +419,18 @@ def _branch_commit_kernel(
             tl.where(fenced, 0, tl.minimum(ng, WG) * POOL),
         )
         tl.store(fovf_ptr + slot, fenced.to(tl.int32))
-        if fenced:
+        # Two different events, and conflating them is what made the second one
+        # invisible. `fovf` means "fence this lane to DSA's selection" and must stay
+        # 0 on the truncate path, where WF arrives unreachable -- so the tally that
+        # used to live inside `if fenced` stopped counting anything at all while the
+        # capacity clamp below went on silently dropping rows. A silent row drop is
+        # the failure mode that once had attention reading the trash slot for ten
+        # hours with every byte, kept and ITL number reproducing, so it gets its own
+        # counters: how many lane-steps had to clamp, and how many GROUPS were lost.
+        over = ng - WG
+        if over > 0:
             tl.atomic_add(ovf_count_ptr, 1)
+            tl.atomic_add(ovf_rows_ptr, over)
         # The quantile scratch for the next (layer, step). Nothing reads it
         # after this kernel; resetting here costs no launch where a standalone
         # memset would cost one per layer. branch_scratch seeds the first call.
@@ -507,7 +518,8 @@ def branch_fire(
     )
     _branch_commit_kernel[(min(NBK, D.SCAN_GRID_CAP), B)](
         sc["hit"], sc["offsets"], sc["total"], sc["cap"], slots, r2t,
-        fetch_buf, fetch_len, fetch_ovf, sc["ovf_count"], sc["hist"], sc["range"],
+        fetch_buf, fetch_len, fetch_ovf, sc["ovf_count"], sc["ovf_rows"],
+        sc["hist"], sc["range"],
         sc["smax"], sc["smaxn"],
         G, GP, WG, WF if not _cap else (1 << 30), r2t.shape[1],
         POOL=pool, BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
@@ -538,5 +550,9 @@ def branch_scratch(*, bs, G, nslot, fetch_w, pool, fence_groups, dev):
         "cap": torch.full((bs,), -1, dtype=torch.int32, device=dev),
         "smax": torch.full((bs,), float("-inf"), dtype=torch.float32, device=dev),
         "smaxn": torch.full((bs,), float("-inf"), dtype=torch.float32, device=dev),
+        # Lane-steps that exceeded the fetch capacity, and the groups the clamp
+        # dropped. Separate from fetch_ovf, which is the pack's fence flag: on the
+        # truncate path that flag is always 0 and these are the only witnesses.
         "ovf_count": torch.zeros(1, dtype=torch.int32, device=dev),
+        "ovf_rows": torch.zeros(1, dtype=torch.int32, device=dev),
     }
