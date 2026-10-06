@@ -1121,6 +1121,13 @@ class IndexerKPool(MultiPlatformOp):
                 pool_lens=pool_seqlens,
                 forward_batch=forward_batch,
             )
+            if getattr(vk, "skip_indexer_topk", False):
+                # That arm has no consumer for the selection -- no lane is ever
+                # fenced onto it -- so the top-k would be computed and dropped
+                # every step. The scoring above stays: those logits ARE its
+                # score. None is the answer the lean step already returns, so
+                # the decode path downstream needs nothing new.
+                return None
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
         topk_result = self._topk_from_kpool_logits(
             logits,

@@ -164,6 +164,9 @@ class VestigeKVDSABackend(AttentionBackend):
     _model_runner = None  # bound in __init__; None on __new__ fakes
     _graph_state_args = None
     _dsa_topk = 0  # its index_topk; the fenced arm's row budget on DSA models
+    # Read by the indexer (dsa_indexer_kpool) to decide whether to run its
+    # top-k at all. True only when nothing in this arm can consume a selection.
+    skip_indexer_topk = False
     _dsa_kpool = 1  # its index_kpool; the selection carries seq % kpool tail rows too
     _dsa_resolved = False
     _mem_reqs = 0
@@ -570,7 +573,26 @@ class VestigeKVDSABackend(AttentionBackend):
                     "attend the indexer's top-%d rows",
                     self._dsa_topk,
                 )
+        from sglang.srt.layers.attention.vestigekv.dsa.branch import _fence_truncate
+
         self._dsa_resolved = True
+        # DSA's top-k has exactly one consumer in this arm: a FENCED lane, which
+        # attends the selection instead of kept+fired. Under fence truncation no
+        # lane is ever fenced by overflow (the cap keeps the top WG groups by
+        # score and the fence sentinel never trips), and the remaining fence --
+        # a lane with no compressed state for this layer -- attends its full row
+        # set through r2t, which is correct without a selection and costs one
+        # step's dense read. So the selection is computed and dropped on every
+        # one of 127k steps, 158.5 us of it at 124k. Skip it instead.
+        #
+        # The scoring GEMMs and the paged-MQA logits STAY: those logits are tier
+        # 2's score. This is narrower than the lean step, which skips both.
+        self.skip_indexer_topk = (
+            self._dsa is not None
+            and not self._full_arm()
+            and self._branch_q() is not None
+            and _fence_truncate()
+        )
         return self._dsa
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -2343,7 +2365,11 @@ class VestigeKVDSABackend(AttentionBackend):
         # the fenced arm's rows. The base's decode signature has no such
         # keyword, so it is taken off here whether or not it is used.
         topk = kwargs.pop("topk_indices", None)
-        if topk is not None and self._dsa_topk:
+        if self.skip_indexer_topk:
+            # The indexer returned None for it; drop the keyword's value so the
+            # fork compiles with VK_TOPK=0 and a fenced lane reads r2t.
+            topk = None
+        elif topk is not None and self._dsa_topk:
             # [bs, index_topk + kpool - 1]: pooled budget plus the unpooled tail
             topk = topk[:, : self._dsa_topk + self._dsa_kpool - 1]
         else:
@@ -3597,10 +3623,11 @@ class VestigeKVDSABackend(AttentionBackend):
         if fence:
             fenced |= self._fetch_ovf[lid].gather(0, slots) != 0
         seq = forward_batch.seq_lens[:real].to(torch.int64)
-        if self._dsa_topk:
+        if self._dsa_topk and not self.skip_indexer_topk:
             # DSA fallback: the lane attends what DSA attends; the page-table
             # rows packed here are placeholders the layer's forward_decode
-            # overwrites (_patch_fenced_rows_eager).
+            # overwrites (_patch_fenced_rows_eager). With no selection to patch
+            # in, the lane keeps its full row set instead.
             seq = self._dsa_attended(seq)
         cache = self._dense_cache
         if cache is None or cache[0] is not forward_batch:
