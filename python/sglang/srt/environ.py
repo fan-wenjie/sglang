@@ -773,6 +773,24 @@ class Envs:
     # average: with rho proportional, worst-case kept at 131k is 4 + 1024 +
     # 1023 = 2051 rows and leaves no room for any recall at all.
     SGLANG_VESTIGEKV_KEPT_GROUPS = EnvInt(None)
+    # "C,f": drop fired candidates outside a pseudorandom 1-in-1/f subset of the
+    # coarse groups of C fine groups each. A MEASUREMENT knob for one question,
+    # never a serving mode.
+    #
+    # A two-level scan would pool C fine index groups into one coarse key and
+    # read the fine index only for surviving coarse groups. Offline on the
+    # calibration dumps that costs 33 -> 18.56 B/token of scan at C=16, f=0.50
+    # while keeping 0.905 of what branch_fire actually fires, and 26.84 B/token
+    # at f=0.75 keeping 0.980. So it is a quality-for-bytes trade, and on this
+    # line every such trade has to pass the copy probe, which resolves a row-set
+    # change where multikey does not (1.0000 vs 0.0001 on a matched pair).
+    #
+    # This knob answers that BEFORE the index, the buffers and the two-level
+    # kernels exist: it drops the same SHAPE of candidates -- whole runs of C --
+    # and picks survivors by hash rather than by score, which is strictly worse
+    # than the real filter. A pass here is evidence for the design; a failure
+    # closes it at the cost of one job instead of an implementation.
+    SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
     # rows the KV pool already holds. Unset picks the fastest form that runs on

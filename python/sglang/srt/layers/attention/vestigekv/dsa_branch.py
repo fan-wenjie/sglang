@@ -127,6 +127,21 @@ def _branch_hist_kernel(
     tl.atomic_add(hist_ptr + b * NB + bin_, 1, mask=km)
 
 
+def _coarse_proxy():
+    """(C, keep_per_mille) for the coarse-filter proxy, or (0, 0) when unset.
+
+    SGLANG_VESTIGEKV_COARSE_PROXY is "C,f" with f a fraction, e.g. "16,0.5".
+    Measurement only; see the block it gates in _branch_hit_kernel.
+    """
+    from sglang.srt.environ import envs
+
+    v = envs.SGLANG_VESTIGEKV_COARSE_PROXY.get()
+    if not v:
+        return 0, 0
+    c, f = v.split(",")
+    return int(c), int(round(float(f) * 1000))
+
+
 @triton.jit
 def _branch_hit_kernel(
     logits_ptr, km_ptr, hist_ptr, range_ptr, plen_ptr,
@@ -136,6 +151,7 @@ def _branch_hit_kernel(
     q,
     G, GP,
     BLOCK: tl.constexpr, NB: tl.constexpr,
+    CPX_C: tl.constexpr = 0, CPX_KEEP: tl.constexpr = 0,
 ):
     b = tl.program_id(1)
     blk = tl.program_id(0)
@@ -166,6 +182,23 @@ def _branch_hit_kernel(
     s = tl.load(logits_ptr + b * G + offs, mask=m, other=float("-inf"))
     km = tl.load(km_ptr + b * G + offs, mask=m, other=1)
     fired = m & (offs < plen) & (km == 0) & (s > thr)
+    if CPX_C > 0:
+        # COARSE-FILTER PROXY (SGLANG_VESTIGEKV_COARSE_PROXY), a measurement
+        # knob, never a serving mode. A two-level scan would pool CPX_C fine
+        # groups into one coarse key and read the fine index only for the
+        # surviving coarse groups; this drops the same SHAPE of candidates --
+        # whole runs of CPX_C -- without building the coarse index, so the
+        # question "does losing that fraction of the fired set cost quality"
+        # can be answered before any of it is implemented.
+        #
+        # Deliberately CONSERVATIVE: the survivors here are a hash of the
+        # coarse index, while the real filter picks them by score. Whatever
+        # quality holds under random clustered dropping holds under the real
+        # one, so a pass here is evidence for the design and a failure closes
+        # it without the implementation cost.
+        cg = offs // CPX_C
+        keep = ((cg * 2654435761) % 1000) < CPX_KEEP
+        fired = fired & keep
     # hit covers the padded width so the compaction's tail buckets read zeros.
     tl.store(hit_ptr + b * GP + offs, fired.to(tl.int8), mask=offs < GP)
     tl.store(counts_ptr + b * nb + blk, tl.sum(fired.to(tl.int32), 0))
@@ -279,10 +312,12 @@ def branch_fire(
         logits, sc["km"], sc["range"], sc["hist"], G,
         BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
     )
+    _cpx = _coarse_proxy()
     _branch_hit_kernel[(NBK, B)](
         logits, sc["km"], sc["hist"], sc["range"], pool_lens,
         sc["hit"], sc["counts"], sc["thr"], float(q), G, GP,
         BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
+        CPX_C=_cpx[0], CPX_KEEP=_cpx[1],
     )
     _compact_scan_kernel[(B,)](
         sc["counts"], sc["offsets"], sc["total"], NBK,
