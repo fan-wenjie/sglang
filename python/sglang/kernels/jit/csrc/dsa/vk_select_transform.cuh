@@ -285,7 +285,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_select_transform_kernel(
     const int32_t* __restrict__ kept_groups,
     const int64_t kept_stride,
     const int32_t* __restrict__ kept_lens,
-    const int8_t* __restrict__ kept_mask,
+    int8_t* __restrict__ kept_mask,
     const int64_t kept_mask_stride,
     int32_t* __restrict__ ovf_counts) {
   const auto& [input, row_starts, _, lengths, input_stride] = params;
@@ -362,7 +362,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_select_transform_kernel(
   const auto thr = thresholds[bid];
   const auto kmask = kept_mask == nullptr ? nullptr : kept_mask + bid * kept_mask_stride;
   for (int idx = tid; idx < length; idx += kThreadsPerBlock) {
-    if (kmask != nullptr && kmask[idx] != 0) continue;
+    if (kmask != nullptr && kmask[idx] != 0) {
+      kmask[idx] = 0;  // km's last reader for this layer-step; see vk_collect_kernel
+      continue;
+    }
     const auto sc = score[idx + row_start];
     if (sc > thr) {
       const auto pos = ::atomicAdd(&s_ncand, 1);
@@ -475,7 +478,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_select_fetch_kernel(
     const int64_t score_stride,
     const int32_t* __restrict__ lengths,
     const float* __restrict__ thresholds,
-    const int8_t* __restrict__ kept_mask,
+    int8_t* __restrict__ kept_mask,
     const int64_t kept_mask_stride,
     const int32_t* __restrict__ slots,
     const int32_t* __restrict__ r2t,
@@ -509,7 +512,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_select_fetch_kernel(
   int* cand_idx = reinterpret_cast<int*>(s_dyn) + kCandMax;
 
   for (int idx = tid; idx < length; idx += kThreadsPerBlock) {
-    if (kmask != nullptr && kmask[idx] != 0) continue;
+    if (kmask != nullptr && kmask[idx] != 0) {
+      kmask[idx] = 0;  // km's last reader for this layer-step; see vk_collect_kernel
+      continue;
+    }
     const auto v = sc_row[idx];
     if (v > thr) {
       const auto pos = ::atomicAdd(&s_ncand, 1);
@@ -703,12 +709,12 @@ struct VkSelectTransformKernel {
           kGroupTopK);
     }
     int64_t kept_mask_stride = 0;
-    const int8_t* kept_mask_ptr = nullptr;
+    int8_t* kept_mask_ptr = nullptr;
     if (kept_mask_opt.has_value()) {
       auto KM = SymbolicSize{"kept_mask_stride"};
       TensorMatcher({B, -1}).with_strides({KM, 1}).with_dtype<int8_t>().with_device(device).verify(
           kept_mask_opt.value());
-      kept_mask_ptr = static_cast<const int8_t*>(kept_mask_opt.value().data_ptr());
+      kept_mask_ptr = static_cast<int8_t*>(kept_mask_opt.value().data_ptr());
       kept_mask_stride = static_cast<int64_t>(KM.unwrap());
     }
     if (kept_lens_opt.has_value()) {
@@ -772,7 +778,7 @@ __global__ __launch_bounds__(BLOCK) void vk_collect_kernel(
     const int64_t score_stride,
     const int32_t* __restrict__ lengths,
     const float* __restrict__ thresholds,
-    const int8_t* __restrict__ kept_mask,
+    int8_t* __restrict__ kept_mask,
     const int64_t kept_mask_stride,
     float* __restrict__ cand_score,
     int32_t* __restrict__ cand_idx,
@@ -781,8 +787,19 @@ __global__ __launch_bounds__(BLOCK) void vk_collect_kernel(
   const auto b = static_cast<uint64_t>(blockIdx.y);
   const auto idx = static_cast<int>(blockIdx.x) * BLOCK + static_cast<int>(threadIdx.x);
   if (idx >= lengths[b]) return;
-  const auto kmask = kept_mask + b * kept_mask_stride;
-  if (kmask[idx] != 0) return;
+  auto* const kmask = kept_mask + b * kept_mask_stride;
+  if (kmask[idx] != 0) {
+    // RESET IT. All 11 full-attention layers share one km buffer (the scratch is
+    // keyed on (bs, G), not on layer), and the Triton chain this replaces reset
+    // km in _branch_hit_kernel on its way out. Without the reset km accumulates
+    // the union of every layer's kept groups, the compare pass skips a growing
+    // set, and the fired count decays monotonically across layers and steps --
+    // served telemetry read fetched=261.5 against the chain's 393.9. This kernel
+    // is km's last reader for the layer-step, so the reset rides on a store that
+    // is already in flight rather than costing a memset.
+    kmask[idx] = 0;
+    return;
+  }
   const auto v = score[b * score_stride + idx];
   if (v <= thresholds[b]) return;
   const auto pos = ::atomicAdd(ncand + b, 1);
@@ -938,7 +955,7 @@ struct VkSelectFetchKernel {
         static_cast<int64_t>(S.unwrap()),
         static_cast<const int32_t*>(lengths.data_ptr()),
         static_cast<const float*>(thresholds.data_ptr()),
-        static_cast<const int8_t*>(kept_mask.data_ptr()),
+        static_cast<int8_t*>(kept_mask.data_ptr()),
         static_cast<int64_t>(KM.unwrap()),
         static_cast<const int32_t*>(slots.data_ptr()),
         static_cast<const int32_t*>(r2t.data_ptr()),
@@ -1024,7 +1041,7 @@ struct VkCollectEmitKernel {
         static_cast<int64_t>(S.unwrap()),
         static_cast<const int32_t*>(lengths.data_ptr()),
         static_cast<const float*>(thresholds.data_ptr()),
-        static_cast<const int8_t*>(kept_mask.data_ptr()),
+        static_cast<int8_t*>(kept_mask.data_ptr()),
         static_cast<int64_t>(KM.unwrap()),
         static_cast<float*>(cand_score.data_ptr()),
         static_cast<int32_t*>(cand_idx.data_ptr()),
