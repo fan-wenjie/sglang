@@ -66,6 +66,26 @@ import triton.language as tl
 from sglang.srt.layers.attention.vestigekv import defaults as D
 
 NBIN = 256
+# Coarse levels the capacity cap may be set at. The fired count has to be bounded
+# by the fetch buffer's width, and the bound must be known BEFORE the compaction's
+# offsets are built -- so the hit kernel tallies its fires per coarse level and the
+# scan picks a level, instead of a later pass re-counting them. 16 levels cost
+# 16*4 B per 256-group block each way, 0.5 B/group, against the 9 B/group a
+# candidate-range pass plus a candidate histogram cost.
+NCOARSE = 16
+# Sub-levels for the band ABOVE the main scale, so the retention rule stays
+# score-ordered there too. The main 16 levels span [lo, lo+2w) with w the kept
+# groups' logit range; a score at or above lo+2w takes one of 8 sub-levels over
+# [lo+2w, lo+4w), and only past lo+4w do candidates become indistinguishable.
+#
+# This exists because the main scale's top level is OPEN above, and a cap cannot
+# order inside an open level. Without it a lane whose fires all clamped there got
+# cap = NCOARSE-1, which keeps NOTHING -- flen 0 with the overflow flag clear, so
+# the lane silently degraded to tier-1-only, measured 0.000 on multikey.
+NSUB = 8
+# One monotone code per fire, carried in the int8 `hit` already occupies: 1..16 for
+# the main levels, 17..24 for the sub-levels. 24 of 127 positive values used.
+NCODE = NCOARSE + NSUB
 
 
 @triton.jit
@@ -127,6 +147,25 @@ def _branch_hist_kernel(
     tl.atomic_add(hist_ptr + b * NB + bin_, 1, mask=km)
 
 
+def _fence_truncate():
+    """Whether a would-be-overflowing lane TRUNCATES its own fired set to the fetch
+    buffer's width instead of being handed DSA's selection.
+
+    On by default. The fence saved no bytes -- the buffer holds WF*pool rows and
+    DSA's index_topk is the same 2048, so it swapped one 2048-row budget for
+    another -- and measured worse, because the fallback drops the kept rows (0.3566
+    mass against 0.3635, worst head 0.1079 against 0.1143, on fenced steps). What it
+    bought was a dependency: the fenced lane is the only consumer of DSA's top-k on
+    this arm, and that top-k cannot be skipped speculatively because the indexer
+    runs before attention inside a layer's forward.
+
+    Off restores the fallback, which is the control that prices it.
+    """
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_VESTIGEKV_FENCE_TRUNCATE.get())
+
+
 def _coarse_proxy():
     """(C, keep_per_mille) for the coarse-filter proxy, or (0, 0) when unset.
 
@@ -145,12 +184,14 @@ def _coarse_proxy():
 @triton.jit
 def _branch_hit_kernel(
     logits_ptr, km_ptr, hist_ptr, range_ptr, plen_ptr,
-    hit_ptr,       # [B, GP] int8 out
-    counts_ptr,    # [B, NBK] int32 out, one per bucket
+    smax_ptr,      # [B] fp32 in: last step's highest fired logit, the band's top
+    smaxn_ptr,     # [B] fp32 out: this step's, for the next call
+    hit_ptr,       # [B, GP] int8 out: 0 = no fire, else the fire's level + 1
+    counts_ptr,    # [B, NBK, NC] int32 out, fires per bucket per coarse level
     thr_ptr,       # [B] fp32 out: the resolved threshold (observability/tests)
     q,
     G, GP,
-    BLOCK: tl.constexpr, NB: tl.constexpr,
+    BLOCK: tl.constexpr, NB: tl.constexpr, NC: tl.constexpr,
     CPX_C: tl.constexpr = 0, CPX_KEEP: tl.constexpr = 0,
 ):
     b = tl.program_id(1)
@@ -202,19 +243,110 @@ def _branch_hit_kernel(
         # type int32"), which failed at compile time, i.e. at server start.
         keep = ((cg.to(tl.int64) * 2654435761) % 1000) < CPX_KEEP
         fired = fired & keep
+    # The fire's COARSE LEVEL, carried in the byte `hit` already occupies (0 means
+    # no fire, so a level is stored as level+1). The capacity cap is applied later,
+    # by the scan and the commit, against this level -- which is why it costs no
+    # traffic: both of those already read this byte.
+    #
+    # Binned over the kept range EXTENDED upward by one width. `range` spans the
+    # kept groups' logits and a candidate beating every kept group is exactly what
+    # fires, so the kept range alone would clamp the whole fired set into one
+    # level. Doubling it covers the fired tail without a pass to measure it;
+    # whatever still clamps into the top level is handled by the fence, which stays
+    # as the backstop.
+    # The code scale runs [lo, upper] where `upper` is the PREVIOUS step's highest
+    # fired logit, carried in a scalar. A fixed band cannot be score-ordered: its
+    # top code is open above, every score past it collapses into one code, and the
+    # compaction then cuts that code by POSITION. A unit test with 1200 candidates
+    # spread over four kept-widths kept the lowest 512 of them for exactly that
+    # reason. The max closes the band, and it is free -- this kernel already reads
+    # every score, so recording it is an atomic, not a read.
+    #
+    # Stale by one step on purpose. What must be stable is the logit range, a
+    # distributional property, not WHICH rows score highly -- and the selection
+    # itself turns over 75% per step, so nothing here could rely on that anyway.
+    # Before the first step, and whenever the max has not caught up, the band falls
+    # back to lo+2w and the old behaviour.
+    upper = tl.maximum(tl.load(smax_ptr + b), lo + 2.0 * width)
+    lvl = tl.minimum(
+        tl.maximum(((s - lo) / tl.maximum(upper - lo, 1e-6) * NC).to(tl.int32), 0),
+        NC - 1,
+    )
+    tl.atomic_max(smaxn_ptr + b, tl.max(tl.where(fired, s, float("-inf")), 0))
     # hit covers the padded width so the compaction's tail buckets read zeros.
-    tl.store(hit_ptr + b * GP + offs, fired.to(tl.int8), mask=offs < GP)
-    tl.store(counts_ptr + b * nb + blk, tl.sum(fired.to(tl.int32), 0))
+    tl.store(
+        hit_ptr + b * GP + offs,
+        tl.where(fired, lvl + 1, 0).to(tl.int8),
+        mask=offs < GP,
+    )
+    for l in tl.static_range(NC):
+        tl.store(
+            counts_ptr + b * (nb * NC) + blk * NC + l,
+            tl.sum((fired & (lvl == l)).to(tl.int32), 0),
+        )
     # Reset km for the next (layer, step): this kernel is its last reader, so
     # the reset rides on a store that is already in flight instead of a memset.
     tl.store(km_ptr + b * G + offs, tl.zeros([BLOCK], dtype=tl.int8), mask=m)
 
 
 @triton.jit
+def _branch_cap_scan_kernel(
+    counts_ptr,    # [B, NBK, NC] int32: fires per bucket per coarse level
+    offsets_ptr,   # [B, NBK] int32 out: exclusive prefix of the FILTERED counts
+    total_ptr,     # [B] int32 out: filtered fired count
+    cap_ptr,       # [B] int32 out: levels at or below this one are dropped
+    WF,
+    NBK,
+    NB2: tl.constexpr, NC: tl.constexpr, NC2: tl.constexpr,
+):
+    """Replaces the sketch chain's _compact_scan_kernel on the branch path.
+
+    One launch does three things that used to need three: pick the capacity level,
+    filter the per-bucket counts by it, and prefix-sum the result. Doing it here is
+    what makes the cap free -- a later pass to re-count the survivors would be
+    1 B/group and two more launches a layer-step, and the break-even on the whole
+    change is only ~3.3 us per layer launch.
+
+    The cap is the LOWEST level whose strictly-above population already fits WF, so
+    dropping that level and everything under it leaves at most WF fires. -1 keeps
+    every level, which is the ordinary non-overflowing step.
+    """
+    b = tl.program_id(0)
+    r = tl.arange(0, NB2)
+    # NC2 pads the code axis to a power of two for tl.arange; everything past NC is
+    # masked out, and `fits` carries the mask so the cap cannot select a pad lane
+    # (their population is 0, which would otherwise look like a perfect fit).
+    c = tl.arange(0, NC2)
+    m = r < NBK
+    mc = c < NC
+    cnt = tl.load(
+        counts_ptr + b * (NBK * NC) + r[:, None] * NC + c[None, :],
+        mask=m[:, None] & mc[None, :],
+        other=0,
+    )
+    per_lvl = tl.sum(cnt, 0)                       # [NC2], zero past NC
+    tot = tl.sum(per_lvl, 0)
+    above = tot - tl.cumsum(per_lvl, 0)            # population strictly above level l
+    fits = (above <= WF) & mc
+    # Clamped to NC-2 so the TOP code is always kept. Unclamped, a lane whose
+    # fires all sat in the top code took cap = NC-1 and kept nothing: flen 0 with
+    # the overflow flag clear, i.e. a silent fall to tier-1-only.
+    cap = tl.where(
+        tot <= WF, -1, tl.minimum(tl.min(tl.where(fits, c, NC2), 0), NC - 2)
+    )
+    tl.store(cap_ptr + b, cap)
+    keep = c > cap
+    fc = tl.sum(tl.where((keep & mc)[None, :], cnt, 0), 1)  # [NB2] filtered per bucket
+    tl.store(total_ptr + b, tl.sum(tl.where(m, fc, 0), 0))
+    tl.store(offsets_ptr + b * NBK + r, tl.cumsum(fc, 0) - fc, mask=m)
+
+
+@triton.jit
 def _branch_commit_kernel(
-    hit_ptr,       # [B, GP] int8 (hit kernel)
-    offsets_ptr,   # [B, NBK] int32 exclusive bucket prefix (compact scan)
-    total_ptr,     # [B] int32 fired group count (compact scan)
+    hit_ptr,       # [B, GP] int8 (hit kernel): 0, else the fire's level + 1
+    offsets_ptr,   # [B, NBK] int32 exclusive bucket prefix (cap scan)
+    total_ptr,     # [B] int32 fired group count, already filtered (cap scan)
+    cap_ptr,       # [B] int32 the cap scan's level; levels <= it are dropped
     slot_ptr,      # [B] int pool slot per lane
     r2t_ptr,       # [NSLOT, MAXCTX] int64
     fetch_ptr,     # [NSLOT, W] int32 out
@@ -223,6 +355,8 @@ def _branch_commit_kernel(
     ovf_count_ptr, # [1] int32 running fence tally
     hist_ptr,      # [B, NB] int32: reset here for the NEXT call
     range_ptr,     # [B, 2] fp32: reset here for the NEXT call
+    smax_ptr,      # [B] fp32: this step's fired max rolls in here
+    smaxn_ptr,     # [B] fp32: cleared here
     G, GP, WG, WF, MAXCTX,
     POOL: tl.constexpr, BLOCK: tl.constexpr, NB: tl.constexpr,
 ):
@@ -236,6 +370,14 @@ def _branch_commit_kernel(
     nb = GP // BLOCK
     slot = tl.load(slot_ptr + b).to(tl.int64)
     ng = tl.load(total_ptr + b)
+    cap = tl.load(cap_ptr + b)
+    # WF arrives unreachable on the truncate path, so `fenced` is False there and
+    # the lane never reads DSA's selection. A pathological lane -- more than the
+    # buffer's width of fires all sitting in the TOP code, i.e. all above lo+4w --
+    # is bounded by `pos < WG` below instead. Those scores are within one sub-level
+    # of each other and the case is unobserved in 475 honest queries, so the
+    # residual positional order among near-ties is the price of not keeping a rare
+    # dependency on a kernel that costs 157.4 us every step at 124k.
     fenced = ng > WF
     W = WG * POOL
 
@@ -247,7 +389,14 @@ def _branch_commit_kernel(
         # recalling lane gets its row count. fetch_len is consumed every step
         # even by a lane that fires nothing, so this write cannot ride on
         # bucket 0 existing in the (capped) grid.
-        tl.store(flen_ptr + slot, tl.where(fenced, 0, ng * POOL))
+        # CLAMPED to the buffer: the compaction writes only `pos < WG`, so a
+        # published length past that would hand the fork rows it never wrote. The
+        # fence used to make this unreachable by emptying the lane instead; with
+        # the fence gone on the truncate path, the clamp has to be here.
+        tl.store(
+            flen_ptr + slot,
+            tl.where(fenced, 0, tl.minimum(ng, WG) * POOL),
+        )
         tl.store(fovf_ptr + slot, fenced.to(tl.int32))
         if fenced:
             tl.atomic_add(ovf_count_ptr, 1)
@@ -258,6 +407,11 @@ def _branch_commit_kernel(
         tl.store(hist_ptr + b * NB + bb, tl.zeros([NB], dtype=tl.int32))
         tl.store(range_ptr + b * 2, float("inf"))
         tl.store(range_ptr + b * 2 + 1, float("-inf"))
+        # Roll this step's fired max forward for the next call's band, then clear
+        # it. Same trick as the histogram: the reset rides a store already in
+        # flight instead of costing a memset.
+        tl.store(smax_ptr + b, tl.load(smaxn_ptr + b))
+        tl.store(smaxn_ptr + b, float("-inf"))
 
     if not fenced:
         # The recall arm. The fenced arm does NONE of this -- the point of a
@@ -272,7 +426,9 @@ def _branch_commit_kernel(
             blk = pid + i * NPROG
             offs = blk * BLOCK + tl.arange(0, BLOCK)
             m = offs < G
-            h = tl.load(hit_ptr + b * GP + offs, mask=m, other=0) != 0
+            # The cap, applied in the read the compaction already makes: a byte
+            # of 0 gives level -1, which fails this for any cap >= -1.
+            h = (tl.load(hit_ptr + b * GP + offs, mask=m, other=0).to(tl.int32) - 1) > cap
             base = tl.load(offsets_ptr + b * nb + blk)
             pos = base + tl.cumsum(h.to(tl.int32), 0) - 1
             ok = h & (pos < WG)
@@ -295,10 +451,6 @@ def branch_fire(
     """One layer-step of the branch rule. `scratch` comes from branch_scratch;
     fetch_buf [NSLOT, W], fetch_len/fetch_ovf [NSLOT] are this layer's slices.
     `kept_pos` is tier 1's position table, parallel to its row table."""
-    from sglang.srt.layers.attention.vestigekv.fused_prologue import (
-        _compact_scan_kernel,
-    )
-
     B, G = logits.shape
     NSLOT, CAPK = kept_pos.shape
     sc = scratch
@@ -315,21 +467,28 @@ def branch_fire(
         logits, sc["km"], sc["range"], sc["hist"], G,
         BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
     )
+    _cap = _fence_truncate()
     _cpx = _coarse_proxy()
     _branch_hit_kernel[(NBK, B)](
         logits, sc["km"], sc["hist"], sc["range"], pool_lens,
+        sc["smax"], sc["smaxn"],
         sc["hit"], sc["counts"], sc["thr"], float(q), G, GP,
-        BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
+        BLOCK=D.SCAN_BUCKET, NB=NBIN, NC=NCODE, num_warps=4,
         CPX_C=_cpx[0], CPX_KEEP=_cpx[1],
     )
-    _compact_scan_kernel[(B,)](
-        sc["counts"], sc["offsets"], sc["total"], NBK,
-        NB2=triton.next_power_of_2(NBK),
+    # WF only caps when truncation is on; passing the full width leaves `cap` at
+    # -1 on every step, so the control arm reaches the fence exactly as before.
+    _branch_cap_scan_kernel[(B,)](
+        sc["counts"], sc["offsets"], sc["total"], sc["cap"],
+        WF if _cap else (1 << 30), NBK,
+        NB2=triton.next_power_of_2(NBK), NC=NCODE,
+        NC2=triton.next_power_of_2(NCODE),
     )
     _branch_commit_kernel[(min(NBK, D.SCAN_GRID_CAP), B)](
-        sc["hit"], sc["offsets"], sc["total"], slots, r2t,
+        sc["hit"], sc["offsets"], sc["total"], sc["cap"], slots, r2t,
         fetch_buf, fetch_len, fetch_ovf, sc["ovf_count"], sc["hist"], sc["range"],
-        G, GP, WG, WF, r2t.shape[1],
+        sc["smax"], sc["smaxn"],
+        G, GP, WG, WF if not _cap else (1 << 30), r2t.shape[1],
         POOL=pool, BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
     )
 
@@ -349,8 +508,14 @@ def branch_scratch(*, bs, G, nslot, fetch_w, pool, fence_groups, dev):
         ),
         "thr": torch.zeros(bs, dtype=torch.float32, device=dev),
         "hit": torch.zeros(bs, GP, dtype=torch.int8, device=dev),
-        "counts": torch.zeros(bs, NBK, dtype=torch.int32, device=dev),
+        # Per BUCKET per COARSE LEVEL, so the scan can filter before it prefixes.
+        # 16*4 B a 256-group bucket each way is 0.5 B/group, against the 9 B/group
+        # a candidate-range pass plus a candidate histogram would have cost.
+        "counts": torch.zeros(bs, NBK * NCODE, dtype=torch.int32, device=dev),
         "offsets": torch.zeros(bs, NBK, dtype=torch.int32, device=dev),
         "total": torch.zeros(bs, dtype=torch.int32, device=dev),
+        "cap": torch.full((bs,), -1, dtype=torch.int32, device=dev),
+        "smax": torch.full((bs,), float("-inf"), dtype=torch.float32, device=dev),
+        "smaxn": torch.full((bs,), float("-inf"), dtype=torch.float32, device=dev),
         "ovf_count": torch.zeros(1, dtype=torch.int32, device=dev),
     }

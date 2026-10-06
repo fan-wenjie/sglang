@@ -108,7 +108,7 @@ def _all_positions(row_slots):
 # 9 B per group of 4 is the branch chain's own sweep (dsa_branch.py: km in
 # _branch_hist_kernel, logits + km + hit in _branch_hit_kernel, hit in
 # _branch_commit_kernel), so our fixed per-token read is 33 + 9/4.
-_VK_FIXED_B = 33.0 + 9.0 / 4.0
+_VK_FIXED_B = 33.0 + 9.75 / 4.0
 
 class VestigeKVDSABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.

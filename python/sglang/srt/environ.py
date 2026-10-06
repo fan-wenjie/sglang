@@ -800,6 +800,11 @@ class Envs:
     # and picks survivors by hash rather than by score, which is strictly worse
     # than the real filter. A pass here is evidence for the design; a failure
     # closes it at the cost of one job instead of an implementation.
+    # A would-be-overflowing branch lane truncates its own fired set to the fetch
+    # buffer's width instead of being handed DSA's index_topk selection. On by
+    # default: the fallback read the SAME 2048 rows and dropped the kept ones.
+    # 0 restores it, which is the control that prices what the fallback was worth.
+    SGLANG_VESTIGEKV_FENCE_TRUNCATE = EnvBool(True)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
