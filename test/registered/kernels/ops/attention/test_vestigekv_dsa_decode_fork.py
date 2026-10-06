@@ -53,7 +53,7 @@ def _dsa(q, kv, rows, splits, scale):
 
 class TestDsaDecodeFork(CustomTestCase):
     def _fork(self, q, kv, vk, splits, scale):
-        from sglang.srt.layers.attention.vestigekv.dsa_decode_fork import vk_dsa_decode
+        from sglang.srt.layers.attention.vestigekv.dsa.decode_fork import vk_dsa_decode
 
         out = torch.zeros(1, H, DV, dtype=torch.bfloat16, device="cuda")
         vk_dsa_decode(q, kv, out, vk, scale, d_v=DV, kv_splits=splits)
@@ -85,7 +85,7 @@ class TestDsaDecodeFork(CustomTestCase):
         rows = torch.cat([vk.kept_buf[slot, :37], vk.fetch_buf[slot, :5]])
         # poison the partial buffers first: an unwritten split must not leak
         from sglang.kernels.ops.attention.dsa import triton_sparse_mla_decode as m
-        from sglang.srt.layers.attention.vestigekv import dsa_decode_fork as f
+        from sglang.srt.layers.attention.vestigekv.dsa import decode_fork as f
 
         for buf in f._vk_splitk_bufs(1, 64, 16, DV, q.device):
             buf.fill_(float("nan"))
@@ -131,7 +131,7 @@ class TestDsaDecodeFork(CustomTestCase):
         # fork reads both where they are (no concat) and the result is the
         # concatenated call's, bit for bit. The rope part is a strided view,
         # as the model's split of the projected q is.
-        from sglang.srt.layers.attention.vestigekv.dsa_decode_fork import vk_dsa_decode
+        from sglang.srt.layers.attention.vestigekv.dsa.decode_fork import vk_dsa_decode
 
         gen, kv, q = self._setup(7)
         vk = _rows(gen, nk=1500, nf=100)
@@ -175,7 +175,7 @@ class TestSplitKBufsOutliveTheirGraphs(CustomTestCase):
     def test_growing_the_workspace_keeps_the_earlier_buffer_alive(self):
         import torch
 
-        from sglang.srt.layers.attention.vestigekv import dsa_decode_fork as f
+        from sglang.srt.layers.attention.vestigekv.dsa import decode_fork as f
 
         dev = torch.device("cuda", 0)
         f._vk_splitk.pop(dev, None)
@@ -199,7 +199,7 @@ class TestSplitKBufsOutliveTheirGraphs(CustomTestCase):
     def test_a_fitting_buffer_is_reused_rather_than_reallocated(self):
         import torch
 
-        from sglang.srt.layers.attention.vestigekv import dsa_decode_fork as f
+        from sglang.srt.layers.attention.vestigekv.dsa import decode_fork as f
 
         dev = torch.device("cuda", 0)
         f._vk_splitk.pop(dev, None)

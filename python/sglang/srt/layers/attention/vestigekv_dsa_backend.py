@@ -22,11 +22,9 @@ import torch
 from sglang.srt.configs.hybrid_arch import glm5_next_config, kimi_linear_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.vestigekv import defaults as D
-from sglang.srt.layers.attention.vestigekv.eviction import (
-    blockwise_sigma_from_pool,
-    kept_rows,
-)
+from sglang.srt.layers.attention.vestigekv.dsa import defaults as D
+from sglang.srt.layers.attention.vestigekv.dsa.hot_set import kept_rows
+from sglang.srt.layers.attention.vestigekv.eviction import blockwise_sigma_from_pool
 from sglang.srt.layers.attention.vestigekv.config import VestigeKVConfig
 from sglang.srt.layers.attention.vestigekv.telemetry import hist_percentiles
 from sglang.srt.runtime_context import get_parallel, get_schedule
@@ -185,7 +183,7 @@ class VestigeKVDSABackend(AttentionBackend):
         model_runner: ModelRunner,
         *,
         config: VestigeKVConfig,
-        rho: float = D.DSA_RHO,
+        rho: float = D.RHO,
     ):
         _refuse_sharded_sequence()
         self.base = base
@@ -211,16 +209,16 @@ class VestigeKVDSABackend(AttentionBackend):
         self.rho = float(_rho) if _rho else rho
         if _rho:
             # Bounded by defaults.RHO, which _nkm and the scan arena are sized
-            # from -- NOT by this arm's served default (defaults.DSA_RHO), so a
+            # from -- NOT by this arm's served default (dsa.defaults.RHO), so a
             # control run can override back up to the sizing ceiling. Anything
             # at or below it leaves the buffers oversized and safe; above it
             # would undersize them, and the first symptom would be _write_kept
             # raising mid-request, which reads like a defect rather than a
             # misconfiguration.
-            if self.rho > D.RHO:
+            if self.rho > D.RHO_CEILING:
                 raise ValueError(
                     f"SGLANG_VESTIGEKV_RHO={self.rho:g} exceeds the sizing "
-                    f"ceiling {D.RHO:g}; the kept table and scan arena are "
+                    f"ceiling {D.RHO_CEILING:g}; the kept table and scan arena are "
                     "allocated from the latter. Raise defaults.RHO instead."
                 )
             logger.info("VestigeKV: rho overridden to %.6g (default %.6g)", self.rho, rho)
@@ -244,17 +242,17 @@ class VestigeKVDSABackend(AttentionBackend):
                 2 * self.lowpass_kappa - 1, 2 * D.LOWPASS_KAPPA_MAX,
             )
         _cb = envs.SGLANG_VESTIGEKV_CLOSE_BLOCK.get()
-        self.close_block = int(_cb) if _cb else D.DSA_CLOSE_BLOCK
+        self.close_block = int(_cb) if _cb else D.CLOSE_BLOCK
         if _cb:
             # Bounded by defaults.CLOSE_BLOCK, as rho is by defaults.RHO:
             # _nkm and _kept_cap size the kept table from it, so a smaller
             # window leaves them oversized while a larger one would undersize
-            # the tail they hold. This arm serves DSA_CLOSE_BLOCK, well under
+            # the tail they hold. This arm's served cadence is well under
             # the ceiling, so every measured grid point stays expressible.
-            if self.close_block > D.CLOSE_BLOCK:
+            if self.close_block > D.CLOSE_BLOCK_CEILING:
                 raise ValueError(
                     f"SGLANG_VESTIGEKV_CLOSE_BLOCK={self.close_block} exceeds the "
-                    f"sizing ceiling {D.CLOSE_BLOCK}; the kept table is allocated "
+                    f"sizing ceiling {D.CLOSE_BLOCK_CEILING}; the kept table is allocated "
                     "from the latter. Raise defaults.CLOSE_BLOCK instead."
                 )
             if self.close_block & (self.close_block - 1):
@@ -265,7 +263,7 @@ class VestigeKVDSABackend(AttentionBackend):
             logger.info(
                 "VestigeKV: close block overridden to %d (default %d); sigma's "
                 "low-pass cutoff moves with it, to window/kappa = %d tokens",
-                self.close_block, D.DSA_CLOSE_BLOCK, self.close_block // self.lowpass_kappa,
+                self.close_block, D.CLOSE_BLOCK, self.close_block // self.lowpass_kappa,
             )
         # Unconditional, because the override lines above fire only when an
         # env var is set: a run on the compiled-in pair otherwise left no
@@ -281,7 +279,7 @@ class VestigeKVDSABackend(AttentionBackend):
                 else f"rho={self.rho:.6g}"
             ),
             self.close_block, self.close_block // self.lowpass_kappa,
-            2 * self.lowpass_kappa - 1, D.RHO, D.CLOSE_BLOCK,
+            2 * self.lowpass_kappa - 1, D.RHO_CEILING, D.CLOSE_BLOCK_CEILING,
         )
         self.index_rank = index_rank
         # Route the base's stage-1 decode at the tiers instead of a packed CSR.
@@ -399,7 +397,7 @@ class VestigeKVDSABackend(AttentionBackend):
         # unfinished block plus one prefill step.
         #
         # Out-of-row geometries read their salience keys straight out of DSA's
-        # index-k cache (vestigekv/dsa_index_view.py): the indexer key IS the
+        # index-k cache (vestigekv/dsa/index_view.py): the indexer key IS the
         # salience channel here, DSA stores it per token per layer quantised by
         # the same act_quant math, and it is written before this backend runs
         # in the same layer forward. The 52 MiB slot-indexed ring this replaces
@@ -1678,11 +1676,11 @@ class VestigeKVDSABackend(AttentionBackend):
         # Deliberately the SIZING ceilings, not self.rho / self.close_block:
         # both may be overridden downward at launch, and sizing from the
         # effective pair would make the allocation depend on an env var the
-        # buffers outlive. Oversized by 4x at the served pair (DSA_RHO,
-        # DSA_CLOSE_BLOCK), which is 2 int32 tables of 32768 rows per layer
+        # buffers outlive. Oversized by 4x at the served pair (rho,
+        # close block), which is 2 int32 tables of 32768 rows per layer
         # per slot at max_context -- ~70 MB at a 32-request pool, and the
         # price of keeping every control arm expressible.
-        return int(D.RHO * max_ctx) + 3 * D.CLOSE_BLOCK
+        return int(D.RHO_CEILING * max_ctx) + 3 * D.CLOSE_BLOCK_CEILING
 
     def _kept_cap(self, max_ctx: int) -> int:
         # Capacity of one kept-table row. The compressed arm never holds more
@@ -1695,7 +1693,7 @@ class VestigeKVDSABackend(AttentionBackend):
         # _write_kept enforces the bound on every host-side writer.
         if envs.SGLANG_TEST_VESTIGEKV_FULL_ARM_FLAG.get():
             return max_ctx
-        bound = max(self.config.activation_min_tokens, self._nkm(max_ctx)) + D.CLOSE_BLOCK
+        bound = max(self.config.activation_min_tokens, self._nkm(max_ctx)) + D.CLOSE_BLOCK_CEILING
         return min(max_ctx, bound)
 
     def _closed_for(self, seq_len: int) -> int:
@@ -1932,7 +1930,7 @@ class VestigeKVDSABackend(AttentionBackend):
         """Telemetry (SGLANG_DEBUG_VESTIGEKV_SPECTRUM): the closing blocks'
         above-cutoff peak. Reads the same branch sigma just read; nothing
         downstream consumes it (vestigekv/spectrum.py)."""
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
             group_sigma_window,
         )
 
@@ -1941,7 +1939,7 @@ class VestigeKVDSABackend(AttentionBackend):
             rows = self.req_to_token_pool.req_to_token[slot, c0:c1].to(torch.int64)
             side = kbuf.index_select(0, rows)[:, g.sigma_offset : g.sigma_offset + g.sigma_dim]
         else:
-            from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+            from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
                 index_group_keys,
             )
 
@@ -1984,7 +1982,7 @@ class VestigeKVDSABackend(AttentionBackend):
         """
         if self.geom.sigma_in_row:
             return None
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
             index_group_keys,
         )
 
@@ -2031,7 +2029,7 @@ class VestigeKVDSABackend(AttentionBackend):
         trigger raises the overflow flag and the pack fences the lane to DSA's
         own top-k (fork: a fenced lane attends the indexer's selection and NOT
         the kept rows). No top-k of ours and no sketch: the operators are
-        vestigekv/dsa_branch.py, all fixed-shape so the decode graph captures
+        vestigekv/dsa/branch.py, all fixed-shape so the decode graph captures
         them. NOT stale by one, unlike the sketch scan this replaces: the
         indexer runs before the attention within a layer's forward, so the rows
         written here are consumed by this same step's fork -- which is also why
@@ -2042,7 +2040,7 @@ class VestigeKVDSABackend(AttentionBackend):
         q = self._branch_q()
         if q is None or layer_id not in self._qbuf or self._full_arm():
             return
-        from sglang.srt.layers.attention.vestigekv.dsa_branch import branch_fire
+        from sglang.srt.layers.attention.vestigekv.dsa.branch import branch_fire
 
         li = self._li_map[layer_id]
         bs, G = logits.shape
@@ -2066,7 +2064,7 @@ class VestigeKVDSABackend(AttentionBackend):
     def _branch_scratch(self, bs, dev, G):
         # Fixed-address scratch per (batch width, logits width): nothing is
         # allocated inside the captured step (dsa_branch.branch_scratch).
-        from sglang.srt.layers.attention.vestigekv.dsa_branch import branch_scratch
+        from sglang.srt.layers.attention.vestigekv.dsa.branch import branch_scratch
 
         key = (bs, G)
         d = self.__dict__.setdefault("_branch_scratch_bufs", {})
@@ -2100,7 +2098,7 @@ class VestigeKVDSABackend(AttentionBackend):
         if q is None:
             if rec["lazy"] is None:
                 return None, None
-            from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+            from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
                 indexer_query,
             )
 
@@ -2148,11 +2146,11 @@ class VestigeKVDSABackend(AttentionBackend):
         token span and therefore the physical cutoff are unchanged
         (group_sigma_window).
         """
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
             group_sigma_window,
             index_group_keys,
         )
-        from sglang.srt.layers.attention.vestigekv.eviction import blockwise_sigma
+        from sglang.srt.layers.attention.vestigekv.dsa.sigma import group_sigma
 
         pool_size = self._text_cfg_index_kpool
         assert c0 % pool_size == 0, (
@@ -2177,7 +2175,7 @@ class VestigeKVDSABackend(AttentionBackend):
             slots_per_page=self.token_to_kv_pool.slots_per_page,
             pool_size=pool_size,
         )
-        sig = blockwise_sigma(
+        sig = group_sigma(
             keys,
             group_sigma_window(self.close_block, pool_size),
             kappa=self.lowpass_kappa,
@@ -2423,7 +2421,7 @@ class VestigeKVDSABackend(AttentionBackend):
         # no index_put), and the fork reads q's parts in place. The base's
         # forward_decode is not involved: its write is the concatenated
         # index_put, and everything else it does serves its own kernel.
-        from sglang.srt.layers.attention.vestigekv.dsa_decode_fork import vk_dsa_decode
+        from sglang.srt.layers.attention.vestigekv.dsa.decode_fork import vk_dsa_decode
 
         if save_kv_cache:
             self.token_to_kv_pool.set_mla_kv_buffer(
@@ -2574,7 +2572,7 @@ class VestigeKVDSABackend(AttentionBackend):
         pool_tokens = getattr(self.token_to_kv_pool, "size", None)
         arena = n_lids * maxbs * max_ctx
         if isinstance(pool_tokens, int) and pool_tokens > 0:
-            arena = min(arena, n_lids * (pool_tokens + D.CLOSE_BLOCK))
+            arena = min(arena, n_lids * (pool_tokens + D.CLOSE_BLOCK_CEILING))
         # Kept rows are scored in place in the KV pool: the pack carries the
         # pool row ids (4 bytes each) instead of a bf16 copy of every row,
         # which was 87% of it at bs16. The pool is one allocation per layer,

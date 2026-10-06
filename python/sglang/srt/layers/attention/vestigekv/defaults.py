@@ -46,20 +46,6 @@ below it stays expressible as a control. The vestigekv_mla arm has no override
 and serves this value directly -- the Kimi line's recorded results are all at
 this rho, which is why the dsa arm's new default is a separate constant."""
 
-DSA_RHO = 1 / 128
-"""Served keep rate for the vestigekv_dsa arm (GLM-5.3), the coefficient of the
-fixed per-token cost: kept costs exactly rho * 1024 B/token.
-
-Measured 2026-10-05 at 4k in / 32k out, 32750 steps, fallback 0.00000: with
-DSA_CLOSE_BLOCK this reads 0.607-0.614x DSA's bytes against 1.348-1.351x at RHO
-+ CLOSE_BLOCK (two runs of each; kept reproduces to the row, fetch spreads ~6%,
-so the ratio carries ~0.01 of replicate noise and a move that small is not a
-result). On an aligned 32k prefill it reads 0.688x. Both knobs are needed on a
-long decode -- rho alone reaches 1.174x.
-
-Quality here is "not refuted", not verified: niah_multikey_3 reads 1.000 at
-every rho from 1/32 to 1/512, but tier 1 ALONE reads 0.000 on that task, so the
-metric cannot resolve the component rho moves. No probe on this line can."""
 
 SINKS = 4
 """Leading rows kept unconditionally: attention sinks are never anomalous by
@@ -77,8 +63,9 @@ so this must stay a value whose double is tl.dot-friendly (32). Raising it
 widens every projection's K dimension, for every kappa, so it is a kernel
 change and not a configuration one."""
 
+
 LOWPASS_KAPPA = 16
-"""rFFT cutoff for the low-pass whose residual defines sigma.
+"""rFFT cutoff for the low-pass whose residual defines sigma, on the MLA arm.
 
 Derivability was measured and rejected (m8, 3 docs x 7 layers, real queries):
 the query-grounded criterion -- attention mass captured by the sigma_kappa
@@ -167,33 +154,6 @@ so that buffer keeps the base metadata's kv_indices dtype (int64)."""
 
 # ---- decode-time block closing ----
 
-DSA_CLOSE_BLOCK = 1024
-"""Close cadence for the vestigekv_dsa arm (GLM-5.3), the other term of
-kept = SINKS + rho * closed + tail: the un-closed tail averages half a block,
-so halving the cadence halves it. Neither knob reaches below 1x alone (rho
-1/128 at a 4096 block is 1.174x; a 1024 block at rho 1/32 is 0.848x).
-
-1024 is the SMALLEST block that leaves sigma intact. The window IS the close
-block and LOWPASS_KAPPA is fixed, so the low-pass cutoff is block/kappa: 64
-tokens here, with the 2*kappa-1 = 31 dim basis at 3% of the window. At 256 the
-cutoff is 16 and the basis is 48% of the window, and that configuration scored
-0.000 on niah_multikey_3 -- a collapse, not a degradation. kappa cannot
-compensate: a 256-token cutoff inside a 256-token window needs kappa=1, which
-collapses the basis to its DC term.
-
-Fetch is not predictable from either knob alone. The tier-2 threshold is a
-quantile of the kept GROUPS' logits, so changing the kept set's composition
-moves it: at rho 1/32 fetch rises monotonically as the block shrinks
-(332 -> 392 -> 458 rows/step), at rho 1/128 it does not (283 -> 218 -> 290).
-
-Which makes the gain SHAPE-DEPENDENT, and this block is not free everywhere.
-On a prompt that is a whole multiple of either block the tail is already zero,
-so a smaller block buys no kept rows -- but it is still sigma's window, so it
-changes WHICH rows tier 1 keeps and moves the threshold anyway. Measured at a
-32768 prefill: kept is flat (379 -> 367 rows) while fetch rises 29% (507 ->
-654), taking the ratio from 0.645x at a 4096 block to 0.688x at 1024. The pair
-is still under 1x on both shapes, and the long decode it is chosen for gains
-far more (1.174x -> 0.607x) than this shape gives up."""
 
 CLOSE_BLOCK = 4096
 """Decoded tokens per compression event. Every CLOSE_BLOCK decode steps a
@@ -207,7 +167,7 @@ a close would be unrecallable -- both wrong at long generation.
 Also the SIZING ceiling, as RHO is: the kept table holds a tail under one
 block, _nkm and _kept_cap are allocated from this value, and the env override
 is refused above it. The vestigekv_mla arm serves it directly; the dsa arm's
-served cadence is DSA_CLOSE_BLOCK and may be anything at or below this."""
+dsa arm serves its own cadence (vestigekv/dsa/defaults.py) at or below this."""
 
 SCAN_GRID_CAP = 128
 """Cap on the capacity-baked block grid of the batched scan and compact-write

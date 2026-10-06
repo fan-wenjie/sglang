@@ -1,4 +1,4 @@
-"""The GLM branch rule's operators (vestigekv/dsa_branch.py) against a torch
+"""The GLM branch rule's operators (vestigekv/dsa/branch.py) against a torch
 reference of the rule: threshold = q-quantile of the kept groups' logits, fire
 every archive group above it, fence the lane past the trigger.
 
@@ -69,7 +69,7 @@ def _fixture(seeds_slots):
 
 
 def _scratch(bs, G, fence_groups=None):
-    from sglang.srt.layers.attention.vestigekv.dsa_branch import branch_scratch
+    from sglang.srt.layers.attention.vestigekv.dsa.branch import branch_scratch
 
     return branch_scratch(bs=bs, G=G, nslot=NSLOT, fetch_w=W, pool=POOL,
                           fence_groups=fence_groups, dev="cuda")
@@ -77,7 +77,7 @@ def _scratch(bs, G, fence_groups=None):
 
 def _run(sc, logits, pool_lens, slots, kept_pos, klen, r2t, q,
          fence_groups=None, out=None):
-    from sglang.srt.layers.attention.vestigekv.dsa_branch import branch_fire
+    from sglang.srt.layers.attention.vestigekv.dsa.branch import branch_fire
 
     if out is None:
         out = (

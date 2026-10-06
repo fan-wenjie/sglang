@@ -655,7 +655,7 @@ class Envs:
     # {3,7,11,15} another -- so such a set describes the run it was fitted on.
     SGLANG_VESTIGEKV_DSA_LAYERS = EnvTuple(tuple())
     # Tier-1 keep rate, overriding the arm's served default DOWNWARD only
-    # (vestigekv_dsa serves defaults.DSA_RHO, vestigekv_mla defaults.RHO); the
+    # (vestigekv_dsa serves dsa.defaults.RHO, vestigekv_mla defaults.RHO); the
     # ceiling is defaults.RHO either way, because the kept table and the scan
     # arena are allocated from it. The coefficient of the only
     # term that grows with context: the kept set is rho*S rows, scored densely
@@ -666,7 +666,7 @@ class Envs:
     # which value produced it.
     SGLANG_VESTIGEKV_RHO = EnvFloat(None)
     # Decoded tokens per compression event, overriding the arm's served default
-    # (vestigekv_dsa serves defaults.DSA_CLOSE_BLOCK = 1024, vestigekv_mla
+    # (vestigekv_dsa serves dsa.defaults.CLOSE_BLOCK = 1024, vestigekv_mla
     # defaults.CLOSE_BLOCK) DOWNWARD only, bounded by defaults.CLOSE_BLOCK
     # which the kept table is sized from. Not a dial: it sets the close cadence
     # AND the window sigma's low-pass projection is built over, so the cutoff

@@ -123,7 +123,7 @@ class TierDecodeRouter(msgspec.Struct, dict=True):
 
 class DsaTierDecodeRouter(TierDecodeRouter):
     """The DSA-model router: stage 1 and 2 are DSA's own split-K decode over
-    the tiers (vestigekv/dsa_decode_fork.py) instead of the MLA-decode fork.
+    the tiers (vestigekv/dsa/decode_fork.py) instead of the MLA-decode fork.
     Layers without rows still fall through to the base's function."""
 
     def __call__(
@@ -150,7 +150,7 @@ class DsaTierDecodeRouter(TierDecodeRouter):
                 attn_lse, num_kv_splits, max_kv_splits, sm_scale, k_descale,
                 v_descale, **kw,
             )
-        from sglang.srt.layers.attention.vestigekv.dsa_decode_fork import vk_dsa_decode
+        from sglang.srt.layers.attention.vestigekv.dsa.decode_fork import vk_dsa_decode
 
         kb = k_buffer.view(k_buffer.shape[0], 1, -1) if k_buffer.dim() != 3 else k_buffer
         vk_dsa_decode(q, kb, o, vk, sm_scale, d_v=o.shape[-1])
