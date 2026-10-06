@@ -146,3 +146,45 @@ def vk_select_fetch(
         slots.to(torch.int32), r2t, fetch_buf, fetch_len, fetch_ovf,
         ovf_counts, group_budget, pool,
     )
+
+
+@cache_once
+def _jit_vk_collect_emit_module() -> Module:
+    return load_jit(
+        "vk_collect_emit",
+        cuda_files=["dsa/vk_select_transform.cuh"],
+        cuda_wrappers=[("vk_collect_emit", "VkCollectEmitKernel::run")],
+        extra_cuda_cflags=["-DSGL_GROUP_TOPK=512"],
+        extra_include_paths=_cuda_include_paths(),
+    )
+
+
+def vk_collect_emit(
+    *,
+    logits: torch.Tensor,
+    pool_lens: torch.Tensor,
+    thresholds: torch.Tensor,
+    kept_mask: torch.Tensor,
+    cand_score: torch.Tensor,
+    cand_idx: torch.Tensor,
+    ncand: torch.Tensor,
+    slots: torch.Tensor,
+    r2t: torch.Tensor,
+    fetch_buf: torch.Tensor,
+    fetch_len: torch.Tensor,
+    fetch_ovf: torch.Tensor,
+    ovf_counts: torch.Tensor,
+    group_budget: int,
+    pool: int,
+) -> None:
+    """The selection as a WIDE compare pass plus a narrow cut-and-emit.
+
+    DSA's rank threshold forces one CTA over every group, because the rank is not
+    known until the whole histogram exists. A reference-set threshold is known
+    first, so the compare has no cross-group dependency and takes the device.
+    """
+    _jit_vk_collect_emit_module().vk_collect_emit(
+        logits, pool_lens.to(torch.int32), thresholds, kept_mask,
+        cand_score, cand_idx, ncand, slots.to(torch.int32), r2t,
+        fetch_buf, fetch_len, fetch_ovf, ovf_counts, group_budget, pool,
+    )

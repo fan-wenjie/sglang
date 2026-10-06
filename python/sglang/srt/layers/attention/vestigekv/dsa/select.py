@@ -102,8 +102,13 @@ def kept_threshold(*, logits, kept_pos, klen, slots, q, pool, scratch, kg_max):
     return scratch["thr"]
 
 
-def select_scratch(*, bs, G, kg_max, dev):
+def select_scratch(*, bs, G, kg_max, dev, cand_max=2048):
     return {
+        # Candidates staged in GLOBAL memory for the wide collect pass, which
+        # cannot use shared memory across CTAs. kCandMax in the .cuh must match.
+        "cand_score": torch.zeros(bs, cand_max, dtype=torch.float32, device=dev),
+        "cand_idx": torch.zeros(bs, cand_max, dtype=torch.int32, device=dev),
+        "ncand": torch.zeros(bs, dtype=torch.int32, device=dev),
         "km": torch.zeros(bs, G, dtype=torch.int8, device=dev),
         "kg": torch.zeros(bs, int(kg_max), dtype=torch.int32, device=dev),
         "kgn": torch.zeros(bs, dtype=torch.int32, device=dev),

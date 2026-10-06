@@ -89,6 +89,73 @@ class TestVkSelectFetch(CustomTestCase):
                         pool=self.POOL, group_topk=self.WG)
         return fetch, flen, fovf, sel
 
+    def _wide(self, logits, pos, klen, slots, r2t, q):
+        from sglang.kernels.ops.attention.dsa.vk_select_transform import (
+            vk_collect_emit,
+        )
+        from sglang.srt.layers.attention.vestigekv.dsa.select import (
+            kept_threshold,
+            select_scratch,
+        )
+
+        bs, G = logits.shape
+        W = self.WG * self.POOL
+        kg = int(klen[0]) // self.POOL
+        sel = select_scratch(bs=bs, G=G, kg_max=kg, dev=self.dev)
+        kept_threshold(logits=logits, kept_pos=pos, klen=klen, slots=slots, q=q,
+                       pool=self.POOL, scratch=sel, kg_max=kg)
+        fetch = torch.full((bs, W), -1, dtype=torch.int32, device=self.dev)
+        flen = torch.zeros(bs, dtype=torch.int32, device=self.dev)
+        fovf = torch.zeros(bs, dtype=torch.int32, device=self.dev)
+        plen = torch.full((bs,), G, dtype=torch.int32, device=self.dev)
+        vk_collect_emit(logits=logits, pool_lens=plen, thresholds=sel["thr"],
+                        kept_mask=sel["km"], cand_score=sel["cand_score"],
+                        cand_idx=sel["cand_idx"], ncand=sel["ncand"],
+                        slots=slots, r2t=r2t, fetch_buf=fetch, fetch_len=flen,
+                        fetch_ovf=fovf, ovf_counts=sel["ovf"],
+                        group_budget=self.WG, pool=self.POOL)
+        return fetch, flen, fovf, sel
+
+    def test_the_wide_path_matches_the_chain(self):
+        """The 2.58x result is worthless unless it is the same answer."""
+        args = self._case()
+        of, ol, oo, _ = self._old(*args, q=0.75)
+        wf, wl, wo, sel = self._wide(*args, q=0.75)
+        self.assertEqual(int(sel["ovf"].sum()), 0)
+        self.assertEqual(int(ol[0]), int(wl[0]), "fetch_len disagrees")
+        n = int(ol[0])
+        self.assertEqual(set(of[0, :n].tolist()), set(wf[0, :n].tolist()))
+        self.assertEqual(int(oo[0]), int(wo[0]))
+
+    def test_the_wide_path_resets_its_counter(self):
+        """ncand is global and reused every layer-step; a missed reset would
+        accumulate and silently truncate from the second call on."""
+        args = self._case()
+        first = None
+        for _ in range(3):
+            wf, wl, _, sel = self._wide(*args, q=0.75)
+            n = int(wl[0])
+            got = set(wf[0, :n].tolist())
+            if first is None:
+                first = (n, got)
+            self.assertEqual((n, got), first, "the counter did not reset")
+            self.assertEqual(int(sel["ncand"][0]), 0)
+
+    def test_the_wide_path_cuts_by_score_on_overflow(self):
+        logits, pos, klen, slots, r2t = self._case(lift=0.0)
+        wf, wl, _, sel = self._wide(logits, pos, klen, slots, r2t, q=0.75)
+        self.assertGreater(int(sel["ovf"].sum()), 0, "expected an overflow")
+        self.assertEqual(int(wl[0]), self.WG * self.POOL)
+        thr = float(sel["thr"][0])
+        km = sel["km"][0].bool()
+        cand = torch.nonzero((logits[0] > thr) & ~km).flatten()
+        best = cand[logits[0][cand].argsort(descending=True)][: self.WG]
+        got = set()
+        for i in range(0, int(wl[0]), self.POOL):
+            r = int(wf[0, i])
+            got.add(int((r2t[0] == r).nonzero()[0]) // self.POOL)
+        self.assertEqual(got, set(best.tolist()))
+
     def test_the_two_paths_emit_the_same_rows(self):
         """The drop-in claim: same set, same length, same fence flag."""
         args = self._case()

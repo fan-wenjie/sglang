@@ -752,6 +752,126 @@ struct VkSelectTransformKernel {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Wide collect + narrow emit.
+//
+// This is the whole point of a reference-set threshold. DSA's rank rule needs a
+// global histogram before any score can be judged, a histogram needs one block,
+// and so kpool_topk_transform runs ONE CTA over every group -- 127 kB through a
+// single SM at ~25 GB/s, which is its 14.31 us/layer-step. Our threshold is
+// known before the first score is read, so the comparison has no cross-group
+// dependency at all and the pass can take the whole device.
+//
+// Collect is therefore wide (one CTA per BLOCK groups, a global atomic per fire,
+// and firing is sparse -- ~115 of 32768). Only the cut and the row expansion
+// need the candidates gathered, and those touch n_cand <= kCandMax entries
+// rather than all G.
+template <int BLOCK>
+__global__ __launch_bounds__(BLOCK) void vk_collect_kernel(
+    const float* __restrict__ score,
+    const int64_t score_stride,
+    const int32_t* __restrict__ lengths,
+    const float* __restrict__ thresholds,
+    const int8_t* __restrict__ kept_mask,
+    const int64_t kept_mask_stride,
+    float* __restrict__ cand_score,
+    int32_t* __restrict__ cand_idx,
+    const int64_t cand_stride,
+    int32_t* __restrict__ ncand) {
+  const auto b = static_cast<uint64_t>(blockIdx.y);
+  const auto idx = static_cast<int>(blockIdx.x) * BLOCK + static_cast<int>(threadIdx.x);
+  if (idx >= lengths[b]) return;
+  const auto kmask = kept_mask + b * kept_mask_stride;
+  if (kmask[idx] != 0) return;
+  const auto v = score[b * score_stride + idx];
+  if (v <= thresholds[b]) return;
+  const auto pos = ::atomicAdd(ncand + b, 1);
+  if (pos < kCandMax) {
+    cand_score[b * cand_stride + pos] = v;
+    cand_idx[b * cand_stride + pos] = idx;
+  }
+}
+
+// One CTA per lane, over the candidates alone.
+__global__ __launch_bounds__(kThreadsPerBlock) void vk_emit_kernel(
+    const float* __restrict__ cand_score_g,
+    const int32_t* __restrict__ cand_idx_g,
+    const int64_t cand_stride,
+    int32_t* __restrict__ ncand,
+    const int32_t* __restrict__ slots,
+    const int32_t* __restrict__ r2t,
+    const int64_t r2t_stride,
+    int32_t* __restrict__ fetch,
+    const int64_t fetch_stride,
+    int32_t* __restrict__ flen,
+    int32_t* __restrict__ fovf,
+    int32_t* __restrict__ ovf_counts,
+    const int32_t group_budget,
+    const int32_t pool_size,
+    const int32_t maxctx) {
+  const auto b = static_cast<uint64_t>(blockIdx.x);
+  const auto tid = static_cast<int>(threadIdx.x);
+  const auto slot = static_cast<uint64_t>(slots[b]);
+  const auto raw = ncand[b];
+  const auto n_cand = raw < kCandMax ? raw : kCandMax;
+  const auto spilled = raw > kCandMax;
+
+  extern __shared__ int s_dyn2[];
+  float* cs = reinterpret_cast<float*>(s_dyn2);
+  int* ci = reinterpret_cast<int*>(s_dyn2) + kCandMax;
+
+  if (raw > group_budget) {
+    for (int i = tid; i < kCandMax; i += kThreadsPerBlock) {
+      const bool live = i < n_cand;
+      cs[i] = live ? cand_score_g[b * cand_stride + i] : -INFINITY;
+      ci[i] = live ? cand_idx_g[b * cand_stride + i] : -1;
+    }
+    __syncthreads();
+    if (tid == 0 && ovf_counts != nullptr) {
+      ::atomicAdd(ovf_counts + b, raw - group_budget);
+    }
+    // Exact score-ordered cut, where the Triton chain quantised to 24 levels.
+    for (int kk = 2; kk <= kCandMax; kk <<= 1) {
+      for (int jj = kk >> 1; jj > 0; jj >>= 1) {
+        for (int i = tid; i < kCandMax; i += kThreadsPerBlock) {
+          const int ixj = i ^ jj;
+          if (ixj > i) {
+            const bool down = (i & kk) != 0;
+            const bool sw = down ? (cs[i] > cs[ixj]) : (cs[i] < cs[ixj]);
+            if (sw) {
+              const auto f = cs[i]; cs[i] = cs[ixj]; cs[ixj] = f;
+              const auto t = ci[i]; ci[i] = ci[ixj]; ci[ixj] = t;
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+  } else {
+    for (int i = tid; i < n_cand; i += kThreadsPerBlock) {
+      ci[i] = cand_idx_g[b * cand_stride + i];
+    }
+    __syncthreads();
+  }
+
+  const auto take = raw < group_budget ? raw : group_budget;
+  for (int i = tid; i < take; i += kThreadsPerBlock) {
+    const auto g = ci[i];
+    if (g < 0) continue;
+    for (int j = 0; j < pool_size; ++j) {
+      auto tp = g * pool_size + j;
+      if (tp > maxctx - 1) tp = maxctx - 1;
+      fetch[slot * fetch_stride + i * pool_size + j] = r2t[slot * r2t_stride + tp];
+    }
+  }
+  if (tid == 0) {
+    flen[slot] = take * pool_size;
+    fovf[slot] = 0;
+    ncand[b] = 0;  // reset for the next layer-step; this kernel is its last reader
+    if (spilled && ovf_counts != nullptr) ::atomicAdd(ovf_counts + b, 1);
+  }
+}
+
 struct VkSelectFetchKernel {
   static constexpr auto kernel = vk_select_fetch_kernel<kGroupTopK>;
 
@@ -811,6 +931,94 @@ struct VkSelectFetchKernel {
         static_cast<const float*>(thresholds.data_ptr()),
         static_cast<const int8_t*>(kept_mask.data_ptr()),
         static_cast<int64_t>(KM.unwrap()),
+        static_cast<const int32_t*>(slots.data_ptr()),
+        static_cast<const int32_t*>(r2t.data_ptr()),
+        static_cast<int64_t>(R.unwrap()),
+        static_cast<int32_t*>(fetch.data_ptr()),
+        static_cast<int64_t>(F.unwrap()),
+        static_cast<int32_t*>(flen.data_ptr()),
+        static_cast<int32_t*>(fovf.data_ptr()),
+        static_cast<int32_t*>(ovf_counts.data_ptr()),
+        static_cast<int32_t>(group_budget),
+        static_cast<int32_t>(pool_size),
+        static_cast<int32_t>(r2t.shape()[1]));
+  }
+};
+
+struct VkCollectEmitKernel {
+  static void run(
+      const tvm::ffi::TensorView score,
+      const tvm::ffi::TensorView lengths,
+      const tvm::ffi::TensorView thresholds,
+      const tvm::ffi::TensorView kept_mask,
+      const tvm::ffi::TensorView cand_score,
+      const tvm::ffi::TensorView cand_idx,
+      const tvm::ffi::TensorView ncand,
+      const tvm::ffi::TensorView slots,
+      const tvm::ffi::TensorView r2t,
+      const tvm::ffi::TensorView fetch,
+      const tvm::ffi::TensorView flen,
+      const tvm::ffi::TensorView fovf,
+      const tvm::ffi::TensorView ovf_counts,
+      const int64_t group_budget,
+      const int64_t pool_size) {
+    using namespace host;
+    constexpr int kCollectBlock = 256;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto S = SymbolicSize{"score_stride"};
+    auto KM = SymbolicSize{"kept_mask_stride"};
+    auto CS = SymbolicSize{"cand_stride"};
+    auto R = SymbolicSize{"r2t_stride"};
+    auto F = SymbolicSize{"fetch_stride"};
+    auto NSLOT = SymbolicSize{"nslot"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(score);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);
+    TensorMatcher({B}).with_dtype<float>().with_device(device).verify(thresholds);
+    TensorMatcher({B, -1}).with_strides({KM, 1}).with_dtype<int8_t>().with_device(device).verify(kept_mask);
+    TensorMatcher({B, -1}).with_strides({CS, 1}).with_dtype<float>().with_device(device).verify(cand_score);
+    TensorMatcher({B, -1}).with_strides({CS, 1}).with_dtype<int32_t>().with_device(device).verify(cand_idx);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ncand);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(slots);
+    TensorMatcher({NSLOT, -1}).with_strides({R, 1}).with_dtype<int32_t>().with_device(device).verify(r2t);
+    TensorMatcher({NSLOT, -1}).with_strides({F, 1}).with_dtype<int32_t>().with_device(device).verify(fetch);
+    TensorMatcher({NSLOT}).with_dtype<int32_t>().with_device(device).verify(flen);
+    TensorMatcher({NSLOT}).with_dtype<int32_t>().with_device(device).verify(fovf);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ovf_counts);
+
+    const auto cand_w = static_cast<int64_t>(cand_score.shape()[1]);
+    RuntimeCheck(cand_w >= kCandMax, "candidate buffer ", cand_w, " < ", kCandMax);
+    RuntimeCheck(
+        group_budget * pool_size <= static_cast<int64_t>(fetch.shape()[1]),
+        "group_budget x pool exceeds the fetch buffer width");
+
+    const auto bs = static_cast<uint32_t>(B.unwrap());
+    const auto G = static_cast<int32_t>(score.shape()[1]);
+    const auto nblk = static_cast<uint32_t>((G + kCollectBlock - 1) / kCollectBlock);
+
+    LaunchKernel(dim3(nblk, bs), kCollectBlock, device.unwrap(), 0)(
+        vk_collect_kernel<kCollectBlock>,
+        static_cast<const float*>(score.data_ptr()),
+        static_cast<int64_t>(S.unwrap()),
+        static_cast<const int32_t*>(lengths.data_ptr()),
+        static_cast<const float*>(thresholds.data_ptr()),
+        static_cast<const int8_t*>(kept_mask.data_ptr()),
+        static_cast<int64_t>(KM.unwrap()),
+        static_cast<float*>(cand_score.data_ptr()),
+        static_cast<int32_t*>(cand_idx.data_ptr()),
+        static_cast<int64_t>(CS.unwrap()),
+        static_cast<int32_t*>(ncand.data_ptr()));
+
+    setup_kernel_smem_once<&vk_emit_kernel, kSmem>();
+    LaunchKernel(bs, kThreadsPerBlock, device.unwrap(), kSmem)(
+        vk_emit_kernel,
+        static_cast<const float*>(cand_score.data_ptr()),
+        static_cast<const int32_t*>(cand_idx.data_ptr()),
+        static_cast<int64_t>(CS.unwrap()),
+        static_cast<int32_t*>(ncand.data_ptr()),
         static_cast<const int32_t*>(slots.data_ptr()),
         static_cast<const int32_t*>(r2t.data_ptr()),
         static_cast<int64_t>(R.unwrap()),

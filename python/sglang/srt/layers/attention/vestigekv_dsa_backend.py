@@ -2118,7 +2118,7 @@ class VestigeKVDSABackend(AttentionBackend):
         and softmax does not care).
         """
         from sglang.kernels.ops.attention.dsa.vk_select_transform import (
-            vk_select_fetch,
+            vk_collect_emit,
         )
         from sglang.srt.layers.attention.vestigekv.dsa.select import kept_threshold
 
@@ -2134,11 +2134,17 @@ class VestigeKVDSABackend(AttentionBackend):
             scratch=sc,
             kg_max=kg,
         )
-        vk_select_fetch(
+        # The WIDE compare pass, which is the whole result: DSA's rank threshold
+        # forces one CTA over every group, ours is known before the first score
+        # is read and takes the device. 2.58x its top-k at 124k, 1.47x at 36k.
+        vk_collect_emit(
             logits=logits,
             pool_lens=pool_lens,
             thresholds=sc["thr"],
             kept_mask=sc["km"],
+            cand_score=sc["cand_score"],
+            cand_idx=sc["cand_idx"],
+            ncand=sc["ncand"],
             slots=slots.to(torch.int32),
             r2t=self.req_to_token_pool.req_to_token,
             fetch_buf=self._fetch_stack[li],
@@ -2147,7 +2153,6 @@ class VestigeKVDSABackend(AttentionBackend):
             ovf_counts=sc["ovf"],
             group_budget=self._fetch_w // self._text_cfg_index_kpool,
             pool=self._text_cfg_index_kpool,
-            group_topk=self._fetch_w // self._text_cfg_index_kpool,
         )
 
     def _select_scratch(self, bs, dev, G):
