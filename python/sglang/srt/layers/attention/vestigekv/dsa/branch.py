@@ -72,6 +72,16 @@ NBIN = 256
 # scan picks a level, instead of a later pass re-counting them. 16 levels cost
 # 16*4 B per 256-group block each way, 0.5 B/group, against the 9 B/group a
 # candidate-range pass plus a candidate histogram cost.
+# Grid block for the two kernels that only need to SEE every group, decoupled from
+# the compaction's bucket. At 124k, G/pool = 32768 groups and a 256-wide block gives
+# NBK = 128 CTAs against 188 SMs -- so _branch_hit read 164 kB in 27.4 us, 6 GB/s,
+# about 0.4% of the device. These kernels were never bandwidth bound, their grid was
+# too small. 64 gives 512 CTAs. The compaction cannot follow: its `pos` comes from a
+# bucket's exclusive prefix plus a within-block cumsum, so BLOCK there must stay the
+# bucket width. A CTA of 64 sits entirely inside one 256-wide bucket, so the fire
+# tally is still one atomic per level per CTA rather than a scatter.
+GBLOCK = 64
+
 NCOARSE = 16
 # Sub-levels for the band ABOVE the main scale, so the retention rule stays
 # score-ordered there too. The main 16 levels span [lo, lo+2w) with w the kept
@@ -190,13 +200,16 @@ def _branch_hit_kernel(
     counts_ptr,    # [B, NBK, NC] int32 out, fires per bucket per coarse level
     thr_ptr,       # [B] fp32 out: the resolved threshold (observability/tests)
     q,
-    G, GP,
-    BLOCK: tl.constexpr, NB: tl.constexpr, NC: tl.constexpr,
+    G, GP, NBK,
+    BLOCK: tl.constexpr, BUCKET: tl.constexpr, NB: tl.constexpr, NC: tl.constexpr,
     CPX_C: tl.constexpr = 0, CPX_KEEP: tl.constexpr = 0,
 ):
     b = tl.program_id(1)
     blk = tl.program_id(0)
-    nb = GP // BLOCK
+    # The BUCKET this CTA falls in. GBLOCK divides BUCKET and the grid is aligned, so
+    # all BLOCK groups here share one bucket and the tally is a single atomic per
+    # level -- the compaction still reads per-bucket counts at its own width.
+    bucket = (blk * BLOCK) // BUCKET
     # The threshold, per CTA, off the 256-bin histogram: the (r+1)-th largest
     # kept-group logit, r = floor((1-q) n), rounded DOWN to its bin's lower
     # edge. 256 loads and a scan per CTA is cheaper than the launch a separate
@@ -280,10 +293,9 @@ def _branch_hit_kernel(
         mask=offs < GP,
     )
     for l in tl.static_range(NC):
-        tl.store(
-            counts_ptr + b * (nb * NC) + blk * NC + l,
-            tl.sum((fired & (lvl == l)).to(tl.int32), 0),
-        )
+        n_l = tl.sum((fired & (lvl == l)).to(tl.int32), 0)
+        if n_l > 0:
+            tl.atomic_add(counts_ptr + b * (NBK * NC) + bucket * NC + l, n_l)
     # Reset km for the next (layer, step): this kernel is its last reader, so
     # the reset rides on a store that is already in flight instead of a memset.
     tl.store(km_ptr + b * G + offs, tl.zeros([BLOCK], dtype=tl.int8), mask=m)
@@ -339,6 +351,14 @@ def _branch_cap_scan_kernel(
     fc = tl.sum(tl.where((keep & mc)[None, :], cnt, 0), 1)  # [NB2] filtered per bucket
     tl.store(total_ptr + b, tl.sum(tl.where(m, fc, 0), 0))
     tl.store(offsets_ptr + b * NBK + r, tl.cumsum(fc, 0) - fc, mask=m)
+    # Zero the tally for the next call. The hit kernel now ACCUMULATES into it (its
+    # grid is finer than a bucket), so it can no longer clear by overwriting, and
+    # doing it here costs nothing: the data is already in registers.
+    tl.store(
+        counts_ptr + b * (NBK * NC) + r[:, None] * NC + c[None, :],
+        tl.zeros([NB2, NC2], dtype=tl.int32),
+        mask=m[:, None] & mc[None, :],
+    )
 
 
 @triton.jit
@@ -459,21 +479,22 @@ def branch_fire(
     WG = fetch_buf.shape[1] // pool
     WF = WG if fence_groups is None else max(1, min(WG, int(fence_groups)))
 
-    _branch_kept_kernel[(triton.cdiv(CAPK, 256), B)](
+    _branch_kept_kernel[(triton.cdiv(CAPK, 64), B)](
         kept_pos, klen, slots, logits, sc["km"], sc["range"],
-        CAPK, G, POOL=pool, BK=256, num_warps=4,
+        CAPK, G, POOL=pool, BK=64, num_warps=4,
     )
-    _branch_hist_kernel[(NBK, B)](
+    NG = triton.cdiv(GP, GBLOCK)
+    _branch_hist_kernel[(NG, B)](
         logits, sc["km"], sc["range"], sc["hist"], G,
-        BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
+        BLOCK=GBLOCK, NB=NBIN, num_warps=4,
     )
     _cap = _fence_truncate()
     _cpx = _coarse_proxy()
-    _branch_hit_kernel[(NBK, B)](
+    _branch_hit_kernel[(NG, B)](
         logits, sc["km"], sc["hist"], sc["range"], pool_lens,
         sc["smax"], sc["smaxn"],
-        sc["hit"], sc["counts"], sc["thr"], float(q), G, GP,
-        BLOCK=D.SCAN_BUCKET, NB=NBIN, NC=NCODE, num_warps=4,
+        sc["hit"], sc["counts"], sc["thr"], float(q), G, GP, NBK,
+        BLOCK=GBLOCK, BUCKET=D.SCAN_BUCKET, NB=NBIN, NC=NCODE, num_warps=4,
         CPX_C=_cpx[0], CPX_KEEP=_cpx[1],
     )
     # WF only caps when truncation is on; passing the full width leaves `cap` at
