@@ -109,8 +109,6 @@ def _branch_kept_kernel(
 def _branch_hist_kernel(
     logits_ptr, km_ptr, range_ptr,
     hist_ptr,      # [B, NB] int32 (zero on entry)
-    crange_ptr,    # [B, 2] fp32 in/out: the CANDIDATE range, (+inf, -inf) on entry
-    plen_ptr,      # [B] int32 prefix length, to exclude the un-closed tail
     G,
     BLOCK: tl.constexpr, NB: tl.constexpr,
 ):
@@ -119,14 +117,7 @@ def _branch_hist_kernel(
     offs = blk * BLOCK + tl.arange(0, BLOCK)
     m = offs < G
     km = tl.load(km_ptr + b * G + offs, mask=m, other=0) != 0
-    sa = tl.load(logits_ptr + b * G + offs, mask=m, other=0.0)
-    # The candidate range rides on this pass: the block is already loaded, so the
-    # capacity threshold costs atomics rather than a second read of the logits.
-    plen = tl.load(plen_ptr + b)
-    cand = m & (offs < plen) & (km == 0)
-    tl.atomic_min(crange_ptr + b * 2, tl.min(tl.where(cand, sa, float("inf")), 0))
-    tl.atomic_max(crange_ptr + b * 2 + 1, tl.max(tl.where(cand, sa, float("-inf")), 0))
-    s = tl.where(km, sa, 0.0)
+    s = tl.load(logits_ptr + b * G + offs, mask=km, other=0.0)
     lo = tl.load(range_ptr + b * 2)
     hi = tl.load(range_ptr + b * 2 + 1)
     width = tl.maximum(hi - lo, 1e-6)
@@ -134,54 +125,6 @@ def _branch_hist_kernel(
         tl.maximum(((s - lo) / width * NB).to(tl.int32), 0), NB - 1
     )
     tl.atomic_add(hist_ptr + b * NB + bin_, 1, mask=km)
-
-
-@triton.jit
-def _branch_chist_kernel(
-    logits_ptr, km_ptr, crange_ptr, plen_ptr,
-    chist_ptr,     # [B, NB] int32 (zero on entry)
-    G,
-    BLOCK: tl.constexpr, NB: tl.constexpr,
-):
-    """Histogram of the CANDIDATE groups' logits, for the capacity threshold.
-
-    A separate pass because a histogram needs its range closed first, and the
-    range is only complete after _branch_hist_kernel has swept every block. One
-    extra pass over G per layer-step, which buys a fired count bounded by the
-    fetch buffer's width -- so the lane never has to be handed DSA's selection.
-    """
-    b = tl.program_id(1)
-    blk = tl.program_id(0)
-    offs = blk * BLOCK + tl.arange(0, BLOCK)
-    m = offs < G
-    km = tl.load(km_ptr + b * G + offs, mask=m, other=0) != 0
-    plen = tl.load(plen_ptr + b)
-    cand = m & (offs < plen) & (km == 0)
-    s = tl.load(logits_ptr + b * G + offs, mask=cand, other=0.0)
-    lo = tl.load(crange_ptr + b * 2)
-    hi = tl.load(crange_ptr + b * 2 + 1)
-    width = tl.maximum(hi - lo, 1e-6)
-    bin_ = tl.minimum(tl.maximum(((s - lo) / width * NB).to(tl.int32), 0), NB - 1)
-    tl.atomic_add(chist_ptr + b * NB + bin_, 1, mask=cand)
-
-
-def _fence_truncate():
-    """Whether a would-be-overflowing lane TRUNCATES its own fired set to the
-    fetch buffer's width instead of being handed DSA's selection.
-
-    On by default. The fence saved no bytes: the buffer holds WF*pool rows and
-    DSA's index_topk is the same 2048, so the fallback swapped one 2048-row budget
-    for another -- and measured worse, because it drops the kept rows (0.3566 mass
-    against 0.3635, worst head 0.1079 against 0.1143, on fenced steps). What it did
-    buy was a dependency: the fenced lane is the only consumer of DSA's top-k on
-    this arm, and that top-k cannot be skipped speculatively because the indexer
-    runs before attention inside a layer's forward.
-
-    Set to 0 for the control arm that measures what the fallback was worth.
-    """
-    from sglang.srt.environ import envs
-
-    return bool(envs.SGLANG_VESTIGEKV_FENCE_TRUNCATE.get())
 
 
 def _coarse_proxy():
@@ -202,14 +145,12 @@ def _coarse_proxy():
 @triton.jit
 def _branch_hit_kernel(
     logits_ptr, km_ptr, hist_ptr, range_ptr, plen_ptr,
-    chist_ptr, crange_ptr,
     hit_ptr,       # [B, GP] int8 out
     counts_ptr,    # [B, NBK] int32 out, one per bucket
     thr_ptr,       # [B] fp32 out: the resolved threshold (observability/tests)
-    q, WF,
+    q,
     G, GP,
     BLOCK: tl.constexpr, NB: tl.constexpr,
-    CAP: tl.constexpr = 1,
     CPX_C: tl.constexpr = 0, CPX_KEEP: tl.constexpr = 0,
 ):
     b = tl.program_id(1)
@@ -233,43 +174,6 @@ def _branch_hit_kernel(
     # which overflows and fences the lane to DSA. That is the right degenerate
     # answer -- there is no resident set to rank against.
     thr = tl.where(nkg > 0, lo + sel.to(tl.float32) / NB * width, float("-inf"))
-    if CAP:
-        # CAPACITY threshold: the WF-th largest CANDIDATE logit, so the fired
-        # count cannot exceed the fetch buffer's width and the lane never has to
-        # be handed DSA's selection instead of its own.
-        #
-        # Rounded UP to the selected bin's upper edge, the opposite of the
-        # quantile above: there the slop must fire at least r+1, here it must
-        # fire at most WF. `above_c[i]` counts candidates in bins strictly above
-        # i, so the smallest i with above_c[i] <= WF, taken at its upper edge,
-        # fires exactly above_c[i] <= WF of them.
-        #
-        # max() with the quantile is the whole rule, and it only BINDS when the
-        # quantile would overflow: if fewer than WF candidates clear thr_q then
-        # thr_q already exceeds the WF-th largest, so the max is thr_q and an
-        # ordinary step is untouched.
-        hc = tl.load(chist_ptr + b * NB + bb)
-        ncand = tl.sum(hc, 0)
-        above_c = ncand - tl.cumsum(hc, 0)
-        sel_c = tl.min(tl.where(above_c <= WF, bb, NB), 0)
-        clo = tl.load(crange_ptr + b * 2)
-        chi = tl.load(crange_ptr + b * 2 + 1)
-        cwidth = tl.maximum(chi - clo, 1e-6)
-        # Bind only when the QUANTILE would actually overflow, counted in the
-        # candidate histogram's own bins. Testing `ncand > WF` instead was wrong:
-        # the cap is rounded UP to a bin's upper edge, so it can land above thr_q
-        # on a step that was never going to overflow and silently fire FEWER
-        # groups than the quantile asked for.
-        bq = tl.minimum(
-            tl.maximum(((thr - clo) / cwidth * NB).to(tl.int32), 0), NB - 1
-        )
-        n_above_q = tl.sum(tl.where(bb > bq, hc, 0), 0)
-        thr_cap = tl.where(
-            n_above_q > WF,
-            clo + (sel_c + 1).to(tl.float32) / NB * cwidth,
-            float("-inf"),
-        )
-        thr = tl.maximum(thr, thr_cap)
     if blk == 0:
         tl.store(thr_ptr + b, thr)
     offs = blk * BLOCK + tl.arange(0, BLOCK)
@@ -319,8 +223,6 @@ def _branch_commit_kernel(
     ovf_count_ptr, # [1] int32 running fence tally
     hist_ptr,      # [B, NB] int32: reset here for the NEXT call
     range_ptr,     # [B, 2] fp32: reset here for the NEXT call
-    chist_ptr,     # [B, NB] int32: reset here too
-    crange_ptr,    # [B, 2] fp32: reset here too
     G, GP, WG, WF, MAXCTX,
     POOL: tl.constexpr, BLOCK: tl.constexpr, NB: tl.constexpr,
 ):
@@ -356,9 +258,6 @@ def _branch_commit_kernel(
         tl.store(hist_ptr + b * NB + bb, tl.zeros([NB], dtype=tl.int32))
         tl.store(range_ptr + b * 2, float("inf"))
         tl.store(range_ptr + b * 2 + 1, float("-inf"))
-        tl.store(chist_ptr + b * NB + bb, tl.zeros([NB], dtype=tl.int32))
-        tl.store(crange_ptr + b * 2, float("inf"))
-        tl.store(crange_ptr + b * 2 + 1, float("-inf"))
 
     if not fenced:
         # The recall arm. The fenced arm does NONE of this -- the point of a
@@ -413,24 +312,14 @@ def branch_fire(
         CAPK, G, POOL=pool, BK=256, num_warps=4,
     )
     _branch_hist_kernel[(NBK, B)](
-        logits, sc["km"], sc["range"], sc["hist"], sc["crange"], pool_lens, G,
+        logits, sc["km"], sc["range"], sc["hist"], G,
         BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
     )
-    _cap = _fence_truncate()
-    if _cap:
-        # One extra pass over G, and the only one the capacity threshold costs:
-        # the range it bins into rode on the histogram pass above, but a histogram
-        # cannot be built until its range is closed over every block.
-        _branch_chist_kernel[(NBK, B)](
-            logits, sc["km"], sc["crange"], pool_lens, sc["chist"], G,
-            BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
-        )
     _cpx = _coarse_proxy()
     _branch_hit_kernel[(NBK, B)](
         logits, sc["km"], sc["hist"], sc["range"], pool_lens,
-        sc["chist"], sc["crange"],
-        sc["hit"], sc["counts"], sc["thr"], float(q), WF, G, GP,
-        BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4, CAP=1 if _cap else 0,
+        sc["hit"], sc["counts"], sc["thr"], float(q), G, GP,
+        BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
         CPX_C=_cpx[0], CPX_KEEP=_cpx[1],
     )
     _compact_scan_kernel[(B,)](
@@ -440,7 +329,6 @@ def branch_fire(
     _branch_commit_kernel[(min(NBK, D.SCAN_GRID_CAP), B)](
         sc["hit"], sc["offsets"], sc["total"], slots, r2t,
         fetch_buf, fetch_len, fetch_ovf, sc["ovf_count"], sc["hist"], sc["range"],
-        sc["chist"], sc["crange"],
         G, GP, WG, WF, r2t.shape[1],
         POOL=pool, BLOCK=D.SCAN_BUCKET, NB=NBIN, num_warps=4,
     )
@@ -457,15 +345,6 @@ def branch_scratch(*, bs, G, nslot, fetch_w, pool, fence_groups, dev):
         "km": torch.zeros(bs, G, dtype=torch.int8, device=dev),
         "hist": torch.zeros(bs, NBIN, dtype=torch.int32, device=dev),
         "range": torch.tensor(
-            [[float("inf"), float("-inf")]] * bs, dtype=torch.float32, device=dev
-        ),
-        # The CANDIDATE histogram and its own range, for the capacity threshold.
-        # Separate from the kept ones because `range` spans the KEPT groups'
-        # logits and a candidate scoring above every kept group is precisely what
-        # fires -- clamping those into the kept range collapses them all into the
-        # top bin, which is the one place resolution is needed.
-        "chist": torch.zeros(bs, NBIN, dtype=torch.int32, device=dev),
-        "crange": torch.tensor(
             [[float("inf"), float("-inf")]] * bs, dtype=torch.float32, device=dev
         ),
         "thr": torch.zeros(bs, dtype=torch.float32, device=dev),
