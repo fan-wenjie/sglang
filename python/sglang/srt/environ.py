@@ -805,6 +805,12 @@ class Envs:
     # default: the fallback read the SAME 2048 rows and dropped the kept ones.
     # 0 restores it, which is the control that prices what the fallback was worth.
     SGLANG_VESTIGEKV_FENCE_TRUNCATE = EnvBool(True)
+    # Serve tier 2 through the forked CUDA selection (wide compare + narrow cut)
+    # instead of the five-stage Triton chain. Lossless by construction and by
+    # test: same threshold, same emitted row set, same fetch_len. Measured 3.35x
+    # DSA's own top-k at 124k and 1.47x at 36k, and flat in context where DSA's
+    # cost doubles. Off by default until it has served a quality draw.
+    SGLANG_VESTIGEKV_SELECT_FORK = EnvBool(False)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
