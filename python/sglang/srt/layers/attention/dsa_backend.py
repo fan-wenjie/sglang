@@ -2335,7 +2335,7 @@ class DeepseekSparseAttnBackend(
         # salience ring went away sigma needs nothing but that cache, so both
         # selectors can be compared on one step rather than across two runs.
         from sglang.srt.layers.attention.vestigekv import defaults as D
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
             group_sigma_window,
             index_group_keys,
         )

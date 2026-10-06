@@ -17,7 +17,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_page_views
+from sglang.srt.layers.attention.vestigekv.dsa.index_view import index_page_views
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

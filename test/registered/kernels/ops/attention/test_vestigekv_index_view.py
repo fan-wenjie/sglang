@@ -54,7 +54,7 @@ class TestIndexViewLayout(CustomTestCase):
         self.buf = _canonical_buffer(self.P, self.keys, self.scales)
 
     def test_rows_match_the_canonical_accessor_arithmetic(self):
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_rows
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import index_rows
 
         slots = torch.tensor([0, 1, 63, 64, 65, 127, 128, 191], device="cuda")
         got = index_rows(
@@ -71,7 +71,7 @@ class TestIndexViewLayout(CustomTestCase):
         If this ever passes, the two layouts have converged and the fix is
         moot -- which would be worth knowing.
         """
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_rows
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import index_rows
 
         slots = torch.arange(PAGE * self.P, device="cuda")
         good = index_rows(
@@ -98,7 +98,7 @@ class TestIndexViewLayout(CustomTestCase):
         )
 
     def test_a_wrong_page_size_is_refused_not_silently_read(self):
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
             index_page_views,
         )
 
@@ -114,7 +114,7 @@ class TestIndexViewLayout(CustomTestCase):
         bytes for a scale. Reading the canonical layout gives norms of order
         the key's own magnitude.
         """
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_rows
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import index_rows
 
         slots = torch.arange(PAGE * self.P, device="cuda")
         got = index_rows(
@@ -172,7 +172,7 @@ class TestPooledGroupRead(CustomTestCase):
             self.truth[pid] = v.to(torch.float8_e4m3fn).float() * scale
 
     def _read(self, pool_ids):
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
             index_group_keys,
         )
 
@@ -196,7 +196,7 @@ class TestPooledGroupRead(CustomTestCase):
 
     def test_the_per_token_read_finds_mostly_nothing(self):
         """The symptom that led here: 3 of 4 token-slot reads are zero."""
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import index_rows
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import index_rows
 
         # token slots as the old path used them: positions, not pool ids
         slots = torch.arange(self.n_groups * POOL, device="cuda")
@@ -221,7 +221,7 @@ class TestGroupSigmaWindow(CustomTestCase):
         tokens. If this ever needs a kappa rescale, the window rule is wrong.
         """
         from sglang.srt.layers.attention.vestigekv import defaults as D
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
             group_sigma_window,
         )
 
@@ -233,7 +233,7 @@ class TestGroupSigmaWindow(CustomTestCase):
                                places=9)
 
     def test_a_window_that_is_not_a_multiple_of_the_pool_is_refused(self):
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import (
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import (
             group_sigma_window,
         )
 
@@ -253,7 +253,7 @@ class TestGroupSelector(CustomTestCase):
     """
 
     def test_the_budget_is_stated_in_rows_and_spent_in_groups(self):
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import select_groups
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import select_groups
 
         scores = torch.randn(4096, device="cuda")
         sel = select_groups(scores, 2048, POOL)
@@ -264,20 +264,20 @@ class TestGroupSelector(CustomTestCase):
         torch.testing.assert_close(sel.sort().values, want)
 
     def test_a_budget_that_is_not_a_multiple_of_the_pool_is_refused(self):
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import select_groups
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import select_groups
 
         with self.assertRaises(AssertionError):
             select_groups(torch.randn(64, device="cuda"), 2047, POOL)
 
     def test_fewer_groups_than_budget_is_not_an_error(self):
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import select_groups
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import select_groups
 
         sel = select_groups(torch.randn(10, device="cuda"), 2048, POOL)
         self.assertEqual(sel.numel(), 10)
 
     def test_the_layer_score_is_best_over_heads(self):
         """One set per layer: a group any head wants is a group the layer wants."""
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import group_scores
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import group_scores
 
         G, H = 32, 8
         keys = torch.randn(G, DIM, device="cuda")
@@ -288,7 +288,7 @@ class TestGroupSelector(CustomTestCase):
         self.assertEqual(tuple(got.shape), (G,))
 
     def test_a_head_gate_weights_rather_than_tie_breaks(self):
-        from sglang.srt.layers.attention.vestigekv.dsa_index_view import group_scores
+        from sglang.srt.layers.attention.vestigekv.dsa.index_view import group_scores
 
         G, H = 16, 4
         keys = torch.randn(G, DIM, device="cuda")
