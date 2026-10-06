@@ -117,7 +117,7 @@ def _all_positions(row_slots):
 # toward 1 with context. A first cut at the cap cost 9 B/group here, taking the
 # slope to 37.5 and the 4k/124k ratio from 0.706 to 0.741, to buy a 1.34% latency
 # term. Keep this line honest or the ratio silently flatters the arm.
-_VK_FIXED_B = 33.0 + 9.5 / 4.0
+_VK_FIXED_B = 33.0 + 9.75 / 4.0
 
 class VestigeKVDSABackend(AttentionBackend):
     """Wrap a base MLA backend; compress the latent cache on decode.
