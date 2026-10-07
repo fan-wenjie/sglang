@@ -837,33 +837,76 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_emit_kernel(
   float* cs = reinterpret_cast<float*>(s_dyn2);
   int* ci = reinterpret_cast<int*>(s_dyn2) + kCandMax;
 
+  // RADIX select, not a sort. A 2048-element bitonic sort ran 66 stages in one
+  // CTA and measured 35.1 us against 6.4 us for the non-overflowing path -- 28.7
+  // us to cut a set, which made the whole arm a 200-270 us/step regression in
+  // situ once overflow became common at 124k. It was adopted on the premise that
+  // overflow is rare and small; that holds at 4k (smoke: overflow=0) and not at
+  // 124k, where 31744 groups put candidates past the budget on ~13% of steps.
+  //
+  // Selecting the best `group_budget` of n_cand needs a PARTIAL order, and the
+  // kernel this was forked from already had the right algorithm: histogram the
+  // scores by a monotone 8-bit key, find the bin the budget-th largest falls in,
+  // take everything above it and fill from the tying bin. Two passes over the
+  // candidates instead of n log^2 n, and the same guarantee DSA gives -- exact
+  // down to the bin, arbitrary within it.
+  __shared__ int s_hist[256];
+  __shared__ int s_cut;      // bin index of the budget-th largest
+  __shared__ int s_above;    // how many strictly above it
+  __shared__ int s_taken;    // running count while filling from the tying bin
   if (raw > group_budget) {
-    for (int i = tid; i < kCandMax; i += kThreadsPerBlock) {
-      const bool live = i < n_cand;
-      cs[i] = live ? cand_score_g[b * cand_stride + i] : -INFINITY;
-      ci[i] = live ? cand_idx_g[b * cand_stride + i] : -1;
+    for (int i = tid; i < 256; i += kThreadsPerBlock) s_hist[i] = 0;
+    if (tid == 0) {
+      s_taken = 0;
+      if (ovf_counts != nullptr) ::atomicAdd(ovf_counts + b, raw - group_budget);
     }
     __syncthreads();
-    if (tid == 0 && ovf_counts != nullptr) {
-      ::atomicAdd(ovf_counts + b, raw - group_budget);
+    for (int i = tid; i < n_cand; i += kThreadsPerBlock) {
+      cs[i] = cand_score_g[b * cand_stride + i];
+      ci[i] = cand_idx_g[b * cand_stride + i];
+      ::atomicAdd(&s_hist[convert_to_uint8(cs[i])], 1);
     }
-    // Exact score-ordered cut, where the Triton chain quantised to 24 levels.
-    for (int kk = 2; kk <= kCandMax; kk <<= 1) {
-      for (int jj = kk >> 1; jj > 0; jj >>= 1) {
-        for (int i = tid; i < kCandMax; i += kThreadsPerBlock) {
-          const int ixj = i ^ jj;
-          if (ixj > i) {
-            const bool down = (i & kk) != 0;
-            const bool sw = down ? (cs[i] > cs[ixj]) : (cs[i] < cs[ixj]);
-            if (sw) {
-              const auto f = cs[i]; cs[i] = cs[ixj]; cs[ixj] = f;
-              const auto t = ci[i]; ci[i] = ci[ixj]; ci[ixj] = t;
-            }
-          }
-        }
-        __syncthreads();
+    __syncthreads();
+    // Suffix count per bin, descending by key, in one thread: 256 adds is
+    // cheaper than a parallel scan's barriers at this size.
+    if (tid == 0) {
+      int acc = 0, cut = 0;
+      for (int bin = 255; bin >= 0; --bin) {
+        if (acc + s_hist[bin] >= group_budget) { cut = bin; break; }
+        acc += s_hist[bin];
+        cut = bin;
+      }
+      s_cut = cut;
+      s_above = acc;
+    }
+    __syncthreads();
+    const int cut = s_cut;
+    // Compact into a SEPARATE destination. `pos` comes from an atomic in
+    // arbitrary order, so pos < i happens, and writing ci[pos] while another
+    // thread still has to read ci[i] as a source is a write-before-read race no
+    // tagging scheme fixes. sel sits past cs and ci in the 32 KB dynamic block:
+    // 2 x 2048 x 4 B used, group_budget x 4 B more, well inside it.
+    int* const sel = reinterpret_cast<int*>(s_dyn2) + 2 * kCandMax;
+    for (int i = tid; i < group_budget; i += kThreadsPerBlock) sel[i] = -1;
+    __syncthreads();
+    // Everything strictly above the cut bin is in, unconditionally.
+    for (int i = tid; i < n_cand; i += kThreadsPerBlock) {
+      if (static_cast<int>(convert_to_uint8(cs[i])) > cut) {
+        const auto pos = ::atomicAdd(&s_taken, 1);
+        if (pos < group_budget) sel[pos] = ci[i];
       }
     }
+    __syncthreads();
+    // Then fill the remainder from the tying bin.
+    for (int i = tid; i < n_cand; i += kThreadsPerBlock) {
+      if (static_cast<int>(convert_to_uint8(cs[i])) == cut) {
+        const auto pos = ::atomicAdd(&s_taken, 1);
+        if (pos < group_budget) sel[pos] = ci[i];
+      }
+    }
+    __syncthreads();
+    for (int i = tid; i < group_budget; i += kThreadsPerBlock) ci[i] = sel[i];
+    __syncthreads();
   } else {
     for (int i = tid; i < n_cand; i += kThreadsPerBlock) {
       ci[i] = cand_idx_g[b * cand_stride + i];
@@ -1048,6 +1091,11 @@ struct VkCollectEmitKernel {
         static_cast<int64_t>(CS.unwrap()),
         static_cast<int32_t*>(ncand.data_ptr()));
 
+    // cs + ci (kCandMax each) plus the selection destination.
+    static_assert(
+        (2 * static_cast<std::size_t>(kCandMax) + static_cast<std::size_t>(kGroupTopK))
+            * sizeof(int) <= kSmem,
+        "dynamic shared memory does not cover cs + ci + sel");
     setup_kernel_smem_once<&vk_emit_kernel, kSmem>();
     LaunchKernel(bs, kThreadsPerBlock, device.unwrap(), kSmem)(
         vk_emit_kernel,
