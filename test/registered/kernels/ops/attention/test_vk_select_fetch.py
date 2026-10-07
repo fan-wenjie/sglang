@@ -159,6 +159,15 @@ class TestVkSelectFetch(CustomTestCase):
             self.assertEqual((n, got), first, "the counter did not reset")
             self.assertEqual(int(sel["ncand"][0]), 0)
 
+    @staticmethod
+    def _bin8(x: torch.Tensor) -> torch.Tensor:
+        """The kernel's monotone 8-bit key, mirrored: fp16 bits, sign-folded,
+        high byte. The radix select orders by THIS, so the contract is exact
+        down to a bin and arbitrary within one."""
+        bits = x.to(torch.float16).view(torch.int16).to(torch.int32) & 0xFFFF
+        key = torch.where(bits & 0x8000 != 0, (~bits) & 0xFFFF, bits | 0x8000)
+        return key >> 8
+
     def test_the_wide_path_cuts_by_score_on_overflow(self):
         logits, pos, klen, slots, r2t = self._case(lift=0.0, G=7936)
         wf, wl, _, sel = self._wide(logits, pos, klen, slots, r2t, q=0.75)
@@ -170,12 +179,27 @@ class TestVkSelectFetch(CustomTestCase):
         if kept:
             keep_mask[torch.tensor(sorted(kept), device=self.dev)] = False
         cand = torch.nonzero((logits[0] > thr) & keep_mask).flatten()
-        best = cand[logits[0][cand].argsort(descending=True)][: self.WG]
         got = set()
         for i in range(0, int(wl[0]), self.POOL):
             r = int(wf[0, i])
             got.add(int((r2t[0] == r).nonzero()[0]) // self.POOL)
-        self.assertEqual(got, set(best.tolist()))
+        self.assertEqual(len(got), self.WG, "the budget was not filled exactly")
+        self.assertTrue(got <= set(cand.tolist()), "emitted a non-candidate")
+
+        # The contract is a radix SELECT, not a sort: exact down to the 8-bit
+        # key's bin, arbitrary within one. An exact top-WG assertion would be
+        # wrong here -- and the bitonic sort that WOULD satisfy it measured 35.1
+        # us against 6.4 for the non-overflowing path, which is what made the
+        # arm a regression in situ. So: every emitted score must sit in a bin at
+        # least as high as every dropped candidate's.
+        gl = torch.tensor(sorted(got), device=self.dev)
+        dropped = torch.tensor(sorted(set(cand.tolist()) - got), device=self.dev)
+        if dropped.numel():
+            self.assertGreaterEqual(
+                int(self._bin8(logits[0][gl]).min()),
+                int(self._bin8(logits[0][dropped]).max()),
+                "a dropped candidate outranks a kept one by more than a bin",
+            )
 
     def test_the_two_paths_emit_the_same_rows(self):
         """The drop-in claim: same set, same length, same fence flag."""
