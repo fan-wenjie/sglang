@@ -796,6 +796,80 @@ class IndexerKPool(MultiPlatformOp):
         )
         return torch.cat([topk_full, padding], dim=1)
 
+    def _vk_select_from_kpool_logits(
+        self,
+        logits: torch.Tensor,
+        pool_lens: torch.Tensor,
+        *,
+        layer_id: int,
+        seq_lens: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        topk_offsets: Optional[torch.Tensor] = None,
+        out_rows: Optional[int] = None,
+    ) -> torch.Tensor:
+        """The rank top-k replaced by a reference-set threshold.
+
+        The reference set is the groups THIS layer selected on the previous
+        step, published by the kernel itself -- dst_token_indices cannot serve
+        as one because it holds page-table-mapped physical rows. State is per
+        layer: each layer's score distribution is its own, and sharing one
+        buffer across layers is the bug that cost a 1.000 -> 0.18 multikey
+        on the sibling arm.
+
+        With no previous selection the threshold is -inf, every group becomes a
+        candidate, the staging area spills and the spill path runs DSA's own
+        radix over the full row -- so a request's first step IS DSA.
+        """
+        from sglang.kernels.ops.attention.dsa.vk_select_transform import (
+            vk_dsa_select,
+        )
+        from sglang.srt.layers.attention.dsa.vk_select import (
+            prev_threshold,
+            select_state,
+        )
+
+        n_rows = logits.shape[0]
+        if page_table is not None and page_table.shape[0] != n_rows:
+            page_table = page_table[:n_rows]
+        if topk_offsets is not None and topk_offsets.shape[0] != n_rows:
+            topk_offsets = topk_offsets[:n_rows]
+
+        pool = self.index_kpool
+        budget = self.index_topk // pool
+        key = (layer_id, n_rows)
+        states = self.__dict__.setdefault("_vk_select_states", {})
+        if key not in states:
+            states[key] = select_state(
+                bs=n_rows, group_budget=budget, dev=logits.device
+            )
+        st = states[key]
+
+        prev_threshold(
+            logits=logits,
+            sel_groups=st["sel_groups"],
+            sel_n=st["sel_n"],
+            thr=st["thr"],
+            q=float(envs.SGLANG_DSA_VK_SELECT_Q.get()),
+        )
+        result = vk_dsa_select(
+            score=logits,
+            lengths=pool_lens[:n_rows],
+            thresholds=st["thr"],
+            state=st,
+            pool_size=pool,
+            topk=self.index_topk,
+            page_table=page_table,
+            topk_indices_offset=topk_offsets,
+            seq_lens=seq_lens[:n_rows] if seq_lens is not None else None,
+        )
+        if out_rows is None or out_rows == result.shape[0]:
+            return result
+        padded = torch.full(
+            (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
+        )
+        padded[: result.shape[0]] = result
+        return padded
+
     def _topk_from_kpool_logits(
         self,
         logits: torch.Tensor,
@@ -1129,6 +1203,16 @@ class IndexerKPool(MultiPlatformOp):
                 # the decode path downstream needs nothing new.
                 return None
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
+        if envs.SGLANG_DSA_VK_SELECT.get():
+            return self._vk_select_from_kpool_logits(
+                logits,
+                pool_seqlens,
+                layer_id=layer_id,
+                seq_lens=seqlens_32,
+                page_table=page_table_1,
+                topk_offsets=topk_offsets,
+                out_rows=num_q_padded if num_q_padded != n_real else None,
+            )
         topk_result = self._topk_from_kpool_logits(
             logits,
             pool_seqlens,

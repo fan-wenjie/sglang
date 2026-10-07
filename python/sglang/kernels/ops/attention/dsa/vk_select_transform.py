@@ -188,3 +188,53 @@ def vk_collect_emit(
         cand_score, cand_idx, ncand, slots.to(torch.int32), r2t,
         fetch_buf, fetch_len, fetch_ovf, ovf_counts, group_budget, pool,
     )
+
+
+@cache_once
+def _jit_vk_dsa_select_module(group_topk: int) -> Module:
+    return load_jit(
+        f"vk_dsa_select_{group_topk}",
+        cuda_files=["dsa/vk_select_transform.cuh"],
+        cuda_wrappers=[("vk_dsa_select", "VkDsaSelectKernel::run")],
+        extra_cuda_cflags=[f"-DSGL_GROUP_TOPK={group_topk}"],
+        extra_include_paths=_cuda_include_paths(),
+    )
+
+
+def vk_dsa_select(
+    *,
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    thresholds: torch.Tensor,
+    state: dict,
+    pool_size: int,
+    topk: int,
+    page_table: Optional[torch.Tensor] = None,
+    topk_indices_offset: Optional[torch.Tensor] = None,
+    row_starts: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
+    page_table_row_index: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """DSA's selection with a reference-set threshold, in DSA's own layout.
+
+    Returns dst_token_indices exactly as `topk_from_pooled_history_logits` does,
+    and publishes the selected group ids into `state["sel_groups"]` for the next
+    step to threshold against.
+    """
+    group_topk = topk // pool_size
+    rows = score.shape[0]
+    tail_cols = pool_size - 1 if seq_lens is not None else 0
+    if out is None:
+        out = torch.empty((rows, topk + tail_cols), dtype=torch.int32,
+                          device=score.device)
+    _jit_vk_dsa_select_module(group_topk).vk_dsa_select(
+        score, lengths.to(torch.int32), thresholds,
+        state["cand_score"], state["cand_idx"], state["ncand"],
+        out, state["sel_groups"], state["sel_n"], state["ovf"],
+        group_topk, pool_size,
+        page_table, topk_indices_offset, row_starts,
+        seq_lens.to(torch.int32) if seq_lens is not None else None,
+        page_table_row_index,
+    )
+    return out

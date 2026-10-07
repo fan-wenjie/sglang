@@ -604,6 +604,161 @@ const T* optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& opt) 
   return static_cast<const T*>(opt.value().data_ptr());
 }
 
+// ---------------------------------------------------------------------------
+// STEP 1 of the DSA patch: emit in DSA's own layout, and publish the selected
+// GROUP ids for the next step to threshold against.
+//
+// The reference set cannot be DSA's own output: dst_token_indices holds
+// page-table-mapped PHYSICAL ROW ids, not group indices. This kernel still has
+// the group list before the mapping, so it writes it out as a side output and
+// the next layer-step takes its q-quantile. No spectral tier, no position
+// table, no km mask -- a group in the reference set SHOULD be allowed to fire
+// again, unlike a tier-1 kept row, which must be excluded.
+//
+// Bootstrap: with no previous selection the threshold is -inf, every group
+// becomes a candidate, the staging area spills, and the spill path runs DSA's
+// own radix over the FULL score row -- exact, not an approximation of it. That
+// is why `score` is passed in.
+__global__ __launch_bounds__(kThreadsPerBlock) void vk_emit_dsa_kernel(
+    const float* __restrict__ score,
+    const int64_t score_stride,
+    const float* __restrict__ cand_score_g,
+    const int32_t* __restrict__ cand_idx_g,
+    const int64_t cand_stride,
+    int32_t* __restrict__ ncand,
+    const int32_t* __restrict__ lengths,
+    const int32_t* __restrict__ row_starts,
+    int32_t* __restrict__ dst_token_indices,
+    const int64_t dst_stride,
+    int32_t* __restrict__ sel_groups,
+    const int64_t sel_stride,
+    int32_t* __restrict__ sel_n,
+    int32_t* __restrict__ ovf_counts,
+    const int32_t group_budget,
+    const int32_t pool_size,
+    const int32_t token_topk,
+    const int32_t out_cols,
+    const int32_t* __restrict__ page_table,
+    const int64_t page_table_stride,
+    const int32_t* __restrict__ page_table_row_index,
+    const int32_t* __restrict__ topk_indices_offset,
+    const int32_t* __restrict__ seq_lens) {
+  const auto b = static_cast<uint64_t>(blockIdx.x);
+  const auto tid = static_cast<int>(threadIdx.x);
+  const auto length = lengths[b];
+  const auto row_start = row_starts == nullptr ? 0 : row_starts[b];
+  const auto sc_row = score + b * score_stride;
+  const auto dst = dst_token_indices + b * dst_stride;
+  const auto ptr_row = page_table_row_index == nullptr
+                           ? b
+                           : static_cast<uint64_t>(page_table_row_index[b]);
+  const auto page_table_entry =
+      page_table == nullptr ? nullptr : page_table + ptr_row * page_table_stride;
+  const auto offset = topk_indices_offset == nullptr ? 0 : topk_indices_offset[b];
+  const bool append_tail = seq_lens != nullptr;
+  const auto tail_count = append_tail ? seq_lens[b] % pool_size : 0;
+
+  __shared__ int s_sel[kGroupTopK];
+  __shared__ int s_hist[256];
+  __shared__ int s_cut, s_above, s_taken;
+  extern __shared__ int s_dyn3[];
+  float* cs = reinterpret_cast<float*>(s_dyn3);
+  int* ci = reinterpret_cast<int*>(s_dyn3) + kCandMax;
+
+  const auto raw = ncand[b];
+  const auto n_cand = raw < kCandMax ? raw : kCandMax;
+  const bool spilled = raw > kCandMax;
+
+  if (spilled) {
+    // DSA exactly, over the whole row.
+    if (tid == 0 && ovf_counts != nullptr) ::atomicAdd(ovf_counts + b, raw);
+    fast_topk_cuda_tl_impl<kGroupTopK>(sc_row, s_sel, row_start, length);
+    __syncthreads();
+    if (tid == 0) s_taken = kGroupTopK;
+    __syncthreads();
+  } else if (raw > group_budget) {
+    for (int i = tid; i < 256; i += kThreadsPerBlock) s_hist[i] = 0;
+    if (tid == 0) {
+      s_taken = 0;
+      if (ovf_counts != nullptr) ::atomicAdd(ovf_counts + b, raw - group_budget);
+    }
+    __syncthreads();
+    for (int i = tid; i < n_cand; i += kThreadsPerBlock) {
+      cs[i] = cand_score_g[b * cand_stride + i];
+      ci[i] = cand_idx_g[b * cand_stride + i];
+      ::atomicAdd(&s_hist[convert_to_uint8(cs[i])], 1);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      int acc = 0, cut = 0;
+      for (int bin = 255; bin >= 0; --bin) {
+        if (acc + s_hist[bin] >= group_budget) { cut = bin; break; }
+        acc += s_hist[bin];
+        cut = bin;
+      }
+      s_cut = cut;
+      s_above = acc;
+    }
+    __syncthreads();
+    const int cut = s_cut;
+    for (int i = tid; i < group_budget; i += kThreadsPerBlock) s_sel[i] = -1;
+    __syncthreads();
+    for (int i = tid; i < n_cand; i += kThreadsPerBlock) {
+      if (static_cast<int>(convert_to_uint8(cs[i])) > cut) {
+        const auto pos = ::atomicAdd(&s_taken, 1);
+        if (pos < group_budget) s_sel[pos] = ci[i];
+      }
+    }
+    __syncthreads();
+    for (int i = tid; i < n_cand; i += kThreadsPerBlock) {
+      if (static_cast<int>(convert_to_uint8(cs[i])) == cut) {
+        const auto pos = ::atomicAdd(&s_taken, 1);
+        if (pos < group_budget) s_sel[pos] = ci[i];
+      }
+    }
+    __syncthreads();
+    if (tid == 0) s_taken = group_budget;
+    __syncthreads();
+  } else {
+    for (int i = tid; i < raw; i += kThreadsPerBlock) {
+      s_sel[i] = cand_idx_g[b * cand_stride + i];
+    }
+    if (tid == 0) s_taken = raw;
+    __syncthreads();
+  }
+
+  const auto n_sel = s_taken < group_budget ? s_taken : group_budget;
+  const auto sel_len = n_sel * pool_size;
+  const auto full = length * pool_size;
+  const auto cap = full < token_topk ? full : token_topk;
+  const auto hist_len = sel_len < cap ? sel_len : cap;
+
+  // DSA's emit, verbatim in shape: pool-expand, page-table map, tail, -1 pad.
+  for (int col = tid; col < out_cols; col += kThreadsPerBlock) {
+    if (col < hist_len) {
+      const auto g = s_sel[col / pool_size];
+      const auto raw_token = g * pool_size + (col % pool_size);
+      dst[col] = g < 0 ? -1
+                       : transform_kpool_token(raw_token, page_table_entry,
+                                               topk_indices_offset, offset);
+    } else if (append_tail && col < hist_len + tail_count) {
+      const auto raw_token = length * pool_size + (col - hist_len);
+      dst[col] = transform_kpool_token(raw_token, page_table_entry,
+                                       topk_indices_offset, offset);
+    } else {
+      dst[col] = -1;
+    }
+  }
+  // Publish the reference set for the NEXT layer-step.
+  for (int i = tid; i < n_sel; i += kThreadsPerBlock) {
+    sel_groups[b * sel_stride + i] = s_sel[i];
+  }
+  if (tid == 0) {
+    sel_n[b] = n_sel;
+    ncand[b] = 0;  // last reader of the counter; reset so the next step starts clean
+  }
+}
+
 struct VkSelectTransformKernel {
   static constexpr auto kernel = vk_select_transform_kernel<kGroupTopK>;
 
@@ -787,8 +942,11 @@ __global__ __launch_bounds__(BLOCK) void vk_collect_kernel(
   const auto b = static_cast<uint64_t>(blockIdx.y);
   const auto idx = static_cast<int>(blockIdx.x) * BLOCK + static_cast<int>(threadIdx.x);
   if (idx >= lengths[b]) return;
-  auto* const kmask = kept_mask + b * kept_mask_stride;
-  if (kmask[idx] != 0) {
+  // The DSA-patch rule passes no mask at all: its reference set is the previous
+  // selection, whose groups SHOULD be allowed to fire again, unlike a tier-1
+  // kept row which must be excluded. So the pointer is genuinely optional.
+  auto* const kmask = kept_mask == nullptr ? nullptr : kept_mask + b * kept_mask_stride;
+  if (kmask != nullptr && kmask[idx] != 0) {
     // RESET IT. All 11 full-attention layers share one km buffer (the scratch is
     // keyed on (bs, G), not on layer), and the Triton chain this replaces reset
     // km in _branch_hit_kernel on its way out. Without the reset km accumulates
@@ -1114,6 +1272,124 @@ struct VkCollectEmitKernel {
         static_cast<int32_t>(group_budget),
         static_cast<int32_t>(pool_size),
         static_cast<int32_t>(r2t.shape()[1]));
+  }
+};
+
+struct VkDsaSelectKernel {
+  // Wide collect + DSA-layout emit. One export so the pair cannot be launched
+  // out of order or with mismatched scratch.
+  static void run(
+      const tvm::ffi::TensorView score,
+      const tvm::ffi::TensorView lengths,
+      const tvm::ffi::TensorView thresholds,
+      const tvm::ffi::TensorView cand_score,
+      const tvm::ffi::TensorView cand_idx,
+      const tvm::ffi::TensorView ncand,
+      const tvm::ffi::TensorView dst_token_indices,
+      const tvm::ffi::TensorView sel_groups,
+      const tvm::ffi::TensorView sel_n,
+      const tvm::ffi::TensorView ovf_counts,
+      const int64_t group_budget,
+      const int64_t pool_size,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> topk_indices_offset_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> seq_lens_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_row_index_opt) {
+    using namespace host;
+    constexpr int kCollectBlock = 256;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto S = SymbolicSize{"score_stride"};
+    auto CS = SymbolicSize{"cand_stride"};
+    auto D = SymbolicSize{"dst_stride"};
+    auto SG = SymbolicSize{"sel_stride"};
+    auto out_cols_sym = SymbolicSize{"out_cols"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(score);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);
+    TensorMatcher({B}).with_dtype<float>().with_device(device).verify(thresholds);
+    TensorMatcher({B, -1}).with_strides({CS, 1}).with_dtype<float>().with_device(device).verify(cand_score);
+    TensorMatcher({B, -1}).with_strides({CS, 1}).with_dtype<int32_t>().with_device(device).verify(cand_idx);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ncand);
+    TensorMatcher({B, out_cols_sym}).with_strides({D, 1}).with_dtype<int32_t>().with_device(device).verify(dst_token_indices);
+    TensorMatcher({B, -1}).with_strides({SG, 1}).with_dtype<int32_t>().with_device(device).verify(sel_groups);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(sel_n);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ovf_counts);
+
+    RuntimeCheck(pool_size > 1, "pool_size must be > 1, got ", pool_size);
+    RuntimeCheck(
+        group_budget == kGroupTopK,
+        "this module is built for group_topk=", kGroupTopK, " but got ", group_budget);
+    RuntimeCheck(
+        static_cast<int64_t>(sel_groups.shape()[1]) >= group_budget,
+        "sel_groups width ", sel_groups.shape()[1], " < budget ", group_budget);
+    RuntimeCheck(
+        static_cast<int64_t>(cand_score.shape()[1]) >= kCandMax,
+        "candidate buffer ", cand_score.shape()[1], " < ", kCandMax);
+    static_assert(
+        (2 * static_cast<std::size_t>(kCandMax)) * sizeof(int) <= kSmem,
+        "dynamic shared memory does not cover cs + ci");
+
+    const auto out_cols = static_cast<int32_t>(out_cols_sym.unwrap());
+    const auto tail_cols = seq_lens_opt.has_value() ? static_cast<int32_t>(pool_size) - 1 : 0;
+    RuntimeCheck(out_cols > tail_cols, "dst columns ", out_cols, " must exceed tail ", tail_cols);
+    const auto token_topk = out_cols - tail_cols;
+
+    int64_t page_table_stride = 0;
+    const int32_t* page_table_ptr = nullptr;
+    if (page_table_opt.has_value()) {
+      auto P = SymbolicSize{"page_table_stride"};
+      TensorMatcher({-1, -1}).with_strides({P, 1}).with_dtype<int32_t>().with_device(device).verify(
+          page_table_opt.value());
+      page_table_ptr = static_cast<const int32_t*>(page_table_opt.value().data_ptr());
+      page_table_stride = static_cast<int64_t>(P.unwrap());
+    }
+
+    const auto bs = static_cast<uint32_t>(B.unwrap());
+    const auto G = static_cast<int32_t>(score.shape()[1]);
+    const auto nblk = static_cast<uint32_t>((G + kCollectBlock - 1) / kCollectBlock);
+
+    LaunchKernel(dim3(nblk, bs), kCollectBlock, device.unwrap(), 0)(
+        vk_collect_kernel<kCollectBlock>,
+        static_cast<const float*>(score.data_ptr()),
+        static_cast<int64_t>(S.unwrap()),
+        static_cast<const int32_t*>(lengths.data_ptr()),
+        static_cast<const float*>(thresholds.data_ptr()),
+        nullptr, int64_t{0},                       // no km mask in this rule
+        static_cast<float*>(cand_score.data_ptr()),
+        static_cast<int32_t*>(cand_idx.data_ptr()),
+        static_cast<int64_t>(CS.unwrap()),
+        static_cast<int32_t*>(ncand.data_ptr()));
+
+    setup_kernel_smem_once<&vk_emit_dsa_kernel, kSmem>();
+    LaunchKernel(bs, kThreadsPerBlock, device.unwrap(), kSmem)(
+        vk_emit_dsa_kernel,
+        static_cast<const float*>(score.data_ptr()),
+        static_cast<int64_t>(S.unwrap()),
+        static_cast<const float*>(cand_score.data_ptr()),
+        static_cast<const int32_t*>(cand_idx.data_ptr()),
+        static_cast<int64_t>(CS.unwrap()),
+        static_cast<int32_t*>(ncand.data_ptr()),
+        static_cast<const int32_t*>(lengths.data_ptr()),
+        optional_data_ptr<int32_t>(row_starts_opt),
+        static_cast<int32_t*>(dst_token_indices.data_ptr()),
+        static_cast<int64_t>(D.unwrap()),
+        static_cast<int32_t*>(sel_groups.data_ptr()),
+        static_cast<int64_t>(SG.unwrap()),
+        static_cast<int32_t*>(sel_n.data_ptr()),
+        static_cast<int32_t*>(ovf_counts.data_ptr()),
+        static_cast<int32_t>(group_budget),
+        static_cast<int32_t>(pool_size),
+        token_topk,
+        out_cols,
+        page_table_ptr,
+        page_table_stride,
+        optional_data_ptr<int32_t>(page_table_row_index_opt),
+        optional_data_ptr<int32_t>(topk_indices_offset_opt),
+        optional_data_ptr<int32_t>(seq_lens_opt));
   }
 };
 

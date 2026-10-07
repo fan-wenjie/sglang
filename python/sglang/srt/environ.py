@@ -802,15 +802,28 @@ class Envs:
     # closes it at the cost of one job instead of an implementation.
     # A would-be-overflowing branch lane truncates its own fired set to the fetch
     # buffer's width instead of being handed DSA's index_topk selection. On by
-    # default: the fallback read the SAME 2048 rows and dropped the kept ones.
-    # 0 restores it, which is the control that prices what the fallback was worth.
+    # default: the fallback read the SAME 2048 rows, delivered less attention mass
+    # because it drops the kept rows (0.3566 vs 0.3635, worst head 0.1079 vs
+    # 0.1143 on fenced steps), and created the dependency that keeps DSA's top-k
+    # alive here -- 85.9 us a step at 36k, 157.4 at 124k. 0 restores the fallback.
     SGLANG_VESTIGEKV_FENCE_TRUNCATE = EnvBool(True)
-    # Serve tier 2 through the forked CUDA selection (wide compare + narrow cut)
-    # instead of the five-stage Triton chain. Lossless by construction and by
-    # test: same threshold, same emitted row set, same fetch_len. Measured 3.35x
-    # DSA's own top-k at 124k and 1.47x at 36k, and flat in context where DSA's
-    # cost doubles. Off by default until it has served a quality draw.
+    # Serve tier 2 through the forked CUDA selection kernel (two kernels) rather
+    # than the five-stage Triton chain. Equivalent by construction -- same
+    # threshold, same emitted row set, same fetch_len -- and its overflow cut is
+    # an exact score-ordered sort where the chain quantises to 24 score levels.
+    # Off by default: measured a wash on latency (a graph launch costs 0.5 us, so
+    # 55 -> 22 launches is ~16 us/step against a 138 us chain whose cost is its
+    # work), so this is a code simplification and has to prove itself per arm.
     SGLANG_VESTIGEKV_SELECT_FORK = EnvBool(False)
+
+    # DSA's selection by a REFERENCE-SET threshold instead of its rank top-k:
+    # the q-quantile of the groups the previous layer-step selected. A rank
+    # threshold is unknown until every score is histogrammed, a histogram needs
+    # one block, so kpool_topk_transform runs one CTA over all groups; a
+    # reference-set threshold is known first and the compare takes the device.
+    # Measured 2.1x that kernel at the served fire rate, holding through bs=8.
+    SGLANG_DSA_VK_SELECT = EnvBool(False)
+    SGLANG_DSA_VK_SELECT_Q = EnvFloat(0.75)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
