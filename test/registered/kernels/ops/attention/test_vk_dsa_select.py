@@ -218,3 +218,71 @@ class TestVkDsaSelectIndexerHook(CustomTestCase):
             thr = float(st["thr"][0])
             self.assertGreaterEqual(thr, float(logits[0].min()))
             self.assertLessEqual(thr, float(logits[0].max()))
+
+
+class TestVkDsaSelectAcrossSteps(CustomTestCase):
+    """CORRELATED steps -- the structure the rule actually depends on.
+
+    Every other case here draws independent logits per step, which makes the
+    previous selection a random sample under the new scores: its q-quantile is
+    then just the overall q-quantile, 512 groups fire at every q, and the
+    fixture cannot see the mechanism at all. That blindness is why q=0.75
+    shipped and served multikey 0.72. Consecutive decode steps share keys and
+    move the query slowly, so the fixture has to be correlated.
+    """
+
+    POOL = 4
+    GROUP_TOPK = 512
+    G = 4096
+
+    def setUp(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        self.dev = torch.device("cuda")
+
+    def _trace(self, q, rho=0.99, steps=5):
+        from sglang.kernels.ops.attention.dsa.vk_select_transform import vk_dsa_select
+        from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
+            fast_kpool_topk_transform_fused,
+        )
+        from sglang.srt.layers.attention.dsa.vk_select import (
+            prev_threshold, select_state,
+        )
+        torch.manual_seed(0)
+        base = torch.randn(1, self.G, device=self.dev, dtype=torch.float32)
+        st = select_state(bs=1, group_budget=self.GROUP_TOPK, dev=self.dev)
+        lengths = torch.full((1,), self.G, dtype=torch.int32, device=self.dev)
+        out = []
+        for s in range(steps):
+            torch.manual_seed(500 + s)
+            noise = torch.randn(1, self.G, device=self.dev, dtype=torch.float32)
+            logits = rho * base + (1.0 - rho ** 2) ** 0.5 * noise
+            prev_threshold(logits=logits, sel_groups=st["sel_groups"],
+                           sel_n=st["sel_n"], thr=st["thr"], q=q)
+            r = vk_dsa_select(score=logits, lengths=lengths, thresholds=st["thr"],
+                              state=st, pool_size=self.POOL,
+                              topk=self.GROUP_TOPK * self.POOL)
+            want = fast_kpool_topk_transform_fused(
+                score=logits, lengths=lengths, pool_size=self.POOL,
+                topk=self.GROUP_TOPK * self.POOL)
+            wg = {t // self.POOL for t in want[0].tolist() if t >= 0}
+            gg = {t // self.POOL for t in r[0].tolist() if t >= 0}
+            out.append((int(st["sel_n"][0]), len(gg & wg) / max(len(wg), 1)))
+        return out
+
+    def test_the_default_q_is_a_fixed_point(self):
+        """q=0 must hold the budget and the recall across steps."""
+        tr = self._trace(0.0)
+        for i, (n, rec) in enumerate(tr):
+            self.assertEqual(n, self.GROUP_TOPK, "step %d fired %d" % (i, n))
+            self.assertGreater(rec, 0.85, "step %d recall %.2f" % (i, rec))
+
+    def test_a_positive_q_ratchets_the_threshold_shut(self):
+        """The regression this guards: q=0.75 collapsed to 9 groups and 0.02
+        recall, and served multikey 0.72. Any q>0 is unstable by construction --
+        the threshold sits above the selection's own cut, so each step's
+        reference set is smaller and higher-scoring than the last."""
+        tr = self._trace(0.75)
+        n_last, rec_last = tr[-1]
+        self.assertLess(n_last, 100, "expected the ratchet; got %s" % (tr,))
+        self.assertLess(rec_last, 0.2, "expected recall collapse; got %s" % (tr,))
