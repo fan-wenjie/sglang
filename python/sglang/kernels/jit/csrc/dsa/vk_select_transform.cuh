@@ -65,7 +65,16 @@ namespace {
 inline constexpr int kGroupTopK = SGL_GROUP_TOPK;
 inline constexpr int kThreadsPerBlock = 1024;
 
-inline constexpr std::size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
+// 48KB. Raised from 32 to let kCandMax reach 4096: the staging area has to
+// cover the realistic candidate count or the spill path runs DSA's radix, which
+// re-reads the whole score row two or three times -- the very cost this rule
+// exists to remove, resurfacing on the rare path. Measured candidate counts at
+// 124k: 741-1045 at step-to-step correlation 0.999, 1582-2611 at 0.99,
+// 5226-12913 at 0.95. 4096 covers through 0.99; the trace showed ~10% of
+// layer-steps spilling at 2048 (16.3 us/step of DSA radix). This device allows
+// 49152 per block by default and 101376 opt-in, which setup_kernel_smem_once
+// takes, and the emit kernel is one CTA per row so the occupancy cost is nil.
+inline constexpr std::size_t kSmem = 12 * 1024 * sizeof(uint32_t);  // 48KB (bytes)
 
 // Candidates staged for the bitonic tier, as (float, int) pairs in the dynamic
 // shared memory above: 2048 * 8 B = 16 KB of the 32 KB, so it shares the block
@@ -73,7 +82,7 @@ inline constexpr std::size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (byte
 // because the bitonic stages require it. Firing is sparse -- about 115 groups of
 // 32768 a layer-step -- so 2048 is four times the whole budget and reaching it
 // means the threshold is wrong, not merely loose, which is what tier 3 is for.
-inline constexpr int kCandMax = 2048;
+inline constexpr int kCandMax = 4096;
 
 struct FastTopKParams {
   const float* __restrict__ input;         // [B, input_stride]

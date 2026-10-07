@@ -139,7 +139,10 @@ class TestVkSelectTransform(CustomTestCase):
             fast_kpool_topk_transform_fused,
         )
 
-        bs, G, ng = 1, 4096, 8
+        # G > kCandMax (4096) so the -inf threshold spills into DSA's radix,
+        # which is the path this case is about. At G == kCandMax it would take
+        # the on-candidate select instead, exact only to a bin.
+        bs, G, ng = 1, 8192, 8
         logits = torch.randn(bs, G, device=self.dev, dtype=torch.float32)
         pos, klen = self._kept(bs=bs, G=G, n_groups=ng)
         sc = self._thr_and_scratch(logits, pos, klen, 0.75, kg_max=ng)

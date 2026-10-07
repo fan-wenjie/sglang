@@ -85,7 +85,7 @@ def prev_threshold(*, logits, sel_groups, sel_n, thr, q):
     return thr
 
 
-def select_state(*, bs, group_budget, dev, cand_max=2048):
+def select_state(*, bs, group_budget, dev, cand_max=4096):
     """Fixed-address scratch. Nothing is allocated inside a captured step."""
     return {
         "cand_score": torch.zeros(bs, cand_max, dtype=torch.float32, device=dev),
