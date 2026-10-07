@@ -633,6 +633,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_emit_dsa_kernel(
     int32_t* __restrict__ sel_groups,
     const int64_t sel_stride,
     int32_t* __restrict__ sel_n,
+    float* __restrict__ next_thr,
     int32_t* __restrict__ ovf_counts,
     const int32_t group_budget,
     const int32_t pool_size,
@@ -749,13 +750,44 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_emit_dsa_kernel(
       dst[col] = -1;
     }
   }
-  // Publish the reference set for the NEXT layer-step.
+  // Publish the NEXT step's threshold directly, as a scalar.
+  //
+  // It is the minimum of the scores of what we just selected -- and those
+  // scores are in hand right here. Deriving it instead from a separate kernel
+  // that re-reads logits at the selected positions is a SCATTERED GATHER of
+  // group_budget elements out of the global score row: 512 cache lines moved to
+  // use 2 kB, in one CTA, every layer-step. Reading the global score array more
+  // than once per step is the known trap on this path, and the whole point of a
+  // reference-set threshold is that it costs nothing to carry forward.
+  //
+  // sel_groups stays published for observability and for the tests; nothing on
+  // the hot path reads it back any more.
+  // A plain shared tree reduction. An atomicMin on a float needs a
+  // sign-folded integer key to be monotone, and that is exactly the sort of
+  // cleverness that earns a bug six months later; over <=group_budget values
+  // the reduction costs nothing worth the risk.
+  __shared__ float s_red[kThreadsPerBlock];
+  float local = INFINITY;
   for (int i = tid; i < n_sel; i += kThreadsPerBlock) {
-    sel_groups[b * sel_stride + i] = s_sel[i];
+    const auto g = s_sel[i];
+    sel_groups[b * sel_stride + i] = g;
+    if (g >= 0) {
+      const auto v = sc_row[g + row_start];
+      if (v < local) local = v;
+    }
+  }
+  s_red[tid] = local;
+  __syncthreads();
+  for (int w = kThreadsPerBlock / 2; w > 0; w >>= 1) {
+    if (tid < w && s_red[tid + w] < s_red[tid]) s_red[tid] = s_red[tid + w];
+    __syncthreads();
   }
   if (tid == 0) {
     sel_n[b] = n_sel;
     ncand[b] = 0;  // last reader of the counter; reset so the next step starts clean
+    // No selection -> -inf, which fires everything next step and routes it to
+    // the radix: the same bootstrap the first step takes.
+    next_thr[b] = n_sel > 0 ? s_red[0] : -INFINITY;
   }
 }
 
@@ -959,7 +991,11 @@ __global__ __launch_bounds__(BLOCK) void vk_collect_kernel(
     return;
   }
   const auto v = score[b * score_stride + idx];
-  if (v <= thresholds[b]) return;
+  // INCLUSIVE. The carried threshold is the minimum of the previous selection,
+  // so a strict > excludes the very group that defined it and the budget drifts
+  // down (measured 512 -> 492 on the second step). DSA's rank rule includes the
+  // K-th largest, so >= is the faithful comparison and the fixed point is exact.
+  if (v < thresholds[b]) return;
   const auto pos = ::atomicAdd(ncand + b, 1);
   if (pos < kCandMax) {
     cand_score[b * cand_stride + pos] = v;
@@ -1288,6 +1324,7 @@ struct VkDsaSelectKernel {
       const tvm::ffi::TensorView dst_token_indices,
       const tvm::ffi::TensorView sel_groups,
       const tvm::ffi::TensorView sel_n,
+      const tvm::ffi::TensorView next_thr,
       const tvm::ffi::TensorView ovf_counts,
       const int64_t group_budget,
       const int64_t pool_size,
@@ -1317,6 +1354,7 @@ struct VkDsaSelectKernel {
     TensorMatcher({B, out_cols_sym}).with_strides({D, 1}).with_dtype<int32_t>().with_device(device).verify(dst_token_indices);
     TensorMatcher({B, -1}).with_strides({SG, 1}).with_dtype<int32_t>().with_device(device).verify(sel_groups);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(sel_n);
+    TensorMatcher({B}).with_dtype<float>().with_device(device).verify(next_thr);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(ovf_counts);
 
     RuntimeCheck(pool_size > 1, "pool_size must be > 1, got ", pool_size);
@@ -1380,6 +1418,7 @@ struct VkDsaSelectKernel {
         static_cast<int32_t*>(sel_groups.data_ptr()),
         static_cast<int64_t>(SG.unwrap()),
         static_cast<int32_t*>(sel_n.data_ptr()),
+        static_cast<float*>(next_thr.data_ptr()),
         static_cast<int32_t*>(ovf_counts.data_ptr()),
         static_cast<int32_t>(group_budget),
         static_cast<int32_t>(pool_size),

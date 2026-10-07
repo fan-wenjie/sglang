@@ -219,8 +219,10 @@ def vk_dsa_select(
     """DSA's selection with a reference-set threshold, in DSA's own layout.
 
     Returns dst_token_indices exactly as `topk_from_pooled_history_logits` does,
-    and publishes the selected group ids into `state["sel_groups"]` for the next
-    step to threshold against.
+    and writes the NEXT step's threshold into `state["thr"]` -- the minimum of
+    the scores it just selected, which it has in hand. No separate threshold
+    kernel and no second read of the score row: reading the global scores more
+    than once a step is the trap on this path.
     """
     group_topk = topk // pool_size
     rows = score.shape[0]
@@ -231,7 +233,7 @@ def vk_dsa_select(
     _jit_vk_dsa_select_module(group_topk).vk_dsa_select(
         score, lengths.to(torch.int32), thresholds,
         state["cand_score"], state["cand_idx"], state["ncand"],
-        out, state["sel_groups"], state["sel_n"], state["ovf"],
+        out, state["sel_groups"], state["sel_n"], state["thr"], state["ovf"],
         group_topk, pool_size,
         page_table, topk_indices_offset, row_starts,
         seq_lens.to(torch.int32) if seq_lens is not None else None,

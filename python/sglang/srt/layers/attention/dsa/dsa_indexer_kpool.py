@@ -823,10 +823,7 @@ class IndexerKPool(MultiPlatformOp):
         from sglang.kernels.ops.attention.dsa.vk_select_transform import (
             vk_dsa_select,
         )
-        from sglang.srt.layers.attention.dsa.vk_select import (
-            prev_threshold,
-            select_state,
-        )
+        from sglang.srt.layers.attention.dsa.vk_select import select_state
 
         n_rows = logits.shape[0]
         if page_table is not None and page_table.shape[0] != n_rows:
@@ -844,13 +841,10 @@ class IndexerKPool(MultiPlatformOp):
             )
         st = states[key]
 
-        prev_threshold(
-            logits=logits,
-            sel_groups=st["sel_groups"],
-            sel_n=st["sel_n"],
-            thr=st["thr"],
-            q=float(envs.SGLANG_DSA_VK_SELECT_Q.get()),
-        )
+        # No threshold kernel: the previous step's emit already wrote
+        # st["thr"] as the minimum of what it selected. That removes a whole
+        # launch and, more importantly, a scattered gather of group_budget
+        # elements out of the global score row every layer-step.
         result = vk_dsa_select(
             score=logits,
             lengths=pool_lens[:n_rows],
