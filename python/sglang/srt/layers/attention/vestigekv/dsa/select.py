@@ -117,7 +117,7 @@ def kept_threshold(*, logits, kept_pos, klen, slots, q, pool, scratch, kg_max):
     return scratch["thr"]
 
 
-def select_scratch(*, bs, G, kg_max, dev, cand_max=2048):
+def select_scratch(*, bs, G, kg_max, dev, cand_max=4096):
     return {
         # Candidates staged in GLOBAL memory for the wide collect pass, which
         # cannot use shared memory across CTAs. kCandMax in the .cuh must match.

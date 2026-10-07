@@ -28,7 +28,12 @@ class TestVkDsaSelect(CustomTestCase):
     POOL = 4
     GROUP_TOPK = 512
     TOPK = GROUP_TOPK * POOL
-    G = 4096           # groups; 4096*4 = 16k tokens, past the K<=length early path
+    # Groups. MUST exceed kCandMax (4096) so a -inf threshold actually SPILLS:
+    # at G == kCandMax the bootstrap holds every candidate and takes the
+    # on-candidate radix select, which is exact only to an 8-bit bin, where
+    # DSA refines within the tying bin. The bootstrap's whole claim is that it
+    # IS DSA, so the case has to run on a shape that reaches that path.
+    G = 8192
 
     def setUp(self):
         if not torch.cuda.is_available():
