@@ -823,7 +823,15 @@ class Envs:
     # reference-set threshold is known first and the compare takes the device.
     # Measured 2.1x that kernel at the served fire rate, holding through bs=8.
     SGLANG_DSA_VK_SELECT = EnvBool(False)
-    SGLANG_DSA_VK_SELECT_Q = EnvFloat(0.75)
+    # q=0 is the only SELF-CONSISTENT choice, and it is derivable rather than
+    # tuned. The reference set is the previous selection, so the threshold is a
+    # fixed point only where the quantile equals that selection's own cut -- its
+    # MINIMUM, which approximates the K-th largest, i.e. DSA's own threshold one
+    # step stale. At any q>0 the threshold sits above the cut, fewer than K fire,
+    # the next reference set is smaller and higher-scoring, and it ratchets:
+    # measured 512 -> 130 -> 35 -> 9 groups at q=0.75 with recall 1.00 -> 0.02,
+    # which served as multikey 0.72 against DSA's 1.000.
+    SGLANG_DSA_VK_SELECT_Q = EnvFloat(0.0)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
