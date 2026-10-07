@@ -313,9 +313,9 @@ class VestigeKVDSABackend(AttentionBackend):
             )
         # DSA's split-K decode over the tiers (dsa_decode_fork.py): 9 us per
         # layer per step against the MLA fork's 20 us on the same rows.
-        self._router = DsaTierDecodeRouter(
-            inner=base.decode_attention_fwd, page_size=page_size
-        )
+        # No page_size: DSA's fork does not read one, and the check above has
+        # already refused any pool that is not paged at 1.
+        self._router = DsaTierDecodeRouter(inner=base.decode_attention_fwd)
         base.decode_attention_fwd = self._router
         # Pool handles shared with the base (the latent rows VestigeKV compresses).
         self.token_to_kv_pool = base.token_to_kv_pool

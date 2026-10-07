@@ -121,10 +121,21 @@ class TierDecodeRouter(msgspec.Struct, dict=True):
         return o
 
 
-class DsaTierDecodeRouter(TierDecodeRouter):
+class DsaTierDecodeRouter(msgspec.Struct, dict=True):
     """The DSA-model router: stage 1 and 2 are DSA's own split-K decode over
     the tiers (vestigekv/dsa/decode_fork.py) instead of the MLA-decode fork.
-    Layers without rows still fall through to the base's function."""
+    Layers without rows still fall through to the base's function.
+
+    A sibling of `TierDecodeRouter`, not a subclass: the two share no behaviour
+    (this `__call__` overrode every line of it) and the three fields below are
+    the whole overlap. Inheriting brought in `page_size` and `blend`, which
+    nothing here reads, so the DSA construction site could pass either and be
+    answered by silence -- the failure mode `VKBLEND active` below exists to
+    rule out. Three duplicated field declarations buy that back."""
+
+    inner: object  # the base's original function, for layers this backend skips
+    rows: dict = {}  # layer id -> VestigeKVRows, refreshed per step by the backend
+    current_layer: int = -1
 
     def __call__(
         self,
