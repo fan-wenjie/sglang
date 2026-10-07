@@ -53,9 +53,13 @@ class TestVkDsaSelect(CustomTestCase):
         )
 
     def _thr(self, logits, st, q=0.75):
-        from sglang.srt.layers.attention.dsa.vk_select import prev_threshold
-        return prev_threshold(logits=logits, sel_groups=st["sel_groups"],
-                              sel_n=st["sel_n"], thr=st["thr"], q=q)
+        """No-op: the threshold carries itself now.
+
+        The emit kernel writes st["thr"] as the minimum of what it selected, so
+        there is nothing to compute between steps. Kept as a seam so the cases
+        below still read step-by-step.
+        """
+        return st["thr"]
 
     @staticmethod
     def _groups(row, pool):
@@ -109,7 +113,7 @@ class TestVkDsaSelect(CustomTestCase):
         fired = self._groups(got[0], self.POOL)
         self.assertGreater(len(fired), 0, "vacuous: nothing fired")
 
-        want = set(torch.nonzero(logits[0] > thr).flatten().tolist())
+        want = set(torch.nonzero(logits[0] >= thr).flatten().tolist())
         if len(want) <= self.GROUP_TOPK:
             self.assertEqual(fired, want)
         else:
@@ -240,14 +244,12 @@ class TestVkDsaSelectAcrossSteps(CustomTestCase):
             self.skipTest("CUDA required")
         self.dev = torch.device("cuda")
 
-    def _trace(self, q, rho=0.99, steps=5):
+    def _trace(self, q, rho=0.99, steps=5):  # noqa: D401
         from sglang.kernels.ops.attention.dsa.vk_select_transform import vk_dsa_select
         from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
             fast_kpool_topk_transform_fused,
         )
-        from sglang.srt.layers.attention.dsa.vk_select import (
-            prev_threshold, select_state,
-        )
+        from sglang.srt.layers.attention.dsa.vk_select import select_state
         torch.manual_seed(0)
         base = torch.randn(1, self.G, device=self.dev, dtype=torch.float32)
         st = select_state(bs=1, group_budget=self.GROUP_TOPK, dev=self.dev)
@@ -257,8 +259,6 @@ class TestVkDsaSelectAcrossSteps(CustomTestCase):
             torch.manual_seed(500 + s)
             noise = torch.randn(1, self.G, device=self.dev, dtype=torch.float32)
             logits = rho * base + (1.0 - rho ** 2) ** 0.5 * noise
-            prev_threshold(logits=logits, sel_groups=st["sel_groups"],
-                           sel_n=st["sel_n"], thr=st["thr"], q=q)
             r = vk_dsa_select(score=logits, lengths=lengths, thresholds=st["thr"],
                               state=st, pool_size=self.POOL,
                               topk=self.GROUP_TOPK * self.POOL)
@@ -270,13 +270,35 @@ class TestVkDsaSelectAcrossSteps(CustomTestCase):
             out.append((int(st["sel_n"][0]), len(gg & wg) / max(len(wg), 1)))
         return out
 
-    def test_the_default_q_is_a_fixed_point(self):
-        """q=0 must hold the budget and the recall across steps."""
-        tr = self._trace(0.0)
-        for i, (n, rec) in enumerate(tr):
-            self.assertEqual(n, self.GROUP_TOPK, "step %d fired %d" % (i, n))
-            self.assertGreater(rec, 0.85, "step %d recall %.2f" % (i, rec))
+    def test_the_carried_threshold_is_a_fixed_point(self):
+        """The carried minimum must hold the budget and the recall across steps.
 
+        q is no longer a knob on the served path: the emit kernel writes the
+        MINIMUM of what it selected, which is the q=0 case and the only
+        self-consistent one. The offline sweep that found the ratchet at q>0
+        lives in the register, not here.
+        """
+        # 20 steps, because the property is the absence of DRIFT, not the value
+        # at any one step. The count above a fixed cut is ~Binomial(G, K/G), so
+        # sd ~= sqrt(K(1-K/G)) ~= 21 at K=512, G=4096: a single step reading 492
+        # is one sd and means nothing. What would matter is a downward trend --
+        # the ratchet that q=0.75 produced in its sharp form.
+        tr = self._trace(0.0, steps=20)
+        ns = [n for n, _ in tr]
+        recs = [r for _, r in tr]
+        first5 = sum(ns[1:6]) / 5.0
+        last5 = sum(ns[-5:]) / 5.0
+        self.assertGreater(last5, 0.90 * self.GROUP_TOPK,
+                           "budget collapsed: %s" % (ns,))
+        self.assertGreater(last5, 0.90 * first5,
+                           "budget drifts down: first5 %.0f last5 %.0f %s"
+                           % (first5, last5, ns))
+        self.assertGreater(min(recs[1:]), 0.85, "recall dipped: %s" % (
+            ["%.2f" % r for r in recs],))
+
+    @unittest.skip("q is not a served knob any more: the emit kernel carries the "
+                   "minimum, which is q=0. The ratchet at q>0 is recorded in the "
+                   "register with its measurements.")
     def test_a_positive_q_ratchets_the_threshold_shut(self):
         """The regression this guards: q=0.75 collapsed to 9 groups and 0.02
         recall, and served multikey 0.72. Any q>0 is unstable by construction --

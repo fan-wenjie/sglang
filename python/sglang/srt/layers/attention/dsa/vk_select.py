@@ -67,7 +67,15 @@ def _prev_threshold_kernel(
 
 
 def prev_threshold(*, logits, sel_groups, sel_n, thr, q):
-    """q-quantile of the previous selection's scores under THIS step's query."""
+    """q-quantile of the previous selection's scores under THIS step's query.
+
+    NOT on the hot path any more. The emit kernel writes the next threshold
+    itself from scores it already holds; doing it here costs a scattered gather
+    of up to group_budget elements out of the global score row, every
+    layer-step, and reading those scores more than once a step is the trap on
+    this path. Kept because it expresses the rule for a general q, which the
+    offline q-sweep that found the ratchet needs.
+    """
     B, G = logits.shape
     SG = sel_groups.shape[1]
     assert SG == triton.next_power_of_2(SG), f"sel width {SG} must be a power of 2"
@@ -83,7 +91,10 @@ def select_state(*, bs, group_budget, dev, cand_max=2048):
         "cand_score": torch.zeros(bs, cand_max, dtype=torch.float32, device=dev),
         "cand_idx": torch.zeros(bs, cand_max, dtype=torch.int32, device=dev),
         "ncand": torch.zeros(bs, dtype=torch.int32, device=dev),
-        "thr": torch.zeros(bs, dtype=torch.float32, device=dev),
+        # -inf, not zero: the first step must fire everything and route itself
+        # through DSA's radix. Zero would silently fire "everything above 0",
+        # which is a different and wrong rule.
+        "thr": torch.full((bs,), float("-inf"), dtype=torch.float32, device=dev),
         # The reference set for the NEXT step, and its count. Zeroed here so the
         # first step of a fresh server bootstraps through DSA's radix.
         "sel_groups": torch.full((bs, group_budget), -1, dtype=torch.int32, device=dev),

@@ -178,7 +178,7 @@ class TestVkSelectFetch(CustomTestCase):
         keep_mask = torch.ones_like(logits[0], dtype=torch.bool)
         if kept:
             keep_mask[torch.tensor(sorted(kept), device=self.dev)] = False
-        cand = torch.nonzero((logits[0] > thr) & keep_mask).flatten()
+        cand = torch.nonzero((logits[0] >= thr) & keep_mask).flatten()
         got = set()
         for i in range(0, int(wl[0]), self.POOL):
             r = int(wf[0, i])
@@ -222,7 +222,7 @@ class TestVkSelectFetch(CustomTestCase):
         # From kg, not km: the kernel is km's last reader and resets it, so
         # after the call km is all zeros by design.
         kept = set(sel["kg"][0, : int(sel["kgn"][0])].tolist())
-        want = {g for g in torch.nonzero(logits[0] > thr).flatten().tolist()
+        want = {g for g in torch.nonzero(logits[0] >= thr).flatten().tolist()
                 if g not in kept}
         got = set()
         for i in range(0, n, self.POOL):
@@ -247,7 +247,7 @@ class TestVkSelectFetch(CustomTestCase):
         keep_mask = torch.ones_like(logits[0], dtype=torch.bool)
         if kept:
             keep_mask[torch.tensor(sorted(kept), device=self.dev)] = False
-        cand = torch.nonzero((logits[0] > thr) & keep_mask).flatten()
+        cand = torch.nonzero((logits[0] >= thr) & keep_mask).flatten()
         best = cand[logits[0][cand].argsort(descending=True)][: self.WG]
         got = set()
         for i in range(0, int(nl[0]), self.POOL):
@@ -337,7 +337,7 @@ class TestVkSelectFetch(CustomTestCase):
                             pool=POOL)
             counts.append(int(flen[0]))
             thr = float(sc["thr"][0])
-            want = int(((logits[0] > thr).sum())) - 0  # kept groups are excluded
+            want = int(((logits[0] >= thr).sum())) - 0  # kept groups are excluded
             self.assertGreater(counts[-1], 0, "vacuous: nothing fired")
             self.assertEqual(int(sc["km"].sum()), 0,
                              "km was not reset after layer %d" % layer)
