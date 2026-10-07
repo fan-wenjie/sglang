@@ -815,6 +815,15 @@ class Envs:
     # 55 -> 22 launches is ~16 us/step against a 138 us chain whose cost is its
     # work), so this is a code simplification and has to prove itself per arm.
     SGLANG_VESTIGEKV_SELECT_FORK = EnvBool(False)
+
+    # DSA's selection by a REFERENCE-SET threshold instead of its rank top-k:
+    # the q-quantile of the groups the previous layer-step selected. A rank
+    # threshold is unknown until every score is histogrammed, a histogram needs
+    # one block, so kpool_topk_transform runs one CTA over all groups; a
+    # reference-set threshold is known first and the compare takes the device.
+    # Measured 2.1x that kernel at the served fire rate, holding through bs=8.
+    SGLANG_DSA_VK_SELECT = EnvBool(False)
+    SGLANG_DSA_VK_SELECT_Q = EnvFloat(0.75)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
