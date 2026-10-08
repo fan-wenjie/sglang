@@ -805,6 +805,65 @@ class IndexerKPool(MultiPlatformOp):
         )
         return torch.cat([topk_full, padding], dim=1)
 
+    # Recency depth in GROUPS. At index_kpool=4 this covers the newest 32
+    # tokens, which spans the few items of a cwe enumeration where the
+    # repetition starts.
+    _VK_TELE_R = 8
+
+    def _vk_recency_telemetry(self, *, score, pool_lens, st, thr_before, layer_id):
+        """By how recent a group is: how often selected, how far from the cut.
+
+        Every op here is a device op on tensors already in hand -- no .item(),
+        no host read, no value-dependent shape -- so these record into the CUDA
+        graph at capture and run on every replay. The readout is the opposite:
+        it needs a host sync, so it only runs when the stream is NOT capturing
+        (an eager extend step), which is also why the counters are cumulative
+        rather than per step.
+        """
+        R = self._VK_TELE_R
+        sel = st["sel_groups"]
+        dev = score.device
+        acc = st.get("tele")
+        if acc is None:
+            acc = {
+                "n": torch.zeros((), dtype=torch.long, device=dev),
+                "sel": torch.zeros(R, dtype=torch.long, device=dev),
+                "above": torch.zeros(R, dtype=torch.long, device=dev),
+                "margin": torch.zeros(R, dtype=torch.float32, device=dev),
+                # DSA's answer on the SAME steps: an exact rank top-k selects a
+                # group iff fewer than `budget` groups outscore it. Recording it
+                # here makes the contrast within-run, so no second arm is needed
+                # and no cross-run nondeterminism enters the comparison.
+                "dsa_sel": torch.zeros(R, dtype=torch.long, device=dev),
+            }
+            st["tele"] = acc
+        ar = torch.arange(R, device=dev).view(1, R)
+        idx = (pool_lens.long().view(-1, 1) - 1 - ar).clamp_(min=0)
+        hit = (sel.long().unsqueeze(2) == idx.unsqueeze(1)).any(dim=1)
+        sc = score.gather(1, idx)
+        acc["n"] += score.shape[0]
+        acc["sel"] += hit.sum(0)
+        acc["above"] += (sc >= thr_before.view(-1, 1)).sum(0)
+        acc["margin"] += (sc - thr_before.view(-1, 1)).sum(0).float()
+        rank = (score.unsqueeze(1) > sc.unsqueeze(2)).sum(dim=2)  # [bs,R]
+        acc["dsa_sel"] += (rank < sel.shape[1]).sum(0)
+
+        if torch.cuda.is_current_stream_capturing():
+            return
+        n = int(acc["n"])
+        if n == 0:
+            return
+        s_, a_, m_ = acc["sel"].tolist(), acc["above"].tolist(), acc["margin"].tolist()
+        d_ = acc["dsa_sel"].tolist()
+        logger.info(
+            "VKRECENCY layer=%d n=%d sel_frac=%s dsa_frac=%s above_frac=%s mean_margin=%s",
+            layer_id, n,
+            ",".join("%.3f" % (x / n) for x in s_),
+            ",".join("%.3f" % (x / n) for x in d_),
+            ",".join("%.3f" % (x / n) for x in a_),
+            ",".join("%+.4f" % (x / n) for x in m_),
+        )
+
     def _vk_select_from_kpool_logits(
         self,
         logits: torch.Tensor,
@@ -850,6 +909,9 @@ class IndexerKPool(MultiPlatformOp):
             )
         st = states[key]
 
+        tele = envs.SGLANG_DSA_VK_SELECT_TELEMETRY.get()
+        thr_before = st["thr"].clone() if tele else None
+
         # No threshold kernel: the previous step's emit already wrote
         # st["thr"] as the minimum of what it selected. That removes a whole
         # launch and, more importantly, a scattered gather of group_budget
@@ -865,6 +927,11 @@ class IndexerKPool(MultiPlatformOp):
             topk_indices_offset=topk_offsets,
             seq_lens=seq_lens[:n_rows] if seq_lens is not None else None,
         )
+        if tele:
+            self._vk_recency_telemetry(
+                score=logits, pool_lens=pool_lens[:n_rows], st=st,
+                thr_before=thr_before, layer_id=layer_id)
+
         if out_rows is None or out_rows == result.shape[0]:
             return result
         padded = torch.full(

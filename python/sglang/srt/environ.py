@@ -843,6 +843,16 @@ class Envs:
     # Always sweep it on BOTH arms. Must be a multiple of index_kpool, and for
     # SGLANG_DSA_VK_SELECT the quotient must be in SUPPORTED_GROUP_TOPK.
     SGLANG_DSA_INDEX_TOPK = EnvInt(0)
+
+    # Diagnostic: per-layer-step, is the model's OWN RECENT OUTPUT selected?
+    # The carried threshold is the previous selection's minimum, set by
+    # high-scoring prompt rows; nothing in DSA's selection exempts recent rows
+    # (the only unconditional ones are seq_lens % pool_size, the 0-3 leftover
+    # tokens with no pooled group). So a group holding just-generated tokens must
+    # clear a prompt-calibrated cut. This records, by how recent a group is,
+    # how often it is selected and how far its score sits from the threshold.
+    # Costs an extra compare pass; never enable on a latency arm.
+    SGLANG_DSA_VK_SELECT_TELEMETRY = EnvBool(False)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads
