@@ -805,10 +805,12 @@ class IndexerKPool(MultiPlatformOp):
         )
         return torch.cat([topk_full, padding], dim=1)
 
-    # Recency depth in GROUPS. At index_kpool=4 this covers the newest 32
-    # tokens, which spans the few items of a cwe enumeration where the
-    # repetition starts.
-    _VK_TELE_R = 8
+    # Recency depth in GROUPS. At index_kpool=4, R=32 covers the newest 128
+    # tokens. R=8 (32 tokens) was too short to size a window exemption: the
+    # deficit measured +0.147 at the far end with no decay, so where it ends was
+    # outside the instrument. A cwe answer is ~10 items over ~100 tokens, i.e.
+    # ~25 groups, which is what the window has to span.
+    _VK_TELE_R = 32
 
     def _vk_recency_telemetry(self, *, score, pool_lens, st, thr_before, layer_id):
         """By how recent a group is: how often selected, how far from the cut.
