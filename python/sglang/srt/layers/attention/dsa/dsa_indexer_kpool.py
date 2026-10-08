@@ -190,7 +190,16 @@ class IndexerKPool(MultiPlatformOp):
         self.n_heads = index_n_heads
         self.head_dim = index_head_dim
         self.rope_head_dim = rope_head_dim
-        self.index_topk = index_topk
+        # Experiment knob; 0 means the model config's value. See
+        # SGLANG_DSA_INDEX_TOPK -- it moves the attention row count too, so it is
+        # only interpretable when both arms of a pair carry the same value.
+        _topk_override = envs.SGLANG_DSA_INDEX_TOPK.get()
+        self.index_topk = _topk_override if _topk_override else index_topk
+        if _topk_override:
+            logger.info(
+                "SGLANG_DSA_INDEX_TOPK=%d overrides index_topk=%d (layer %s)",
+                _topk_override, index_topk, layer_id,
+            )
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream

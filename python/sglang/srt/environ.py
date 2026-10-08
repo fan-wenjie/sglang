@@ -832,6 +832,17 @@ class Envs:
     # measured 512 -> 130 -> 35 -> 9 groups at q=0.75 with recall 1.00 -> 0.02,
     # which served as multikey 0.72 against DSA's 1.000.
     SGLANG_DSA_VK_SELECT_Q = EnvFloat(0.0)
+
+    # Override DSA's index_topk (the model config's 2048 on GLM-5.3-Flash).
+    # 0 keeps the config value. This is NOT a vk-only knob and must not be read
+    # as one: index_topk is simultaneously the selection budget AND the number of
+    # rows attention reads, because vk_dsa_select derives group_topk = topk //
+    # pool_size and sizes its output (rows, topk + tail) from the same number. So
+    # a budget sweep moves both arms' cost, and a vk arm at a different budget
+    # from its DSA control is not a pair -- the row count confounds the selector.
+    # Always sweep it on BOTH arms. Must be a multiple of index_kpool, and for
+    # SGLANG_DSA_VK_SELECT the quotient must be in SUPPORTED_GROUP_TOPK.
+    SGLANG_DSA_INDEX_TOPK = EnvInt(0)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads

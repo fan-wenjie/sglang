@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 # The same set kpool_topk_transform builds for: the module is specialised on the
 # pooled group budget, which is a compile-time constant in the kernel.
-SUPPORTED_GROUP_TOPK = (128, 160, 192, 224, 256, 512)
+SUPPORTED_GROUP_TOPK = (128, 160, 192, 224, 256, 512, 768, 1024)
 
 
 def _cuda_include_paths() -> List[str]:
