@@ -823,7 +823,14 @@ class IndexerKPool(MultiPlatformOp):
         R = self._VK_TELE_R
         sel = st["sel_groups"]
         dev = score.device
-        acc = st.get("tele")
+        # Keyed by LAYER, not by the (layer_id, n_rows) state key. Decode and
+        # extend carry different n_rows and so different states; the readout can
+        # only run on an eager extend step, so a per-state accumulator reports
+        # extend's counters and never decode's -- measured n=12 instead of
+        # thousands, i.e. the wrong steps entirely. One accumulator per layer is
+        # what makes the extend-time readout report the decode steps.
+        tele_all = self.__dict__.setdefault("_vk_tele", {})
+        acc = tele_all.get(layer_id)
         if acc is None:
             acc = {
                 "n": torch.zeros((), dtype=torch.long, device=dev),
@@ -836,7 +843,11 @@ class IndexerKPool(MultiPlatformOp):
                 # and no cross-run nondeterminism enters the comparison.
                 "dsa_sel": torch.zeros(R, dtype=torch.long, device=dev),
             }
-            st["tele"] = acc
+            # Allocated on the first call, which is an eager extend step in
+            # practice (a request prefills before it decodes). That matters: a
+            # tensor first allocated INSIDE a capture lives in the graph's
+            # private pool and must not be read from outside a replay.
+            tele_all[layer_id] = acc
         ar = torch.arange(R, device=dev).view(1, R)
         idx = (pool_lens.long().view(-1, 1) - 1 - ar).clamp_(min=0)
         hit = (sel.long().unsqueeze(2) == idx.unsqueeze(1)).any(dim=1)
