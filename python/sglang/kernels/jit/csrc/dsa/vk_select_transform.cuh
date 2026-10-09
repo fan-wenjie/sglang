@@ -808,9 +808,13 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_emit_dsa_kernel(
   if (tid == 0) {
     sel_n[b] = n_sel;
     ncand[b] = 0;  // last reader of the counter; reset so the next step starts clean
-    // No selection -> -inf, which fires everything next step and routes it to
-    // the radix: the same bootstrap the first step takes.
-    next_thr[b] = n_sel > 0 ? s_red[0] : -INFINITY;
+    // Nothing FIRED -> -inf, which fires everything next step and routes it to
+    // the radix: the same bootstrap the first step takes. Keyed on n_fired, not
+    // n_sel: the recency window makes n_sel nonzero even when the fired set is
+    // empty, and then s_red[0] is the +INFINITY the reduction started from. That
+    // is an absorbing state -- no score ever clears +inf, so the selection would
+    // be the window alone for the rest of the request.
+    next_thr[b] = n_fired > 0 ? s_red[0] : -INFINITY;
   }
 }
 
@@ -1006,7 +1010,11 @@ __global__ __launch_bounds__(BLOCK) void vk_collect_kernel(
   // carried threshold. next_thr is the minimum over the emitted groups, so a
   // low-scoring recent group defining it would drag the cut into the bulk, fire
   // everything above it next step and spill into the overflow tier.
-  if (recent_w > 0 && idx >= len - recent_w) return;
+  // Clamped the same way the emit clamps it. Unclamped, a row with
+  // len < recent_w has `idx >= len - recent_w` true for EVERY idx, so nothing
+  // becomes a candidate -- which then drives next_thr to +inf below.
+  const auto rw_c = recent_w <= 0 ? 0 : (recent_w < len ? recent_w : len);
+  if (rw_c > 0 && idx >= len - rw_c) return;
   // The DSA-patch rule passes no mask at all: its reference set is the previous
   // selection, whose groups SHOULD be allowed to fire again, unlike a tier-1
   // kept row which must be excluded. So the pointer is genuinely optional.

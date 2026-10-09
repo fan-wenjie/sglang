@@ -211,6 +211,44 @@ class TestRecencyWindow(CustomTestCase):
             self.assertEqual(n, self.BUDGET,
                              "the window must be paid out of the budget, not added to it")
 
+    def test_an_empty_fired_set_rebootstraps_instead_of_latching_plus_inf(self):
+        """Regression: the window must not turn an empty fired set into +inf.
+
+        next_thr is the min over the fired groups, so with nothing fired the
+        reduction returns the +INFINITY it started from. Before the window, the
+        `n_sel > 0` guard caught that and published -inf, re-bootstrapping through
+        the radix. The window makes n_sel nonzero even when n_fired is 0, which
+        silently removed that recovery: +inf is ABSORBING -- no score clears it --
+        so the selection became the window alone for the rest of the request.
+        Served symptom was niah_multikey_3 1.000 -> 0.000 with cwe 0.73 -> 0.05,
+        with no error and no traceback.
+
+        Reached here via length <= recent_w, where the collect's unclamped
+        `idx >= len - recent_w` excluded every group from candidacy.
+        """
+        import math
+
+        from sglang.kernels.ops.attention.dsa.vk_select_transform import vk_dsa_select
+        from sglang.srt.layers.attention.dsa.vk_select import select_state
+
+        dev = "cuda"
+        for G in (8, 16, 64):
+            torch.manual_seed(5)
+            score = torch.randn(1, G, device=dev)
+            lengths = torch.full((1,), G, dtype=torch.int32, device=dev)
+            st = select_state(bs=1, group_budget=self.BUDGET, dev=dev)
+            for step in range(4):
+                vk_dsa_select(score=score, lengths=lengths, thresholds=st["thr"],
+                              state=st, pool_size=self.POOL,
+                              topk=self.BUDGET * self.POOL, recent_w=self.W)
+                thr = float(st["thr"][0])
+                self.assertFalse(math.isinf(thr) and thr > 0,
+                                 "threshold latched at +inf at G=%d step %d" % (G, step))
+                # every group must still be reachable when they all fit
+                self.assertEqual(int(st["sel_n"][0]), min(G, self.BUDGET),
+                                 "G=%d step %d dropped groups: %d"
+                                 % (G, step, int(st["sel_n"][0])))
+
     def test_window_does_not_duplicate_a_group(self):
         """A group emitted twice is attended twice and silently reweights the
         softmax, so the collect must exclude the window from candidacy."""
