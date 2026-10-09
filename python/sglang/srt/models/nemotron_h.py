@@ -25,6 +25,7 @@ from torch import nn
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -615,9 +616,38 @@ class NemotronHAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        self._maybe_dump_k(k, q)
         attn_output = self.attn.forward(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _maybe_dump_k(self, k: torch.Tensor, q: torch.Tensor | None = None) -> None:
+        """Save this layer's K rows for the offline spectral check.
+
+        Prefill only: a decode step carries one row, which says nothing about the
+        spectrum over tokens. Prefill is chunked, so chunks are numbered and
+        concatenated offline rather than accumulated here -- accumulating would
+        hold the whole prompt's K in GPU memory for every layer at once.
+        """
+        out_dir = envs.SGLANG_DEBUG_NOPE_KDUMP_DIR.get()
+        if out_dir is None or k.shape[0] <= 1:
+            return
+        import os
+
+        os.makedirs(out_dir, exist_ok=True)
+        n = self._kdump_seq = getattr(self, "_kdump_seq", 0) + 1
+        torch.save(
+            k.detach().to(torch.float32).cpu(),
+            os.path.join(out_dir, f"L{self.attn.layer_id:03d}_{n:05d}.pt"),
+        )
+        if q is not None:
+            # q as well, so a prune rate can be MEASURED against real scores
+            # rather than inferred from the spread of ||k||. GQA: q head j is
+            # served by kv head j // (num_heads // num_kv_heads).
+            torch.save(
+                q.detach().to(torch.float32).cpu(),
+                os.path.join(out_dir, f"L{self.attn.layer_id:03d}_{n:05d}_q.pt"),
+            )
 
 
 class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):

@@ -215,6 +215,7 @@ def vk_dsa_select(
     seq_lens: Optional[torch.Tensor] = None,
     page_table_row_index: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    recent_w: int = 0,
 ) -> torch.Tensor:
     """DSA's selection with a reference-set threshold, in DSA's own layout.
 
@@ -238,5 +239,6 @@ def vk_dsa_select(
         page_table, topk_indices_offset, row_starts,
         seq_lens.to(torch.int32) if seq_lens is not None else None,
         page_table_row_index,
+        recent_w,
     )
     return out

@@ -589,6 +589,13 @@ class Envs:
     # queries the calibrated index was fitted on, written at its install.
     # The offline certificate studies in the experiment repository read these.
     SGLANG_DEBUG_VESTIGEKV_DUMP_DIR = EnvStr(None)
+
+    # Dump the K rows of a fully-NoPE GQA model's attention layers, for the
+    # offline spectral check. Nemotron-H is unconditionally NoPE -- its
+    # attention forward takes no `positions` argument at all, so it cannot apply
+    # RoPE -- which is the precondition for a training-free f(k): k is immutable,
+    # so a per-layer projection can be fit once offline.
+    SGLANG_DEBUG_NOPE_KDUMP_DIR = EnvStr(None)
     # Directory for allocator snapshots: records allocation stacks from
     # startup, logs VKMEM (allocated / reserved) at every new request's first
     # prefill chunk and writes torch.cuda.memory._dump_snapshot every fifth
@@ -853,6 +860,19 @@ class Envs:
     # how often it is selected and how far its score sits from the threshold.
     # Costs an extra compare pass; never enable on a latency arm.
     SGLANG_DSA_VK_SELECT_TELEMETRY = EnvBool(False)
+
+    # Exempt the newest W GROUPS from the carried threshold: emit them
+    # unconditionally. Nothing in DSA's selection exempts recent rows -- the only
+    # unconditional ones are seq_lens % pool_size, the 0-3 leftover tokens with
+    # no pooled group -- so the model's own output becomes threshold-gated as soon
+    # as it completes a group of 4 tokens, and it repeats itself.
+    # Measured (c521rec3/4, 64k): an exact rank top-k takes those rows 0.94-0.96
+    # of the time and the carried threshold 0.68-0.84; the deficit is flat over
+    # the whole 32-token window and halves only by ~44 tokens back, so a window of
+    # 16 groups (64 tokens) covers 73.9% of it. 0 disables.
+    # The window is paid for out of the budget (group_budget -> budget - W), so the
+    # row count and every downstream shape are unchanged.
+    SGLANG_DSA_VK_SELECT_RECENT_W = EnvInt(0)
     SGLANG_VESTIGEKV_COARSE_PROXY = EnvStr(None)
 
     # VestigeKV kept-row source, a kill-switch A/B over how the prologue reads

@@ -652,7 +652,8 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_emit_dsa_kernel(
     const int64_t page_table_stride,
     const int32_t* __restrict__ page_table_row_index,
     const int32_t* __restrict__ topk_indices_offset,
-    const int32_t* __restrict__ seq_lens) {
+    const int32_t* __restrict__ seq_lens,
+    const int32_t recent_w) {
   const auto b = static_cast<uint64_t>(blockIdx.x);
   const auto tid = static_cast<int>(threadIdx.x);
   const auto length = lengths[b];
@@ -737,7 +738,18 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_emit_dsa_kernel(
     __syncthreads();
   }
 
-  const auto n_sel = s_taken < group_budget ? s_taken : group_budget;
+  // Reserve the tail of the budget for the recency window so the TOTAL row count
+  // is unchanged and dst_token_indices / out_cols stay exactly as sized. The
+  // fired set pays for it: group_budget -> group_budget - rw. NOT named `w`: the
+  // tree reduction below already uses that name.
+  const auto rw = recent_w <= 0 ? 0 : (recent_w < length ? recent_w : length);
+  const auto fired_cap = group_budget - rw;
+  const auto n_fired = s_taken < fired_cap ? s_taken : fired_cap;
+  for (int i = tid; i < rw; i += kThreadsPerBlock) {
+    s_sel[n_fired + i] = length - 1 - i;  // the newest rw groups, always emitted
+  }
+  __syncthreads();
+  const auto n_sel = n_fired + rw;
   const auto sel_len = n_sel * pool_size;
   const auto full = length * pool_size;
   const auto cap = full < token_topk ? full : token_topk;
@@ -780,7 +792,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void vk_emit_dsa_kernel(
   for (int i = tid; i < n_sel; i += kThreadsPerBlock) {
     const auto g = s_sel[i];
     sel_groups[b * sel_stride + i] = g;
-    if (g >= 0) {
+    // Only the FIRED part defines the next threshold; the window rides along. If
+    // it contributed, the cut would collapse to a recent group's score.
+    if (i < n_fired && g >= 0) {
       const auto v = sc_row[g + row_start];
       if (v < local) local = v;
     }
@@ -979,10 +993,20 @@ __global__ __launch_bounds__(BLOCK) void vk_collect_kernel(
     float* __restrict__ cand_score,
     int32_t* __restrict__ cand_idx,
     const int64_t cand_stride,
-    int32_t* __restrict__ ncand) {
+    int32_t* __restrict__ ncand,
+    const int32_t recent_w) {
   const auto b = static_cast<uint64_t>(blockIdx.y);
   const auto idx = static_cast<int>(blockIdx.x) * BLOCK + static_cast<int>(threadIdx.x);
-  if (idx >= lengths[b]) return;
+  const auto len = lengths[b];
+  if (idx >= len) return;
+  // The recency window is emitted UNCONDITIONALLY, so it must not compete here.
+  // Excluding it from candidacy does two jobs: no group can be emitted twice (a
+  // duplicated row is attended twice and silently reweights the softmax), and
+  // the window stays out of the FIRED set, which is what keeps it out of the
+  // carried threshold. next_thr is the minimum over the emitted groups, so a
+  // low-scoring recent group defining it would drag the cut into the bulk, fire
+  // everything above it next step and spill into the overflow tier.
+  if (recent_w > 0 && idx >= len - recent_w) return;
   // The DSA-patch rule passes no mask at all: its reference set is the previous
   // selection, whose groups SHOULD be allowed to fire again, unlike a tier-1
   // kept row which must be excluded. So the pointer is genuinely optional.
@@ -1292,7 +1316,8 @@ struct VkCollectEmitKernel {
         static_cast<float*>(cand_score.data_ptr()),
         static_cast<int32_t*>(cand_idx.data_ptr()),
         static_cast<int64_t>(CS.unwrap()),
-        static_cast<int32_t*>(ncand.data_ptr()));
+        static_cast<int32_t*>(ncand.data_ptr()),
+        /*recent_w=*/0);
 
     // cs + ci (kCandMax each) plus the selection destination.
     static_assert(
@@ -1341,9 +1366,12 @@ struct VkDsaSelectKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> topk_indices_offset_opt,
       const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts_opt,
       const tvm::ffi::Optional<tvm::ffi::TensorView> seq_lens_opt,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_row_index_opt) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_row_index_opt,
+      const int64_t recent_w) {
     using namespace host;
     constexpr int kCollectBlock = 256;
+    RuntimeCheck(recent_w >= 0 && recent_w < group_budget,
+                 "recent_w ", recent_w, " must be in [0, group_budget)");
 
     auto B = SymbolicSize{"batch_size"};
     auto S = SymbolicSize{"score_stride"};
@@ -1409,7 +1437,8 @@ struct VkDsaSelectKernel {
         static_cast<float*>(cand_score.data_ptr()),
         static_cast<int32_t*>(cand_idx.data_ptr()),
         static_cast<int64_t>(CS.unwrap()),
-        static_cast<int32_t*>(ncand.data_ptr()));
+        static_cast<int32_t*>(ncand.data_ptr()),
+        static_cast<int32_t>(recent_w));
 
     setup_kernel_smem_once<&vk_emit_dsa_kernel, kSmem>();
     LaunchKernel(bs, kThreadsPerBlock, device.unwrap(), kSmem)(
@@ -1437,7 +1466,8 @@ struct VkDsaSelectKernel {
         page_table_stride,
         optional_data_ptr<int32_t>(page_table_row_index_opt),
         optional_data_ptr<int32_t>(topk_indices_offset_opt),
-        optional_data_ptr<int32_t>(seq_lens_opt));
+        optional_data_ptr<int32_t>(seq_lens_opt),
+        static_cast<int32_t>(recent_w));
   }
 };
 

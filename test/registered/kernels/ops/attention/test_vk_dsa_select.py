@@ -161,6 +161,78 @@ class TestVkDsaSelect(CustomTestCase):
                                 self.G * self.POOL + 2])
 
 
+class TestRecencyWindow(CustomTestCase):
+    """SGLANG_DSA_VK_SELECT_RECENT_W emits the newest W groups unconditionally.
+
+    The guarded failure is the threshold, not the emission. next_thr is the
+    MINIMUM score over the emitted groups, so a low-scoring recent group that
+    contributed to it would drag the cut into the bulk; the next step would then
+    fire everything above that cut and spill into the overflow tier, and the
+    bitonic cut could drop the recent group again. The window must ride along
+    WITHOUT defining the cut, which is why the collect excludes it from
+    candidacy and the reduction runs over the fired part alone.
+    """
+
+    POOL, BUDGET, G, BS, W = 4, 512, 4096, 2, 16
+
+    def _trace(self, recent_w, steps=4):
+        from sglang.kernels.ops.attention.dsa.vk_select_transform import vk_dsa_select
+        from sglang.srt.layers.attention.dsa.vk_select import select_state
+
+        dev = "cuda"
+        torch.manual_seed(0)
+        score = torch.randn(self.BS, self.G, device=dev)
+        # the newest W groups score far below the bulk: absent the window they are
+        # never selected, and if they fed the reduction the cut would go to -8.
+        score[:, self.G - self.W :] = -8.0
+        lengths = torch.full((self.BS,), self.G, dtype=torch.int32, device=dev)
+        st = select_state(bs=self.BS, group_budget=self.BUDGET, dev=dev)
+        out = []
+        for _ in range(steps):
+            vk_dsa_select(score=score, lengths=lengths, thresholds=st["thr"],
+                          state=st, pool_size=self.POOL,
+                          topk=self.BUDGET * self.POOL, recent_w=recent_w)
+            sel = st["sel_groups"][0].tolist()
+            newest = set(range(self.G - self.W, self.G))
+            out.append((int(st["sel_n"][0]), float(st["thr"][0]),
+                        len(newest & set(sel))))
+        return out
+
+    def test_window_is_emitted_and_does_not_move_the_threshold(self):
+        off, on = self._trace(0), self._trace(self.W)
+        self.assertEqual([c for _, _, c in off], [0] * len(off),
+                         "without the window these groups must never be selected")
+        self.assertEqual([c for _, _, c in on], [self.W] * len(on),
+                         "with it they must be selected on every step: %s" % (on,))
+        # the real guard: the cut stays in the bulk, nowhere near -8
+        for n, thr, _ in on:
+            self.assertGreater(thr, 0.0,
+                               "threshold collapsed toward the window's score: %s" % (on,))
+            self.assertEqual(n, self.BUDGET,
+                             "the window must be paid out of the budget, not added to it")
+
+    def test_window_does_not_duplicate_a_group(self):
+        """A group emitted twice is attended twice and silently reweights the
+        softmax, so the collect must exclude the window from candidacy."""
+        from sglang.kernels.ops.attention.dsa.vk_select_transform import vk_dsa_select
+        from sglang.srt.layers.attention.dsa.vk_select import select_state
+
+        dev = "cuda"
+        torch.manual_seed(1)
+        # newest groups score HIGH, so they would also fire on score alone
+        score = torch.randn(self.BS, self.G, device=dev)
+        score[:, self.G - self.W :] = 8.0
+        lengths = torch.full((self.BS,), self.G, dtype=torch.int32, device=dev)
+        st = select_state(bs=self.BS, group_budget=self.BUDGET, dev=dev)
+        for _ in range(3):
+            vk_dsa_select(score=score, lengths=lengths, thresholds=st["thr"],
+                          state=st, pool_size=self.POOL,
+                          topk=self.BUDGET * self.POOL, recent_w=self.W)
+            sel = [g for g in st["sel_groups"][0].tolist() if g >= 0]
+            self.assertEqual(len(sel), len(set(sel)),
+                             "a group was emitted twice")
+
+
 if __name__ == "__main__":
     unittest.main()
 

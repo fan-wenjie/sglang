@@ -939,6 +939,7 @@ class IndexerKPool(MultiPlatformOp):
             page_table=page_table,
             topk_indices_offset=topk_offsets,
             seq_lens=seq_lens[:n_rows] if seq_lens is not None else None,
+            recent_w=envs.SGLANG_DSA_VK_SELECT_RECENT_W.get(),
         )
         if tele:
             self._vk_recency_telemetry(
